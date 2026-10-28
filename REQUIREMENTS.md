@@ -1,8 +1,9 @@
 # lendisk — requirements
 
-Status: draft v0.7, 2026-10-28. Split out of SPEC v0.6. The design
+Status: draft v0.8, 2026-10-28. Split out of SPEC v0.6 as v0.7; v0.8
+admits a storage engine with its own on-disk format (P-5). The design
 decisions that were §3 of that document, and the implementation detail
-that was mixed into its §4, now live in DESIGN.md.
+that was mixed into its §4, live in DESIGN.md.
 
 ## 0. How to read this document
 
@@ -32,8 +33,7 @@ the requirement; the binary name is a working title (DESIGN.md §1).
 lendisk lets a small group of people who know each other lend each other disk
 space for offsite backups. Each participant runs one node. A backup tool
 (restic, Kopia, or anything that speaks S3) talks to the node as if it were
-an ordinary S3 endpoint; restic may also use its REST protocol. The node
-keeps a local copy of the repository and replicates it to the peers who
+an ordinary S3 endpoint. The node keeps a local copy of the repository and replicates it to the peers who
 have lent you space, over an overlay network that works behind NAT.
 
 The person holding your copy never needs to be trusted with your data: the
@@ -58,13 +58,14 @@ Original requirements this document grew from:
 | **Peer** | Another node you have exchanged invites with. |
 | **Borrower** | The role of a node storing its buckets on a peer. |
 | **Lender** (host) | The role of a node storing a peer's buckets. Most nodes play both roles. |
-| **Local store** | The node's own copy of its buckets, kept as plain files. One per node, never shared. |
+| **Storage engine** | The S3 store the node runs its local store and lending store on: an unmodified, freely available open-source program that can be started on the same directories without lendisk (P-5). Chosen in DESIGN.md. |
+| **Local store** | The node's own copy of its buckets, held in the storage engine. One per node, never shared. |
 | **Bucket** | One backup repository as the backup tool sees it: a namespace of keys in the local store. Formerly "repo". |
 | **Tool profile** | Per-bucket setting (`restic`, `kopia`, `generic`) that selects validation rules and what "snapshot" means. |
 | **Replica** | A copy of a bucket held by one lender or in one external S3 bucket. |
 | **Replication set** | The replicas a bucket is replicated to. |
 | **Offsite-complete** | A point in a bucket's write sequence up to which every object is acknowledged by at least `min_replicas` replicas. Tool profiles map this to "snapshot X is offsite". |
-| **Object** | One key in a bucket with its bytes. For restic, a file such as `data/ab/abcd…`. |
+| **Object** | One key in a bucket with its bytes. For restic, a key such as `data/ab/abcd…`. |
 | **Tombstone** | A deleted object the lender keeps for the retention window. |
 | **Recovery phrase** | 24 words from which the identity is derived. |
 | **Node manifest** | An encrypted record of a node's peers and buckets, stored on every lender for recovery. |
@@ -143,11 +144,22 @@ separately (§4.4). A lender being offline has no effect on a backup
 
 ### P-5. Zero lock-in on both sides
 
-With no daemon running anywhere, the borrower's local copy and each
-lender's replica are each a repository the backup tool opens directly
-from disk (LEND-6, EP-15, scenario 7). A lender can hand you a disk. An
-external S3 replica is likewise a repository the tool opens with no
-lendisk installed (S3-2).
+With no lendisk running anywhere, the borrower's local copy and each
+lender's replica are each readable by the backup tool through the
+storage engine alone: an unmodified, freely available open-source
+program, started on the same directories, with the steps in the user
+guide (LEND-6, EP-15, scenario 7). Each copy can also be written out as
+plain files in the backup tool's own on-disk layout (`lendisk export`,
+REPL-8, LEND-6), and a lender can hand you a disk. An external S3
+replica is likewise a repository the tool opens with no lendisk
+installed (S3-2).
+
+*Rationale:* v0.7 required plain files readable with nothing running.
+v0.8 relaxed this to admit a storage engine with its own on-disk
+format, in exchange for quotas, indexed listings and integrity checks
+the product would otherwise build itself (DESIGN.md D14). The promise
+kept is that no lendisk code, and nothing proprietary, stands between
+the user and their bytes.
 
 ### P-6. Recovery needs the phrase, one lender's address and the backup tool's password
 
@@ -170,8 +182,8 @@ credit and no accounting beyond showing each side what they give and get
 
 ### P-9. v1 audience: self-hosting Linux users, CLI only
 
-- A single binary for Linux, plus a container image for NAS appliances
-  (COMPAT-2).
+- A single service for Linux, with every binary it needs shipped
+  together, plus a container image for NAS appliances (COMPAT-2).
 - CLI plus one configuration file (OPS-6). No GUI and no web UI in v1.
 - macOS, Windows and FreeBSD are post-v1.
 
@@ -278,13 +290,11 @@ double the surface for no change in the core problem.
   daemon with `SIGKILL` at random points during a 10 GB backup, restart,
   and every object present on disk is replicated and none is replicated
   twice.
-- **EP-4** The node shall also expose restic's REST protocol (v1 and v2
-  listings), reachable from the local machine only, with basic-auth
-  credentials generated at init, over the same local store. AC: restic's
-  backend test suite passes against it; an object written via REST is
-  visible via S3 and vice versa.
-- **EP-5** Neither endpoint shall ever listen on a non-loopback
-  interface.
+- **EP-4** Removed in v0.8. It required a restic REST endpoint beside
+  the S3 one; restic's S3 backend covers every use and the second
+  endpoint added a credential, a listener and a test matrix for nothing.
+  The ID is not reused.
+- **EP-5** The endpoint shall never listen on a non-loopback interface.
 - **EP-6** Buckets shall be created with `lendisk bucket add <name>
   --profile restic|kopia|generic --replicas peerA,peerB [--min-replicas
   N] [--mode full|evict]`. The command creates the bucket in the store,
@@ -324,19 +334,19 @@ double the surface for no change in the core problem.
   the filesystem and the missing property.
 - **EP-13** The daemon should sustain at least 200 MB/s of writes from a
   backup tool on local NVMe, measured end to end.
-- **EP-14** The daemon shall reconcile the store directory against its
-  index periodically (default daily, and at startup): a walk of every
-  bucket is compared with the index, files present but not indexed are
-  enqueued as writes, and indexed keys with no file are enqueued as
-  deletes. This covers anything written to the directory outside the
-  daemon. Reconciled changes are counted in `status` so out-of-band
-  traffic is visible.
-- **EP-15** Writing to the store directory directly, with the daemon
-  running, is unsupported and documented as such; EP-14 limits the
-  damage. Reading it directly is always safe in `full` mode and is the
-  lendisk-free restore path (scenario 7). Restores through the S3 or
-  REST endpoint work in both modes with the daemon running; that is the
-  normal path and needs no special mode.
+- **EP-14** The daemon shall reconcile the store's listing against its
+  index periodically (default daily, and at startup): a listing of
+  every bucket is compared with the index, objects present but not
+  indexed are enqueued as writes, and indexed keys with no object are
+  enqueued as deletes. This covers anything that reached the store
+  outside the daemon's capture path. Reconciled changes are counted in
+  `status` so such traffic is visible.
+- **EP-15** Touching the storage engine's directories directly, with or
+  without the daemon running, is unsupported and documented as such;
+  EP-14 limits the damage. The lendisk-free restore path is the storage
+  engine alone, or an export (P-5, LEND-6, scenario 7). Restores
+  through the S3 endpoint work in both modes with the daemon running;
+  that is the normal path and needs no special mode.
 
 ### 4.4 Replication
 
@@ -403,14 +413,15 @@ double the surface for no change in the core problem.
   the backup tool's password and shall never inspect object contents
   beyond the hash.
 - **LEND-5** A lender may rate-limit each borrower independently.
-- **LEND-6** The lender's replica shall be a plain filesystem: each key
-  stored at its path under a directory that belongs to that borrower and
-  bucket, plus the tombstoned versions and an index of hashes. For a
-  restic bucket this is a restic repository readable with
-  `restic -r <path>`; for a Kopia bucket `lendisk export --kopia-layout`
-  shall write the sharded layout Kopia's filesystem backend expects. The
-  lender-only profile (PEER-9) uses the same single binary and the same
-  store.
+- **LEND-6** The lender's replica shall be readable without lendisk:
+  each borrower's buckets are ordinary buckets in the lender's storage
+  engine, which the backup tool opens with the engine alone (P-5), plus
+  the tombstones and an index of hashes. `lendisk export` on the lender
+  shall write any borrower's bucket as plain files: for a restic bucket
+  a restic repository readable with `restic -r <path>`, for a Kopia
+  bucket (`--kopia-layout`) the sharded layout Kopia's filesystem
+  backend expects. The lender-only profile (PEER-9) uses the same
+  binaries and the same store.
 - **LEND-7** Capacity planning shall be built in. `lendisk init` shall
   ask for the expected repository size and intended number of lenders
   `k`, and suggest how much to lend in return. `lendisk status` shall
@@ -446,11 +457,12 @@ double the surface for no change in the core problem.
   challenge on demand, and `--full` shall check every object by hash.
 - **VER-4** `lendisk status` shall show, per replica, when it was last
   successfully verified.
-- **VER-5** The daemon shall check its own local store for bit-rot: a
-  daily random sample (default 0.1% of bytes per week, configurable) is
-  hashed and compared with the index; a lender does the same for each
-  replica it holds. A mismatch raises an alert, and on the borrower
-  side the object is re-fetched from a replica (EP-10).
+- **VER-5** The daemon shall check its own local store for bit-rot at a
+  rate of at least 0.1% of bytes per week (configurable), by hashing a
+  sample and comparing with the index, by the storage engine's own
+  integrity check, or both; a lender does the same for each replica it
+  holds. A mismatch raises an alert, and on the borrower side the
+  object is re-fetched from a replica (EP-10).
 
 ### 4.7 Network
 
@@ -539,10 +551,12 @@ double the surface for no change in the core problem.
 - **SEC-2** Metadata a lender can observe, and that the product accepts
   leaking: object sizes and counts, timing of backups, borrower IP address
   unless relayed. This shall be documented for users.
-- **SEC-3** Secrets on disk shall be limited to: the identity key, the
-  REST endpoint credentials, and per-bucket endpoint credentials, all
-  mode 0600 in the config directory. No embedded component shall keep a
-  credential store of its own.
+- **SEC-3** Secrets on disk shall be limited to: the identity key,
+  per-bucket endpoint credentials, and the node-local credentials with which the daemon drives its storage
+  engine, all mode 0600 in the config directory. No per-bucket or
+  per-peer credential shall be held anywhere else; the storage engine
+  shall hold only node-local credentials that grant nothing beyond the
+  node's own disk.
 - **SEC-4** A compromised borrower machine shall not be able to cause
   offsite data loss within the retention window (RET-2) nor to read
   another borrower's data on a shared lender (PEER-8).
@@ -559,11 +573,14 @@ double the surface for no change in the core problem.
   peer protocol, and every operation the underlying store could expose,
   against A and C; everything outside the NET-7 list is refused.
 - **SEC-8** The daemon shall expose no listener beyond those this
-  document names: the tool-facing endpoints on loopback (EP-1, EP-4,
-  OPS-4) and the lender-facing service on the peer connection (NET-7).
-  Administrative, web or other auxiliary listeners of any embedded
-  component shall be disabled. AC: `ss -lntp` shows no lendisk listener
-  on a non-loopback address.
+  document names: the tool-facing endpoint and metrics on loopback
+  (EP-1, OPS-4) and the lender-facing service on the peer connection
+  (NET-7).
+  Administrative, web or other auxiliary listeners of any embedded or
+  bundled component shall be disabled, and a listener a bundled
+  component cannot run without shall bind loopback or a unix socket
+  only. AC: `ss -lntp` shows no lendisk or storage-engine listener on a
+  non-loopback address.
 - **SEC-9** The lender-facing surface shall be deny-by-default: the
   decorating layer admits the NET-7 list and nothing else, and every
   operation of the underlying store shall be classified as admitted,
@@ -574,20 +591,23 @@ double the surface for no change in the core problem.
 ### 4.10 Compatibility
 
 - **COMPAT-1** Supported backup tools in v1: restic and Kopia, each at
-  the latest release and the two before it, tested in CI through both
-  the S3 endpoint and (restic) the REST endpoint. Duplicacy and rclone
-  should work via `generic` and are smoke-tested.
-- **COMPAT-2** Supported platforms for v1: Linux amd64 and arm64, as a
-  single static binary with a systemd unit, and as a container image.
-  ARMv7 should work.
+  the latest release and the two before it, tested in CI through the S3
+  endpoint. Duplicacy and rclone should work via `generic` and are
+  smoke-tested.
+- **COMPAT-2** Supported platforms for v1: Linux amd64 and arm64, as
+  static binaries in one package with one systemd unit, and as a
+  container image. ARMv7 should work.
 - **COMPAT-3** An existing repository (restic directory or rest-server
   data, Kopia filesystem repository) shall be importable with
   `lendisk bucket import <name> <path>`, which uploads it into the store
   and marks nothing as acknowledged.
-- **COMPAT-4** The store directory layout shall be documented: one file
-  per key at its key path under the bucket's directory, and the name and
-  purpose of every housekeeping directory, so that users and other tools
-  can read it.
+- **COMPAT-4** The store layout shall be documented: which directories
+  the storage engine owns, how the node's own buckets and each
+  borrower's buckets are named inside it, and the name and purpose of
+  every housekeeping directory and file, so that users can read the
+  store with the engine alone (P-5). The plain-file export layout
+  (LEND-6) shall be documented too: one file per key at its key path
+  under the bucket's directory.
 
 ### 4.11 External S3 replicas
 
@@ -690,7 +710,7 @@ current design (component behaviour, API assumptions) are in DESIGN.md
    returns, the queue drains and the snapshot becomes offsite-complete.
 3. **Total loss.** A's house burns down. On a new machine: `lendisk
    recover` with the phrase and B's address from the paper sheet;
-   `restic -r rest:... restore latest` succeeds via read-through without
+   `restic -r s3:... restore latest` succeeds via read-through without
    downloading the whole repository.
 4. **Ransomware.** An attacker on A runs `restic forget --keep-last 0
    --prune` and wipes A's disk. Within 30 days, A recovers as in scenario 3
@@ -700,10 +720,14 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 6. **Quota.** A exceeds 500 GB at B. The local backup still succeeds;
    status shows replication paused for quota; B raises the quota and
    replication resumes without intervention on A.
-7. **Zero lock-in.** With both daemons stopped: on B, `restic -r <the
-   directory holding A's laptop replica> snapshots` works on the plain
-   files; on A, `restic -r <A's local store>/laptop snapshots` works the
-   same way. No service is running on either side.
+7. **Zero lock-in.** With lendisk stopped on both sides: on B, the
+   storage engine alone is started on B's store directories following
+   the user guide, and `restic -r s3:…` against it lists A's snapshots
+   from A's laptop replica; on A, the same on A's store lists them from
+   A's own copy. Alternatively `lendisk export` has written either copy
+   to a directory and `restic -r <directory> snapshots` works on the
+   plain files with nothing running at all. No lendisk code runs on
+   either side.
 8. **Partial trust.** A lends to B and C; B lends to D; A and D have no
    relationship. D cannot connect to A (rejected before any application
    data is exchanged), cannot list or read A's data on B, and does not
@@ -723,6 +747,18 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.8 (2026-10-28)** Storage engine admitted. P-5 no longer requires
+  plain files readable with nothing running; it requires readability
+  through the storage engine alone plus a plain-file export. LEND-6,
+  EP-14, EP-15, COMPAT-4 and scenario 7 reworded to match. SEC-3 allows
+  the node-local credentials the daemon needs to drive its storage
+  engine; SEC-8 allows a bundled component's unavoidable listener on
+  loopback or a unix socket. VER-5 accepts the storage engine's own
+  integrity check as a way to meet the rate. P-9 and COMPAT-2 say "one
+  service, binaries shipped together" instead of "single binary".
+  Glossary gains "storage engine". EP-4 (restic REST endpoint) removed;
+  EP-5, EP-15, SEC-3, SEC-8, COMPAT-1 and scenario 3 lose their
+  references to it. No requirement ID changed meaning otherwise.
 - **v0.7 (2026-10-28)** Split from SPEC v0.6. Former design decisions
   D1, D1a, D2, D7, D8, D9 and the consequences of D3, D4 and D6 became
   principles P-1 to P-9. Implementation detail removed from every
