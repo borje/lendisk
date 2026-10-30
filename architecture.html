@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>lendisk architecture</title>
+<title>lendisk architecture v0.10</title>
 <style>
   :root {
     --bg: #fafaf8;
@@ -120,12 +120,12 @@
 </head>
 <body>
 <main>
-<h1>lendisk architecture · v0.9</h1>
-<p class="sub">The chosen architecture as of 2026-10-29, ahead of DESIGN.md v0.9. versitygw is embedded in the lendisk process as the S3 front end: it terminates every signature, routes every request, and hands storage calls to a lendisk decorator that captures writes and enforces the lender's policy. Under the decorator sit versitygw's own backends: <code>posix</code>, plain files on the local disk, is the default; <code>s3</code> re-signs to any S3-compatible service the user names. lendisk writes no signature code and runs as one process.</p>
-<p class="note">Status: chosen on 2026-10-29, for now. It merges v0.7 (embedded versitygw, least code) with the "any S3 store" idea, using versitygw's <code>s3</code> backend as the proxy instead of one lendisk would write. REQUIREMENTS.md v0.9 and DESIGN.md v0.9 are still to be written to match; until then DESIGN.md v0.8 (Garage) is the committed design text. Assumed: a remote store under the local endpoint is allowed with a warning.</p>
+<h1>lendisk architecture · v0.10</h1>
+<p class="sub">The chosen architecture as of 2026-10-30, as described in DESIGN.md v0.10: the v0.9 drawing with every part that REQUIREMENTS does not ask for removed. versitygw is still embedded as the S3 front end over a lendisk decorator, and the store is still versitygw's <code>posix</code> backend on a local directory or its <code>s3</code> backend against any S3 service the user names. What changed: one store serves both roles, so a friend's buckets live wherever your own do, posix or Garage alike; replication is an in-process S3 client that dials friends through tailcat directly, so there is no rclone child, no rc socket and no loopback forwards; the object hash is taken from the write stream at capture, so each object is read once per replica; and the tunnel has one port. One process, one binary.</p>
+<p class="note">Status: DESIGN.md v0.10 describes this drawing, and REQUIREMENTS v0.9 made the two changes it needed: EP-16 admits a store behind an S3 service the user names, with EP-12, COMPAT-4, SEC-3 and scenarios 1 and 7 extended to match, and REPL-10 was reworded for a hash taken at capture. The parts dropped from v0.9, rclone as the transfer engine and non-S3 replica targets, sit behind the same replica interface and remain v1.1 candidates.</p>
 
 <figure>
-<svg viewBox="0 0 1000 995" role="img" aria-label="A backup tool writes S3 to the lendisk process on loopback; friends reach it through the tailcat tunnel. Inside the process, embedded versitygw terminates SigV4 using lendisk's IAM service, then calls lendisk's backend decorator, which captures writes for your buckets and applies the allow-list, quota, hash checks and retention for borrowers' buckets. The decorator calls one of versitygw's backends: posix, plain files on local disk, or s3, which re-signs to any S3 service. Below the process are the stores: a local directory or any S3-compatible service. The replication worker reads objects through the decorator and sends them to an external bucket over the internet or to a friend's node through the tailcat tunnel, with a DERP relay as fallback." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11">
+<svg viewBox="0 0 1000 1005" role="img" aria-label="A backup tool writes S3 to the lendisk process on loopback; friends reach it through the tailcat tunnel on one port. Inside the process, embedded versitygw terminates SigV4 using lendisk's IAM service, then calls lendisk's backend decorator, which captures writes and hashes the stream for your buckets and applies the allow-list, quota, hash checks and retention for borrowers' buckets. The decorator calls one versitygw backend for the whole node: posix, plain files on local disk, or s3, which re-signs to any S3 service. Below the process is the one store, a local directory or an S3-compatible service, holding your buckets and your friends' buckets side by side. The replication worker reads each object through the decorator and sends it with an in-process S3 client to an external S3 bucket over the internet or to a friend's node through the tailcat tunnel, with a DERP relay as fallback." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11">
   <defs>
     <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10z" fill="currentColor"/>
@@ -159,14 +159,14 @@
     <text x="118" y="122">store set · status · recover</text>
     <text x="278" y="108">S3, SigV4, path-style</text>
     <text x="278" y="122">127.0.0.1:9000</text>
-    <text x="728" y="108">S3 + peer control API</text>
-    <text x="728" y="122">inside WireGuard</text>
+    <text x="728" y="108">S3 + /_lendisk/ control API</text>
+    <text x="728" y="122">inside WireGuard · one port</text>
   </g>
 
   <!-- node boundary -->
-  <rect x="12" y="92" width="976" height="613" rx="8" fill="none" stroke="currentColor" stroke-width="1.5"/>
-  <text x="28" y="686" font-weight="700" font-size="13">lendisk node · one process, one binary</text>
-  <text x="28" y="700" fill="var(--muted)">below this line: not lendisk code</text>
+  <rect x="12" y="92" width="976" height="628" rx="8" fill="none" stroke="currentColor" stroke-width="1.5"/>
+  <text x="28" y="701" font-weight="700" font-size="13">lendisk node · one process, one binary</text>
+  <text x="28" y="715" fill="var(--muted)">below: not lendisk</text>
 
   <!-- row 1: listeners -->
   <g stroke="var(--accent)" stroke-width="1" fill="var(--accent-soft)">
@@ -179,19 +179,19 @@
     <text x="110" y="186" fill="var(--muted)">CLI · status · alerts</text>
     <text x="110" y="199" fill="var(--muted)">metrics on loopback</text>
     <text x="360" y="170" font-weight="600" font-size="12.5">loopback listener</text>
-    <text x="360" y="186" fill="var(--muted)">127.0.0.1:9000 + unix socket</text>
-    <text x="360" y="199" fill="var(--muted)">handed to versitygw as a net.Listener</text>
-    <text x="727" y="170" font-weight="600" font-size="12.5">tailcat Server · tunnel listener</text>
-    <text x="727" y="186" fill="var(--muted)">AllowedClients: known peers + pending invites</text>
-    <text x="727" y="199" fill="var(--muted)">node ID = WireGuard public key · also a net.Listener</text>
+    <text x="360" y="186" fill="var(--muted)">127.0.0.1:9000, TCP only</text>
+    <text x="360" y="199" fill="var(--muted)">versitygw's own listener (address string)</text>
+    <text x="727" y="170" font-weight="600" font-size="12.5">tailcat Server · lendisk tunnel bridge · one port</text>
+    <text x="727" y="186" fill="var(--muted)">AllowClient: known peers + pending invites · peer key per conn</text>
+    <text x="727" y="199" fill="var(--muted)">/_lendisk/ answered here · S3: access key = peer key, then to versitygw</text>
   </g>
 
   <!-- column 1: housekeeping, profiles, export -->
   <rect x="25" y="240" width="170" height="95" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
   <g text-anchor="middle">
     <text x="110" y="260" font-weight="600" font-size="12.5">housekeeping</text>
-    <text x="110" y="277" fill="var(--muted)">prober · purger · reconciler</text>
-    <text x="110" y="292" fill="var(--muted)">evictor · sampler</text>
+    <text x="110" y="277" fill="var(--muted)">purger · reconciler · evictor</text>
+    <text x="110" y="292" fill="var(--muted)">sampler · profile check</text>
     <text x="110" y="307" fill="var(--muted)">retention · quota counters</text>
     <text x="110" y="322" fill="var(--muted)">all via the decorator</text>
   </g>
@@ -217,7 +217,7 @@
     <text x="495" y="259" font-weight="600" font-size="12.5">versitygw, embedded (embedgw) · the S3 front end</text>
     <text x="495" y="276" fill="var(--muted)">terminates SigV4 incl. aws-chunked · routing · multipart · listings · versioning · object lock</text>
     <text x="495" y="293" fill="var(--muted)">IAMService is lendisk's: per-bucket keys on loopback,</text>
-    <text x="495" y="308" fill="var(--muted)">derived per-pair keys in the tunnel (must equal the tunnel key)</text>
+    <text x="495" y="308" fill="var(--muted)">derived per-pair keys in the tunnel (must equal the peer key)</text>
     <text x="495" y="325" font-weight="600">no lendisk code touches a signature</text>
   </g>
   <g stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)">
@@ -226,29 +226,31 @@
   </g>
 
   <!-- row 3: decorator -->
-  <rect x="220" y="365" width="550" height="180" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
+  <rect x="220" y="365" width="550" height="190" rx="6" fill="var(--accent-soft)" stroke="var(--accent)" stroke-width="1.5"/>
   <text x="760" y="378" text-anchor="end" font-weight="700" font-size="9.5" letter-spacing="1" fill="var(--accent)">LENDISK</text>
   <g text-anchor="middle">
     <text x="495" y="384" font-weight="600" font-size="12.5">lendisk backend decorator · implements backend.Backend</text>
     <text x="495" y="399" fill="var(--muted)">every storage call passes here once, after authentication, before storage</text>
   </g>
   <g stroke="currentColor" stroke-width="1" fill="var(--box)">
-    <rect x="235" y="410" width="250" height="95" rx="5"/>
-    <rect x="505" y="410" width="250" height="95" rx="5"/>
+    <rect x="235" y="410" width="250" height="110" rx="5"/>
+    <rect x="505" y="410" width="250" height="110" rx="5"/>
   </g>
   <g text-anchor="middle">
     <text x="360" y="428" font-weight="600" font-size="12.5">your buckets</text>
     <text x="360" y="445" fill="var(--muted)">pending row → backend call → done</text>
-    <text x="360" y="460" fill="var(--muted)">enqueue Put · Complete · Delete</text>
-    <text x="360" y="475" fill="var(--muted)">not found → read-through from a replica</text>
-    <text x="360" y="490" fill="var(--muted)">changed acked key → alert</text>
+    <text x="360" y="460" fill="var(--muted)">SHA-256 taken from the write stream</text>
+    <text x="360" y="475" fill="var(--muted)">enqueue Put · Complete · Delete</text>
+    <text x="360" y="490" fill="var(--muted)">not found → read-through from a replica</text>
+    <text x="360" y="505" fill="var(--muted)">changed acked key → alert</text>
     <text x="630" y="428" font-weight="600" font-size="12.5">borrowers' buckets</text>
-    <text x="630" y="445" fill="var(--muted)">account must equal tunnel key</text>
-    <text x="630" y="460" fill="var(--muted)">13-op allow-list, deny by default</text>
+    <text x="630" y="445" fill="var(--muted)">account must equal peer key</text>
+    <text x="630" y="460" fill="var(--muted)">short allow-list, deny by default</text>
     <text x="630" y="475" fill="var(--muted)">quota → 507 · SHA-256 verified</text>
     <text x="630" y="490" fill="var(--muted)">Delete → delete marker · lock retain-until</text>
+    <text x="630" y="505" fill="var(--muted)">or a lendisk tombstone, store permitting</text>
   </g>
-  <text x="495" y="530" text-anchor="middle" fill="var(--muted)">bucket mapper · capability profile per S3 upstream · lendisk.db is a cache</text>
+  <text x="495" y="540" text-anchor="middle" fill="var(--muted)">bucket mapper · one backend, both roles · lendisk.db is a cache</text>
   <g stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)">
     <line x1="300" y1="335" x2="300" y2="365"/>
     <line x1="630" y1="335" x2="630" y2="365"/>
@@ -256,33 +258,34 @@
   <text x="308" y="356" font-size="10" fill="var(--muted)">backend.Backend calls, account attached</text>
   <line x1="770" y1="440" x2="785" y2="440" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)"/>
 
-  <!-- row 4: versitygw backends -->
-  <rect x="220" y="580" width="550" height="90" rx="6" fill="var(--vgw-soft)" stroke="var(--vgw)" stroke-width="1.5"/>
-  <text x="760" y="593" text-anchor="end" font-weight="700" font-size="9.5" letter-spacing="1" fill="var(--vgw)">LIBRARY · VERSITYGW BACKENDS · ONE PER STORE</text>
+  <!-- row 4: the one versitygw backend -->
+  <rect x="220" y="590" width="550" height="90" rx="6" fill="var(--vgw-soft)" stroke="var(--vgw)" stroke-width="1.5"/>
+  <text x="760" y="603" text-anchor="end" font-weight="700" font-size="9.5" letter-spacing="1" fill="var(--vgw)">LIBRARY · VERSITYGW BACKEND · ONE PER NODE, BOTH ROLES</text>
   <g stroke="var(--vgw)" stroke-width="1" fill="var(--box)">
-    <rect x="235" y="600" width="250" height="62" rx="5"/>
-    <rect x="505" y="600" width="250" height="62" rx="5"/>
+    <rect x="235" y="610" width="250" height="62" rx="5"/>
+    <rect x="505" y="610" width="250" height="62" rx="5"/>
   </g>
   <g text-anchor="middle">
-    <text x="360" y="618" font-weight="600" font-size="12.5">backend/posix · default</text>
-    <text x="360" y="634" fill="var(--muted)">plain files at &lt;dir&gt;/&lt;bucket&gt;/&lt;key&gt;</text>
-    <text x="360" y="649" fill="var(--muted)">versioning dir · xattr metadata · no network</text>
-    <text x="630" y="618" font-weight="600" font-size="12.5">backend/s3 · any store</text>
-    <text x="630" y="634" fill="var(--muted)">re-signs to the endpoint you name</text>
-    <text x="630" y="649" fill="var(--muted)">one credential · multipart passed through</text>
+    <text x="360" y="628" font-weight="600" font-size="12.5">backend/posix · default</text>
+    <text x="360" y="644" fill="var(--muted)">plain files at &lt;dir&gt;/&lt;bucket&gt;/&lt;key&gt;</text>
+    <text x="360" y="659" fill="var(--muted)">versioning dir · xattr metadata · no network</text>
+    <text x="630" y="628" font-weight="600" font-size="12.5">backend/s3 · or any S3 store</text>
+    <text x="630" y="644" fill="var(--muted)">re-signs to the endpoint you name</text>
+    <text x="630" y="659" fill="var(--muted)">one credential · multipart passed through</text>
   </g>
+  <text x="495" y="587" text-anchor="middle" font-size="10" fill="var(--muted)">either one, chosen at init · no mux</text>
   <g stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)">
-    <line x1="300" y1="545" x2="300" y2="580"/>
-    <line x1="630" y1="545" x2="630" y2="580"/>
+    <line x1="300" y1="555" x2="300" y2="590"/>
+    <line x1="630" y1="555" x2="630" y2="590"/>
   </g>
 
   <!-- column 4: control api, db, worker, tailcat client -->
   <rect x="785" y="240" width="165" height="78" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
   <g text-anchor="middle">
     <text x="867" y="259" font-weight="600" font-size="12.5">peer control API</text>
-    <text x="867" y="275" fill="var(--muted)">challenge · manifest</text>
-    <text x="867" y="289" fill="var(--muted)">quota · version · undelete</text>
-    <text x="867" y="306" fill="var(--muted)">auth: tunnel key alone</text>
+    <text x="867" y="275" fill="var(--muted)" font-size="10">redeem · challenge · manifest</text>
+    <text x="867" y="289" fill="var(--muted)" font-size="10">quota · version · undelete</text>
+    <text x="867" y="306" fill="var(--muted)" font-size="10">auth: peer key, per request</text>
   </g>
   <line x1="867" y1="205" x2="867" y2="240" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)"/>
 
@@ -290,98 +293,100 @@
   <g text-anchor="middle">
     <text x="867" y="352" font-weight="600" font-size="12.5">lendisk.db</text>
     <text x="867" y="367" fill="var(--muted)">SQLite · rebuildable cache</text>
-    <text x="867" y="387">queue · SHA-256 index</text>
+    <text x="867" y="387">queue rows with SHA-256</text>
     <text x="867" y="403">watermarks · tombstones</text>
     <text x="867" y="419">peers · invites · manifests</text>
-    <text x="867" y="435">bucket keys · store profiles</text>
+    <text x="867" y="435">bucket keys · store profile</text>
     <text x="867" y="451">quota counters</text>
   </g>
 
-  <rect x="785" y="478" width="165" height="87" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
+  <rect x="785" y="473" width="165" height="115" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
   <g text-anchor="middle">
-    <text x="867" y="497" font-weight="600" font-size="12.5">replication worker</text>
-    <text x="867" y="513" fill="var(--muted)">FIFO · hashes in flight</text>
-    <text x="867" y="528" fill="var(--muted)">S3 replica client (minio-go)</text>
-    <text x="867" y="543" fill="var(--muted)">rate limits · schedule</text>
-    <text x="867" y="557" fill="var(--muted)">same client for every target</text>
+    <text x="867" y="491" font-weight="600" font-size="12.5">replication worker</text>
+    <text x="867" y="506" fill="var(--muted)">FIFO per replica</text>
+    <text x="867" y="520" fill="var(--muted)">in-process S3 client: minio-go</text>
+    <text x="867" y="534" fill="var(--muted)">multipart · retries</text>
+    <text x="867" y="548" fill="var(--muted)">bwlimit · timetable</text>
+    <text x="867" y="562" fill="var(--muted)">hash from the queue row</text>
+    <text x="867" y="576" fill="var(--muted)">one read per object</text>
   </g>
-  <line x1="840" y1="463" x2="840" y2="478" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
-  <line x1="895" y1="478" x2="895" y2="463" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)"/>
-  <line x1="770" y1="520" x2="785" y2="520" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
-  <text x="762" y="558" text-anchor="end" font-size="10" fill="var(--muted)">reads via the</text>
-  <text x="762" y="570" text-anchor="end" font-size="10" fill="var(--muted)">decorator</text>
+  <line x1="840" y1="463" x2="840" y2="473" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
+  <line x1="895" y1="473" x2="895" y2="463" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)"/>
+  <line x1="770" y1="500" x2="785" y2="500" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
+  <text x="762" y="568" text-anchor="end" font-size="10" fill="var(--muted)">object reads via</text>
+  <text x="762" y="580" text-anchor="end" font-size="10" fill="var(--muted)">the decorator</text>
 
-  <rect x="785" y="580" width="165" height="90" rx="5" fill="var(--tc-soft)" stroke="var(--tc)"/>
+  <rect x="785" y="600" width="165" height="70" rx="5" fill="var(--tc-soft)" stroke="var(--tc)"/>
   <g text-anchor="middle">
-    <text x="867" y="601" font-weight="600" font-size="12.5">tailcat Client</text>
-    <text x="867" y="618" fill="var(--muted)">Dial(peer key)</text>
-    <text x="867" y="633" fill="var(--muted)">WireGuard + magicsock</text>
-    <text x="867" y="648" fill="var(--muted)">direct first · DERP fallback</text>
+    <text x="867" y="618" font-weight="600" font-size="12.5">tailcat Client</text>
+    <text x="867" y="633" fill="var(--muted)">Dial(peer) is the S3 client's</text>
+    <text x="867" y="648" fill="var(--muted)">HTTP transport for friends</text>
+    <text x="867" y="663" fill="var(--muted)">direct first · DERP fallback</text>
   </g>
-  <line x1="867" y1="565" x2="867" y2="580" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
+  <line x1="867" y1="588" x2="867" y2="600" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
 
-  <!-- band A: stores, outside the process -->
-  <rect x="220" y="745" width="550" height="100" rx="8" fill="var(--store-soft)" stroke="var(--store)" stroke-width="1.5"/>
-  <text x="232" y="839" font-weight="700" font-size="9.5" letter-spacing="1" fill="var(--store)">YOUR STORES · LOCAL STORE AND LENDING STORE EACH PICK ONE</text>
+  <!-- band A: the one store, outside the process -->
+  <rect x="220" y="755" width="550" height="100" rx="8" fill="var(--store-soft)" stroke="var(--store)" stroke-width="1.5"/>
+  <text x="232" y="849" font-weight="700" font-size="9.5" letter-spacing="1" fill="var(--store)">YOUR STORE · ONE FOR BOTH ROLES · YOUR BUCKETS AND lent-* BUCKETS TOGETHER</text>
   <g stroke="var(--store)" stroke-width="1" fill="var(--box)">
-    <rect x="235" y="759" width="250" height="62" rx="5"/>
-    <rect x="505" y="759" width="250" height="62" rx="5"/>
+    <rect x="235" y="769" width="250" height="62" rx="5"/>
+    <rect x="505" y="769" width="250" height="62" rx="5"/>
   </g>
   <g text-anchor="middle">
-    <text x="360" y="778" font-weight="600" font-size="12.5">a directory on this machine</text>
-    <text x="360" y="795" fill="var(--muted)">restic -r &lt;dir&gt;/laptop, nothing running</text>
-    <text x="360" y="810" fill="var(--muted)">hand over the disk</text>
-    <text x="630" y="778" font-weight="600" font-size="12.5">any S3-compatible service</text>
-    <text x="630" y="795" fill="var(--muted)">LAN: Garage · MinIO · RustFS · versitygw</text>
-    <text x="630" y="810" fill="var(--muted)">provider: B2 · R2 · Wasabi · Hetzner</text>
+    <text x="360" y="788" font-weight="600" font-size="12.5">a directory on this machine</text>
+    <text x="360" y="805" fill="var(--muted)">restic -r &lt;dir&gt;/laptop, nothing running</text>
+    <text x="360" y="820" fill="var(--muted)">hand over the disk</text>
+    <text x="630" y="788" font-weight="600" font-size="12.5">any S3-compatible service</text>
+    <text x="630" y="805" fill="var(--muted)">LAN: Garage · MinIO · RustFS · versitygw</text>
+    <text x="630" y="820" fill="var(--muted)">provider: B2 · R2 · Wasabi · Hetzner</text>
   </g>
   <g stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)">
-    <line x1="300" y1="670" x2="300" y2="759"/>
-    <line x1="630" y1="670" x2="630" y2="759"/>
+    <line x1="300" y1="680" x2="300" y2="769"/>
+    <line x1="630" y1="680" x2="630" y2="769"/>
   </g>
   <g font-size="10" fill="var(--muted)">
-    <text x="308" y="720">filesystem calls</text>
-    <text x="308" y="733">plain files, xattrs</text>
-    <text x="638" y="720">S3 · re-signed with the store credential</text>
-    <text x="638" y="733">over LAN or internet</text>
+    <text x="308" y="728">filesystem calls</text>
+    <text x="308" y="741">plain files, xattrs</text>
+    <text x="638" y="728">S3 · re-signed with the store credential</text>
+    <text x="638" y="741">over LAN or internet</text>
   </g>
 
   <!-- band B: replication targets -->
-  <text x="25" y="893" font-weight="700" font-size="10.5" letter-spacing="1" fill="var(--muted)">REPLICATION TARGETS · THE SAME CLIENT</text>
+  <text x="25" y="903" font-weight="700" font-size="10.5" letter-spacing="1" fill="var(--muted)">REPLICATION TARGETS · ALL S3 · ONE CLIENT</text>
   <g stroke="currentColor" stroke-width="1" fill="var(--box)">
-    <rect x="235" y="905" width="250" height="70" rx="5"/>
-    <rect x="505" y="905" width="250" height="70" rx="5"/>
+    <rect x="235" y="915" width="250" height="70" rx="5"/>
+    <rect x="505" y="915" width="250" height="70" rx="5"/>
   </g>
-  <rect x="785" y="905" width="165" height="70" rx="5" fill="var(--tc-soft)" stroke="var(--tc)" stroke-width="1"/>
+  <rect x="785" y="915" width="165" height="70" rx="5" fill="var(--tc-soft)" stroke="var(--tc)" stroke-width="1"/>
   <g text-anchor="middle">
-    <text x="360" y="926" font-weight="600" font-size="12.5">external S3 bucket</text>
-    <text x="360" y="943" fill="var(--muted)">B2 · R2 · Wasabi · Garage · RustFS</text>
-    <text x="360" y="958" fill="var(--muted)">versioning + lifecycle = retention</text>
-    <text x="630" y="926" font-weight="600" font-size="12.5">friend's node (lends to you)</text>
-    <text x="630" y="943" fill="var(--muted)">same binary, tunnel listener</text>
-    <text x="630" y="958" fill="var(--muted)">its embedded versitygw, its backends</text>
-    <text x="867" y="926" font-weight="600" font-size="12.5">DERP relay</text>
-    <text x="867" y="943" fill="var(--muted)">project fleet or your own</text>
-    <text x="867" y="958" fill="var(--muted)">lendisk relay</text>
+    <text x="360" y="936" font-weight="600" font-size="12.5">external S3 bucket</text>
+    <text x="360" y="953" fill="var(--muted)">B2 · R2 · Wasabi · Hetzner · a Garage</text>
+    <text x="360" y="968" fill="var(--muted)">versioning + lifecycle where it has them</text>
+    <text x="630" y="936" font-weight="600" font-size="12.5">friend's node (lends to you)</text>
+    <text x="630" y="953" fill="var(--muted)">same binary, tunnel listener</text>
+    <text x="630" y="968" fill="var(--muted)">its embedded versitygw, its one store</text>
+    <text x="867" y="936" font-weight="600" font-size="12.5">DERP relay</text>
+    <text x="867" y="953" fill="var(--muted)">project fleet or your own</text>
+    <text x="867" y="968" fill="var(--muted)">lendisk relay</text>
   </g>
-  <path d="M785 545 H777 V885 H360 V905" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
+  <path d="M785 575 H777 V895 H360 V915" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
   <g font-size="10" fill="var(--muted)">
-    <text x="500" y="868">S3 over the internet · credential without delete</text>
+    <text x="500" y="878">S3 over the internet · credential without delete</text>
   </g>
-  <path d="M850 670 V897 H630 V905" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
+  <path d="M850 670 V907 H630 V915" fill="none" stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)"/>
   <g font-size="10" fill="var(--muted)">
-    <text x="842" y="868" text-anchor="end">S3 + control API</text>
-    <text x="842" y="881" text-anchor="end">in WireGuard, direct</text>
+    <text x="842" y="878" text-anchor="end">S3 + control API</text>
+    <text x="842" y="891" text-anchor="end">in WireGuard, direct</text>
   </g>
-  <path d="M885 670 V905" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#a1)"/>
-  <text x="893" y="875" font-size="10" fill="var(--muted)">relayed fallback</text>
-  <line x1="785" y1="940" x2="755" y2="940" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)"/>
+  <path d="M885 670 V915" fill="none" stroke="currentColor" stroke-width="1.2" stroke-dasharray="5 4" marker-end="url(#a1)"/>
+  <text x="893" y="885" font-size="10" fill="var(--muted)">relayed fallback</text>
+  <line x1="785" y1="950" x2="755" y2="950" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)"/>
 </svg>
 <div class="legend">
   <span class="sw sw-lendisk">lendisk code</span>
   <span class="sw sw-vgw">versitygw, linked library</span>
   <span class="sw sw-tc">tailcat and DERP, linked library and relay</span>
-  <span class="sw sw-store">your stores</span>
+  <span class="sw sw-store">your store</span>
   <span class="sw sw-other">other parties</span>
 </div>
 <div class="legend">
@@ -389,30 +394,28 @@
   <span>control and acknowledgements</span>
   <span class="dash">fallback</span>
 </div>
-<figcaption>Figure 1. One node, both roles, one process. Green is code lendisk owns. Blue is versitygw linked in as a library: the front end above the decorator, the backends below it. Purple is Tailscale's data plane, tailcat inside the process and DERP outside it. Amber is storage the user chose per role: the local store defaults to a directory, the lending store may be a directory or an S3 service, and either may be an S3 service the user already runs or pays for. The green decorator between the two blue blocks is the only place lendisk sees a storage call, and it sees every one.</figcaption>
+<figcaption>Figure 1. One node, both roles, one process. Green is code lendisk owns. Blue is versitygw linked in as a library: the front end above the decorator, one backend below it. Purple is Tailscale's data plane, tailcat inside the process and DERP outside it. Amber is the one store the user chose at <code>init</code>: a directory by default, or an S3 service the user already runs or pays for; your buckets and your friends' buckets sit in it side by side. The replication worker is an ordinary S3 client inside the process: it reads each object once through the decorator and sends it to an external bucket over the internet, or to a friend through the tailcat dialer. The green decorator between the two blue blocks is the only place lendisk sees a storage call, and it sees every one.</figcaption>
 </figure>
 
 <h2>What the picture encodes</h2>
 <ul>
-  <li><strong>versitygw is the S3 front end, in-process.</strong> It owns the listeners, parses every request, verifies every SigV4 signature including restic's and Kopia's <code>aws-chunked</code> streaming form, and implements multipart, listings, versioning and object lock. lendisk supplies the two <code>net.Listener</code>s (loopback and the tailcat tunnel) and an <code>IAMService</code>; it writes no protocol code.</li>
-  <li><strong>Credentials are resolved by lendisk, never stored by versitygw.</strong> On loopback the <code>IAMService</code> returns the per-bucket key from <code>lendisk.db</code>. In the tunnel it derives the per-pair secret from the two node keys on demand (NET-7a) and refuses any account whose node ID is not the tunnel peer key. versitygw's own IAM directory is not used.</li>
-  <li><strong>The decorator is the one lendisk seam.</strong> It implements versitygw's <code>backend.Backend</code> interface and wraps a real backend. For your buckets it records a pending queue row, makes the call, marks the row done, and turns a not-found into a read-through from a replica. For borrowers' buckets it applies the allow-list, quota, hash verification, immutability and retention. Capture is in-process and crash-safe exactly as in v0.7 (EP-3): no proxy, no second commit point.</li>
-  <li><strong>Two backends, both versitygw's.</strong> <code>backend/posix</code> stores plain files at their key paths on the local disk and is the default: one process, no sidecar, no network, and P-5 at its v0.7 strength. <code>backend/s3</code> turns the same gateway into a proxy that re-signs each call with the store's credential and forwards it to any S3-compatible endpoint. The local store and the lending store each pick one; a mux in the decorator routes by bucket when they differ.</li>
-  <li><strong>The capability profile matters only for S3 upstreams.</strong> The POSIX backend has versioning, object lock, checksum verification and conditional writes natively. Behind <code>backend/s3</code> those depend on the upstream, so lendisk probes them and chooses delete markers or its own tombstones, store-side or daemon-side integrity, accordingly. <code>status</code> labels the weaker modes, as S3-4 already does for external replicas.</li>
-  <li><strong>The replication worker reads through the decorator.</strong> No loopback S3 round trip: it calls the backend directly, hashes the stream, and sends it with <code>minio-go</code> to an external bucket over the internet or to a friend through <code>tailcat Dial</code>. One client, one resume strategy, one verifier for every target.</li>
-  <li><strong>A lender can lend space it does not own.</strong> Point the lending store at a B2 bucket through <code>backend/s3</code> and lend that; quota, immutability and retention are still the decorator's. The borrower never holds a credential to it.</li>
+  <li><strong>versitygw is the S3 front end, in-process.</strong> It owns the loopback listener, parses every request, verifies every SigV4 signature including restic's and Kopia's <code>aws-chunked</code> streaming form, and implements multipart, listings, versioning and object lock. lendisk supplies an <code>IAMService</code> and writes no protocol code. <code>embedgw</code> takes listener addresses, not a <code>net.Listener</code>, so the loopback listener is versitygw's own and the tunnel side goes through a lendisk bridge. Unchanged from v0.9.</li>
+  <li><strong>The tunnel has one port and the bridge is where peer identity is enforced.</strong> lendisk accepts each tailcat connection, learns its peer key, and checks the relationship on every request. Requests under <code>/_lendisk/</code> are the control API and are answered by lendisk; no S3 bucket can have that name, since bucket names start with a letter or digit. Every other request is an S3 request, passed on to versitygw's internal unix socket only if its access key is the peer key, with the signed headers untouched (SEC-10 to SEC-15). One listener, one middleware, one hostile-peer harness target.</li>
+  <li><strong>Credentials are resolved by lendisk, never stored by versitygw.</strong> On loopback the <code>IAMService</code> returns the per-bucket key from <code>lendisk.db</code>. For a borrower it derives the per-pair secret from the two node keys on demand (NET-7a), and only when a relationship exists. Unchanged from v0.9.</li>
+  <li><strong>The decorator is the one lendisk seam, and it hashes at capture.</strong> It implements versitygw's <code>backend.Backend</code> interface and wraps the one real backend. For your buckets it records a pending queue row, wraps the write stream in a SHA-256 as it passes to the backend, makes the call, marks the row done with the hash, and turns a not-found into a read-through from a replica. EP-11 needs the hash at write time anyway, to notice a changed acknowledged key, so taking it here costs no extra read. For borrowers' buckets it applies the allow-list, quota, hash verification, immutability and retention. Capture is in-process and crash-safe exactly as in v0.7 (EP-3).</li>
+  <li><strong>One backend per node, serving both roles.</strong> The user picks <code>backend/posix</code> or <code>backend/s3</code> at <code>init</code>, and the node's own buckets and every borrower's <code>lent-*</code> bucket go into the same store. On a disk, they are sibling directories. On a Garage, they are sibling buckets. This is what every household in figure 2 already did in v0.9; making it the rule removes the mux between two backend instances and gate Q-W. A friend who wants lent buckets on a second disk mounts it at the bucket directory (gate below).</li>
+  <li><strong>The capability profile is declared for tested stores and probed for the rest.</strong> The POSIX backend has versioning, object lock, checksum verification and conditional writes natively. Behind <code>backend/s3</code> those depend on the upstream. Garage, RustFS and B2 are tested, so their profiles ship as data and the probes at <code>init</code> and <code>store set</code> confirm them; for any other store the probes decide. <code>status</code> labels the weaker modes, as S3-4 already does for external replicas.</li>
+  <li><strong>Replication is an S3 client in the process.</strong> The worker takes the next object from a replica's FIFO queue, reads it through the decorator, and uploads it with <code>minio-go</code>, with the SHA-256 from the queue row as <code>x-amz-meta-lendisk-sha256</code> and as the request checksum where the target verifies one. Multipart with per-part progress on the queue row gives resume at part granularity (REPL-6). A token-bucket limiter and a time-of-day timetable in lendisk give REPL-7. minio-go was chosen on 2026-10-30 for its fit with S3-compatible stores; its owner risk (D11) is accepted, and if the library is withdrawn a new decision is taken, with the AWS SDK for Go v2 as the obvious replacement behind the same interface. For a friend, the client's HTTP transport dials through the tailcat <code>Client</code>, so there is no loopback forward, no child process, no rc socket and no second binary. The lender-only profile simply has no queue.</li>
+  <li><strong>A lender can lend space it does not own.</strong> Point the one store at a B2 bucket through <code>backend/s3</code> and lend part of it; quota, immutability and retention are still the decorator's. The borrower never holds a credential to it. Unchanged from v0.9.</li>
 </ul>
 
 <h2>Four friends, four configurations</h2>
-<p class="sub" style="margin-bottom:12px">The same binary in four households, each using a different corner of the design. Lending is pairwise and one-way; the arrows are replication flows from a borrower to the lender holding its copy. Carla and Björn have no relationship and never learn of each other.</p>
+<p class="sub" style="margin-bottom:12px">The same binary in four households, each using a different corner of the design. Lending is pairwise and one-way; the arrows are replication flows from a borrower to the lender holding its copy. Carla and Björn have no relationship and never learn of each other. Every household keeps its own buckets and its friends' buckets in the same store.</p>
 <figure id="fig2">
-<svg viewBox="0 0 1000 660" role="img" aria-label="Four nodes. Anna runs the default install on a Synology NAS behind NAT with plain files, backs up with restic, replicates to Björn, Carla and a Backblaze B2 bucket, and lends to Björn and Dag. Björn runs a homelab behind CGNAT with Garage on the LAN as his store through backend/s3, uses evict mode, replicates to Anna and Dag, and lends to Anna; his link to Anna goes through a DERP relay. Carla runs a lender-only Raspberry Pi with a USB disk, backs up nothing, and lends to Anna and Dag with a 60-day retention enforced by object lock. Dag runs a small VPS with a public IP, uses Kopia, keeps his store in Hetzner Object Storage through backend/s3, replicates to Anna and Carla, and lends Hetzner space to Björn." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5">
+<svg viewBox="0 0 1000 660" role="img" aria-label="Four nodes. Anna runs the default install on a Synology NAS behind NAT with plain files, backs up with restic, replicates to Björn, Carla and a Backblaze B2 bucket, and lends to Björn and Dag. Björn runs a homelab behind CGNAT with Garage on the LAN as his one store through backend/s3, uses evict mode, replicates to Anna and Dag, and lends to Anna; his link to Anna goes through a DERP relay. Carla runs a lender-only Raspberry Pi with a USB disk, backs up nothing, and lends to Anna and Dag with a 60-day retention enforced by object lock. Dag runs a small VPS with a public IP, uses Kopia, keeps his one store in Hetzner Object Storage through backend/s3, replicates to Anna and Carla, and lends Hetzner space to Björn." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5">
   <defs>
     <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10z" fill="var(--accent)"/>
-    </marker>
-    <marker id="a3-n" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-      <path d="M0 0L10 5L0 10z" fill="currentColor"/>
     </marker>
   </defs>
 
@@ -425,15 +428,15 @@
     <rect x="235" y="112" width="180" height="128" rx="5"/>
   </g>
   <g text-anchor="middle">
-    <text x="132" y="130" font-weight="600" font-size="11.5">local store</text>
+    <text x="132" y="130" font-weight="600" font-size="11.5">own buckets</text>
     <text x="132" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/posix · /volume1/lendisk</text>
     <text x="132" y="163" fill="var(--muted)">laptop · 120 GB · restic · full</text>
     <text x="132" y="178" fill="var(--muted)">replicas: Björn · Carla · B2</text>
     <text x="132" y="193" fill="var(--muted)">min_replicas 2</text>
     <text x="132" y="208" fill="var(--muted)">plain files: hand over the disk</text>
     <text x="132" y="223" fill="var(--muted)">versioning dir · object lock</text>
-    <text x="325" y="130" font-weight="600" font-size="11.5">lending store</text>
-    <text x="325" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/posix · same volume</text>
+    <text x="325" y="130" font-weight="600" font-size="11.5">lent buckets, same store</text>
+    <text x="325" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">/volume1/lendisk/lent-*</text>
     <text x="325" y="163" fill="var(--muted)">lent/björn · photos · 300 GB</text>
     <text x="325" y="178" fill="var(--muted)">lent/dag · kopia-dag · 80 GB</text>
     <text x="325" y="193" fill="var(--muted)">quota 500 GB each · 30 d</text>
@@ -455,15 +458,15 @@
     <rect x="780" y="112" width="180" height="128" rx="5"/>
   </g>
   <g text-anchor="middle">
-    <text x="677" y="130" font-weight="600" font-size="11.5">local store</text>
+    <text x="677" y="130" font-weight="600" font-size="11.5">own buckets</text>
     <text x="677" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/s3 → garage.lan:3900</text>
     <text x="677" y="163" fill="var(--muted)">photos · 300 GB · restic · evict</text>
     <text x="677" y="178" fill="var(--muted)">replicas: Anna · Dag</text>
     <text x="677" y="193" fill="var(--muted)">min_replicas 2 · packs evicted</text>
     <text x="677" y="208" fill="var(--muted)">after 2 acks · metadata stays</text>
     <text x="677" y="223" fill="var(--muted)">restores read-through</text>
-    <text x="870" y="130" font-weight="600" font-size="11.5">lending store</text>
-    <text x="870" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/s3 → same Garage, lent/</text>
+    <text x="870" y="130" font-weight="600" font-size="11.5">lent buckets, same Garage</text>
+    <text x="870" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">garage.lan:3900 · lent-* buckets</text>
     <text x="870" y="163" fill="var(--muted)">lent/anna · laptop · 120 GB</text>
     <text x="870" y="178" fill="var(--muted)">quota 500 GB · 30 d</text>
     <text x="870" y="193" fill="var(--muted)">Garage has no versioning:</text>
@@ -483,14 +486,14 @@
   <rect x="40" y="452" width="185" height="128" rx="5" fill="var(--role)" stroke="var(--muted)" stroke-dasharray="4 3" stroke-width="1"/>
   <rect x="235" y="452" width="180" height="128" rx="5" fill="var(--box)" stroke="var(--store)" stroke-width="1"/>
   <g text-anchor="middle">
-    <text x="132" y="470" font-weight="600" font-size="11.5" fill="var(--muted)">no local store</text>
+    <text x="132" y="470" font-weight="600" font-size="11.5" fill="var(--muted)">no own buckets</text>
     <text x="132" y="490" fill="var(--muted)">nothing listens on loopback</text>
-    <text x="132" y="505" fill="var(--muted)">no buckets · no worker</text>
-    <text x="132" y="520" fill="var(--muted)">no replica queue</text>
+    <text x="132" y="505" fill="var(--muted)">no buckets · no queue</text>
+    <text x="132" y="520" fill="var(--muted)">no replica client</text>
     <text x="132" y="535" fill="var(--muted)">status shows lent space only</text>
     <text x="132" y="550" fill="var(--muted)">the install for a friend</text>
     <text x="132" y="565" fill="var(--muted)">who contributes a disk</text>
-    <text x="325" y="470" font-weight="600" font-size="11.5">lending store</text>
+    <text x="325" y="470" font-weight="600" font-size="11.5">lent buckets, the store</text>
     <text x="325" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/posix · /mnt/usb/lendisk</text>
     <text x="325" y="503" fill="var(--muted)">lent/anna · laptop · 120 GB</text>
     <text x="325" y="518" fill="var(--muted)">lent/dag · kopia-dag · 80 GB</text>
@@ -513,15 +516,15 @@
     <rect x="780" y="452" width="180" height="128" rx="5"/>
   </g>
   <g text-anchor="middle">
-    <text x="677" y="470" font-weight="600" font-size="11.5">local store</text>
+    <text x="677" y="470" font-weight="600" font-size="11.5">own buckets</text>
     <text x="677" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/s3 → Hetzner bucket</text>
     <text x="677" y="503" fill="var(--muted)">kopia-dag · 80 GB · Kopia · full</text>
     <text x="677" y="518" fill="var(--muted)">replicas: Anna · Carla</text>
     <text x="677" y="533" fill="var(--muted)">min_replicas 1 (nudged to 2)</text>
     <text x="677" y="548" fill="var(--muted)">remote store: WAN speed,</text>
     <text x="677" y="563" fill="var(--muted)">warned at init</text>
-    <text x="870" y="470" font-weight="600" font-size="11.5">lending store</text>
-    <text x="870" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/s3 → same bucket, lent/</text>
+    <text x="870" y="470" font-weight="600" font-size="11.5">lent buckets, same bucket</text>
+    <text x="870" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">Hetzner bucket · lent-* prefix</text>
     <text x="870" y="503" fill="var(--muted)">lent/björn · photos · 300 GB</text>
     <text x="870" y="518" fill="var(--muted)">quota 400 GB · 30 d</text>
     <text x="870" y="533" fill="var(--muted)">versioning + lifecycle there</text>
@@ -585,7 +588,7 @@
   <span class="acc">replication, borrower → lender</span>
   <span class="dash">relayed path</span>
 </div>
-<figcaption>Figure 2. Four households, one binary. Anna is the default: plain files on the NAS, two friends plus a B2 bucket. Björn keeps everything in the Garage he already runs, so his lending store has client-side tombstones, and evicts packs once two replicas hold them. Carla lends a USB disk and nothing else, with object lock making her 60-day window store-enforced. Dag has no machine at home, so his store is a Hetzner bucket behind <code>backend/s3</code> on a VPS, and he lends part of that bucket to Björn with versioning and lifecycle doing the retention. Anna and Björn are mutual, every other pair is one-way, and Carla and Björn do not exist to each other.</figcaption>
+<figcaption>Figure 2. Four households, one binary, one store each. Anna is the default: plain files on the NAS, her friends' buckets beside her own, two friends plus a B2 bucket. Björn keeps everything, his own and Anna's, in the Garage he already runs, so Anna's retention at Björn is client-side tombstones, and he evicts packs once two replicas hold them. Carla lends a USB disk and nothing else, with object lock making her 60-day window store-enforced. Dag has no machine at home, so his store is a Hetzner bucket behind <code>backend/s3</code> on a VPS, and he lends part of that bucket to Björn with versioning and lifecycle doing the retention. Anna and Björn are mutual, every other pair is one-way, and Carla and Björn do not exist to each other.</figcaption>
 </figure>
 
 <h3>Who uses what</h3>
@@ -593,8 +596,8 @@
 <table>
   <tr><th></th><th>Anna</th><th>Björn</th><th>Carla</th><th>Dag</th></tr>
   <tr><td>Profile</td><td>full</td><td>full</td><td>lender-only (PEER-9)</td><td>full</td></tr>
-  <tr><td>Local store</td><td><code>backend/posix</code>, NAS volume</td><td><code>backend/s3</code>, Garage on the LAN</td><td>none</td><td><code>backend/s3</code>, Hetzner bucket (remote, warned)</td></tr>
-  <tr><td>Lending store</td><td>same volume</td><td>same Garage, <code>lent/</code> prefix</td><td><code>backend/posix</code>, USB disk</td><td>same Hetzner bucket, <code>lent/</code> prefix</td></tr>
+  <tr><td>The one store</td><td><code>backend/posix</code>, NAS volume</td><td><code>backend/s3</code>, Garage on the LAN</td><td><code>backend/posix</code>, USB disk</td><td><code>backend/s3</code>, Hetzner bucket (remote, warned)</td></tr>
+  <tr><td>Store profile</td><td>native</td><td>declared: Garage</td><td>native</td><td>declared: S3 with versioning, probed</td></tr>
   <tr><td>Tool and mode</td><td>restic, full</td><td>restic, evict (EP-9)</td><td>—</td><td>Kopia, full</td></tr>
   <tr><td>Borrows from</td><td>Björn, Carla, plus B2 (external, S3-1)</td><td>Anna, Dag</td><td>nobody</td><td>Anna, Carla</td></tr>
   <tr><td>Lends to</td><td>Björn, Dag</td><td>Anna</td><td>Anna, Dag</td><td>Björn</td></tr>
@@ -607,24 +610,24 @@
 
 <h3>What the four exercise</h3>
 <ul>
-  <li><strong>Every store kind at once.</strong> Plain files (Anna, Carla), an S3 server the user already runs (Björn), a provider as the store (Dag), and a provider as an external replica (Anna's B2). Four capability profiles, one adapter.</li>
+  <li><strong>Every store kind at once, one per node.</strong> Plain files (Anna, Carla), an S3 server the user already runs (Björn), a provider as the store (Dag), and a provider as an external replica (Anna's B2). Three declared store profiles, one backend per node, no mux.</li>
   <li><strong>Every retention mode.</strong> Store-enforced through object lock on plain files (Anna, Carla), store-enforced through versioning and lifecycle at a provider (Dag, and Anna's B2 with a key that cannot delete), and client-side tombstones where the store has none (Björn). <code>status</code> on each borrower shows which it got.</li>
-  <li><strong>Lending space you do not own.</strong> Dag's lending store is a prefix in a bucket he pays for. Björn's quota, immutability and retention are enforced by Dag's daemon, and Björn never holds the Hetzner credential.</li>
+  <li><strong>Lending space you do not own.</strong> Dag's lent buckets are a prefix in a bucket he pays for. Björn's quota, immutability and retention are enforced by Dag's daemon, and Björn never holds the Hetzner credential.</li>
   <li><strong>Pairwise trust (P-2).</strong> Anna and Björn are mutual, two invites. Every other pair is one-way. Carla and Björn share no relationship and appear nowhere in each other's state, even though both hold data for Anna and one of them holds data for Dag.</li>
-  <li><strong>Every network case.</strong> Hole-punched (Anna to Carla), relayed through DERP because of CGNAT (Anna to Björn, shown as such in both nodes' status), and a static public address dialled directly (everyone to Dag).</li>
+  <li><strong>Every network case.</strong> Hole-punched (Anna to Carla), relayed through DERP because of CGNAT (Anna to Björn, shown as such in both nodes' status), and a static public address dialled directly (everyone to Dag). In every case the borrower's S3 client dials through its own tailcat <code>Client</code>; nothing listens on loopback for replication.</li>
   <li><strong>Evict mode in the wild.</strong> Björn's 300 GB of photos keep about 10 GB locally; a restore reads packs through from Anna or Dag. Anna, holding Björn's packs, cannot read them (P-3) and cannot delete them early (RET-2).</li>
   <li><strong>Recovery for each.</strong> Anna rebuilds from her phrase and Carla's address. Dag rebuilds from his phrase and Anna's address, and his manifest brings back the Hetzner credential. Carla has nothing to recover: her store is readable with <code>restic -r /mnt/usb/lendisk/lent-anna-laptop</code> on any machine, with nothing running.</li>
 </ul>
 
 <h2>The capability profile</h2>
-<p class="sub" style="margin-bottom:10px">Applies to a store behind <code>backend/s3</code>. Probed at <code>init</code>, on <code>store set</code>, and on request; recorded in <code>lendisk.db</code>; shown in <code>status</code>. The POSIX backend has every row natively.</p>
+<p class="sub" style="margin-bottom:10px">Applies to a store behind <code>backend/s3</code>. For a tested store (Garage, RustFS, B2) the profile ships as data and the probes confirm it at <code>init</code> and <code>store set</code>; for any other store the probes decide it. Recorded in <code>lendisk.db</code>, shown in <code>status</code>. The POSIX backend has every row natively. An external replica is checked for two things only: whether versioning is on (S3-4) and whether the credential can delete (S3-5).</p>
 <div class="scroll">
 <table>
   <tr><th>Capability</th><th>Probe</th><th>Upstream has it</th><th>Upstream lacks it</th><th><code>status</code> label</th></tr>
   <tr><td>Versioning</td><td><code>GetBucketVersioning</code></td><td>Deletes are delete markers; undelete removes the marker; listings hide marked objects natively.</td><td>lendisk tombstones: copy aside if server-side copy is cheap, else deferred delete hidden by the decorator.</td><td>retention: store / client-side</td></tr>
   <tr><td>Lifecycle</td><td><code>PutBucketLifecycleConfiguration</code> on a probe prefix</td><td>Store expires non-current versions after the window.</td><td>lendisk purger issues the deletes.</td><td>purge: store / daemon</td></tr>
   <tr><td>Object Lock</td><td><code>GetObjectLockConfiguration</code></td><td>Retain-until set on delete; the lender's own credential cannot purge early.</td><td>RET-2 rests on the lender's daemon.</td><td>retention: store-enforced / daemon-enforced</td></tr>
-  <tr><td>Checksum verification</td><td>PUT with a wrong <code>x-amz-checksum-sha256</code>, expect <code>BadDigest</code></td><td>Decorator trusts the store's check; index rebuildable from <code>GetObjectAttributes</code>.</td><td>Decorator hashes the stream.</td><td>integrity: store / daemon</td></tr>
+  <tr><td>Checksum verification</td><td>PUT with a wrong <code>x-amz-checksum-sha256</code>, expect <code>BadDigest</code></td><td>Decorator trusts the store's check; index rebuildable from <code>GetObjectAttributes</code>.</td><td>Decorator's capture hash is the check.</td><td>integrity: store / daemon</td></tr>
   <tr><td>Conditional PUT</td><td><code>If-None-Match: *</code> on an existing probe key</td><td>Store refuses overwrites itself.</td><td>Decorator checks its index first.</td><td>immutability: store / daemon</td></tr>
   <tr><td>Server-side copy</td><td><code>CopyObject</code> of a probe object, timed</td><td>Cheap tombstone moves, undelete and exports.</td><td>Download and re-upload for those operations.</td><td>copy: server / client</td></tr>
 </table>
@@ -632,24 +635,22 @@
 
 <h2>Where the bytes live</h2>
 <pre>
-local store, default (backend/posix)
+the store, default (backend/posix)
   &lt;dir&gt;/laptop/data/ab/abcd…                 your bucket "laptop", restic layout, plain files
   &lt;dir&gt;/laptop/snapshots/…
   &lt;dir&gt;/photos/p1234…                        your bucket "photos", Kopia layout
+  &lt;dir&gt;/lent-&lt;id16&gt;-laptop/…                  a borrower's bucket, beside yours; the decorator maps "laptop" here
+  &lt;dir&gt;/lendisk-manifests/&lt;borrower-id&gt;       the borrower's encrypted node manifest
   &lt;versioning-dir&gt;/laptop/…                  non-current versions and delete markers (versitygw)
   restic -r &lt;dir&gt;/laptop snapshots           works with nothing running at all
 
-lending store on the same backend
-  &lt;dir&gt;/lent-&lt;borrower-id&gt;-laptop/…           a borrower's bucket; the decorator maps "laptop" here
-  &lt;dir&gt;/lent-&lt;borrower-id&gt;-laptop/.manifest  the borrower's encrypted node manifest
-
-either store behind backend/s3
-  s3://&lt;bucket&gt;/&lt;prefix&gt;/laptop/…             one store bucket, everything under prefixes
-  s3://&lt;bucket&gt;/&lt;prefix&gt;/lent/&lt;borrower-id&gt;/laptop/…
-  restic -r s3:&lt;endpoint&gt;/&lt;bucket&gt;/&lt;prefix&gt;/laptop   any S3 client, lendisk stopped
+the store behind backend/s3
+  s3://laptop/…, s3://lent-&lt;id16&gt;-laptop/…    one upstream bucket per lendisk bucket, yours and theirs alike
+  s3://&lt;bucket&gt;/&lt;prefix&gt;/laptop/…             or prefixes in one bucket, if backend/s3 allows (Q-V)
+  restic -r s3:&lt;endpoint&gt;/laptop snapshots    any S3 client, lendisk stopped
 
 object metadata lendisk writes everywhere
-  x-amz-meta-lendisk-sha256                  content hash, so the index is rebuildable
+  x-amz-meta-lendisk-sha256                  content hash, taken from the write stream at capture; the index is rebuildable
   x-amz-meta-lendisk-deleted                 deletion time, only for lendisk-side tombstones
 </pre>
 
@@ -657,58 +658,73 @@ object metadata lendisk writes everywhere
 <div class="scroll">
 <table>
   <tr><th>Tier</th><th>Store</th><th>Promise</th><th>Testing</th></tr>
-  <tr><td>1 · default</td><td><code>backend/posix</code> on a local directory</td><td>Every requirement, every acceptance scenario, plain files on disk, one process.</td><td>Full suite in CI, including G-3 on a Pi 4.</td></tr>
-  <tr><td>2 · tested</td><td><code>backend/s3</code> against Garage, a MinIO-compatible store (RustFS), one provider (B2)</td><td>Every requirement, with behaviour per capability as labelled.</td><td>Full suite in CI per store; capability matrix asserted.</td></tr>
-  <tr><td>3 · any S3</td><td><code>backend/s3</code> against anything that passes the probe</td><td>Best effort. <code>status</code> shows the profile and the weaker modes.</td><td>Probe only; community reports.</td></tr>
+  <tr><td>1 · default</td><td><code>backend/posix</code> on a local directory</td><td>Every requirement, every acceptance scenario, plain files on disk, no store process.</td><td>Full suite in CI, including G-3 on a Pi 4.</td></tr>
+  <tr><td>2 · tested</td><td><code>backend/s3</code> against Garage, a MinIO-compatible store (RustFS), one provider (B2)</td><td>Every requirement, with behaviour per the declared profile.</td><td>Full suite in CI per store; declared profile asserted by the probes.</td></tr>
+  <tr><td>3 · any S3</td><td><code>backend/s3</code> against anything that passes the probe</td><td>Best effort. <code>status</code> shows the probed profile and the weaker modes.</td><td>Probe only; community reports.</td></tr>
 </table>
 </div>
+<h3>Replica targets</h3>
+<div class="scroll">
+<table>
+  <tr><th>Tier</th><th>Target, through the in-process S3 client (minio-go)</th><th>Retention</th><th>Testing</th></tr>
+  <tr><td>—</td><td>A friend's node, as S3 through the tunnel</td><td>The friend's decorator: delete markers or tombstones, object lock where the store has it</td><td>Two nodes over tailcat in CI.</td></tr>
+  <tr><td>1</td><td>S3 with versioning (B2, Wasabi, Hetzner, R2, RustFS)</td><td>Provider-enforced, credential without delete</td><td>CI per provider.</td></tr>
+  <tr><td>2</td><td>S3 without versioning (Garage)</td><td>Client-side tombstones, labelled in <code>status</code></td><td>CI against Garage.</td></tr>
+</table>
+</div>
+<p class="sub" style="margin-top:8px">Non-S3 targets (SFTP, B2's native API, WebDAV, OAuth remotes) are not in v1. REQUIREMENTS §4.11 asks for S3 buckets; rclone behind the same replica interface is the v1.1 route to the rest, as DESIGN.md D12 already describes.</p>
 
 <h2>Everything that listens</h2>
 <div class="scroll">
 <table>
   <tr><th>Listener</th><th>Where</th><th>Who</th><th>Authenticated by</th></tr>
-  <tr><td>S3, your buckets</td><td><code>127.0.0.1:9000</code> + unix socket, served by embedded versitygw</td><td>Your backup tools</td><td>Per-bucket key from lendisk's <code>IAMService</code></td></tr>
-  <tr><td>S3, borrowers' buckets + control API</td><td>Inside the tailcat tunnel, served by embedded versitygw</td><td>Peers in <code>AllowedClients</code></td><td>Tunnel key, then the derived SigV4 credential that must match it</td></tr>
+  <tr><td>S3, your buckets</td><td><code>127.0.0.1:9000</code>, served by embedded versitygw</td><td>Your backup tools</td><td>Per-bucket key from lendisk's <code>IAMService</code></td></tr>
+  <tr><td>Tunnel: S3 for borrowers and the control API</td><td>One tunnel port: lendisk's bridge answers <code>/_lendisk/</code> itself and proxies the rest to versitygw on <code>&lt;data&gt;/run/tunnel.sock</code></td><td>Peers admitted by the <code>AllowClient</code> hook, checked again per request; invite keys for <code>redeem</code> only</td><td>Peer key; for S3 the access key must equal it and versitygw verifies the derived SigV4 credential</td></tr>
   <tr><td>Metrics</td><td>Loopback port</td><td>Prometheus</td><td>None, loopback only</td></tr>
+  <tr><td><code>peer forward</code> (NET-7b)</td><td>The loopback address the user names, only while the command runs</td><td>A backup tool restoring straight from a friend</td><td>Dials the friend with the node's own key; the friend checks it</td></tr>
   <tr><td>A user-provided store</td><td>Wherever the user runs it</td><td><code>backend/s3</code>, and whatever else the user allows</td><td>The user's credential; outside SEC-8's scope</td></tr>
 </table>
 </div>
-<p class="sub" style="margin-top:8px">No sidecar, no admin socket, no supervisor. versitygw's admin API, web UI and website endpoints are not configured.</p>
+<p class="sub" style="margin-top:8px">No admin socket, no child process, no rc socket, no replication forwards. versitygw's admin API, web UI and website endpoints are not configured. Every row is a listener REQUIREMENTS already names (EP-1, OPS-4, NET-7, NET-7b), so SEC-8 needs no change.</p>
 
 <h2>Five ways back to your data</h2>
 <ol>
-  <li><strong>Normal.</strong> <code>restic restore</code> against <code>127.0.0.1:9000</code>; the local store serves it, read-through fills any gap.</li>
-  <li><strong>From a friend, directly.</strong> <code>lendisk peer forward B 127.0.0.1:9100</code>, then restic against that port; B's embedded gateway serves B's lending store.</li>
-  <li><strong>After total loss.</strong> <code>lendisk recover</code> with the phrase and one lender's address; the manifest brings back peers, buckets, and the credentials of every store, including a remote one.</li>
+  <li><strong>Normal.</strong> <code>restic restore</code> against <code>127.0.0.1:9000</code>; the store serves it, read-through fills any gap.</li>
+  <li><strong>From a friend, directly.</strong> <code>lendisk peer forward B 127.0.0.1:9100</code>, then restic against that port; B's embedded gateway serves B's store.</li>
+  <li><strong>After total loss.</strong> <code>lendisk recover</code> with the phrase and one lender's address; the manifest brings back peers, buckets, and the credentials of the store and every external replica.</li>
   <li><strong>With no lendisk at all.</strong> On the default store, <code>restic -r &lt;dir&gt;/laptop</code> on the plain files, on your disk or on the lender's. Behind <code>backend/s3</code>, any S3 client with the store's credential.</li>
   <li><strong>From a disk in the post.</strong> <code>lendisk export</code> on either side writes the tool's own layout; <code>restic -r /mnt/usb/laptop</code> opens it.</li>
 </ol>
 
-<h2>What changed from the sidecar drawing</h2>
+<h2>What changed from the v0.9 drawing</h2>
 <div class="scroll">
 <table>
-  <tr><th>Area</th><th>Sidecar variant (earlier on 2026-10-29)</th><th>This drawing</th></tr>
-  <tr><td>S3 front end</td><td>A proxy lendisk writes: SigV4 termination, routing, re-signing</td><td>versitygw embedded; lendisk supplies listeners and an <code>IAMService</code></td></tr>
-  <tr><td>Signature code in lendisk</td><td>~500–800 lines, security-critical</td><td>None</td></tr>
-  <tr><td>Capture</td><td>In the proxy, across an HTTP hop</td><td>In-process at <code>backend.Backend</code>, as v0.7</td></tr>
-  <tr><td>Default store</td><td>versitygw as a supervised child over a unix socket</td><td><code>backend/posix</code> in the same process</td></tr>
-  <tr><td>Any S3 store</td><td>lendisk's adapter re-signs</td><td><code>backend/s3</code> re-signs</td></tr>
-  <tr><td>Processes</td><td>Two with the default, one with a remote store</td><td>One, always</td></tr>
-  <tr><td>Replication reads</td><td>S3 GET over loopback</td><td>Direct backend call</td></tr>
-  <tr><td>Boundary risk</td><td>Wire protocol only</td><td>versitygw's Go API (<code>embedgw</code>, <code>backend.Backend</code>), pinned and vendored, plus the wire protocol for S3 upstreams</td></tr>
-  <tr><td>Operation allow-list</td><td>Over HTTP actions</td><td>Over <code>backend.Backend</code> methods; the SEC-9 table is re-reviewed on every versitygw upgrade</td></tr>
-  <tr><td>Estimated lendisk code for this part</td><td>~3 500–5 000 lines</td><td>~2 000–2 500 lines</td></tr>
+  <tr><th>Area</th><th>v0.9 (architecture.html)</th><th>This drawing</th><th>Requirement that allows it</th></tr>
+  <tr><td>Stores</td><td>Local store and lending store each pick a backend; a mux in the decorator when they differ (Q-W)</td><td>One store, one backend, both roles; a friend's buckets live beside yours, on disk or in Garage</td><td>LEND-6 and COMPAT-4 only ask that lent buckets be ordinary buckets in the engine</td></tr>
+  <tr><td>Capability profile</td><td>Six probes at every <code>init</code> and <code>store set</code></td><td>Declared for tested stores, probes confirm; probed only for untested stores</td><td>None constrains how the profile is found</td></tr>
+  <tr><td>Replication engine</td><td><code>rclone rcd</code> child over a unix socket, one rc call per object</td><td>In-process S3 client (<code>minio-go</code>) behind the same replica interface; the design's own fallback in D12</td><td>§4.11 is S3-only; REPL-6 and REPL-7 become lendisk code</td></tr>
+  <tr><td>Reaching a friend</td><td>Ephemeral loopback forward per friend, dialled by rclone</td><td>The S3 client's HTTP transport dials through the tailcat <code>Client</code></td><td>NET-7b's user-invoked forward is the only one left, and NET-7b names it</td></tr>
+  <tr><td>Object hash</td><td>Worker hashes through the decorator, then rclone reads the store again: two reads</td><td>Taken from the write stream at capture, stored on the queue row: one read</td><td>EP-11 needs the hash at write time anyway; REPL-10 reworded in REQUIREMENTS v0.9</td></tr>
+  <tr><td>Replica targets</td><td>Any rclone remote: S3, B2 native, SFTP, more</td><td>S3-compatible buckets and friends</td><td>S3-1 to S3-9</td></tr>
+  <tr><td>Loopback listener</td><td>TCP plus a unix socket</td><td>TCP only; no backup tool can use a unix socket</td><td>EP-1</td></tr>
+  <tr><td>Tunnel ports</td><td>9000 for S3, 9001 for the control API</td><td>One port; control API under <code>/_lendisk/</code></td><td>NET-7</td></tr>
+  <tr><td>Processes and binaries</td><td>lendisk plus rclone; two binaries</td><td>One process, one binary</td><td>P-9, COMPAT-2</td></tr>
+  <tr><td>Listeners (SEC-8 rows)</td><td>7</td><td>5, all already named in REQUIREMENTS</td><td>SEC-8 unchanged</td></tr>
+  <tr><td>REQUIREMENTS changes needed (Q-T)</td><td>4</td><td>2, made in REQUIREMENTS v0.9: EP-16 and SEC-3</td><td></td></tr>
+  <tr><td>Open gates</td><td>Q-I.2, Q-V, Q-W, Q-U, Q-X, backend churn</td><td>Q-I.2, Q-V, Q-X, backend churn, plus the two new ones below</td><td></td></tr>
 </table>
 </div>
 
-<h2>Open before this becomes DESIGN v0.9</h2>
+<h2>Open gates</h2>
 <ul>
-  <li><strong><code>embedgw</code> takes a <code>net.Listener</code>.</strong> Needed for the tailcat tunnel. Fallback: bind a second loopback port and forward the tunnel listener to it in-process.</li>
-  <li><strong>The decorator can see the authenticated account.</strong> Needed to root borrowers' buckets and count quota per borrower. versitygw 1.8 lets <code>embedgw</code> take an external IAM implementation; whether the account reaches the backend call is the question. Fallback: a vendored patch carried as a Go module replace.</li>
-  <li><strong><code>backend/s3</code> pass-through.</strong> Multipart and checksums are documented; whether versioning, object lock and conditional headers pass to the upstream unchanged is not. The capability probe runs through the decorator, so it measures the pair, not the upstream alone.</li>
-  <li><strong>Two backends in one gateway.</strong> One <code>RunVersityGW</code> per process takes one backend; the decorator must mux by bucket when the local store and the lending store differ. Small, but it is lendisk code in the hot path.</li>
-  <li><strong><code>backend.Backend</code> churn.</strong> versitygw ships a minor release roughly monthly. The interface is pinned and vendored, the decorator is the only file touching it, and CI runs restic and Kopia end to end on every bump. This is the risk that made the sidecar attractive; the price of avoiding it was the signature code.</li>
-  <li><strong>Listing at 500k objects on the POSIX backend</strong> (G-3) and <strong>Object Lock semantics on it</strong>, both unmeasured, both testable in a day.</li>
+  <li><strong>The decorator can see the authenticated account (Q-I.2).</strong> <code>Config.IAMService</code> taking lendisk's implementation is confirmed; whether the account reaches the backend call is not. Fallback: a vendored patch carried as a Go module replace. Unchanged.</li>
+  <li><strong><code>backend/s3</code> pass-through (Q-V).</strong> Multipart and checksums are documented; whether versioning, object lock and conditional headers pass to the upstream unchanged is not, nor whether buckets can live as prefixes in one upstream bucket, as figure 2 draws for Dag. Unchanged.</li>
+  <li><strong><code>backend.Backend</code> churn.</strong> Five versitygw minor releases in four months, no stability statement. Pinned and vendored, one file touches it, CI runs restic and Kopia end to end on every bump. Unchanged.</li>
+  <li><strong>Listing at 500k objects on the POSIX backend and Object Lock semantics on it (Q-X).</strong> Unchanged.</li>
+  <li><strong>New: the in-process replica client (replaces Q-U).</strong> Multipart upload with per-part progress on the queue row, resumed after a restart; a token-bucket limiter and the time-of-day timetable (REPL-7); memory per concurrent transfer against OPS-7 on a Pi 4 (G-3); a friend's 507, 403 and 412 reaching the worker through the tailcat transport. All measurable in the two-node CI setup. If REPL-6's byte-offset resume or REPL-7's timetable turn out larger than expected, rclone behind the same interface is the v1.1 answer, as D12 says.</li>
+  <li><strong>New: lent buckets on a second disk under one posix root.</strong> A lender who wants friends' data on another disk mounts or links it at the bucket directory. This needs versitygw's temp directory and versioning directory to stay on the same filesystem as the bucket, or its temp-then-rename and version moves cross a mount. If they do not, the fallback is two posix roots and the mux comes back for that case only.</li>
+  <li><strong>Resolved: hash at capture.</strong> REQUIREMENTS v0.9 reworded REPL-10 so the hash may be taken when the backup tool writes the object, as long as the replica verifies the bytes it receives against it.</li>
+  <li><strong>Resolved: the requirement changes (Q-T).</strong> REQUIREMENTS v0.9 added EP-16 for a store behind an S3 service the user names, extended EP-12, EP-15, LEND-6, COMPAT-4 and scenarios 1 and 7 to match, and put the store credential in SEC-3.</li>
 </ul>
 </main>
 </body>

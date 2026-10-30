@@ -1,6 +1,8 @@
 # lendisk — design
 
-Status: draft v0.8, 2026-10-28. Companion to REQUIREMENTS.md v0.8.
+Status: draft v0.10, 2026-10-30. Companion to REQUIREMENTS.md v0.9,
+which made the two requirement changes this design needed (Q-T,
+resolved).
 
 ## 0. How to read this document
 
@@ -17,7 +19,7 @@ with those decisions: this is where component names, ports, paths,
 headers, formats and algorithms live, and it is the first place to
 edit when a decision changes. §4 derives the capacity numbers. §5
 holds the open gates on the current design and the questions already
-closed.
+closed. `architecture.html` is an overview drawn from this document.
 
 History: v0.4 generalised the product from restic-only to any
 S3-speaking backup tool. v0.5 replaced the Garage sidecar and capturing
@@ -26,10 +28,22 @@ S3 target: a friend's node serves S3 over the tunnel and the borrower
 uses one replica implementation for friends and external buckets alike
 (D12). v0.7 split requirements from design. v0.8 replaced embedded
 versitygw with Garage as the storage engine, behind a lendisk-owned S3
-proxy that terminates authentication, captures writes and enforces the
-lender's policy (D14); this needed REQUIREMENTS.md v0.8, which gave up
-"plain files with nothing running" for "readable with the storage
-engine alone, plus an export". The trust model is unchanged throughout.
+proxy; this needed REQUIREMENTS.md v0.8, which gave up "plain files
+with nothing running" for "readable with the storage engine alone,
+plus an export". v0.8.1 realised the fail-closed peer admission of
+REQUIREMENTS.md v0.8.1 (SEC-10 to SEC-15) with tailcat's admission
+hook, per-connection peer key and disconnect call. v0.9 returns to
+embedded versitygw, now with a choice of two of its backends per store:
+`posix` (plain files, the default) or `s3` (any S3-compatible service
+the user names) (D15). The lendisk proxy and its signature code are
+gone. v0.9 also moved replication to rclone as a supervised child
+process, so that a replica could be any rclone remote. v0.10, the same
+day, took that back after a review against REQUIREMENTS.md: every
+replica is S3 again and an in-process client, **minio-go**, moves the
+bytes (D12); one store serves both roles, so a friend's buckets live
+beside the node's own, on disk or in Garage (D15); the object hash is
+taken at capture; the tunnel has one port. One process, one binary.
+The trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -50,33 +64,58 @@ IDs are stable. D1, D1a, D7, D8 and D9 were decisions in earlier
 versions and are now principles P-1, P-2, P-8, P-6 and P-7 in
 REQUIREMENTS.md: they turned out to be what the product *is*, not how it
 is built, so there is nothing left to decide here. Their mechanisms are
-in §3. D13 (embedded versitygw) was replaced by D14 in v0.8 and is
-recorded there as the rejected alternative.
+in §3. D13 (embedded versitygw over its POSIX backend) was replaced by
+D14 (Garage) in v0.8, and D14 by D15 in v0.9; each is recorded in its
+successor as a rejected alternative.
 
-### D2. Packaging: one service, two static binaries, one TOML file
+**Three roles.** REQUIREMENTS.md asks for three different things, and
+the decisions below follow that split rather than one component per
+feature:
+
+| Role | Requirements | What they stress | Served by |
+|---|---|---|---|
+| **Local store**: the node's own copy, written by the user's backup tool | EP-1 to EP-15, P-5 | Synchronous and protocol-critical: full S3 behaviour for restic and Kopia, crash-safe exactly-once capture with no buffering, 200 MB/s, loopback only. The writer is trusted. | versitygw with the decorator's capture policy (D4, D15) |
+| **Replication**: moving each object to every replica | REPL-1 to REPL-11, §4.11, NET-2 to NET-5 | Asynchronous and robustness-critical: strict FIFO per replica, survival of days-long outages, resume, rate limits, a hash per object, reach behind NAT and to providers. Almost no S3 semantics. | an in-process S3 client (minio-go) driven by lendisk's queue (D12), dialling friends through tailcat (D5) |
+| **Lending store**: a friend's copy, written by a borrower who may be compromised | LEND-1 to LEND-7, RET-1 to RET-3, VER-1, NET-7, SEC-4 to SEC-15 | Enforcement-critical: quota, immutability, retention the borrower cannot bypass, a deny-by-default operation list, isolation between borrowers. | versitygw with the decorator's lender policy (D12, D15), behind the tunnel bridge (§3.7) |
+
+The two stores need the same S3 surface and differ only in policy, so
+one embedded gateway serves both and the decorator applies a different
+policy per bucket. Replication needs none of that surface and all of a
+transfer client's robustness, so it is a separate component behind its
+own interface, even though it runs in the same process. The split also
+says where a component does not belong: the replica client lacks what
+the stores need (synchronous capture, versioning, object lock,
+conditional writes), and versitygw has nothing replication needs beyond
+what the decorator already exposes.
+
+### D2. Packaging: one service, one static binary, one TOML file
 
 *Serves:* P-9, COMPAT-2, OPS-6, OPS-8.
 
 - One package per platform (Linux amd64, arm64; ARMv7 best effort)
-  holding two static binaries: `lendisk` and the pinned `garage`
-  release it was tested with (D14). One systemd unit runs `lendisk`,
-  which starts and supervises `garage` itself; the user never
-  configures Garage. The container image for Synology, TrueNAS and
-  Unraid holds both binaries; `network_mode: host` is recommended so the
-  overlay is not behind a second NAT.
+  holding one static binary, `lendisk`, which links versitygw, tailcat
+  and minio-go (D12). One systemd unit runs it. There is no child
+  process.
+- The container image for Synology, TrueNAS and Unraid holds that
+  binary and is one compose service. `network_mode: host` is
+  recommended so the overlay is not behind a second NAT (G-1), and so
+  `127.0.0.1:9000` is the host's loopback, which is where the backup
+  tool on the host looks. The image runs as an unprivileged user with
+  all capabilities dropped and a read-only root; the config directory
+  and the data directory are the only volumes. A user who already runs
+  an S3 store adds it as a second service on the bridge network,
+  publishing its S3 port on the host's loopback only, and names it as
+  the `s3` backend (D15).
 - Configuration is one TOML file (`BurntSushi/toml`); the CLI is
-  `cobra`. Every setting has a flag and an env var (OPS-6). lendisk
-  generates Garage's own configuration file from it at every start
-  (§3.8), so there is still one file the user edits.
-- The two binaries are upgraded as a pair. lendisk records the Garage
-  version and binary hash it was built against, refuses to start a
-  different one, and runs Garage's documented migration steps as part
-  of its own state migration (OPS-8).
+  `cobra`. Every setting has a flag and an env var (OPS-6). One
+  `[store]` section serves both roles (§3.8).
+- An upgrade is a file swap; the only state with migrations is
+  `lendisk.db` (OPS-8).
 
-*Rejected:* embedding the Garage binary inside the lendisk binary with
-`go:embed` and writing it out at start. It gives a one-file download at
-the cost of a 20–30 MB larger binary and an AGPL-aggregation question
-nobody wants to argue; two files in one tarball is plain aggregation.
+*Rejected:* a second process for transfers, rclone as a supervised
+child (v0.9; D12, alternatives). It brought a second binary, a
+supervisor, a socket and a per-friend loopback forward, for a breadth
+of targets REQUIREMENTS.md does not ask for.
 
 ### D3. Write model: local staging with asynchronous replication
 
@@ -96,23 +135,26 @@ decision is how they are served: in `evict` mode metadata (`config`,
 `keys`, `index`, `snapshots`, `locks`) stays local and evicted packs are
 fetched from a replica on demand through the same read path (EP-10).
 
-### D4. Endpoint: lendisk's S3 proxy in front of Garage
+### D4. Endpoint: S3 served in-process by embedded versitygw
 
 *Serves:* EP-1 to EP-3, EP-5, EP-10, EP-11, COMPAT-1, P-5.
 
 The backup tool talks S3 to the lendisk daemon on `127.0.0.1:9000`. The
-listener is **lendisk's own streaming S3 reverse proxy** (§3.3): it
-verifies the request's SigV4 signature against the per-bucket
-credential lendisk issued, records the operation in the replication
-queue, forwards the body unbuffered to Garage over a unix socket
-(D14), and relays the response. It is the only tool-facing endpoint:
-there is one local copy and one capture point.
+S3 protocol is served by **versitygw embedded in the daemon** (D15): it
+terminates every SigV4 signature, including the `aws-chunked`
+streaming form restic and Kopia send over plain HTTP, routes every
+request, and implements multipart, listings, versioning and object
+lock. Under it sits a lendisk-owned **decorator** of versitygw's
+`backend.Backend` interface, which captures every write and delete
+into the replication queue and enforces the lender's policy. It is the
+only tool-facing endpoint: there is one local copy and one capture
+point.
 
-The same proxy, on a second listener inside the tunnel, is what a
-friend's node talks to (D12). Everything the product adds to S3
-(capture, read-through, quota, immutability, tombstones, the
-deny-by-default allow-list) lives in this one component; Garage only
-stores bytes.
+The same gateway, reached through a lendisk bridge inside the tunnel
+(§3.7), is what a friend's node talks to (D12). Everything the product
+adds to S3 (capture, read-through, quota, immutability, retention, the
+deny-by-default allow-list) lives in the decorator; versitygw parses
+and authenticates, its backends store.
 
 Why S3 and only S3:
 
@@ -121,37 +163,20 @@ Why S3 and only S3:
   a REST shim beside the S3 endpoint (v0.4 to v0.7) bought nothing but a
   second credential, a second listener and a second test matrix; it was
   dropped with REQUIREMENTS.md v0.8 (EP-4).
-- lendisk does not implement S3 storage: multipart assembly, listings,
-  ETags and the on-disk format are Garage's. lendisk implements the
-  parts of the *protocol* that sit in front of storage: signature
-  verification and an operation allow-list, both of which it needs for
-  the lender side regardless (§3.7).
-
-What a proxy costs versus the embedded gateway of v0.5–v0.7, and why it
-is accepted:
-
-- *SigV4 is terminated twice*: the proxy verifies the client's
-  signature (including the `aws-chunked` streaming form restic and Kopia
-  send over plain HTTP) and re-signs the forwarded request with a
-  node-local Garage key, with `UNSIGNED-PAYLOAD`. The chunk framing is
-  stripped as it streams; nothing is buffered (EP-3). The cost is one
-  HMAC per 64 KiB chunk, negligible next to the SHA-256 the replication
-  worker computes anyway (Q-L measures it).
-- *A crash between Garage's success and the queue entry* is handled the
-  same way the decorator did it: a pending row is written before the
-  request is forwarded and completed when Garage answers; pending rows
-  are resolved against Garage at startup (EP-3).
-- *Two processes* instead of one (D2).
+- With versitygw embedded, lendisk implements no part of the S3
+  protocol: no signature code, no request parsing, no multipart
+  assembly. lendisk supplies an `IAMService` and wraps the storage
+  calls underneath.
 
 What changed versus a restic-only design, and the replacement for each:
 
 - *Name-equals-hash validation* (restic names every object by SHA-256;
   Kopia names pack blobs `p<random>`) is replaced by the **immutability
   policy** (EP-11): once a key is acknowledged by a replica, a write to
-  the same key with different content is a violation. The replication
-  worker hashes each object as it reads it from Garage to send it, and
-  sends the hash with the object; the lender verifies the bytes against
-  it (LEND-4).
+  the same key with different content is a violation. The decorator
+  takes the SHA-256 of the write stream at capture and keeps it on the
+  queue row; the hash travels with the object, and the lender verifies
+  the bytes against it (LEND-4).
 - *"Snapshot X is offsite-complete"* becomes a per-bucket high-water mark
   in the write sequence (REPL-11). Tool profiles (`restic`, `kopia`)
   recognise snapshot or manifest keys and present the watermark as
@@ -161,23 +186,26 @@ What changed versus a restic-only design, and the replacement for each:
   replication keeps the replica consistent at every watermark.
 - *Multipart uploads* are enqueued on `CompleteMultipartUpload` only;
   parts and aborted uploads never reach the queue (EP-2).
-- *Zero lock-in* (P-5) holds on both sides in its v0.8 form: with
-  lendisk stopped, an unmodified `garage server` on the same directories
-  serves the buckets to `restic -r s3:…`, and `lendisk export` writes a
-  plain-file repository (§3.5, §3.10).
+- *Zero lock-in* (P-5) holds on both sides, at its v0.7 strength on the
+  default store: objects are plain files at their key paths, so with
+  lendisk stopped `restic -r <store>/<bucket>` opens the borrower's own
+  copy and the lender's replica alike. Behind the `s3` backend, any S3
+  client with the store's credential reads the same layout.
 - *The trust promise* is per tool profile (EP-7, EP-8). restic and Kopia
   always encrypt client-side, so the "lender never sees plaintext"
   guarantee holds. A `generic` bucket (rclone, `aws s3 cp`) is outside
   the guarantee.
 
 *Rejected:* sftp (needs an SSH server); writing an S3 implementation
-(`gofakes3` is a test double and the storage side of the protocol is
-large); embedding rest-server's filesystem handler as the store (a
-second store beside the S3 one, so the restic path would diverge from
-the Kopia path); embedded versitygw (D14, alternatives); pass-through
-of the client's signature to Garage unchanged, which would need the
-per-bucket and the derived per-pair credentials to be imported into
-Garage's key store (SEC-3, NET-7a).
+(`gofakes3` is a test double and the protocol surface is large);
+lendisk's own S3 proxy in front of a store (v0.8's design: ~500–800
+lines of security-critical signature verification and re-signing,
+including the streaming form, plus an HTTP hop between capture and
+storage); a separate store behind a capturing proxy with SigV4
+pass-through (v0.4's design: a crash window between the store's
+acknowledgement and the queue entry); `rclone serve s3` as the front
+end (experimental, built on gofakes3, no versioning, object metadata
+held in memory, multipart parts must arrive in order).
 
 ### D5. Overlay network: Tailscale's data plane via `tailcat`
 
@@ -194,7 +222,8 @@ control plane, no account and no admin panel. Each node runs a tailcat
 `Server` with a saved key; its address string (`tc…`) encodes the public key
 and relay bootstrap info and is exactly what an invite needs to carry. Each
 node also dials peers as a `Client` with its own stable key, and every
-server restricts `AllowedClients` to known peers and pending invites.
+server admits clients through an `AllowClient` hook that consults
+`lendisk.db` and rejects anything it cannot find (§3.9).
 
 Why this over the alternatives:
 
@@ -212,6 +241,15 @@ Risks, and how the design handles them:
 - tailcat is two months old and states no API stability guarantee. The
   underlying components are mature; the wrapper is thin. Pin the version
   and keep it behind the internal `Transport` interface (NET-8, §3.7).
+  The admission API this design needs is newer than the latest tag
+  (Q-Q).
+- tailcat's defaults are open, because its first use is a netcat run by
+  hand: a nil `AllowClient` hook admits every client (and in v0.7.0 an
+  empty `AllowedClients` list did too), and a pre-shared key is
+  generated by default and embedded in the address, which makes the
+  address a secret. lendisk relies on neither default: the hook is
+  always set and fails closed, and the pre-shared key is disabled
+  (SEC-10, SEC-14, §3.9).
 - Tailscale positions it for short-lived connections and its hosted
   relays are throttled, carry no SLA and "may be revoked". The product
   therefore never depends on them: the project runs its own `derper`
@@ -282,34 +320,36 @@ are not reliable enough for that. Mirrors also keep the zero-lock-in
 guarantee: a lender can hand you a disk. The capacity cost is derived
 in §4.
 
-### D10. Language and licence: Go, because of D5
+### D10. Language and licence: Go, because of D5 and D15
 
 *Serves:* COMPAT-2 (static cross-compiled binaries); otherwise a
-consequence of D5.
+consequence of D5 and D15.
 
-The language follows the transport, not the other way round. Nothing else
-in the product forces a choice: the daemon stores opaque objects by key
-and never parses a backup repository, so neither restic's Go code nor
-Rust's `rustic_core` is needed. Garage (D14) is Rust, but it runs as a
-separate process behind a unix socket and is never linked, so it has no
-bearing on the daemon's language.
+The language follows the libraries, not the other way round. The daemon
+stores opaque objects by key and never parses a backup repository, so
+neither restic's Go code nor Rust's `rustic_core` is needed. What does
+force the choice is that the two components lendisk links, tailcat
+(D5) and versitygw (D15), are both Go; Go is the only language in which
+both halves of the design come as libraries today. minio-go (D12) is
+Go as well, but an S3 client exists in every language, so it has no
+bearing on the choice.
 
-- **Go** is required by tailcat (D5). It also matches the restic ecosystem
-  (restic, rest-server) and cross-compiles to static Linux amd64/arm64/
-  armv7 binaries trivially.
-- **Rust** would be the choice with iroh as transport. It would give a
-  slightly smaller and safer daemon at the cost of a custom stream
-  protocol over QUIC. It is a reasonable product; it is not a better one
-  for this problem.
+- **Go** cross-compiles to static Linux amd64/arm64/armv7 binaries
+  trivially and matches the restic ecosystem.
+- **Rust** would mean iroh for the transport and `s3s` for the S3 front
+  end, whose streaming-signature (`aws-chunked`) decoder is still a
+  placeholder, so lendisk would write it; the store would be versitygw
+  or Garage as a sidecar. The shape survives at the cost of the decoder
+  and a second process. A reasonable product; not a better one for this
+  problem.
 
 If field testing fails gate G-1 and the cause is tailcat rather than the
-relays, the fallback is iroh, and that means a Rust rewrite of a thin
-daemon (S3 proxy, SQLite queue, replication loop, Garage supervisor). The requirements are written so that nothing in them
-changes; in this document only D5, D10 and §3.7 would.
+relays, the fallback is iroh, and that means the Rust shape above. The
+requirements are written so that nothing in them changes; in this
+document D5, D10, D15 and §3.7 would.
 
-Licence: Apache-2.0 for lendisk. Garage is AGPL-3.0 and is distributed
-unmodified as a separate executable in the same package (D2); nothing
-of it is linked into lendisk.
+Licence: Apache-2.0 for lendisk. versitygw (Apache-2.0), tailcat
+(BSD-3) and minio-go (Apache-2.0) are linked.
 
 ### D11. Build on existing software
 
@@ -322,25 +362,26 @@ bundled program, not reimplemented. The daemon is glue around these:
 | Concern | Component | Licence | Notes |
 |---|---|---|---|
 | Backup format, client, encryption | **restic**, **Kopia**, unmodified | BSD-2 / Apache | Never imported; only their S3 usage and key naming conventions are relied on, via tool profiles. |
-| Storage engine: local store and lending store | **Garage** (`garagehq.deuxfleurs.fr`), unmodified, pinned release | AGPL-3.0 | D14. Separate process supervised by lendisk, reached over unix sockets. Supplies the S3 storage model, multipart, indexed listings, per-bucket quotas, per-key bucket permissions, block scrub and the admin API. |
-| SigV4 verification (both listeners) | an existing Go verifier, reused: candidates are versitygw's `s3api/auth` package and MinIO's `pkg/signer`; failing those, ~600 lines of own code | Apache | §3.3. Must handle `aws-chunked` streaming signatures. |
-| S3 client (all replicas, and lendisk → Garage) | `minio-go` | Apache | D12. |
-| Garage admin API client | generated from Garage's admin API v2 OpenAPI spec | — | Keys, bucket creation, quotas, bucket statistics, block errors. |
+| S3 front end and stores | **versitygw** via `embedgw`, pinned and vendored | Apache-2.0 | D15. SigV4 incl. `aws-chunked`, routing, multipart, listings, versioning, object lock; `backend/posix` and `backend/s3`. |
+| Replication transfers, every replica | **minio-go** | Apache-2.0 | D12. In-process S3 client, confined to one package behind the replica interface; the AWS SDK for Go v2 is the replacement if it is withdrawn. |
+| Rate limiting | `golang.org/x/time/rate` | BSD-3 | REPL-7's token bucket around each uploaded part. |
 | Overlay network and NAT traversal | **`github.com/tailscale/tailcat`** | BSD-3 | D5. |
 | Relay | **`tailscale.com/cmd/derper`** | BSD-3 | `lendisk relay` is a thin wrapper. |
 | State and queues | **SQLite** via `modernc.org/sqlite` | MIT / BSD | Pure Go, no cgo, so static builds stay simple. |
 | Recovery phrase | `github.com/tyler-smith/go-bip39` | MIT | |
 | CLI, config | `cobra`, `BurntSushi/toml` | Apache / MIT | |
-| Metrics | `prometheus/client_golang` | Apache | Garage's own metrics are scraped over its admin socket and re-exposed. |
+| Metrics | `prometheus/client_golang` | Apache | Transfer counters come from the replication worker. |
 
-What is written from scratch, because nothing exists: the S3 proxy
-(signature termination and re-signing, operation allow-list, capture,
-read-through, bucket mapping, quota, immutability, tombstones; D4, D12,
-D14, §3.3, §3.5, §3.6), the Garage supervisor and config generator
-(§3.8), the replication queue and its ordering guarantee (REPL-1), the
-challenge protocol (VER-1), the node manifest and recovery flow (§3.1),
-invites (PEER-1), tool profiles, `lendisk export`/`import` (REPL-8,
-LEND-6) and the CLI.
+What is written from scratch, because nothing exists: the backend
+decorator (capture, read-through, bucket mapping, quota, immutability,
+retention, the operation allow-list, the mux between two backends;
+D4, D15, §3.3, §3.5, §3.6), the `IAMService` (§3.3, §3.7), the tunnel
+bridge and the peer control API (§3.7, §3.9), the capability probe
+(D15), the replication queue and its ordering guarantee (REPL-1) with
+the replica client's multipart resume loop, rate limiter and timetable
+(D12, §3.4), the challenge protocol (VER-1), the node manifest and recovery flow
+(§3.1), invites (PEER-1), tool profiles, `lendisk export`/`import`
+(REPL-8, LEND-6) and the CLI.
 
 *Considered and rejected as the foundation:* **Syncthing** itself. The
 obvious "existing software" answer is: run an S3 or REST server locally,
@@ -359,38 +400,39 @@ guarantees, so wrapping Syncthing would mean fighting it.
 *Also rejected:* **rest-server's `repo` package** as the local store. It
 is a fine embeddable restic REST handler, but it is a second,
 filesystem-based store beside the S3 one, and keeping both means the
-restic path and the Kopia path diverge. **rclone `serve restic`** and
-**rclone `serve s3`**: same objection, plus they are processes without
-capture hooks.
+restic path and the Kopia path diverge. **rclone** as the replication
+engine (v0.9): see D12. **minio-go** was itself set aside in v0.9 for
+its owner risk, since MinIO archived its server and `mc` in 2026;
+v0.10 takes it back with that risk accepted on 2026-10-30. It is
+confined to one package, and if it is withdrawn a new decision is
+taken, with the AWS SDK for Go v2 as the obvious replacement.
 
-### D12. Every replica is S3
+### D12. Every replica is S3; an in-process client moves the bytes
 
-*Serves:* NET-7, NET-7a, NET-7b, LEND-2, LEND-4, RET-1 to RET-3, S3-3,
-S3-4, P-5, P-7.
+*Serves:* NET-7, NET-7a, NET-7b, REPL-1, REPL-6, REPL-7, REPL-10,
+LEND-2, LEND-4, RET-1 to RET-3, S3-1 to S3-9, P-5, P-7.
 
 A replication target is anything that implements the replica interface
-(`Put`, `Get` with range, `Head`, `List`, `Delete`, `Undelete`, `Verify`).
-There is **one S3 implementation** of it, over `minio-go`, and two kinds
-of target behind it:
+(`Put`, `Get` with range, `Head`, `List`, `Delete`, `Undelete`,
+`Verify`). There is **one implementation** of it, an S3 client linked
+into the daemon (**minio-go**, §3.4), and two kinds of target behind
+it:
 
-- an **external S3-compatible bucket** (Backblaze B2, Wasabi, Hetzner,
-  R2, Garage, RustFS, MinIO), dialled over the internet with the user's
-  credentials (§3.11);
+- an **external bucket**: any S3-compatible bucket the user configures,
+  in support tiers (§3.11), with versioning and lifecycle where the
+  provider has them;
 - a **friend's node**, dialled through the tailcat tunnel (§3.7). The
-  friend's daemon serves S3 through the same lendisk proxy that fronts
-  its own Garage (D4, D14), on a second listener bound to the tunnel.
-  The proxy maps the borrower's bucket names onto Garage buckets that
-  belong to that borrower and adds what S3 lacks: per-borrower quota
-  (LEND-1), immutability (LEND-4), retention that the borrower cannot
-  bypass (RET-1, RET-2) and a deny-by-default operation allow-list
-  (SEC-9).
+  friend's daemon serves S3 from the same embedded versitygw that fronts
+  its own store (D15), through the lender-side policy in the decorator:
+  per-borrower quota (LEND-1), immutability (LEND-4), retention that the
+  borrower cannot bypass (RET-1, RET-2) and a deny-by-default operation
+  allow-list (SEC-9).
 
 Both kinds appear in a bucket's replication set and count towards
 `min_replicas`. The friend kind differs from the external kind in two
-methods only: `Verify` is the challenge (VER-1) and `Undelete` is a
-control API call (RET-3), because a friend's store has no object
-versioning to express tombstones with (D14). Everything that moves
-bytes is the same code.
+methods only: `Verify` is the challenge (VER-1), and `Undelete` goes
+over the control API when the friend's store has no versioning
+(§3.6). Everything that moves bytes is the same code.
 
 Why one implementation rather than a custom peer protocol beside S3
 (v0.5's design):
@@ -398,164 +440,253 @@ Why one implementation rather than a custom peer protocol beside S3
 - The custom protocol was S3 with the names changed: `PUT` with a hash
   header, ranged `GET`, `HEAD`, paged `LIST`, `DELETE`. Everything it
   needed that S3 lacks (quota, immutability, tombstones) was going to
-  live in the lender's daemon anyway, and it still does, in the proxy
-  that D4 already requires. Garage supplies multipart, listings and the
-  storage side for free.
-- One replica implementation, one resume strategy (multipart) and one
-  verification sampler (VER-2) for every target.
-- The friend's replica becomes a plain S3 endpoint, so **restic and
-  Kopia can restore from a friend directly** (`restic -r s3:…` over the
-  tunnel) with no lendisk replica code in the path (NET-7b), which
-  extends the second recovery path of the external bucket to friends.
-- The lender-only profile (PEER-9) is the same binaries and the same
+  live in the lender's daemon anyway, and it still does, in the
+  decorator that D4 already requires.
+- One replica implementation, one resume strategy and one verification
+  sampler (VER-2) for every target.
+- The friend's replica is a plain S3 endpoint, so **restic and Kopia can
+  restore from a friend directly** (`restic -r s3:…` over the tunnel)
+  with no lendisk replica code in the path (NET-7b).
+- The lender-only profile (PEER-9) is the same binary and the same
   store as everyone else, with one fewer code path to test.
 
-What stays outside S3: the **peer control API**, five lendisk endpoints
-served beside the S3 listener inside the same tunnel and authenticated
-by the tunnel peer key alone: `challenge` (VER-1, S3 has no HMAC
-challenge), `manifest` (ID-4, which must be fetchable before any S3
-credential exists), `quota` (LEND-3), `version` (NET-6) and `undelete`
-(RET-3, since the lender's tombstones are not S3 versions).
+Why an in-process client, and why minio-go:
 
-**Credentials.** The proxy requires SigV4, and D5 says the tunnel key is
+- Under REQUIREMENTS.md every target is S3: a friend serves S3 over the
+  tunnel (NET-7) and §4.11 is written for S3 buckets. A client in the
+  process reaches both with one HTTP transport, and for a friend that
+  transport's dial function is the tailcat `Client` (§3.7). No loopback
+  forward, no second process, no socket, no second binary.
+- Each object is read once per replica. The decorator takes the SHA-256
+  of the write stream at capture (§3.3) and the worker streams the
+  object from the store straight into the upload, with the hash as
+  metadata (REPL-10).
+- Credentials never leave the process: the derived per-pair secret
+  (NET-7a) and every external credential are used by the client
+  directly, not handed to another program.
+- A friend's `507`, `403` and `412` arrive as S3 errors the worker maps
+  itself (LEND-2, SEC-15, EP-11).
+- minio-go is written for S3-compatible stores first: path-style, no
+  AWS-only request defaults, and multipart, ranged reads, versioned
+  listings, delete-marker removal and object-lock calls all present.
+  Its low-level multipart calls are what the resume loop needs.
+
+What lendisk writes because the client does not: the resume loop,
+which keeps the multipart upload ID and the ETag of each completed part
+on the queue row so a restart continues at the next part (REPL-6); a
+token-bucket limiter (`golang.org/x/time/rate`) around each part and a
+time-of-day timetable checked before each part (REPL-7); and the FIFO
+queue, which was lendisk's in every version.
+
+What stays outside S3: the **peer control API**, six lendisk endpoints
+served under `/_lendisk/` on the same tunnel port as S3 and
+authenticated by the tunnel peer key, checked against `lendisk.db` on
+every request (SEC-11): `redeem` (PEER-2, the invite handshake and the
+only endpoint an invite key may call, SEC-13), `challenge` (VER-1, S3
+has no HMAC challenge), `manifest` (ID-4, which must be fetchable
+before any S3 credential exists), `quota` (LEND-3), `version` (NET-6)
+and `undelete` (RET-3, for a friend whose store keeps lendisk-side
+tombstones).
+
+**Credentials.** versitygw requires SigV4, and D5 says the tunnel key is
 the identity. These are reconciled by deriving the pair's S3 credential
 from the tunnel keys rather than storing it (NET-7a, §3.7): access key
 is the borrower's node ID, secret is a key derivation over the X25519
 shared secret of the two nodes' keys. Both sides compute it, nothing is
 exchanged or written down, and recovery (P-6, ID-5) needs nothing
-beyond the phrase and one lender's address. The lender's proxy refuses
-a request whose tunnel peer key does not match the access key it
-presents, so there is still no second trust decision, only a second
-encoding of the same one. Because the proxy terminates the signature
-itself, the derived secret never has to exist inside Garage.
+beyond the phrase and one lender's address. The lender's tunnel bridge
+refuses a request whose access key is not the tunnel peer key (SEC-12),
+so there is still no second trust decision, only a second encoding of
+the same one. The borrower's client uses the derived secret directly;
+it is never written to a file.
 
-**Retention for external buckets** is delegated to the provider (S3-4):
-versioning plus a lifecycle rule provide tombstones, and the borrower
-is told to use a credential **without delete permission** (S3-5), which
-makes the copy immune to a compromised borrower machine, a stronger
-promise than a friend's node can make (RET-2 relies on the friend's
-daemon being honest and intact). For friends, the lender's proxy keeps
-tombstones as deferred deletes in its own index (§3.6): the object stays
-in Garage, hidden from the borrower, until the window expires.
+**Retention for external buckets** is delegated to the provider where
+the bucket has versioning (S3-4): versioning plus a lifecycle rule
+provide tombstones, and the borrower is told to use a credential
+**without delete permission** (S3-5), which makes the copy immune to a
+compromised borrower machine, a stronger promise than a friend's node
+can make (RET-2 relies on the friend's daemon being honest and intact).
+A bucket without versioning (Garage) gets lendisk-side tombstones and
+the "retention: client-side" label. For friends, the lender's decorator
+keeps retention, with delete markers in versitygw's versioning or its
+own tombstones depending on the store (§3.6).
 
 Costs accepted:
 
-- The proxy's admitted S3 surface is reachable by invited peers, so the
-  hostile-peer test (SEC-7) covers every S3 operation the allow-list
-  admits. The list (§3.7) is short and everything else is refused
-  before reaching Garage; Garage's own `501 Not Implemented` for
-  operations it lacks is a second backstop.
-- The "listable with plain `curl`" property of the old protocol is
-  lost; any S3 client works instead.
-- A node that both lends and borrows runs one proxy with two listeners
-  and one Garage.
-
-*Not used for:* the backing store of a friend's lender (that is the
-friend's own Garage on local disk), nor the borrower's local store
-(same). A lender who wants object storage behind Garage's data
-directory can mount it; it is unsupported.
-
-External buckets are tested in CI against Garage and documented for
-Backblaze B2, Wasabi, Hetzner Object Storage, Cloudflare R2, Garage and
-RustFS. Friend replicas are tested in CI with two nodes over tailcat.
-
-### D14. Storage engine: Garage, supervised, behind the lendisk proxy
-
-*Serves:* EP-1 to EP-3, EP-10, EP-12, EP-13, EP-14, LEND-1, LEND-6,
-VER-5, COMPAT-4, SEC-3, SEC-5, SEC-8, P-5, G-3. Replaces D13.
-
-The node's local store and its lending store are buckets in one
-**Garage** instance (Rust, AGPL-3.0, `garagehq.deuxfleurs.fr`; v2.3.0,
-April 2026) that lendisk starts as a child process, configures, and
-reaches only over unix sockets in a directory of its own (§3.8). No
-client ever talks to Garage directly: the lendisk proxy (D4) sits in
-front of both listeners.
-
-What Garage brings that the product would otherwise build:
-
-- **Per-bucket size quotas** (`maxSize`, `maxObjects` through the admin
-  API), used as a hard backstop under the proxy's per-borrower
-  accounting (LEND-1, SEC-5).
-- **Per-key bucket permissions** (read, write, owner), so a second,
-  Garage-enforced wall stands between borrowers even if the proxy's
-  bucket mapping has a bug (PEER-8).
-- **Indexed listings** (LMDB or SQLite metadata). Listing 500k objects
-  is a database range scan, not a `readdir` and sort; the G-3 listing
-  measurement no longer rides on the store (EP-14, G-3).
-- **Whole-store block scrub** every 25–35 days, verifying every block
-  against its hash, with a tranquility setting to keep it off the
-  backup's way (VER-5).
-- **Small-hardware design**: single static binary, low idle memory,
-  SQLite metadata option for 32-bit, built for exactly the Raspberry Pi
-  and NAS class of machine G-3 measures.
-- **S3 storage done**: multipart assembly, ETags, range reads, bucket
-  management and an admin API with scoped tokens; lendisk writes none
-  of it.
-
-What Garage lacks, and which part of the proxy covers it:
-
-| Gap | Covered by |
-|---|---|
-| Object versioning, `ListObjectVersions` | Deferred-delete tombstones in lendisk's index (§3.6). |
-| Bucket notifications or a change feed | Capture in the proxy (EP-2, EP-3); listing-based reconcile (EP-14). |
-| Bucket policies, IAM | The proxy's allow-list and bucket mapping (§3.7); Garage keys are node-local and never given to clients. |
-| Conditional writes (`If-None-Match`), unconfirmed at the pinned version | The proxy's index is authoritative (it is the only writer) and refuses before forwarding (LEND-4, EP-11). |
-| Upload checksum verification (`x-amz-checksum-sha256`), unconfirmed (Q-J) | The proxy hashes the stream it is already consuming for signature verification and compares after Garage answers. |
-| Repair of a corrupted block on a single node | lendisk reads Garage's block-error list and re-fetches the object from a replica (Q-K, EP-10). |
-| Plain-file on-disk layout | Given up in REQUIREMENTS.md v0.8 (P-5); `lendisk export` writes it on demand (LEND-6). |
-
-The trust model (P-2) is untouched: the borrower-facing listener binds
-loopback only, the lender-facing listener binds the tailcat tunnel
-only, Garage is reachable from neither, and everything that crosses
-between households is S3 plus the peer control API, both inside the
-tunnel and both served by the lendisk process (D12).
-
-Known costs and their handling:
-
-- *Second process.* Supervised by lendisk, invisible to the user (D2,
-  §3.8). A Garage crash is a lendisk alert and a restart; the proxy
-  returns `503` meanwhile and the backup tool retries.
-- *AGPL.* Garage is distributed unmodified beside lendisk and never
-  linked; the proxy talks to it over a socket. The project's own code
-  stays Apache-2.0 (D10).
-- *Metadata engine.* LMDB (Garage's default) is memory-mapped and
-  counts towards RSS as pages are touched; on 32-bit it is limited to a
-  small map and not recommended by Garage. lendisk configures LMDB on
-  64-bit and SQLite on ARMv7; Q-M measures both against OPS-7.
-- *Garage version churn.* The admin API is v2 since Garage 2.0 and the
-  S3 surface is stable; the binary is pinned, upgraded as a pair with
-  lendisk, and CI runs restic and Kopia end to end on every bump.
-- *Compression and dedup are useless here* (the data is encrypted) and
-  are turned off or ignored; block hashing still costs CPU (Q-L).
-- *Garage's RPC listener* exists even on a single node; it binds
-  loopback with a random secret (SEC-8).
+- Non-S3 targets (SFTP, B2's native API, WebDAV, OAuth remotes) are
+  not in v1. REQUIREMENTS.md §4.11 does not ask for them; rclone behind
+  the same interface is the v1.1 route (alternatives below).
+- REPL-6 and REPL-7 are lendisk code, a few hundred lines, exercised
+  by the two-node CI and against every tier-1 and tier-2 bucket (Q-Y).
+- minio-go's owner risk: MinIO archived its server and `mc` in 2026,
+  and the client's future rests on their commercial product. Accepted
+  on 2026-10-30. The client is confined to one package behind the
+  replica interface; if it is withdrawn a new decision is taken, with
+  the AWS SDK for Go v2 as the obvious replacement (D11).
+- REPL-10's SHA-256 travels as user metadata
+  (`x-amz-meta-lendisk-sha256`) and, where the target verifies one, as
+  the request checksum. The lender's decorator hashes the stream anyway
+  and compares with the metadata (LEND-4).
+- Stored-checksum verification is per target (an MD5 ETag on
+  single-part objects, nothing usable on multipart at many providers);
+  sample downloads carry the real check (VER-2, S3-6).
 
 *Alternatives considered:*
 
-- **versitygw embedded via `embedgw` over its POSIX backend** (v0.5 to
-  v0.7's design, formerly D13). One process, plain files, xattr ETags,
-  `readdir` listings. Everything a lender needs beyond storage (quota,
-  per-borrower isolation, scrub, indexed listings) had to be written in
-  the backend decorator and was gated on five unconfirmed properties of
-  a young `embedgw` API (former Q-I). Garage ships those four as
-  features. The price was plain files, paid in REQUIREMENTS.md v0.8.
-- **RustFS** (Rust, Apache-2.0, 1.0 GA on 2026-09-16). MinIO-compatible,
-  with object versioning, lifecycle rules, IAM and event notifications,
-  all of which would have simplified the lender side. Rejected for v1's
-  hardware: its documentation strongly recommends XFS and says to avoid
-  ext4, btrfs and ZFS, which are what Synology, TrueNAS and most
-  homelabs run; its stated test-environment minimum is 2 GB of memory;
-  it ships a web console that would have to be disabled (SEC-8); and it
-  is six weeks past GA. Its one-directory-per-object layout is no more
-  restic-readable than Garage's blocks. Kept as a documented external
-  replica target, where its versioning works with S3-4 as written.
-  Revisit if Garage fails Q-L or Q-M.
-- **MinIO**: AGPL, heavier, its community edition shed features through
-  2025 and its repository is reported archived in early 2026.
-- **SeaweedFS**: capable, larger than needed, and a filer plus volume
-  server topology for a single-node job.
-- **Any of these as a cluster spanning friends**: rejected for the trust
-  reasons in D11; a cluster is one trust domain.
+- **rclone as a supervised child process driven over its rc API**
+  (v0.9). It made any rclone remote a target and brought a widely used
+  transfer engine, at the price of a second binary and process with a
+  supervisor, a per-friend loopback forward because rclone cannot dial
+  through tailcat (a listener class REQUIREMENTS.md SEC-8 would have
+  had to admit), secrets passed in rc request bodies, two reads of
+  every object, errors mapped across a process boundary, and eight
+  unverified rc checks (former Q-U). Dropped on 2026-10-30 because
+  REQUIREMENTS.md asks for S3 targets only. It remains the v1.1 route
+  to non-S3 targets, behind the same interface.
+- **The AWS SDK for Go v2.** Equivalent coverage and no owner risk, but
+  AWS-first defaults: since 2025 it adds a CRC32 request checksum that
+  several non-AWS stores reject, so every tier-2 store and every friend
+  would need it configured off. The replacement if minio-go is
+  withdrawn.
+- **Linking rclone's Go packages** (`fs.Fs` and its backends): an
+  unguaranteed API on a path nobody else uses, and a lendisk binary two
+  to three times larger.
+- **An S3-only CLI** (s5cmd, the AWS CLI, `mc`): the cost of a child
+  process without rclone's breadth; `mc` is archived.
+- **Go CDK's `blob` package**: no versioning or delete-marker
+  operations, and it sits on the AWS SDK anyway.
+
+External buckets are tested in CI against an S3 store with versioning
+(RustFS, and B2 as the provider) and against Garage; friend replicas
+with two nodes over tailcat.
+
+### D15. Stores: versitygw embedded, `posix` or `s3` backend per store
+
+*Serves:* EP-1 to EP-3, EP-10, EP-12, EP-14, EP-15, LEND-1, LEND-6,
+VER-5, COMPAT-4, SEC-3, SEC-8, P-5, G-3. Replaces D14.
+
+The daemon embeds **versitygw** (Go, Apache-2.0) through its `embedgw`
+package: `embedgw.RunVersityGW(ctx, backend, *Config)` serves the S3 API
+over any `backend.Backend`. lendisk passes its decorator (D4), which
+wraps one of versitygw's own backends, chosen once per node:
+
+- **`backend/posix`, the default.** Objects are plain files at
+  `<dir>/<bucket>/<key>`, written temp-then-rename, with ETags and
+  metadata in xattrs, a versioning directory for non-current versions
+  and delete markers, and object lock. One process, no network, and P-5
+  at its v0.7 strength: `restic -r <dir>/<bucket>` works with nothing
+  running.
+- **`backend/s3`, any store.** The same gateway becomes a proxy that
+  re-signs each call with the store's own credential and forwards it to
+  an S3-compatible endpoint the user names: a Garage, MinIO-compatible
+  store or versitygw on the LAN, or a provider (B2, R2, Wasabi,
+  Hetzner). lendisk still writes no signature code.
+
+**One store serves both roles.** The node picks `posix` or `s3` once,
+at `init`, and its own buckets and every borrower's `lent-*` bucket go
+into that store: sibling directories on a disk, sibling buckets in a
+Garage. This is the point of the product for the user who runs storage:
+a friend's data lands where their own does. It also means one backend
+instance, no mux, and Q-W closed. A lender who wants lent buckets on a
+second disk mounts it at the bucket directory (Q-Z). A store behind
+`backend/s3` that is not on the local network is allowed with a warning
+at `init` and `store set`: backups then run at WAN speed (EP-16).
+
+What this buys over the v0.8 Garage design:
+
+- No signature code in lendisk: the ~500–800 security-critical lines of
+  the v0.8 proxy are versitygw's, tested against restic, Kopia and the
+  AWS SDKs by its own users.
+- Capture is synchronous and in the same process as the backend call. A
+  pending queue row is written before the backend call and completed
+  after it (EP-3), with no HTTP hop between capture and storage.
+- The default store is plain files again, and the store engine is
+  replaceable by configuration: anything S3-compatible fits under
+  `backend/s3`.
+- One lendisk process instead of lendisk plus a supervised Garage, and
+  no admin socket, RPC port or metadata engine to configure.
+
+**The capability profile.** Behind `backend/posix` every feature the
+lender uses is native. Behind `backend/s3` they depend on the upstream,
+so each store has a profile. For a tested store (Garage, RustFS, B2)
+the profile ships as data and the probes below confirm it at `init` and
+`store set`; for any other store the probes decide it. The result is
+recorded in `lendisk.db`, shown in `status`, and chooses the mode per
+feature:
+
+| Capability | Probe | Upstream has it | Upstream lacks it | `status` label |
+|---|---|---|---|---|
+| Versioning | `GetBucketVersioning` | Deletes are delete markers; undelete removes the marker. | lendisk tombstones (§3.6). | retention: store / client-side |
+| Lifecycle | `PutBucketLifecycleConfiguration` on a probe prefix | Store expires non-current versions after the window. | lendisk's purger issues the deletes. | purge: store / daemon |
+| Object Lock | `GetObjectLockConfiguration` | Retain-until set on delete; the lender's own credential cannot purge early. | RET-2 rests on the lender's daemon. | retention: store-enforced / daemon-enforced |
+| Checksum verification | PUT with a wrong `x-amz-checksum-sha256`, expect `BadDigest` | The decorator trusts the store's check. | The decorator hashes the stream. | integrity: store / daemon |
+| Conditional PUT | `If-None-Match: *` on an existing probe key | Store refuses overwrites itself. | The decorator checks its index first. | immutability: store / daemon |
+| Server-side copy | `CopyObject` of a probe object, timed | Cheap tombstone moves, undelete and exports. | Download and re-upload for those. | copy: server / client |
+
+The probe runs through the decorator and versitygw's `backend/s3`, so it
+measures the pair, not the upstream alone (Q-V).
+
+**Support tiers for stores:** tier 1 is `backend/posix` on a local
+directory (every requirement and scenario, full CI including G-3 on a
+Pi 4); tier 2 is `backend/s3` against Garage, a MinIO-compatible store
+(RustFS) and one provider (B2), with the full suite per store and the
+declared profile asserted by the probes; tier 3 is anything else that
+passes the probe, best effort.
+
+The trust model (P-2) is untouched: the borrower-facing listener binds
+loopback only, the lender-facing side is reachable only through the
+tailcat tunnel and lendisk's bridge (§3.7), a store behind `backend/s3`
+is reached with a credential the borrower never holds, and everything
+that crosses between households is S3 plus the peer control API.
+
+Known costs and their handling:
+
+- *`embedgw` and `backend.Backend` churn.* The embeddable package was
+  extracted in versitygw v1.5.0 (June 2026), external IAM arrived in
+  v1.8.0 (September) and v1.10.0 shipped on 22 October: five minor
+  releases in four months, with no stability statement. The version is
+  pinned and vendored, the decorator is the only file that touches the
+  interface, the SEC-9 table and the replication-hole review (Q-H) are
+  re-run on every bump, and CI runs restic and Kopia end to end. This is
+  the risk that made the v0.8 sidecar attractive; the price of avoiding
+  it was the signature code.
+- *No `net.Listener`.* `embedgw`'s listener fields are address strings
+  (TCP, file-backed or abstract unix sockets). The loopback listener is
+  versitygw's own; the tunnel side is bridged by lendisk to an internal
+  unix socket in a 0700 directory (§3.7).
+- *xattrs are required* on the `posix` store. ext4, xfs, btrfs, zfs and
+  Docker overlay2 volumes support them; SMB and some NAS exports do not.
+  `init` tests the store directory and refuses one without them (EP-12).
+- *Multipart completion copies parts into the final file.* On btrfs and
+  xfs `copy_file_range` is a reflink; on ext4 it is a real copy.
+  Accepted.
+- *Listings on `posix` are `readdir` plus sort.* G-3 measures 500k
+  objects; if it fails, the decorator serves `ListObjectsV2` from
+  lendisk's index, which it maintains anyway (Q-X).
+- *No scrub.* The daemon's own sampler hashes stored objects against
+  the index (VER-5).
+
+*Alternatives considered:*
+
+- **Garage as a supervised sidecar behind lendisk's own proxy** (v0.8,
+  formerly D14). Indexed listings, per-bucket quotas, block scrub and a
+  small-hardware design, but lendisk had to verify and re-sign every
+  signature itself, the default store was Garage's block format, and
+  two processes were always needed. Garage remains a tier-2 store
+  behind `backend/s3` and an external replica target; it has no
+  versioning, so lendisk-side tombstones apply there.
+- **versitygw as a supervised child** over a unix socket, with
+  lendisk's proxy in front (the sidecar variant considered on
+  2026-10-29). Removes the `backend.Backend` coupling at the cost of the
+  signature code and an HTTP hop between capture and storage.
+- **RustFS** (Apache-2.0, 1.0 GA 2026-09-16): versioning, lifecycle and
+  IAM, but its documentation recommends XFS and says to avoid ext4,
+  btrfs and ZFS, needs 2 GB of memory to test, and ships a web console.
+  A tier-2 store behind `backend/s3`, not the engine.
+- **MinIO**: AGPL, heavier, community edition archived in 2026.
+- **SeaweedFS**: a filer plus volume servers for a single-node job.
+- **Any of these as a cluster spanning friends**: rejected for the
+  trust reasons in D11; a cluster is one trust domain.
 
 ## 3. Realisation, by requirement area
 
@@ -565,16 +696,21 @@ narrows a requirement; if a line seems to, the requirement is wrong or
 this line is.
 
 Paths used below: `<config>` is the config directory (mode 0700),
-`<data>` the data directory. Garage owns `<data>/garage/` entirely:
-`data/` (blocks), `meta/` (LMDB or SQLite), `garage.toml` (generated),
-`s3.sock` and `admin.sock`. lendisk's state is `<data>/lendisk.db`
-(SQLite). Garage bucket naming: the node's own buckets keep their names;
-a borrower's bucket `b` is Garage bucket `lent-<id16>-b`, where `id16`
-is the first 16 characters of the borrower's node ID in lowercase
-base32. `bucket add` refuses own names beginning with `lent-` and
-limits bucket names to 40 characters so the lent form fits S3's 63.
-The mapping table in `lendisk.db` is authoritative; the name is a
-stable label for reading the store with Garage alone (P-5).
+`<data>` the data directory. On the default `posix` backend the store
+is `<data>/store/` (or a directory the user names, such as a USB disk),
+holding the node's own buckets and the `lent-*` buckets side by side,
+with versitygw's versioning directory beside it; `lendisk.db` (SQLite)
+is in `<data>`; `<data>/run/` (mode 0700) holds the internal tunnel
+socket. Bucket naming: the node's own buckets keep their names; a
+borrower's bucket `b` is stored as `lent-<id16>-b`, where `id16` is the
+first 16 characters of the borrower's node ID in lowercase base32.
+`bucket add` refuses own names beginning with `lent-` and the reserved
+name `lendisk-manifests`, and limits bucket names to 40 characters so
+the lent form fits S3's 63. The mapping table in `lendisk.db` is
+authoritative; the name is a stable label for reading the store with no
+lendisk running (P-5). Behind `backend/s3` the same names are upstream
+bucket names; placing them as prefixes inside one upstream bucket is
+Q-V.
 
 ### 3.1 Identity and recovery
 
@@ -589,186 +725,228 @@ stable label for reading the store with Garage alone (P-5).
 - **ID-4** The manifest is encrypted with a key derived from the
   identity (HKDF over the private key with a fixed info string) and
   pushed to every lender through the control API `manifest` endpoint
-  (D12), which the lender stores as a blob in `lendisk.db`, keyed by
-  borrower; it never enters Garage. Addressing hints are the peer's
-  `tc…` string plus any explicit addresses (NET-3).
+  (D12). The lender writes it through its backend as the object
+  `<borrower-id>` in the reserved bucket `lendisk-manifests`, which no
+  borrower's account can name or list (PEER-8), so it survives the loss
+  of `lendisk.db` and is part of a lender's disk handed over (P-5).
+  Addressing hints are the peer's `tc…` string plus any explicit
+  addresses (NET-3).
 - **ID-5** A lender's address is its tailcat `tc…` string, which carries
-  the public key and relay bootstrap info. `recover` derives the key
+  the public key and relay bootstrap info and no pre-shared key
+  (SEC-14). `recover` derives the key
   from the phrase, dials the lender, fetches the manifest over the
   control API (no S3 credential needed yet), then derives the per-pair
   S3 credentials (§3.7) for every lender listed.
-- **ID-6** Read-through is the proxy's `GetObject`/`HeadObject` miss
-  path (EP-10); after `recover` every object is a miss until fetched.
+- **ID-6** Read-through is the decorator's `GetObject`/`HeadObject`
+  miss path (EP-10); after `recover` every object is a miss until
+  fetched.
 - **ID-7** The sheet is generated from the manifest; a lender's `tc…`
-  string changes only when its key changes, so regeneration is rare.
+  string changes only when its key or its configured bootstrap region
+  changes (SEC-14), so regeneration is rare.
 
 ### 3.2 Peers and invites
 
 - **PEER-1** The invite string carries the lender's `tc…` address, the
-  quota, the retention offer and a single-use secret. The lender adds a
-  key derived from the secret to its tailcat `AllowedClients` until the
-  invite is redeemed or expires; the borrower dials with that key to
-  perform the handshake, after which its real key replaces it.
-- **PEER-2** On redemption the lender creates, through Garage's admin
-  API, one node-local Garage key for the borrower, with `createBucket`
-  denied; every bucket the borrower later creates is created by lendisk
-  under the `lent-<id16>-` name and granted to that key alone, with
-  `maxSize` set to the borrower's quota.
-- **PEER-8** Two walls. The proxy resolves the tunnel peer key to the
-  borrower, maps bucket names through the mapping table, and forwards
-  nothing it did not map. The forwarded request is signed with that
-  borrower's Garage key, which Garage has granted on that borrower's
-  buckets only, so a mapping bug cannot cross into another borrower's
-  data. `ListBuckets` is answered from the mapping table.
-- **PEER-9** The lender-only profile skips the loopback S3 listener;
-  Garage and the proxy's tunnel listener still run.
+  quota, the retention offer and a single-use secret. The lender's
+  admission hook admits a key derived from the secret, in the `invite`
+  role, until the invite is redeemed or expires (§3.9); the borrower
+  dials with that key to call `redeem`, after which its real key
+  replaces it.
+- **PEER-2** On redemption the lender records the relationship (borrower
+  key, quota, retention) in `lendisk.db`. From then on the borrower's
+  node ID is an account in lendisk's `IAMService`, with its derived
+  secret (NET-7a) computed on demand and never stored. Buckets the
+  borrower creates are created by the decorator under the
+  `lent-<id16>-` name and owned by that account alone.
+- **PEER-8** Two walls. The decorator maps every bucket name through
+  the borrower's own mapping table, so a borrower can only name its own
+  buckets; and versitygw's bucket-ownership check refuses an account
+  any bucket it does not own, so a mapping bug cannot cross into another
+  borrower's data or the lender's own. `ListBuckets` is answered from
+  the mapping table.
+- **PEER-9** The lender-only profile skips the loopback S3 listener and
+  runs no replication worker; versitygw still runs, behind the tunnel
+  bridge only.
 - **PEER-10** Peers are rows in `lendisk.db`; nothing in the control API
   or the S3 surface returns them.
 
 ### 3.3 Endpoint and local store
 
-- **EP-1** The proxy listens on `127.0.0.1:9000` and a unix socket, and
-  forwards to Garage over `<data>/garage/s3.sock`. Path-style
-  addressing is the only form the proxy accepts. The proxy is a
-  `net/http` handler around `httputil.ReverseProxy` with a verifying
-  body reader: it parses the SigV4 authorization header, resolves the
-  access key to a lendisk-issued credential, verifies the seed
-  signature and, for `aws-chunked` bodies, each chunk signature as the
-  chunk streams past, stripping the framing. The outgoing request is
-  signed with the node-local Garage key and `x-amz-content-sha256:
-  UNSIGNED-PAYLOAD`, with `Content-Length` set to the decoded length
-  the client declared. Headers Garage does not know are dropped.
-- **EP-2** The proxy enqueues on a `200` to `PutObject` or
-  `CompleteMultipartUpload`, and a delete on a `204` to `DeleteObject`
-  or each deleted entry of `DeleteObjects`. Parts and aborted uploads
-  never reach those branches.
-- **EP-3** The proxy writes a pending queue row (bucket, key, operation,
-  Garage upload id if any) before forwarding and marks it complete when
-  Garage answers success; on failure it deletes the row. At startup,
-  pending rows are resolved by `HeadObject` against Garage. The proxy
-  neither buffers nor hashes request bodies; hashing happens when the
-  replication worker reads the object from Garage to send it (REPL-10).
+- **EP-1** Embedded versitygw (D15) over the decorated backend,
+  listening on `127.0.0.1:9000`. No unix socket: no backup tool can use
+  one. Path-style addressing is versitygw's default.
+- **EP-2** The decorator enqueues on a successful `PutObject` or
+  `CompleteMultipartUpload`, and a delete on a successful
+  `DeleteObject` or each successful entry of `DeleteObjects`. Parts and
+  aborted uploads do not pass through those methods.
+- **EP-3** The decorator writes a pending queue row (bucket, key,
+  operation) before calling the backend and marks it complete after the
+  backend returns success; on failure it deletes the row. At startup,
+  pending rows are resolved with `HeadObject` against the backend. The
+  decorator does not buffer request bodies; it wraps the stream in a
+  SHA-256 as it passes to the backend and writes the hash to the
+  completed row, so the object is never read again to hash it
+  (REPL-10). EP-11 needs the hash at write time in any case, to notice
+  a changed acknowledged key.
 - **EP-6** Bucket credentials are one access/secret pair per bucket,
-  generated and stored by lendisk in `lendisk.db` and verified by the
-  proxy. Garage never sees them. Creating a bucket creates the Garage
-  bucket through the admin API and grants it to the node's own Garage
-  key.
-- **EP-10** The proxy's `GetObject`/`HeadObject` turn a `NoSuchKey` from
-  Garage into a fetch from a replica through the replica interface
-  (D12), a `PutObject` into Garage with the node's own key, and the
-  response to the client. In `evict` mode the eviction worker issues
-  the Garage delete once `min_replicas` have acknowledged and no tool
-  lock is present.
-- **EP-12** `init` checks that `<data>` is a local filesystem (not NFS,
-  SMB or FUSE, which LMDB and Garage's data directory are not safe on),
-  has the free-space floor, and that the bundled `garage` binary
-  matches the pinned version and hash. `status` reports the Garage
-  version.
-- **EP-13** Throughput is the proxy's chunk-signature HMAC plus Garage's
-  per-block hashing and writes. `block_size` is set to 4 MiB
-  (configurable), `compression_level = "none"`, `data_fsync` off by
-  default; Q-L measures on NVMe and on a Pi 4.
-- **EP-14** The reconciler pages through `ListObjectsV2` of every Garage
-  bucket over the socket and compares with the index in `lendisk.db`.
-  Since nothing but lendisk can write into Garage, drift comes only from
-  crashes and from `lendisk import`.
-- **EP-15** The user guide shows how to start `garage server` on
-  `<data>/garage/garage.toml` with lendisk stopped, create a read-only
-  key with `garage key create` and `garage bucket allow --read`, and
-  point `restic -r s3:` at it (P-5, scenario 7).
+  generated and stored by lendisk in `lendisk.db` and resolved by
+  lendisk's `IAMService` (`Config.IAMService`, which takes precedence
+  over versitygw's own IAM options). versitygw's `IAMDir` is not used.
+- **EP-10** The decorator's `GetObject`/`HeadObject` turn a not-found
+  from the backend into a ranged fetch from a replica through the
+  replica interface (D12; a ranged `GetObject` by the replica client), write the object
+  into the store, and return it. In `evict` mode the eviction worker
+  deletes a pack from the store once `min_replicas` have acknowledged
+  it and no tool lock is present.
+- **EP-12** On `posix`, `init` checks xattr support and the free-space
+  floor on the store directory and refuses otherwise. On `s3`, it runs
+  the capability probe (D15) and warns when the endpoint is not on the
+  local network. `status` reports the pinned versitygw and tailcat
+  versions.
+- **EP-13** Throughput is versitygw's chunk-signature verification plus
+  the backend's writes; on `posix` with NVMe this is file I/O. Measured
+  with G-3.
+- **EP-14** The reconciler pages through `ListObjectsV2` of every bucket
+  through the backend and compares with the index in `lendisk.db`.
+- **EP-15** On `posix` the store is plain files: `restic -r
+  <data>/store/<bucket>` opens it with nothing running, and a borrower's
+  replica on the lender, `restic -r <data>/store/lent-<id16>-<bucket>`,
+  likewise (scenario 7).
+  Behind `backend/s3`, any S3 client with the store's credential reads
+  the same keys.
 
 ### 3.4 Replication
 
 - **REPL-1 to REPL-3** The queue is a SQLite table with one FIFO
-  sequence per replica.
-- **REPL-6** Byte-offset resume is S3 multipart upload: objects above
-  16 MiB are sent in parts and an interrupted upload resumes at the
-  last completed part, the same for friends and external buckets
-  (D12).
-- **REPL-8** `export` pages through the bucket over the Garage socket
+  sequence per replica. The worker uploads one object at a time per
+  replica in sequence order, several replicas in parallel, and moves
+  the watermark only when every earlier entry is acknowledged.
+- **The replica client.** One minio-go client per replica, built from
+  the configuration and the manifest. A friend is the friend's tunnel
+  address as endpoint, path-style, the derived credential (NET-7a), and
+  an HTTP transport whose dial function is the tailcat `Client` for
+  that peer (§3.7). An external bucket is the endpoint, bucket, prefix
+  and credential the user registered (S3-1). The clients are built in
+  one package, which is the only code that imports minio-go (D12).
+- **Operations.** `Put` streams the object from the store through the
+  decorator into `PutObject`, or for objects above the part size into
+  the low-level multipart calls (`NewMultipartUpload`, `PutObjectPart`,
+  `CompleteMultipartUpload`), with `x-amz-meta-lendisk-sha256` from the
+  queue row and the SHA-256 as the request checksum where the target
+  verifies one. `Get` with a range is `GetObject` with a range option.
+  `Head`, `List` and `Delete` map to `StatObject`, `ListObjects` (with
+  versions where needed) and `RemoveObject`. `Undelete` is §3.6.
+- **Errors.** The client's S3 errors are mapped to the replica
+  interface's: a `507 QuotaExceeded` from a friend's decorator becomes
+  "paused for quota" (LEND-2); a `403` after a removal becomes
+  "removed" (PEER-5, SEC-15); a `412` becomes an immutability alert
+  (EP-11); anything else is a retry with backoff.
+- **REPL-6** The upload ID and the ETag of each completed part are
+  written to the queue row as parts complete. After a restart or an
+  interruption the worker lists the parts of the open upload, checks
+  them against the row, and continues at the next part. Objects below
+  the part size (16 MiB, configurable) restart whole. The same for
+  friends and external buckets.
+- **REPL-7** Per-peer and global limits are token buckets
+  (`golang.org/x/time/rate`) wrapped around the reader of each part;
+  the time-of-day schedule is checked before each part, so a closing
+  window stops a transfer within one part. Both change at runtime from
+  the configuration.
+- **REPL-8** `export` pages through the bucket through the decorator
   and writes one file per key at its key path (or Kopia's sharded
-  layout); `import` on the lender walks the directory and `PutObject`s
-  each file into the borrower's Garage bucket with the node-local key,
-  recording hashes in the index as acknowledged.
-- **REPL-10** The hash is SHA-256, computed while streaming the object
-  from Garage's `GetObject`, sent as `x-amz-checksum-sha256`, and
-  stored in the `lendisk.db` index on acknowledgement.
+  layout); `import` on the lender walks the directory and puts each
+  file into the borrower's bucket through the decorator, recording
+  hashes in the index as acknowledged.
+- **REPL-10** The hash is SHA-256, taken by the decorator from the
+  write stream at capture (EP-3) and kept on the queue row; the worker
+  sends it with the object as `x-amz-meta-lendisk-sha256` and stores
+  it in the `lendisk.db` index on acknowledgement. The object is read
+  once per replica, as it is sent. The lender compares what it received
+  with the hash (LEND-4), so a local copy that rotted between capture
+  and send is rejected and alerted rather than replicated.
+  REQUIREMENTS.md v0.9 reworded REPL-10 to allow the hash to be taken
+  when the tool writes the object, for exactly this.
 - **REPL-11** The watermark is the queue sequence number of the last
   acknowledged write per replica.
 
 ### 3.5 Lending and quotas
 
-- **LEND-1** The proxy keeps a per-borrower byte counter in `lendisk.db`
-  (live objects plus tombstones, updated on every completed put and
-  every purge) and reconciles it daily against the admin API's
-  `GetBucketInfo` byte totals. Each lent bucket also carries a Garage
-  `maxSize` equal to the borrower's quota, so Garage refuses on its own
-  if the counter ever drifts. The optional global cap is a second
-  counter over all borrowers.
-- **LEND-2** The proxy refuses `PutObject`, `CreateMultipartUpload` and
-  `CreateBucket` with S3 error code `QuotaExceeded`, HTTP 507, when the
-  counter would exceed quota or `statfs` on `<data>` is below the
-  floor. A quota error from Garage itself is mapped to the same code.
-  The borrower's replica implementation maps it to a pause of that
-  queue.
-- **LEND-4** The proxy hashes the body as it streams it to Garage
-  (SHA-256 over the de-chunked bytes), compares with
-  `x-amz-checksum-sha256` when Garage answers, and on mismatch deletes
-  the object and returns `BadDigest`; if Garage verifies the header
-  itself at the pinned version (Q-J) the mismatch never reaches that
-  branch. The existing-key check happens before any byte is forwarded:
-  a key present in the index with a different hash than the header is
-  refused with `PreconditionFailed`. A put without the header is
-  refused on the tunnel listener.
-- **LEND-6** The lending store is the set of Garage buckets
-  `lent-<id16>-<bucket>`, plus the tombstone and hash tables in
-  `lendisk.db`. With lendisk stopped, `garage server` serves them to
-  `restic -r s3:` as in EP-15; `lendisk export <bucket> --borrower <id>
-  <path>` writes the plain-file layout (REPL-8).
+- **LEND-1** The decorator keeps a per-borrower byte counter in
+  `lendisk.db` (live objects plus non-current versions or tombstones,
+  updated on every completed put and every purge) and reconciles it
+  daily against a listing. The optional global cap is a second counter
+  over all borrowers.
+- **LEND-2** The decorator refuses `PutObject`, `CreateMultipartUpload`
+  and `CreateBucket` with S3 error code `QuotaExceeded`, HTTP 507, when
+  the counter would exceed quota or `statfs` on the store is below the
+  floor. Whether a backend error can carry a custom code
+  through versitygw is Q-I.5; the fallback is `AccessDenied` with a
+  distinguishing message the borrower parses.
+- **LEND-4** The decorator hashes the body as it streams it to the
+  backend (SHA-256), compares with `x-amz-meta-lendisk-sha256` when the
+  backend answers, and on mismatch deletes the object and returns
+  `BadDigest`. The existing-key check happens before any byte is
+  stored: a key present in the index with a different hash is refused
+  with `PreconditionFailed`, using a conditional put where the store
+  supports one (D15, capability profile). A put without the hash is
+  refused on the tunnel side.
+- **LEND-6** The lending store is the set of `lent-<id16>-<bucket>`
+  buckets in the node's one store, beside its own, plus versioning or
+  tombstones and the hash index. With lendisk stopped they are plain
+  files on `posix` (EP-15); `lendisk export <bucket> --borrower <id>
+  <path>` writes the tool's own layout from either backend kind
+  (REPL-8).
 - **LEND-7** The suggestion is `1.2 × k × R`; the derivation is §4.
 
 ### 3.6 Deletion, retention and verification
 
-- **RET-1** A `DeleteObject` from a borrower does not reach Garage. The
-  proxy inserts a row in `tombstones` (borrower, bucket, key, hash,
-  deleted at, purge after) and answers `204`. From then on the key is
-  hidden from that borrower's `GetObject`, `HeadObject` and
-  `ListObjectsV2` (the proxy filters listing pages against the table).
-  The purger issues the real Garage delete when `purge after` passes
-  and decrements the quota counter. A put to a tombstoned key with the
-  same hash removes the row (an undelete by re-upload); with a
-  different hash the proxy first `CopyObject`s the stored object to
-  `.lendisk/tomb/<key>/<unix-time>` inside the same bucket and points
-  the row at it, then admits the put (Q-O). Keys beginning with
-  `.lendisk/` are refused from borrowers.
-- **RET-2** No admitted operation (§3.7) can touch the tombstone table
-  or the `.lendisk/` prefix, and the real delete is issued by the purger
-  alone. The borrower holds no Garage credential, so nothing it can
-  present reaches Garage except through the proxy.
-- **RET-3** `undelete` on the borrower calls the control API `undelete`
-  endpoint (bucket, since) for friends; the lender removes the matching
-  tombstone rows, moving any `.lendisk/tomb/` copies back to their keys.
-  For external buckets it removes delete markers through `minio-go` as
-  before (§3.11).
+- **RET-1** A borrower's `DeleteObject` on a store with versioning
+  (`posix` always; `s3` per the probe) places a delete marker and the
+  object becomes a non-current version; lendisk's purger removes
+  non-current versions older than the window where the store has no
+  lifecycle of its own. On object-lock-capable stores the decorator
+  sets retain-until at delete time, so the lender's own credential
+  cannot purge early. On a store without versioning the decorator keeps
+  tombstones instead: a row in `tombstones` (borrower, bucket, key,
+  hash, deleted at, purge after), the key hidden from that borrower's
+  reads and listings, and the real delete issued by the purger after
+  the window; a put with different content to a tombstoned key first
+  moves the stored object to `.lendisk/tomb/<key>/<unix-time>`.
+  Whether versitygw's `posix` versioning gives these semantics is
+  Q-I.4.
+- **RET-2** The decorator refuses `DeleteObject` with a version id
+  unless that version is a delete marker created within the window, and
+  admits no lifecycle, bucket-deletion, object-lock or admin call (§3.7
+  allow-list). Keys beginning with `.lendisk/` are refused from
+  borrowers.
+- **RET-3** `undelete` for a friend removes delete markers with
+  `RemoveObject` by version id where the friend's store versions (the
+  one versioned delete NET-7 admits), and calls the control API
+  `undelete` (bucket, since) where it keeps tombstones. For an external
+  bucket it removes delete markers the same way where the bucket
+  versions; elsewhere it clears the borrower's own client-side
+  tombstones (S3-4).
 - **VER-1** The challenge is a control API call: the borrower sends an
-  object key, a byte range and a nonce; the lender reads the range from
-  Garage and returns HMAC-SHA256(nonce, bytes); the borrower computes
-  the same over its local copy.
-- **VER-5** Garage's scheduled scrub verifies every block hash every
-  25–35 days on both sides, which exceeds the 0.1%-per-week rate. After
-  each scrub lendisk reads the block-error list through the admin API,
-  maps errored blocks to objects, raises the alert and, on the borrower
-  side, deletes and re-fetches the object (EP-10). A weekly 0.1% sample
-  through `GetObject` compared with the index stays as the end-to-end
-  check that also covers the index itself.
+  object key, a byte range and a nonce; the lender reads the range
+  through its decorator and returns HMAC-SHA256(nonce, bytes); the
+  borrower computes the same over its local copy.
+- **VER-2** Samples are ranged `GetObject` calls by the replica
+  client, hashed by lendisk and compared with the index.
+- **VER-5** The sampler hashes a weekly 0.1% of stored objects through
+  the decorator and compares with the index, on both sides; neither
+  backend has a scrub of its own. On a mismatch the borrower deletes
+  and re-fetches the object (EP-10).
 
 ### 3.7 Network
 
 - **NET-1** Every peer connection is a WireGuard tunnel via tailcat; the
-  lender's `AllowedClients` is the set of known peer keys plus pending
-  invite keys.
-- **NET-2 to NET-4** magicsock hole punching with UPnP/NAT-PMP/PCP, DERP
-  fallback; `PathInfo` reports direct or relayed for `status`.
+  lender's `AllowClient` hook admits known peer keys and pending invite
+  keys and nothing else (SEC-10).
+- **NET-2 to NET-4** magicsock hole punching with UPnP/NAT-PMP/PCP
+  (Q-R), DERP fallback; `PathInfo` is built on `Client.DiscoPing`,
+  whose result names an endpoint only when the pong came over a direct
+  path, and reports direct or relayed for `status`. `Client.Ping`
+  always measures the DERP path and is not used for this.
 - **NET-5** Relays are DERP servers. The project publishes a DERP map;
   `relays.map_url` or `relays.list` replaces it; `lendisk relay` wraps
   `tailscale.com/cmd/derper`. Tailscale's hosted DERP map may be
@@ -777,109 +955,216 @@ stable label for reading the store with Garage alone (P-5).
   `tc…` relay hints are merged into the node's DERP map.
 - **NET-6** The version is carried by the control API `version`
   endpoint; the S3 surface is governed by its own stability.
-- **NET-7** The proxy's tunnel listener admits exactly these S3
-  operations: `PutObject`, `CreateMultipartUpload`, `UploadPart`,
-  `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`,
-  `GetObject` with Range, `HeadObject`, `HeadBucket`, `ListObjectsV2`,
-  `ListBuckets` (own buckets only), `CreateBucket` (counted against
-  quota) and `DeleteObject` without a version id (tombstones). Every
+- **The tunnel bridge.** `embedgw` takes listener addresses, not a
+  `net.Listener` (D15), so the lender side is bridged. The tailcat
+  `Server` listens on one tunnel port, 9000. lendisk accepts each
+  connection itself, resolves its peer key (SEC-12) and serves HTTP on
+  it. A request whose path begins with `/_lendisk/` is the control API
+  and is answered by lendisk directly; no S3 bucket can have that name,
+  since bucket names begin with a letter or digit, so the two surfaces
+  cannot collide. Every other request is an S3 request: it is checked
+  (SEC-11, SEC-12) and then proxied, unbuffered, to versitygw's
+  internal listener on
+  `<data>/run/tunnel.sock`, with the `Host` header and every signed
+  header passed unchanged so the client's signature still verifies.
+  versitygw terminates the signature; lendisk never computes one on
+  this path.
+- **NET-7** The decorator admits exactly these S3 operations from a
+  borrower's account: `PutObject`, `CreateMultipartUpload`,
+  `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`,
+  `ListParts`, `GetObject` with Range, `HeadObject`, `HeadBucket`,
+  `ListObjectsV2`, `ListObjectVersions`, `ListBuckets` (own buckets
+  only), `CreateBucket` (counted against quota), `DeleteObject` without
+  a version id (a delete marker or a tombstone) and `DeleteObject` with
+  the version id of a delete marker inside the window (undelete). Every
   other operation, including `DeleteObjects`, `CopyObject`,
-  `UploadPartCopy`, any versioned or lifecycle call and any bucket
-  configuration call, is refused with `AccessDenied` before anything is
-  forwarded. The control API (`challenge`, `manifest`, `quota`,
-  `version`, `undelete`) is plain HTTP beside the S3 listener inside the
-  tunnel, authenticated by the tunnel peer key alone. The borrower
-  replicates to a friend with the same `minio-go` replica implementation
-  it uses for external buckets, with a dialer that routes through the
-  tunnel. AC check: from an allowed peer, `restic -r
-  s3:http://<lender>:9000/<bucket> snapshots` works with the derived
-  credential.
+  `UploadPartCopy`, tagging, lifecycle, object-lock and any bucket
+  configuration call, is refused with `AccessDenied` before reaching the
+  backend. The control API (`redeem`, `challenge`, `manifest`, `quota`,
+  `version`, `undelete`) is plain HTTP under `/_lendisk/` on the same
+  tunnel port, authenticated by the tunnel peer key and checked per
+  request against `lendisk.db` (SEC-11). The borrower replicates to a
+  friend with the same replica client it uses for external buckets,
+  dialling through tailcat as below. AC check: from an allowed peer,
+  `restic -r s3:http://<lender>:9000/<bucket> snapshots` works with the
+  derived credential.
 - **NET-7a** The S3 credential for a borrower–lender pair is derived:
   access key is the borrower's node ID; secret key is
   `HKDF-SHA256(X25519(borrower key, lender key), info="lendisk-s3-v1")`.
-  The lender's proxy resolves the access key to the borrower, computes
-  the secret on demand and verifies the signature itself; it refuses a
-  request whose tunnel peer key differs from the access key. The
-  derived secret is never stored and never given to Garage.
-- **NET-7b** `peer forward` opens a local TCP listener and proxies each
-  connection through the tunnel to the lender's S3 listener.
+  The lender's `IAMService` resolves a node-ID access key only when a
+  relationship exists for it (SEC-11), since any node can derive a valid
+  secret for its own key, and computes the secret on demand. The bridge
+  refuses a request whose access key is not the tunnel peer key
+  (SEC-12). The derived secret is never stored.
+- **Dialling a friend.** The replica client's HTTP transport uses the
+  tailcat `Client.Dial` for that peer as its dial function, so
+  replication traffic enters the tunnel from inside the process. No
+  listener is opened on the borrower's side for replication.
+- **NET-7b** `peer forward` opens a listener on the loopback address
+  the user names, for as long as the command runs, and copies each
+  accepted connection into a tailcat dial to the friend's tunnel port,
+  so a backup tool can read a friend's replica directly. It is the only
+  forward in the design, and it is the listener NET-7b itself names.
 - **NET-8** The internal `Transport` interface is `Listen`,
-  `Dial(peerKey)`, `AllowedPeers`, `PathInfo`. tailcat is the only
-  implementation; Syncthing's stack or iroh would be the second (D5).
+  `Dial(peerKey)`, `Admit(func(peerKey) bool)`, `PeerOf(conn)`,
+  `Disconnect(peerKey)`, `PathInfo`. `Admit` must be called before
+  `Listen`, and an implementation with no admission function refuses
+  every connection; `PeerOf` returns the key that authenticated an
+  accepted connection (SEC-12). These three are the contract any
+  second implementation has to meet, whatever its own defaults are.
+  tailcat is the only implementation; Syncthing's stack or iroh would
+  be the second (D5).
 
 ### 3.8 Operations and observability
 
-- **Garage supervision.** At start lendisk writes
-  `<data>/garage/garage.toml` (mode 0600) from its own config:
-  `replication_factor = 1`, `metadata_dir`, `data_dir`, `db_engine`
-  (`lmdb` on 64-bit, `sqlite` on 32-bit), `block_size`,
-  `compression_level = "none"`, `rpc_bind_addr = "127.0.0.1:3901"`, a
-  random `rpc_secret`, `[s3_api] api_bind_addr = "<data>/garage/s3.sock"`,
-  `[admin] api_bind_addr = "<data>/garage/admin.sock"` with
-  `admin_token` and `metrics_token` from `<config>`, and no `[s3_web]`
-  or K2V section. It then starts `garage server`, waits for the admin
-  socket, and on first run assigns the single-node layout and creates
-  the node's own Garage key. The `<data>/garage/` directory is mode
-  0700 so the sockets, which Garage creates world-writable, are
-  reachable only by the lendisk user. Garage is restarted with backoff
-  if it exits; three exits in ten minutes raise an alert.
-- **OPS-4** `prometheus/client_golang` on a loopback port. Garage's
-  metrics are scraped over the admin socket and re-exposed under a
-  `garage_` prefix, so one endpoint covers both.
+- **OPS-4** `prometheus/client_golang` on a loopback port. Transfer
+  counters (bytes, objects, retries, lag, per replica) come from the
+  replication worker.
 - **OPS-6** The configuration file is TOML; state lives in `lendisk.db`.
-  Garage settings the user may want (`block_size`, scrub tranquility,
-  metadata engine) are lendisk settings under `[engine]`.
-- **OPS-7** Idle RSS is lendisk plus Garage; Q-M measures it.
-- **OPS-8** lendisk and Garage upgrade as a pair; lendisk's migration
-  runs Garage's documented migration for the version step, and refuses
-  to start a Garage binary other than the pinned one.
+  Store settings are one `[store]` section (`backend = "posix"` with a
+  `path`, or `backend = "s3"` with endpoint and a credential file in
+  `<config>`), used for both roles; replication settings, including the
+  limits and the timetable, are `[replication]`.
+- **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the
+  replica client included); active RSS adds one part buffer (16 MiB by
+  default) per transfer in flight. Q-M measures both.
+- **OPS-8** One binary; versitygw, tailcat and minio-go are vendored,
+  so their upgrades are lendisk releases. State migrations are
+  `lendisk.db`'s, forward and one minor version back.
 
 ### 3.9 Security
 
-- **SEC-3** Per-bucket S3 keys live in `lendisk.db`. Garage's key store holds only node-local keys (one for
-  the node's own buckets, one per borrower), each created by lendisk,
-  stored in `lendisk.db` and granting nothing beyond this node's disk.
-  The admin and metrics tokens are files in `<config>`, mode 0600.
-- **SEC-7** The hostile-peer test exercises every S3 operation against
-  the tunnel listener and every control API endpoint, from an allowed
+- **SEC-3** Per-bucket S3 keys live in `lendisk.db`; versitygw's
+  `IAMDir` is not used. A `backend/s3` store credential and external
+  replica credentials are files in `<config>`, mode 0600, and replica
+  credentials are also carried in the node manifest (S3-1). They are
+  read by the process that uses them and never passed to another.
+- **SEC-7** The hostile-peer test exercises every S3 operation through
+  the tunnel bridge and every control API endpoint, from an allowed
   peer's identity and from an unknown one.
-- **SEC-8** Garage has no web endpoint configured, no K2V, S3 and admin
-  on unix sockets, RPC on loopback. lendisk's listeners are loopback S3,
-  loopback metrics and the tailcat tunnel. Q-N confirms
-  the listener set with `ss -lntp` and `ss -lxp`.
-- **SEC-9** The classification table is over S3 operations (every
-  action name in the S3 API reference), each marked admitted, refused
-  or unreachable at the tunnel listener, with a test that sends one
-  request per action and asserts the outcome. It does not depend on
-  Garage's version, since refused actions never reach Garage; the
-  Garage upgrade review checks only that admitted actions still behave.
+- **SEC-8** versitygw's admin API, web UI and website endpoints are not
+  configured. lendisk's listeners are loopback S3 (TCP), loopback
+  metrics, the tailcat tunnel (one port inside it), the internal
+  `tunnel.sock`, and the loopback listener `peer forward` opens while
+  that command runs (NET-7b). There is no child process and no other
+  socket. Every listener is one REQUIREMENTS.md names, so SEC-8 needs
+  no change. Checked with `ss -lntp` and `ss -lxp`.
+- **SEC-9** The classification table covers every `backend.Backend`
+  method at the pinned versitygw version, each marked admitted,
+  refused or unreachable for a borrower's account, with a test that
+  sends one request per S3 action through the bridge and asserts the
+  outcome. It is re-reviewed on every versitygw upgrade, together with
+  the replication-hole review (Q-H).
+- **SEC-10** `Server.AllowClient` is always set, before `Start`, to a
+  lendisk function that looks the key up in `lendisk.db`: a
+  relationship row admits it in the `peer` role, an unexpired invite
+  key in the `invite` role, and anything else, including a database
+  error or a closed database, is rejected. The hook is never nil and
+  tailcat's `AllowedClients` list is never used, since both admit
+  everyone when unset or empty. tailcat retries a rejected client
+  about once a second, so the hook keeps a negative cache per key,
+  cleared whenever a relationship or invite changes. The server starts
+  even with zero rows, so the address exists from `init` on and every
+  connection is refused until the first invite. The SEC-7 harness runs
+  an unknown identity against zero peers, one peer, and zero after
+  `peer remove`.
+- **SEC-11** The tunnel port sits behind one middleware in the bridge,
+  in front of both the control API and the S3 proxy, that takes the
+  connection's peer key (SEC-12), loads its relationship
+  and role from `lendisk.db` and answers `AccessDenied` (403) before
+  routing or proxying if there is none. It reads the row on every
+  request, not once per connection, so quota and state changes apply
+  to the next request (SEC-15). The `IAMService` repeats the
+  relationship check when it resolves a node-ID access key, so a
+  request reaching versitygw by any path is refused without one. A
+  build tag `admitall`, used only by the SEC-11 test, replaces the
+  admission hook with one that admits everyone, to show the middleware
+  alone refuses an unknown peer.
+- **SEC-12** The bridge resolves each accepted connection with
+  `Server.PeerKey(conn.RemoteAddr())` and puts the key in the request
+  context through `http.Server.ConnContext`; a connection without a key
+  is closed before any byte is read. For an S3 request it reads the
+  access key from the `Authorization` header's `Credential=` or a presigned
+  URL's `X-Amz-Credential`, without verifying anything, and refuses the
+  request unless it equals the peer key; versitygw then verifies the
+  signature for that access key. A request with neither form is
+  refused. The control API takes the borrower from the context, never
+  from a parameter.
+- **SEC-13** In the `invite` role the middleware admits `redeem` and
+  refuses every other S3 and control API request. `redeem` checks the
+  invite secret, marks it used in the same transaction that creates the
+  relationship row, and the invite key's connection is then closed;
+  the borrower reconnects with its own key.
+- **SEC-14** `DisablePresharedKey` is set and `Key` is the identity's
+  WireGuard key (ID-1), so the `tc…` address is a function of the
+  public key and the bootstrap region only. `Region` is set from the
+  region chosen at `init` and saved in the config, rather than picked
+  by latency at each start, because the address embeds it and would
+  otherwise change on restart. Without a pre-shared key the tunnel is
+  WireGuard's standard Noise IK handshake; what is given up is the
+  pre-shared key's hedge against a future break of X25519, which for
+  lendisk exposes S3 headers and control API traffic, never backup
+  contents (P-3).
+- **SEC-15** On `peer remove`, a quota change, or an invite's
+  redemption or expiry, lendisk commits the change to `lendisk.db`,
+  clears the hook's cache, cancels the contexts of in-flight requests
+  from that key and closes its connections (the bridge tracks them per
+  key, including the proxied half to `tunnel.sock`), and, when no
+  relationship is left, calls `Server.DisconnectClient`. tailcat's
+  disconnect alone does not reset connections, which would stall until
+  they time out, so lendisk closes its own. Later requests are answered
+  according to the relationship's new state (PEER-5, PEER-6).
 
 ### 3.10 Compatibility
 
-- **COMPAT-2** Garage publishes static builds for amd64, arm64 and
-  32-bit ARM, so the package exists for every v1 platform. The Docker
-  image recommends `network_mode: host`.
+- **COMPAT-2** lendisk is one static Go binary for amd64, arm64 and
+  32-bit ARM, so the package exists for every v1 platform.
+  The container image recommends `network_mode: host` (D2). versitygw
+  also builds on macOS, BSD and Windows, which keeps post-v1 ports
+  open.
 - **COMPAT-3** `bucket import` walks the directory and puts each file
-  through the proxy's internal path, so it is captured but marked
-  unacknowledged.
-- **COMPAT-4** The documented layout is `<data>/garage/{data,meta}` as
-  Garage's own, the bucket naming rule (own names as-is, borrowers'
-  under `lent-<id16>-`), the `.lendisk/tomb/` prefix, `lendisk.db` and
-  its tables, and the export layout (one file per key at its key path;
-  Kopia's sharded form with `--kopia-layout`).
+  through the decorator, so it is captured but marked unacknowledged.
+- **COMPAT-4** The documented layout on `posix` is
+  `<store>/<bucket>/<key>` as plain files with versitygw's xattrs, its
+  `.sgwtmp/` and `.vgwlocks/` housekeeping directories and its
+  versioning directory; borrowers' buckets under `lent-<id16>-`; the
+  reserved `lendisk-manifests` bucket; the `.lendisk/tomb/` prefix where
+  tombstones apply; `lendisk.db` and its tables; and the export layout
+  (one file per key at its key path; Kopia's sharded form with
+  `--kopia-layout`). Every object lendisk stores carries
+  `x-amz-meta-lendisk-sha256`, so the hash index can be rebuilt from
+  the store.
 
-### 3.11 External S3 replicas
+### 3.11 External replicas
 
-- **S3-3** The checksum is `x-amz-checksum-sha256` where the provider
-  supports it, otherwise Content-MD5. Objects above 64 MiB use
-  multipart upload with resume.
-- **S3-4** Providers without versioning (Garage among them) get
-  lendisk-side tombstones: the delete is recorded locally and issued
-  after the window; `status` labels the replica "retention:
-  client-side".
-- **S3-6** Stored checksums are read via `GetObjectAttributes` or HEAD.
-- **S3-9** Adoption lists the bucket with `minio-go` and seeds the
-  acknowledged-hash index from the provider's checksums.
+Support tiers, all through the replica client (D12):
+
+| Tier | Targets | Retention | Testing |
+|---|---|---|---|
+| 1 | S3 with versioning (B2, Wasabi, Hetzner, R2, RustFS) | provider-enforced (S3-4), credential without delete (S3-5) | CI per provider |
+| 2 | S3 without versioning (Garage) | client-side tombstones, labelled | CI against Garage |
+
+Non-S3 targets (SFTP, B2's native API, WebDAV, OAuth remotes such as
+Google Drive) are not in v1: REQUIREMENTS.md §4.11 asks for S3
+buckets, and rclone behind the same replica interface is the v1.1
+route to the rest (D12).
+
+- **S3-1** `replica add s3 <name> …` stores the endpoint, bucket,
+  prefix and credential in `<config>` (mode 0600) and in the manifest;
+  the client is built from them.
+- **S3-3** Uploads carry the SHA-256 as the request checksum where the
+  provider verifies one and Content-MD5 otherwise, plus lendisk's
+  SHA-256 as metadata. Large objects use multipart with the resume of
+  §3.4.
+- **S3-4** Buckets without versioning get lendisk-side tombstones: the
+  delete is recorded locally and issued after the window; `status`
+  labels the replica "retention: client-side".
+- **S3-6** Stored checksums are read with `StatObject` (the ETag,
+  where it is an MD5 of a single-part object) and compared where the
+  type matches; sample downloads (VER-2) are the check everywhere.
+- **S3-9** Adoption lists the bucket with `ListObjects` and seeds the
+  acknowledged-hash index from `x-amz-meta-lendisk-sha256` where
+  present, otherwise by hashing a download.
 
 ## 4. Capacity planning
 
@@ -887,11 +1172,6 @@ Mirroring (D6) sets the disk cost. Let `R` be the repository size:
 source data after deduplication and compression (typically 0.5–1.0× the
 source; ~1× for photos and video), plus the snapshot history the user's
 `forget` policy keeps. Let `k` be the number of lenders.
-
-Garage adds metadata of a few hundred bytes per object and per block;
-for a 1 TiB restic repository in 16 MiB packs that is well under 1 GB.
-Its block deduplication saves nothing, since every repository is
-encrypted with its own key.
 
 **What a borrower consumes elsewhere:** `k × R`, plus headroom at each
 lender for tombstones (RET-1) and the lender's free-space floor
@@ -916,7 +1196,7 @@ of data.
 
 **Rule of thumb for users (LEND-7):** lend `k` times what you back up,
 plus 20%. Reciprocity is not enforced (P-8); this is the number that
-makes a symmetric group work. An external S3 replica counts in `k` but
+makes a symmetric group work. An external replica counts in `k` but
 costs money instead of lent disk: one friend plus one bucket means
 lending ~1.2 × R and paying for ~R.
 
@@ -944,52 +1224,116 @@ design and disappear with it.
   transfers and weeks-idle peers? If G-2 fails here, options are
   application-level keepalives over the tunnel or a different
   `Transport`.
-- **Q-F (superseded)** Asked whether versitygw could be embedded. It
-  could; v0.8 chose Garage instead (D14), and listings are Garage's
-  indexed ones, so the G-3 listing measurement no longer has a store
-  fallback to plan for.
-- **Q-G (superseded)** There is a proxy again, but no SigV4
-  pass-through: the proxy terminates the client's signature and signs
-  the forwarded request itself (D4, §3.3).
-- **Q-H (superseded)** The replication-hole review was over versitygw's
-  `backend.Backend` interface. The equivalent in v0.8 is SEC-9's table
-  over S3 actions at the proxy, which is complete by construction
-  (every action not listed is refused) and does not change with Garage
-  upgrades (§3.9).
-- **Q-I (superseded)** The five versitygw properties are gone with it.
-  Their Garage counterparts are Q-J to Q-P below.
-- **Q-J (gate, open)** Does Garage at the pinned version verify
-  `x-amz-checksum-sha256` on `PutObject` and `UploadPart`? Garage 2.0
-  added checksum algorithms and `x-amz-checksum-type`, but upload-side
-  verification is unconfirmed. Not blocking: the proxy verifies either
-  way (LEND-4); the answer decides only whether its check is a second
-  line or the first.
-- **Q-K (gate, open)** On a single node, how does Garage report a block
-  whose hash no longer matches: block-error list through the admin API,
-  metrics, both? Does `GetObject` of the affected object fail cleanly?
-  Needed for VER-5's re-fetch path. Fallback: lendisk's own weekly
-  sample is the only detector, at a higher rate.
+- **Q-F (resolved, measured by G-3)** versitygw is embedded again
+  (D15), via `embedgw.RunVersityGW(ctx, backend.Backend, *Config)` at
+  v1.10.0. If G-3's listing measurement fails on `posix`, the decorator
+  serves listings from lendisk's own index (Q-X).
+- **Q-G (resolved)** No lendisk proxy and no SigV4 code in lendisk:
+  versitygw terminates every signature, and the tunnel bridge passes
+  requests to it with the signed headers untouched (§3.7).
+- **Q-H (open, again since v0.9)** The decorator must be checked against
+  the full `backend.Backend` interface at the pinned version: every
+  method that can create, replace or remove an object (including
+  `CopyObject`, `UploadPartCopy`, `PutObjectTagging`, `RestoreObject`
+  if present) is either captured or disabled. A method that mutates
+  objects without being captured is a replication hole. Re-run on every
+  versitygw upgrade, together with SEC-9's table.
+- **Q-I (gate, open)** The embedded design depends on five properties of
+  versitygw at the pinned version:
+  1. *Resolved:* `embedgw` takes listener address strings, not a
+     `net.Listener`. The tunnel side is bridged through an internal
+     unix socket (§3.7).
+  2. *Half resolved:* `Config.IAMService` takes an external
+     `auth.IAMService` and overrides every built-in IAM option
+     (confirmed). Open is whether the authenticated account reaches the
+     backend call, so the decorator can map bucket names per borrower
+     and count quota. Fallback: a vendored patch that puts the account
+     in the request context, carried as a Go module `replace`.
+  3. *No longer needed:* whether versitygw verifies
+     `x-amz-checksum-sha256` on upload. REPL-10's hash travels as
+     metadata and the decorator compares it itself (LEND-4).
+  4. The `posix` versioning directory produces delete markers on
+     `DeleteObject` and lists non-current versions with the semantics
+     RET-1 to RET-3 need. Fallback: the tombstone path of §3.6, which
+     exists anyway for stores without versioning.
+  5. A backend can return a custom error (`QuotaExceeded`, HTTP 507)
+     and a conditional-put refusal (`PreconditionFailed`). Fallback:
+     `AccessDenied` with a distinguishing message the borrower parses.
+- **Q-J, Q-K, Q-N, Q-O, Q-P (superseded)** Questions about Garage as the
+  storage engine (upload checksum verification, block-error reporting,
+  listener set, `CopyObject` cost, byte-total freshness). They went with
+  D14; Garage is now a tier-2 store behind `backend/s3` and an external
+  replica target, covered by the capability probe.
 - **Q-L (gate, open, measured with G-3)** End-to-end write throughput
-  through proxy plus Garage on NVMe (EP-13, 200 MB/s) and on a
-  Raspberry Pi 4, as a function of `block_size`, `data_fsync` and
-  metadata engine; and the cost of the proxy's chunk-signature
-  verification on the Pi. Fallback if the NVMe number fails: larger
-  `block_size`, then RustFS (D14, alternatives).
-- **Q-M (gate, open, measured with G-3)** Idle RSS of lendisk plus
-  Garage with a 1 TiB, 500k-object store and 10 peers, with LMDB and
-  with SQLite metadata, against OPS-7's 256 MiB. Fallback: SQLite on
-  every platform.
-- **Q-N (gate, open)** With no `[s3_web]` section and no K2V feature,
-  Garage opens exactly the S3 socket, the admin socket and the loopback
-  RPC port; the sockets are unreachable from other users given the 0700
-  directory. Checked with `ss -lntp` and `ss -lxp` (SEC-8).
-- **Q-O (open)** Is `CopyObject` in Garage a metadata operation (new
-  object version referencing the same blocks) or a data copy? Expected
-  metadata-only, since blocks are content-addressed. It matters only
-  for the rare overwrite of a tombstoned key with different content
-  (RET-1); if it copies data, that case is still correct, only slower.
-- **Q-P (open)** How current are the admin API's per-bucket byte totals
-  under write load (Garage's counters are maintained asynchronously)?
-  The proxy keeps its own counter and uses Garage's for daily
-  reconciliation and as a backstop, so lag is tolerable; the gate sets
-  how large a drift the reconciler should alert on.
+  through versitygw and the decorator on `posix` on NVMe (EP-13, 200
+  MB/s) and on a Raspberry Pi 4, including chunk-signature
+  verification, and the replication rate from the store to a friend
+  through the replica client and the tunnel on the Pi.
+- **Q-M (gate, open, measured with G-3)** Idle and active RSS of lendisk
+  with a 1 TiB, 500k-object store and 10 peers, against OPS-7's 256 MiB
+  idle, and with four transfers in flight.
+- **Q-Q (gate, open)** Which tailcat to pin. The admission API §3.9
+  relies on (`Server.AllowClient`, `KeySet`, `Server.PeerKey`,
+  `Server.DisconnectClient`) is on `main` as of 2026-10-07 but in no
+  tag: v0.7.0 (2026-09-18), the latest, has only `AllowedClients`,
+  which admits everyone while empty, an add method with no remove, and
+  no per-connection peer key. Pin a `main` commit until a tag carries
+  this API, then move to the tag. Every bump re-runs the SEC-10 to
+  SEC-13 tests, since admission semantics have already changed once.
+- **Q-R (open)** Does tailcat's engine run Tailscale's port mapper
+  (UPnP, NAT-PMP, PCP)? D5 and NET-2 assume so, but tailcat's
+  documentation mentions only STUN and hole punching. It matters for
+  NET-3 and for G-1's direct-path rate. Checked by reading the pinned
+  source and with a UPnP router in the G-1 field test.
+- **Q-S (open, measured with G-3)** Each tailcat `Client` creates its
+  own userspace WireGuard engine, with its own UDP socket, DERP
+  connection and netstack, so a node with ten lenders runs eleven
+  engines with the server. Measure their RSS with Q-M against OPS-7.
+  Fallback: dial lenders on demand and close a `Client` after an idle
+  period, at the cost of a fresh hole punch per replication burst.
+- **Q-T (resolved)** REQUIREMENTS.md v0.9 made the two changes this
+  design needed: EP-16 admits a store behind an S3 service the user
+  names, with EP-12, EP-15, LEND-6, COMPAT-4 and scenarios 1 and 7
+  extended to match, and SEC-3 admits that store's credential. It also
+  reworded REPL-10 so the hash may be taken at capture (§3.4). The two
+  further changes v0.9 of this document needed, §4.11 generalised to
+  non-S3 remotes and replication forwards in SEC-8, went with the
+  rclone design.
+- **Q-U (superseded)** The eight rclone-over-rc checks. They went with
+  the v0.9 replication design (D12, alternatives); Q-Y replaces them.
+- **Q-V (gate, open)** `backend/s3` pass-through. Multipart and
+  checksums are documented; whether versioning, object lock and
+  conditional headers pass to the upstream unchanged is not, and
+  neither is whether lendisk's buckets can be placed as prefixes inside
+  one upstream bucket rather than one upstream bucket each. The
+  capability probe runs through the decorator and `backend/s3`, so it
+  measures the pair.
+- **Q-W (resolved)** One store serves both roles (D15), so one
+  `RunVersityGW` with one backend and no mux. The mux survives only as
+  Q-Z's fallback.
+- **Q-X (gate, open, measured with G-3)** Listing time at 500k objects
+  in one bucket on `posix`, and object lock semantics on `posix`
+  (retain-until honoured against the lender's own credential). Both
+  testable in a day.
+- **Q-Y (gate, open)** The replica client (D12, §3.4), against the
+  pinned minio-go, before the worker is built on it:
+  1. A multipart upload killed with `SIGKILL` mid-part resumes at the
+     next part after restart, against a friend (versitygw), RustFS, B2
+     and Garage.
+  2. Each tier-1 and tier-2 target accepts the request checksum lendisk
+     sends, or the client is configured per target to send none.
+  3. A friend's `507`, `403` and `412` reach the worker as
+     distinguishable errors through the tailcat transport.
+  4. The limiter and the timetable hold to within one part.
+  5. RSS per transfer in flight (with Q-M) and throughput to a friend
+     on a Pi 4 (with Q-L).
+  If minio-go fails these in a way configuration cannot fix, the AWS
+  SDK for Go v2 behind the same interface (D12).
+- **Q-Z (open)** Lent buckets on a second disk under one `posix` root.
+  A lender who mounts or links another disk at a `lent-*` bucket
+  directory needs versitygw's temp directory and versioning directory
+  to stay on the same filesystem as the bucket, or its temp-then-rename
+  and version moves cross a mount. Check in the pinned source and with
+  a bind mount in CI. Fallback: a second `posix` backend instance for
+  `lent-*` buckets with a mux by bucket name, for that configuration
+  only.
