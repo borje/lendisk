@@ -1,8 +1,8 @@
 # lendisk — design
 
-Status: draft v0.10, 2026-10-30. Companion to REQUIREMENTS.md v0.9,
+Status: draft v0.10.1, 2026-10-30. Companion to REQUIREMENTS.md v0.9.1,
 which made the two requirement changes this design needed (Q-T,
-resolved).
+resolved) and then moved third-party credentials to the environment.
 
 ## 0. How to read this document
 
@@ -43,7 +43,9 @@ replica is S3 again and an in-process client, **minio-go**, moves the
 bytes (D12); one store serves both roles, so a friend's buckets live
 beside the node's own, on disk or in Garage (D15); the object hash is
 taken at capture; the tunnel has one port. One process, one binary.
-The trust model is unchanged throughout.
+v0.10.1 made the identity a bare X25519 key, with no Ed25519 and no
+signatures anywhere, and reads third-party credentials from the
+environment. The trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -102,7 +104,9 @@ what the decorator already exposes.
   `127.0.0.1:9000` is the host's loopback, which is where the backup
   tool on the host looks. The image runs as an unprivileged user with
   all capabilities dropped and a read-only root; the config directory
-  and the data directory are the only volumes. A user who already runs
+  and the data directory are the only volumes, and third-party
+  credentials arrive as environment variables, not files (SEC-3). A
+  user who already runs
   an S3 store adds it as a second service on the bridge network,
   publishing its S3 port on the host's loopback only, and names it as
   the `s3` backend (D15).
@@ -714,12 +718,20 @@ Q-V.
 
 ### 3.1 Identity and recovery
 
-- **ID-1** The identity is an Ed25519 keypair; the same key, converted,
-  is the WireGuard key tailcat uses (D5), so node ID and tunnel identity
-  are one key. The display form is base32 with a checksum.
-- **ID-2** The 24 words are BIP-39 (`go-bip39`); the identity is derived
-  from the BIP-39 seed with a fixed derivation path. Two nodes from the
-  same phrase derive the same key (the AC).
+- **ID-1** The identity is an X25519 key: the WireGuard key tailcat
+  uses (D5). Node ID, tunnel key and S3 access key (NET-7a) are
+  literally the same key; there is no Ed25519 and no conversion.
+  Nothing in the design needs a signature today: invites carry a
+  symmetric secret (PEER-1), the challenge is an HMAC (VER-1), the
+  manifest is AEAD-encrypted under a derived key (ID-4), and the
+  per-pair S3 secret is a key agreement (NET-7a). If a feature ever
+  needs signatures, it gets a separate signing key derived from the
+  same seed, not a change to the identity. The display form is base32
+  with a checksum.
+- **ID-2** The 24 words are BIP-39 (`go-bip39`); the private key is
+  HKDF-SHA256 of the BIP-39 seed with a fixed info string, clamped as
+  X25519 requires. Two nodes from the same phrase derive the same key
+  (the AC).
 - **ID-3** The private key file is encrypted with a key stored beside
   it in the config directory, mode 0600. The phrase is never written.
 - **ID-4** The manifest is encrypted with a key derived from the
@@ -736,7 +748,9 @@ Q-V.
   (SEC-14). `recover` derives the key
   from the phrase, dials the lender, fetches the manifest over the
   control API (no S3 credential needed yet), then derives the per-pair
-  S3 credentials (§3.7) for every lender listed.
+  S3 credentials (§3.7) for every lender listed. External replica
+  credentials found in the manifest are shown once, for the user to
+  put in the environment (SEC-3); they are not written to disk.
 - **ID-6** Read-through is the decorator's `GetObject`/`HeadObject`
   miss path (EP-10); after `recover` every object is a miss until
   fetched.
@@ -1022,9 +1036,9 @@ Q-V.
   replication worker.
 - **OPS-6** The configuration file is TOML; state lives in `lendisk.db`.
   Store settings are one `[store]` section (`backend = "posix"` with a
-  `path`, or `backend = "s3"` with endpoint and a credential file in
-  `<config>`), used for both roles; replication settings, including the
-  limits and the timetable, are `[replication]`.
+  `path`, or `backend = "s3"` with endpoint; its credential comes from
+  the environment, SEC-3), used for both roles; replication settings,
+  including the limits and the timetable, are `[replication]`.
 - **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the
   replica client included); active RSS adds one part buffer (16 MiB by
   default) per transfer in flight. Q-M measures both.
@@ -1036,9 +1050,18 @@ Q-V.
 
 - **SEC-3** Per-bucket S3 keys live in `lendisk.db`; versitygw's
   `IAMDir` is not used. A `backend/s3` store credential and external
-  replica credentials are files in `<config>`, mode 0600, and replica
-  credentials are also carried in the node manifest (S3-1). They are
-  read by the process that uses them and never passed to another.
+  replica credentials are read from environment variables at start:
+  `LENDISK_STORE_ACCESS_KEY` and `LENDISK_STORE_SECRET_KEY` for the
+  store, `LENDISK_REPLICA_<NAME>_ACCESS_KEY` and
+  `LENDISK_REPLICA_<NAME>_SECRET_KEY` for each external replica, with
+  the variable names overridable per entry in the config file. They
+  are supplied by systemd's `EnvironmentFile=` (a root-owned file the
+  service user cannot read) or the container runtime's secrets;
+  lendisk never writes them to disk, redacts them from logs and
+  `status`, and refuses to start a store or replica whose variables
+  are unset. Replica credentials are also carried in the encrypted
+  node manifest (S3-1) for recovery. They are read by the process that
+  uses them and never passed to another.
 - **SEC-7** The hostile-peer test exercises every S3 operation through
   the tunnel bridge and every control API endpoint, from an allowed
   peer's identity and from an unknown one.
@@ -1149,9 +1172,11 @@ Google Drive) are not in v1: REQUIREMENTS.md §4.11 asks for S3
 buckets, and rclone behind the same replica interface is the v1.1
 route to the rest (D12).
 
-- **S3-1** `replica add s3 <name> …` stores the endpoint, bucket,
-  prefix and credential in `<config>` (mode 0600) and in the manifest;
-  the client is built from them.
+- **S3-1** `replica add s3 <name> …` stores the endpoint, bucket and
+  prefix in the config file and reads the credential from the
+  environment (SEC-3), testing it before the replica is accepted; the
+  credential is carried in the encrypted manifest for recovery, and the
+  client is built from all of these at start.
 - **S3-3** Uploads carry the SHA-256 as the request checksum where the
   provider verifies one and Content-MD5 otherwise, plus lendisk's
   SHA-256 as metadata. Large objects use multipart with the resume of

@@ -1,10 +1,11 @@
 # lendisk — requirements
 
-Status: draft v0.9, 2026-10-30. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.9.1, 2026-10-30. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
-own and its friends' buckets alike (EP-16). The design
+own and its friends' buckets alike (EP-16); v0.9.1 reads third-party
+credentials from the environment (SEC-3). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -583,14 +584,18 @@ double the surface for no change in the core problem.
 - **SEC-2** Metadata a lender can observe, and that the product accepts
   leaking: object sizes and counts, timing of backups, borrower IP address
   unless relayed. This shall be documented for users.
-- **SEC-3** Secrets on disk shall be limited to: the identity key,
-  per-bucket endpoint credentials, the credentials of external replicas
-  (S3-1), and the credential with which the daemon drives its storage
-  engine, which is node-local for a store on the node's own disk and
-  the service's credential for a named S3 service (EP-16), all mode
-  0600 in the config directory. No per-bucket or per-peer credential
-  shall be held anywhere else; the store credential grants access to
-  the node's own store and nothing else, and no peer ever receives it.
+- **SEC-3** Secrets on disk shall be limited to the identity key and
+  the per-bucket endpoint credentials the node itself issues, mode 0600
+  under the node's own directories. Third-party credentials, meaning
+  the credential of a named S3 service used as the store (EP-16) and
+  the credentials of external replicas (S3-1), shall be read from
+  environment variables when the daemon starts, supplied by the service
+  manager or container runtime, and the daemon shall never write them
+  to disk; the configuration file names the variables, not the values.
+  No per-bucket or per-peer credential shall be held anywhere else; the
+  store credential grants access to the node's own store and nothing
+  else, and no peer ever receives it. The encrypted node manifest
+  (ID-4) may carry external replica credentials for recovery.
 - **SEC-4** A compromised borrower machine shall not be able to cause
   offsite data loss within the retention window (RET-2) nor to read
   another borrower's data on a shared lender (PEER-8).
@@ -711,10 +716,11 @@ follow §4.5 and §4.6 because the lender enforces them.
 
 - **S3-1** `lendisk replica add s3 <name> --endpoint … --bucket …
   --prefix …` shall register a bucket as a replication target; it then
-  appears in `--replicas` lists and in `status` like a peer.
-  Credentials are stored in the config directory (mode 0600) and in the
-  node manifest (ID-4), so recovery through a friend also recovers
-  bucket access.
+  appears in `--replicas` lists and in `status` like a peer. The
+  credential is read from the environment (SEC-3) and carried in the
+  encrypted node manifest (ID-4), so recovery through a friend also
+  recovers bucket access: `recover` shows it once for the user to place
+  in the environment and does not write it.
 - **S3-2** The replica layout in the bucket shall be the backup tool's
   standard layout under the prefix. AC: `restic -r
   s3:<endpoint>/<bucket>/<prefix> snapshots` works with no lendisk
@@ -839,6 +845,14 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.9.1 (2026-10-30)** Third-party credentials come from the
+  environment. SEC-3 now limits secrets on disk to the identity key and
+  the node's own per-bucket credentials; the store credential (EP-16)
+  and external replica credentials (S3-1) are read from environment
+  variables at start and never written by the daemon. S3-1 reworded to
+  match: the manifest still carries replica credentials for recovery,
+  and `recover` shows them once instead of writing them. No other
+  requirement changed meaning.
 - **v0.9 (2026-10-30)** A named S3 service admitted as the store.
   EP-16 added: the store may be an S3-compatible service the user
   names, and one store holds the node's own buckets and the buckets it
