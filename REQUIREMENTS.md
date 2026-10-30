@@ -1,7 +1,8 @@
 # lendisk — requirements
 
-Status: draft v0.8, 2026-10-28. Split out of SPEC v0.6 as v0.7; v0.8
-admits a storage engine with its own on-disk format (P-5). The design
+Status: draft v0.8.1, 2026-10-30. Split out of SPEC v0.6 as v0.7; v0.8
+admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
+peer admission fail closed (SEC-10 to SEC-15). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -587,6 +588,61 @@ double the surface for no change in the core problem.
   refused or unreachable. AC: the classification is checked into the
   repository, a test asserts it is complete, and it is re-reviewed on
   every upgrade of the store.
+- **SEC-10** Peer admission shall fail closed. A node with no peers and
+  no pending invites shall accept no connection on the peer connection,
+  and neither shall a node that cannot read its own relationship state.
+  No state of the node, including a fresh install, the moment after the
+  last peer is removed, a restart and an upgrade, shall admit an unknown
+  identity. AC: SEC-7's hostile-peer test runs from an unknown identity
+  against a node with zero peers, with one peer, and with zero peers
+  after the last one is removed; every connection is refused before any
+  application data is exchanged.
+- **SEC-11** Authorisation shall not rest on connection admission alone.
+  Every request the lender-facing service handles shall be checked
+  against the relationship held for the identity the request arrived
+  from, at the point where the request is served. A request from an
+  identity with no relationship is refused even if the connection was
+  admitted. Proving an identity grants nothing by itself. AC: in a test
+  build with connection-level admission disabled, SEC-7's hostile-peer
+  test from an unknown identity still has every request refused.
+- **SEC-12** Every request shall be bound to the authenticated identity
+  of the connection it arrives on. Any identity a request claims (a
+  credential, an access key, a borrower ID, a bucket name) shall match
+  that identity, and a mismatch shall be refused. The peer connection
+  shall report, for each incoming connection, the identity that
+  authenticated it; a transport that cannot is not a way to meet NET-1.
+  AC: B, on its own connection to the lender, sends a request carrying
+  A's valid credential; it is refused.
+- **SEC-13** An invite admits only its own redemption. A connection
+  accepted because it presents a pending invite (PEER-1) shall be able
+  to complete the handshake of PEER-2 and nothing else until that
+  handshake completes: no NET-7 operation, no manifest, challenge or
+  quota request. AC: from a connection holding an unredeemed invite,
+  every NET-7 operation is refused.
+- **SEC-14** A node's address shall carry no secret. Knowing an address
+  (ID-5, ID-7, PEER-1) shall let a node attempt a connection and nothing
+  more; access is granted by identity and relationship (NET-7a), never
+  by possession of the address. A node's address shall not change when
+  the node restarts or upgrades. The single-use secret in an invite
+  (SEC-6) is the only secret an invite carries. AC: a node given only
+  A's address, with no relationship and no invite, is refused as in
+  SEC-10; A's address is identical before and after a restart.
+- **SEC-15** Changes to relationships shall apply to open connections.
+  When a relationship is removed (PEER-5, PEER-12) or its quota lowered
+  (PEER-6), or an invite is redeemed or expires, the node shall apply
+  the change to connections that are already open as well as new ones,
+  within 60 seconds and without a restart. AC: during a running
+  transfer from B, A removes B; within 60 seconds every request on B's
+  open connection gets the answer PEER-5 prescribes for a removed
+  borrower, and none is served under the old relationship.
+
+*Rationale for SEC-10 to SEC-15:* the lender-facing service is the only
+surface reachable from outside the machine, and the connection layer
+in front of it is a replaceable component (NET-8) whose defaults and
+guarantees can differ from one implementation to the next. Admission
+must not depend on any of them: an empty allow-list that means "allow
+everyone", an address that doubles as a password, or a revocation that
+waits for a reconnect would each turn a component choice into a hole.
 
 ### 4.10 Compatibility
 
@@ -747,6 +803,13 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.8.1 (2026-10-30)** Peer admission requirements added: fail closed
+  with no peers (SEC-10), authorisation per request and not only per
+  connection (SEC-11), requests bound to the connection's identity
+  (SEC-12), an invite admits only its redemption (SEC-13), addresses
+  carry no secret and survive restarts (SEC-14), and relationship
+  changes apply to open connections (SEC-15). No existing requirement
+  changed meaning.
 - **v0.8 (2026-10-28)** Storage engine admitted. P-5 no longer requires
   plain files readable with nothing running; it requires readability
   through the storage engine alone plus a plain-file export. LEND-6,
