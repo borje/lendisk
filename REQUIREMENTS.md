@@ -1,8 +1,10 @@
 # lendisk — requirements
 
-Status: draft v0.8.1, 2026-10-30. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.9, 2026-10-30. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
-peer admission fail closed (SEC-10 to SEC-15). The design
+peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
+S3-compatible service the user names as the store, holding the node's
+own and its friends' buckets alike (EP-16). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -59,7 +61,7 @@ Original requirements this document grew from:
 | **Peer** | Another node you have exchanged invites with. |
 | **Borrower** | The role of a node storing its buckets on a peer. |
 | **Lender** (host) | The role of a node storing a peer's buckets. Most nodes play both roles. |
-| **Storage engine** | The S3 store the node runs its local store and lending store on: an unmodified, freely available open-source program that can be started on the same directories without lendisk (P-5). Chosen in DESIGN.md. |
+| **Storage engine** | The S3 store that holds the node's local store and lending store: an unmodified, freely available open-source program started on the node's own directories, or an S3-compatible service the user names (EP-16). Either is readable without lendisk (P-5). The program is chosen in DESIGN.md. |
 | **Local store** | The node's own copy of its buckets, held in the storage engine. One per node, never shared. |
 | **Bucket** | One backup repository as the backup tool sees it: a namespace of keys in the local store. Formerly "repo". |
 | **Tool profile** | Per-bucket setting (`restic`, `kopia`, `generic`) that selects validation rules and what "snapshot" means. |
@@ -149,7 +151,9 @@ With no lendisk running anywhere, the borrower's local copy and each
 lender's replica are each readable by the backup tool through the
 storage engine alone: an unmodified, freely available open-source
 program, started on the same directories, with the steps in the user
-guide (LEND-6, EP-15, scenario 7). Each copy can also be written out as
+guide, or, where the store is an S3 service the user named (EP-16),
+any S3 client with the store's credential (LEND-6, EP-15, scenario 7).
+Each copy can also be written out as
 plain files in the backup tool's own on-disk layout (`lendisk export`,
 REPL-8, LEND-6), and a lender can hand you a disk. An external S3
 replica is likewise a repository the tool opens with no lendisk
@@ -160,7 +164,11 @@ v0.8 relaxed this to admit a storage engine with its own on-disk
 format, in exchange for quotas, indexed listings and integrity checks
 the product would otherwise build itself (DESIGN.md D14). The promise
 kept is that no lendisk code, and nothing proprietary, stands between
-the user and their bytes.
+the user and their bytes. v0.9 admits an S3 service the user names as
+the store, so that someone who already runs or pays for one keeps
+their own and their friends' data in it; access is then standard S3
+with the user's own credential, as S3-2 already promises for an
+external replica.
 
 ### P-6. Recovery needs the phrase, one lender's address and the backup tool's password
 
@@ -332,7 +340,11 @@ double the surface for no change in the core problem.
 - **EP-12** `lendisk init` shall verify that the store directory's
   filesystem supports what the store needs and has at least the
   configured free-space floor, and refuse otherwise with a message naming
-  the filesystem and the missing property.
+  the filesystem and the missing property. For a store that is an S3
+  service (EP-16), `init` shall instead verify that the service is
+  reachable with the credential, determine which of the properties the
+  daemon relies on it provides, record the result and show it in
+  `status`.
 - **EP-13** The daemon should sustain at least 200 MB/s of writes from a
   backup tool on local NVMe, measured end to end.
 - **EP-14** The daemon shall reconcile the store's listing against its
@@ -345,9 +357,25 @@ double the surface for no change in the core problem.
 - **EP-15** Touching the storage engine's directories directly, with or
   without the daemon running, is unsupported and documented as such;
   EP-14 limits the damage. The lendisk-free restore path is the storage
-  engine alone, or an export (P-5, LEND-6, scenario 7). Restores
-  through the S3 endpoint work in both modes with the daemon running;
-  that is the normal path and needs no special mode.
+  engine alone, any S3 client against a named service (EP-16), or an
+  export (P-5, LEND-6, scenario 7). Restores through the S3 endpoint
+  work in both modes with the daemon running; that is the normal path
+  and needs no special mode.
+- **EP-16** The store may be an S3-compatible service the user names
+  (`lendisk init --store s3 --endpoint … --bucket …`, or `[store]` in
+  config) instead of a directory on the node. One store holds the
+  node's own buckets and every bucket it lends (LEND-6): what the user
+  runs or pays for is where their friends' data goes too. `init` and
+  `store set` shall warn when the service is not on the local network,
+  since backups then run at the speed of that link, not of local disk
+  (P-4, scenario 1). Where the service lacks a property the lender's
+  guarantees rest on (versioning, object lock, checksum verification),
+  the daemon shall provide it itself and `status` shall label the
+  weaker mode, as S3-4 does for external replicas. The borrower never
+  holds the lender's store credential (PEER-8, SEC-3). AC: with the
+  store on an S3 server on the LAN, scenarios 1, 7 and 10 pass, with
+  scenario 7's lendisk-free read done by any S3 client against that
+  server.
 
 ### 4.4 Replication
 
@@ -383,10 +411,12 @@ double the surface for no change in the core problem.
 - **REPL-9** Replication shall never block the endpoint. A lender being
   offline shall have no effect on a backup to the local copy.
 - **REPL-10** Every object sent to a replica shall carry a cryptographic
-  hash of its content, computed by the borrower from the local copy as
-  it sends. The replica verifies the received bytes against it before
-  acknowledging and rejects a mismatch (LEND-4); the borrower records the
-  hash on acknowledgement. The index of acknowledged hashes is what
+  hash of its content, computed by the borrower from the object's
+  bytes: at the latest as it sends them, at the earliest as the backup
+  tool wrote them. The replica verifies the received bytes against it
+  before acknowledging and rejects a mismatch (LEND-4), so a copy that
+  changed between hashing and sending is refused rather than
+  replicated; the borrower records the hash on acknowledgement. The index of acknowledged hashes is what
   verification (VER-1, VER-2) and the immutability policy (EP-11) check
   against. The hash shall be computed the same way for friends and for
   external buckets.
@@ -416,8 +446,9 @@ double the surface for no change in the core problem.
 - **LEND-5** A lender may rate-limit each borrower independently.
 - **LEND-6** The lender's replica shall be readable without lendisk:
   each borrower's buckets are ordinary buckets in the lender's storage
-  engine, which the backup tool opens with the engine alone (P-5), plus
-  the tombstones and an index of hashes. `lendisk export` on the lender
+  engine, beside the lender's own (EP-16), which the backup tool opens
+  with the engine alone or, for a named S3 service, with any S3 client
+  (P-5), plus the tombstones and an index of hashes. `lendisk export` on the lender
   shall write any borrower's bucket as plain files: for a restic bucket
   a restic repository readable with `restic -r <path>`, for a Kopia
   bucket (`--kopia-layout`) the sharded layout Kopia's filesystem
@@ -553,11 +584,13 @@ double the surface for no change in the core problem.
   leaking: object sizes and counts, timing of backups, borrower IP address
   unless relayed. This shall be documented for users.
 - **SEC-3** Secrets on disk shall be limited to: the identity key,
-  per-bucket endpoint credentials, and the node-local credentials with which the daemon drives its storage
-  engine, all mode 0600 in the config directory. No per-bucket or
-  per-peer credential shall be held anywhere else; the storage engine
-  shall hold only node-local credentials that grant nothing beyond the
-  node's own disk.
+  per-bucket endpoint credentials, the credentials of external replicas
+  (S3-1), and the credential with which the daemon drives its storage
+  engine, which is node-local for a store on the node's own disk and
+  the service's credential for a named S3 service (EP-16), all mode
+  0600 in the config directory. No per-bucket or per-peer credential
+  shall be held anywhere else; the store credential grants access to
+  the node's own store and nothing else, and no peer ever receives it.
 - **SEC-4** A compromised borrower machine shall not be able to cause
   offsite data loss within the retention window (RET-2) nor to read
   another borrower's data on a shared lender (PEER-8).
@@ -658,7 +691,8 @@ waits for a reconnect would each turn a component choice into a hole.
   `lendisk bucket import <name> <path>`, which uploads it into the store
   and marks nothing as acknowledged.
 - **COMPAT-4** The store layout shall be documented: which directories
-  the storage engine owns, how the node's own buckets and each
+  the storage engine owns, or which buckets and prefixes in a named S3
+  service (EP-16), how the node's own buckets and each
   borrower's buckets are named inside it, and the name and purpose of
   every housekeeping directory and file, so that users can read the
   store with the engine alone (P-5). The plain-file export layout
@@ -758,8 +792,9 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 1. **First backup.** Two nodes, A behind NAT at home, B behind NAT at a
    friend's. B invites A with 500 GB. A adds bucket `laptop --profile
-   restic` with replica B. `restic backup` on A finishes at local disk
-   speed. Within the bandwidth available, `lendisk status` shows the
+   restic` with replica B. `restic backup` on A, whose store is the
+   default directory, finishes at local disk speed. Within the
+   bandwidth available, `lendisk status` shows the
    snapshot offsite-complete.
 2. **Friend offline.** B is powered off for three days. `restic backup` on
    A keeps working. Status shows lag; at 24h an alert fires. When B
@@ -778,7 +813,8 @@ current design (component behaviour, API assumptions) are in DESIGN.md
    replication resumes without intervention on A.
 7. **Zero lock-in.** With lendisk stopped on both sides: on B, the
    storage engine alone is started on B's store directories following
-   the user guide, and `restic -r s3:…` against it lists A's snapshots
+   the user guide, or B's store is an S3 service B named (EP-16), and
+   `restic -r s3:…` against it with B's credential lists A's snapshots
    from A's laptop replica; on A, the same on A's store lists them from
    A's own copy. Alternatively `lendisk export` has written either copy
    to a directory and `restic -r <directory> snapshots` works on the
@@ -803,6 +839,16 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.9 (2026-10-30)** A named S3 service admitted as the store.
+  EP-16 added: the store may be an S3-compatible service the user
+  names, and one store holds the node's own buckets and the buckets it
+  lends. Glossary "storage engine", P-5, EP-12, EP-15, LEND-6, COMPAT-4
+  and scenarios 1 and 7 extended to match. SEC-3 admits that service's
+  credential and now lists external replica credentials (S3-1), which
+  it had omitted. REPL-10 reworded: the hash may be taken when the
+  backup tool writes the object rather than only as it is sent, since
+  the replica verifies the received bytes either way. No other
+  requirement changed meaning.
 - **v0.8.1 (2026-10-30)** Peer admission requirements added: fail closed
   with no peers (SEC-10), authorisation per request and not only per
   connection (SEC-11), requests bound to the connection's identity
