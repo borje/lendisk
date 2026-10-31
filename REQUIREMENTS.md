@@ -1,12 +1,13 @@
 # lendisk — requirements
 
-Status: draft v0.9.2, 2026-10-31. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.9.3, 2026-10-31. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
 own and its friends' buckets alike (EP-16); v0.9.1 reads third-party
 credentials from the environment (SEC-3); v0.9.2 lets backup tools on
-other machines on the local network use the node (EP-17). The design
+other machines on the local network use the node (EP-17); v0.9.3 hides
+bucket names from lenders (SEC-16). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -233,8 +234,9 @@ double the surface for no change in the core problem.
   no requirement to download the entire repository first. Fetched objects
   are cached locally.
 - **ID-7** `lendisk recovery-sheet` shall print a page meant for paper:
-  the phrase, the node ID, the addresses of all lenders, and the restore
-  commands. It shall remind the user that the restic password is a
+  the phrase, the node ID, the addresses of all lenders, the restore
+  commands, and for each bucket the name it has at its lenders
+  (SEC-16). It shall remind the user that the restic password is a
   separate secret. The sheet shall be regenerated (and the user alerted)
   whenever a lender's address changes.
 
@@ -595,7 +597,9 @@ double the surface for no change in the core problem.
 - **NET-7b** `lendisk peer forward <peer> <addr>` should expose a friend's
   replica on a local address through the peer connection, so a backup
   tool on the borrower's machine can read it directly, with no lendisk
-  replication code in the path (scenario 10).
+  replication code in the path (scenario 10). It shall print, for each
+  of the borrower's buckets held by that peer, the bucket's name at the
+  lender (SEC-16) and the tool's repository string using it.
 - **NET-8** The overlay network shall sit behind an internal interface so
   that it can be replaced without touching replication, storage or the
   CLI.
@@ -632,7 +636,10 @@ double the surface for no change in the core problem.
   shall not weaken it, e.g. by requiring the restic password anywhere.)
 - **SEC-2** Metadata a lender can observe, and that the product accepts
   leaking: object sizes and counts, timing of backups, borrower IP address
-  unless relayed. This shall be documented for users.
+  unless relayed, how many buckets the borrower keeps at that lender, and
+  which backup tool wrote each one (its key layout is recognisable). The
+  names of the borrower's buckets are not on this list (SEC-16). This
+  shall be documented for users.
 - **SEC-3** Secrets on disk shall be limited to the identity key, the
   per-bucket endpoint credentials the node itself issues and the
   private key of the endpoint's TLS certificate where one is used
@@ -726,6 +733,16 @@ double the surface for no change in the core problem.
   transfer from B, A removes B; within 60 seconds every request on B's
   open connection gets the answer PEER-5 prescribes for a removed
   borrower, and none is served under the old relationship.
+- **SEC-16** A lender shall not learn the names of the borrower's
+  buckets. The name under which a borrower's bucket is sent to and
+  stored at a lender shall be derived from the borrower's identity and
+  the bucket's name so that it reveals nothing about that name, shall
+  be the same at every lender and stable for the life of the bucket,
+  and shall be recomputable from the recovery phrase and the bucket
+  name alone, so that recovery (ID-5) and reading a replica with
+  lendisk stopped (P-5) still work. AC: after scenario 1, a search of
+  B's store, `lendisk.db`, logs and `status` output for the string
+  `laptop` finds nothing.
 
 *Rationale for SEC-10 to SEC-15:* the lender-facing service is the only
 surface reachable from outside the machine, and the connection layer
@@ -751,7 +768,7 @@ waits for a reconnect would each turn a component choice into a hole.
 - **COMPAT-4** The store layout shall be documented: which directories
   the storage engine owns, or which buckets and prefixes in a named S3
   service (EP-16), how the node's own buckets and each
-  borrower's buckets are named inside it, and the name and purpose of
+  borrower's buckets are named inside it (SEC-16), and the name and purpose of
   every housekeeping directory and file, so that users can read the
   store with the engine alone (P-5). The plain-file export layout
   (LEND-6) shall be documented too: one file per key at its key path
@@ -874,7 +891,8 @@ current design (component behaviour, API assumptions) are in DESIGN.md
    storage engine alone is started on B's store directories following
    the user guide, or B's store is an S3 service B named (EP-16), and
    `restic -r s3:…` against it with B's credential lists A's snapshots
-   from A's laptop replica; on A, the same on A's store lists them from
+   from A's laptop replica, found under the name A's recovery sheet
+   gives for it (SEC-16); on A, the same on A's store lists them from
    A's own copy. Alternatively `lendisk export` has written either copy
    to a directory and `restic -r <directory> snapshots` works on the
    plain files with nothing running at all. No lendisk code runs on
@@ -891,8 +909,8 @@ current design (component behaviour, API assumptions) are in DESIGN.md
    deletes old packs; B tombstones them. A restores a file on a fresh
    machine via read-through after `lendisk recover`.
 10. **Restore straight from a friend.** On A, `lendisk peer forward B
-    127.0.0.1:9100` then `restic -r s3:http://127.0.0.1:9100/laptop
-    snapshots` lists A's snapshots held at B. B's daemon refuses `restic
+    127.0.0.1:9100` prints the repository string for `laptop` at B,
+    and `restic -r` with it lists A's snapshots held at B. B's daemon refuses `restic
     prune`'s attempt to remove tombstoned data (RET-2) and refuses every
     operation outside the NET-7 list (SEC-9).
 11. **Backup from another machine.** A runs on a NAS. The user sets
@@ -908,6 +926,14 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.9.3 (2026-10-31)** Bucket names hidden from lenders. SEC-16
+  added: the name a lender sees for a borrower's bucket is derived from
+  the borrower's identity and reveals nothing about the real name, and
+  can be recomputed from the phrase. SEC-2 now lists what the lender
+  still learns about buckets: how many, and which tool wrote each.
+  ID-7 puts each bucket's name at its lenders on the recovery sheet;
+  NET-7b prints it. COMPAT-4 and scenarios 7 and 10 reworded to match.
+  No other requirement changed meaning.
 - **v0.9.2 (2026-10-31)** Backup tools on other machines. EP-17 added:
   the user may give the endpoint network addresses besides loopback,
   with per-bucket credentials and TLS by default (plaintext if the

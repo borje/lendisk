@@ -437,8 +437,8 @@
     <text x="132" y="223" fill="var(--muted)">versioning dir · object lock</text>
     <text x="325" y="130" font-weight="600" font-size="11.5">lent buckets, same store</text>
     <text x="325" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">/volume1/lendisk/lent-*</text>
-    <text x="325" y="163" fill="var(--muted)">lent/björn · photos · 300 GB</text>
-    <text x="325" y="178" fill="var(--muted)">lent/dag · kopia-dag · 80 GB</text>
+    <text x="325" y="163" fill="var(--muted)">lent/björn · s7qe… · 300 GB</text>
+    <text x="325" y="178" fill="var(--muted)">lent/dag · sm3a… · 80 GB</text>
     <text x="325" y="193" fill="var(--muted)">quota 500 GB each · 30 d</text>
     <text x="325" y="208" fill="var(--muted)">delete → delete marker</text>
     <text x="325" y="223" fill="var(--muted)">retention: store-enforced</text>
@@ -467,7 +467,7 @@
     <text x="677" y="223" fill="var(--muted)">restores read-through</text>
     <text x="870" y="130" font-weight="600" font-size="11.5">lent buckets, same Garage</text>
     <text x="870" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">garage.lan:3900 · lent-* buckets</text>
-    <text x="870" y="163" fill="var(--muted)">lent/anna · laptop · 120 GB</text>
+    <text x="870" y="163" fill="var(--muted)">lent/anna · s4k2… · 120 GB</text>
     <text x="870" y="178" fill="var(--muted)">quota 500 GB · 30 d</text>
     <text x="870" y="193" fill="var(--muted)">Garage has no versioning:</text>
     <text x="870" y="208" fill="var(--muted)">tombstones kept by lendisk</text>
@@ -495,8 +495,8 @@
     <text x="132" y="565" fill="var(--muted)">who contributes a disk</text>
     <text x="325" y="470" font-weight="600" font-size="11.5">lent buckets, the store</text>
     <text x="325" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/posix · /mnt/usb/lendisk</text>
-    <text x="325" y="503" fill="var(--muted)">lent/anna · laptop · 120 GB</text>
-    <text x="325" y="518" fill="var(--muted)">lent/dag · kopia-dag · 80 GB</text>
+    <text x="325" y="503" fill="var(--muted)">lent/anna · s4k2… · 120 GB</text>
+    <text x="325" y="518" fill="var(--muted)">lent/dag · sm3a… · 80 GB</text>
     <text x="325" y="533" fill="var(--muted)">quota 500 GB · 200 GB · 60 d</text>
     <text x="325" y="548" fill="var(--muted)">object lock: delete + 60 d</text>
     <text x="325" y="563" fill="var(--muted)">weekly 0.1% sample scrub</text>
@@ -525,7 +525,7 @@
     <text x="677" y="563" fill="var(--muted)">warned at init</text>
     <text x="870" y="470" font-weight="600" font-size="11.5">lent buckets, same bucket</text>
     <text x="870" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">Hetzner bucket · lent-* prefix</text>
-    <text x="870" y="503" fill="var(--muted)">lent/björn · photos · 300 GB</text>
+    <text x="870" y="503" fill="var(--muted)">lent/björn · s7qe… · 300 GB</text>
     <text x="870" y="518" fill="var(--muted)">quota 400 GB · 30 d</text>
     <text x="870" y="533" fill="var(--muted)">versioning + lifecycle there</text>
     <text x="870" y="548" fill="var(--muted)">retention: store-enforced</text>
@@ -616,7 +616,7 @@
   <li><strong>Pairwise trust (P-2).</strong> Anna and Björn are mutual, two invites. Every other pair is one-way. Carla and Björn share no relationship and appear nowhere in each other's state, even though both hold data for Anna and one of them holds data for Dag.</li>
   <li><strong>Every network case.</strong> Hole-punched (Anna to Carla), relayed through DERP because of CGNAT (Anna to Björn, shown as such in both nodes' status), and a static public address dialled directly (everyone to Dag). In every case the borrower's S3 client dials through its own tailcat <code>Client</code>; nothing listens on loopback for replication.</li>
   <li><strong>Evict mode in the wild.</strong> Björn's 300 GB of photos keep about 10 GB locally; a restore reads packs through from Anna or Dag. Anna, holding Björn's packs, cannot read them (P-3) and cannot delete them early (RET-2).</li>
-  <li><strong>Recovery for each.</strong> Anna rebuilds from her phrase and Carla's address. Dag rebuilds from his phrase and Anna's address, and his manifest brings back the Hetzner credential. Carla has nothing to recover: her store is readable with <code>restic -r /mnt/usb/lendisk/lent-anna-laptop</code> on any machine, with nothing running.</li>
+  <li><strong>Recovery for each.</strong> Anna rebuilds from her phrase and Carla's address. Dag rebuilds from his phrase and Anna's address, and his manifest brings back the Hetzner credential. Carla has nothing to recover: her store is readable with <code>restic -r /mnt/usb/lendisk/lent-&lt;anna&gt;-s4k2…</code> on any machine, using the name on Anna's recovery sheet, with nothing running.</li>
 </ul>
 
 <h2>The capability profile</h2>
@@ -639,13 +639,13 @@ the store, default (backend/posix)
   &lt;dir&gt;/laptop/data/ab/abcd…                 your bucket "laptop", restic layout, plain files
   &lt;dir&gt;/laptop/snapshots/…
   &lt;dir&gt;/photos/p1234…                        your bucket "photos", Kopia layout
-  &lt;dir&gt;/lent-&lt;id16&gt;-laptop/…                  a borrower's bucket, beside yours; the decorator maps "laptop" here
+  &lt;dir&gt;/lent-&lt;id16&gt;-&lt;sealed&gt;/…                a borrower's bucket, beside yours; the lender never sees "laptop"
   &lt;dir&gt;/lendisk-manifests/&lt;borrower-id&gt;       the borrower's encrypted node manifest
   &lt;versioning-dir&gt;/laptop/…                  non-current versions and delete markers (versitygw)
   restic -r &lt;dir&gt;/laptop snapshots           works with nothing running at all
 
 the store behind backend/s3
-  s3://laptop/…, s3://lent-&lt;id16&gt;-laptop/…    one upstream bucket per lendisk bucket, yours and theirs alike
+  s3://laptop/…, s3://lent-&lt;id16&gt;-&lt;sealed&gt;/…  one upstream bucket per lendisk bucket, yours and theirs alike
   s3://&lt;bucket&gt;/&lt;prefix&gt;/laptop/…             or prefixes in one bucket, if backend/s3 allows (Q-V)
   restic -r s3:&lt;endpoint&gt;/laptop snapshots    any S3 client, lendisk stopped
 

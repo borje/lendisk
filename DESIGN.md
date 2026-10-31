@@ -1,10 +1,11 @@
 # lendisk — design
 
-Status: draft v0.10.2, 2026-10-31. Companion to REQUIREMENTS.md v0.9.2,
+Status: draft v0.10.3, 2026-10-31. Companion to REQUIREMENTS.md v0.9.3,
 which made the two requirement changes this design needed (Q-T,
-resolved), then moved third-party credentials to the environment, and
+resolved), then moved third-party credentials to the environment,
 then let backup tools on other machines use the node (EP-17; the LAN
-bridge, §3.3).
+bridge, §3.3), and then hid bucket names from lenders (SEC-16; sealed
+names, §3).
 
 ## 0. How to read this document
 
@@ -47,7 +48,9 @@ beside the node's own, on disk or in Garage (D15); the object hash is
 taken at capture; the tunnel has one port. One process, one binary.
 v0.10.1 made the identity a bare X25519 key, with no Ed25519 and no
 signatures anywhere, and reads third-party credentials from the
-environment. The trust model is unchanged throughout.
+environment. v0.10.3 sends a borrower's buckets to lenders under
+sealed names, so a lender no longer learns what they are called. The
+trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -80,7 +83,7 @@ feature:
 |---|---|---|---|
 | **Local store**: the node's own copy, written by the user's backup tool | EP-1 to EP-15, P-5 | Synchronous and protocol-critical: full S3 behaviour for restic and Kopia, crash-safe exactly-once capture with no buffering, 200 MB/s, loopback only unless the user enables the LAN bridge (EP-17). The writer is trusted. | versitygw with the decorator's capture policy (D4, D15) |
 | **Replication**: moving each object to every replica | REPL-1 to REPL-11, §4.11, NET-2 to NET-5 | Asynchronous and robustness-critical: strict FIFO per replica, survival of days-long outages, resume, rate limits, a hash per object, reach behind NAT and to providers. Almost no S3 semantics. | an in-process S3 client (minio-go) driven by lendisk's queue (D12), dialling friends through tailcat (D5) |
-| **Lending store**: a friend's copy, written by a borrower who may be compromised | LEND-1 to LEND-7, RET-1 to RET-3, VER-1, NET-7, SEC-4 to SEC-15 | Enforcement-critical: quota, immutability, retention the borrower cannot bypass, a deny-by-default operation list, isolation between borrowers. | versitygw with the decorator's lender policy (D12, D15), behind the tunnel bridge (§3.7) |
+| **Lending store**: a friend's copy, written by a borrower who may be compromised | LEND-1 to LEND-7, RET-1 to RET-3, VER-1, NET-7, SEC-4 to SEC-16 | Enforcement-critical: quota, immutability, retention the borrower cannot bypass, a deny-by-default operation list, isolation between borrowers. | versitygw with the decorator's lender policy (D12, D15), behind the tunnel bridge (§3.7) |
 
 The two stores need the same S3 surface and differ only in policy, so
 one embedded gateway serves both and the decorator applies a different
@@ -711,14 +714,24 @@ is `<data>/store/` (or a directory the user names, such as a USB disk),
 holding the node's own buckets and the `lent-*` buckets side by side,
 with versitygw's versioning directory beside it; `lendisk.db` (SQLite)
 is in `<data>`; `<data>/run/` (mode 0700) holds the internal tunnel
-socket. Bucket naming: the node's own buckets keep their names; a
-borrower's bucket `b` is stored as `lent-<id16>-b`, where `id16` is the
-first 16 characters of the borrower's node ID in lowercase base32.
-`bucket add` refuses own names beginning with `lent-` and the reserved
-name `lendisk-manifests`, and limits bucket names to 40 characters so
-the lent form fits S3's 63. The mapping table in `lendisk.db` is
-authoritative; the name is a stable label for reading the store with no
-lendisk running (P-5). Behind `backend/s3` the same names are upstream
+socket. Bucket naming: the node's own buckets keep their names. A borrower
+never sends a bucket's own name to a lender (SEC-16); it sends the
+bucket's **sealed name** `s<26>`, where `<26>` is the first 26
+characters, lowercase base32, of
+`HMAC-SHA256(K_name, bucket name)` and
+`K_name = HKDF-SHA256(identity private key, info="lendisk-bucket-name-v1")`.
+That is 130 bits, the same at every lender, fixed for the bucket's
+life, and recomputable from the phrase and the name alone, so `recover`
+and the recovery sheet need nothing else. The lender stores the
+borrower's sealed bucket `t` as `lent-<id16>-t`, where `id16` is the
+first 16 characters of the borrower's node ID in lowercase base32: 49
+characters whatever the real name, so own bucket names may use S3's
+full 63. `bucket add` refuses own names beginning with `lent-` and the
+reserved name `lendisk-manifests`. The borrower's `lendisk.db` and its
+encrypted manifest (ID-4) hold the name-to-sealed-name map; the
+lender's mapping table holds only sealed names and is authoritative on
+its side; the stored name is a stable label for reading the store with
+no lendisk running (P-5). Behind `backend/s3` the same names are upstream
 bucket names; placing them as prefixes inside one upstream bucket is
 Q-V.
 
@@ -762,7 +775,10 @@ Q-V.
   fetched.
 - **ID-7** The sheet is generated from the manifest; a lender's `tc…`
   string changes only when its key or its configured bootstrap region
-  changes (SEC-14), so regeneration is rare.
+  changes (SEC-14), so regeneration is rare. Each bucket is listed with
+  its sealed name and the `lent-<id16>-<sealed>` name it has in every
+  lender's store (SEC-16), which is what a restore with lendisk stopped
+  (P-5) needs.
 
 ### 3.2 Peers and invites
 
@@ -776,8 +792,9 @@ Q-V.
   key, quota, retention) in `lendisk.db`. From then on the borrower's
   node ID is an account in lendisk's `IAMService`, with its derived
   secret (NET-7a) computed on demand and never stored. Buckets the
-  borrower creates are created by the decorator under the
-  `lent-<id16>-` name and owned by that account alone.
+  borrower creates, always under their sealed names (SEC-16), are
+  created by the decorator under the `lent-<id16>-` name and owned by
+  that account alone.
 - **PEER-8** Two walls. The decorator maps every bucket name through
   the borrower's own mapping table, so a borrower can only name its own
   buckets; and versitygw's bucket-ownership check refuses an account
@@ -869,7 +886,7 @@ Q-V.
   through the backend and compares with the index in `lendisk.db`.
 - **EP-15** On `posix` the store is plain files: `restic -r
   <data>/store/<bucket>` opens it with nothing running, and a borrower's
-  replica on the lender, `restic -r <data>/store/lent-<id16>-<bucket>`,
+  replica on the lender, `restic -r <data>/store/lent-<id16>-<sealed>`,
   likewise (scenario 7).
   Behind `backend/s3`, any S3 client with the store's credential reads
   the same keys.
@@ -882,8 +899,9 @@ Q-V.
   the watermark only when every earlier entry is acknowledged.
 - **The replica client.** One minio-go client per replica, built from
   the configuration and the manifest. A friend is the friend's tunnel
-  address as endpoint, path-style, the derived credential (NET-7a), and
-  an HTTP transport whose dial function is the tailcat `Client` for
+  address as endpoint, path-style, the derived credential (NET-7a), the
+  bucket's sealed name in place of its own (SEC-16), and an HTTP
+  transport whose dial function is the tailcat `Client` for
   that peer (§3.7). An external bucket is the endpoint, bucket, prefix
   and credential the user registered (S3-1). The clients are built in
   one package, which is the only code that imports minio-go (D12).
@@ -949,7 +967,7 @@ Q-V.
   with `PreconditionFailed`, using a conditional put where the store
   supports one (D15, capability profile). A put without the hash is
   refused on the tunnel side.
-- **LEND-6** The lending store is the set of `lent-<id16>-<bucket>`
+- **LEND-6** The lending store is the set of `lent-<id16>-<sealed>`
   buckets in the node's one store, beside its own, plus versioning or
   tombstones and the hash index. With lendisk stopped they are plain
   files on `posix` (EP-15); `lendisk export <bucket> --borrower <id>
@@ -1064,6 +1082,10 @@ Q-V.
   accepted connection into a tailcat dial to the friend's tunnel port,
   so a backup tool can read a friend's replica directly. It is the only
   forward in the design, and it is the listener NET-7b itself names.
+  Since the forward is a byte copy, the tool must name the sealed
+  bucket; the command prints, from the borrower's own map, one line per
+  bucket held at that peer, e.g.
+  `laptop  restic -r s3:http://127.0.0.1:9100/s4k2…`.
 - **NET-8** The internal `Transport` interface is `Listen`,
   `Dial(peerKey)`, `Admit(func(peerKey) bool)`, `PeerOf(conn)`,
   `Disconnect(peerKey)`, `PathInfo`. `Admit` must be called before
@@ -1191,6 +1213,18 @@ Q-V.
   disconnect alone does not reset connections, which would stall until
   they time out, so lendisk closes its own. Later requests are answered
   according to the relationship's new state (PEER-5, PEER-6).
+- **SEC-16** The sealed name (§3, bucket naming) is the only bucket
+  name that crosses the tunnel: in S3 paths and in any control API
+  call that names a bucket (`challenge`, `undelete`). A keyed hash
+  rather than a counter or a random label keeps it stateless: a node
+  rebuilt from the phrase can reach its buckets at every lender before
+  its manifest is fetched, and because the key is per identity a lender
+  cannot tell that two borrowers both have a bucket called `laptop`.
+  Not hidden, and listed under SEC-2: the number of buckets per
+  borrower, and the tool, which shows in the key layout (`data/`,
+  `snapshots/`, `kopia.repository`). Hiding keys as well would mean
+  rewriting them on the lender's disk and losing P-5, so it is not
+  done.
 
 ### 3.10 Compatibility
 
@@ -1204,7 +1238,8 @@ Q-V.
 - **COMPAT-4** The documented layout on `posix` is
   `<store>/<bucket>/<key>` as plain files with versitygw's xattrs, its
   `.sgwtmp/` and `.vgwlocks/` housekeeping directories and its
-  versioning directory; borrowers' buckets under `lent-<id16>-`; the
+  versioning directory; borrowers' buckets under `lent-<id16>-` and
+  their sealed names (SEC-16); the
   reserved `lendisk-manifests` bucket; the `.lendisk/tomb/` prefix where
   tombstones apply; `lendisk.db` and its tables; and the export layout
   (one file per key at its key path; Kopia's sharded form with
