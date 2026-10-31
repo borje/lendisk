@@ -1,0 +1,55 @@
+# Björn · store is the Garage he already runs · DESIGN.md v0.10.1
+#
+# After init:
+#   lendisk bucket add photos --profile restic --replicas anna,dag --min-replicas 2 --mode evict
+#   lendisk invite --quota 500G --retention 30d     # Anna
+#
+# `init` ran the capability probe against Garage (EP-12, D15) and
+# recorded: versioning no, lifecycle yes, object lock no, checksum
+# verification yes, conditional PUT no, server-side copy yes. Retention
+# for Anna's replica is therefore daemon-enforced with tombstones.
+
+role = "full"
+
+[endpoint]
+listen  = "127.0.0.1:9000"
+metrics = "127.0.0.1:9100"
+
+[store]
+# Any S3-compatible service the user names (EP-16). Each lendisk bucket
+# is an upstream bucket of the same name (photos, lent-<id>-<sealed name of laptop>,
+# lendisk-manifests), so the key needs permission to create buckets.
+# Credential: LENDISK_STORE_ACCESS_KEY / LENDISK_STORE_SECRET_KEY.
+backend  = "s3"
+endpoint = "http://127.0.0.1:3900"   # Garage, published on the host's loopback
+region   = "garage"
+# access_key_env = "LENDISK_STORE_ACCESS_KEY"   # defaults; override only if you must
+# secret_key_env = "LENDISK_STORE_SECRET_KEY"
+
+[tunnel]
+port   = 9000
+region = "ams"
+
+[relays]
+map_url           = "https://relays.lendisk.example/derpmap.json"
+accept_peer_hints = false
+
+[lending]
+retention_min = "30d"
+global_cap    = "600G"
+
+[replication]
+upload_limit = "5M"          # CGNAT upstream is thin; Anna is reached through a relay
+schedule     = "00:00-06:00"
+part_size    = "16M"
+
+[eviction]
+# EP-9: packs leave the local store once min_replicas have acknowledged
+# them and no restic lock is present. Metadata never leaves.
+idle_before_evict = "15m"
+
+[alerts]
+webhook = "https://ntfy.sh/bjorn-lendisk"
+
+[log]
+level = "info"

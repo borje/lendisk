@@ -1,0 +1,33 @@
+# Dag: a small VPS with a public IP and little disk. The store for both
+# roles is a Hetzner Object Storage bucket behind the `s3` backend
+# (EP-16): his own Kopia repository and the lent-* buckets Björn writes
+# both live there. `init` warned that backups run at the speed of that
+# link, not of local disk; Dag accepted.
+#
+# With a public IP, friends dial Dag directly (NET-3); no relay is ever
+# needed for him. network_mode: host still applies so the WireGuard
+# port is the VPS's own.
+
+services:
+  lendisk:
+    image: ghcr.io/lendisk/lendisk:0.10
+    container_name: lendisk
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      LENDISK_CONFIG: /etc/lendisk/lendisk.toml
+    env_file:
+      - lendisk.env                 # LENDISK_STORE_ACCESS_KEY / _SECRET_KEY for Hetzner (SEC-3)
+    volumes:
+      - ./config:/etc/lendisk
+      - /var/lib/lendisk:/var/lib/lendisk   # lendisk.db and run/ only
+    healthcheck:
+      test: ["CMD", "lendisk", "status", "--quiet"]
+      interval: 60s
+      timeout: 10s
+      retries: 3

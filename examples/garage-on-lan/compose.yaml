@@ -1,0 +1,45 @@
+# Björn: homelab behind CGNAT, already runs Garage. lendisk uses it as the
+# store for both roles through the `s3` backend (EP-16, D15): his own
+# buckets and the lent-* buckets Anna writes land in the same Garage.
+#
+# Garage stays on Docker's bridge and publishes its S3 port on the host's
+# loopback only (SEC-8). lendisk, on the host network, reaches it there.
+# Garage has no versioning, so Björn's lending store gets lendisk-side
+# tombstones and `status` says "retention: client-side".
+
+services:
+  garage:
+    image: dxflrs/garage:v2.3.0
+    container_name: garage
+    restart: unless-stopped
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - /srv/garage/meta:/var/lib/garage/meta
+      - /srv/garage/data:/var/lib/garage/data
+    ports:
+      - "127.0.0.1:3900:3900"     # S3 API, loopback only
+      - "127.0.0.1:3903:3903"     # admin API, loopback only, for `garage` CLI use
+
+  lendisk:
+    image: ghcr.io/lendisk/lendisk:0.10
+    container_name: lendisk
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    depends_on: [garage]
+    environment:
+      LENDISK_CONFIG: /etc/lendisk/lendisk.toml
+    env_file:
+      - lendisk.env                 # LENDISK_STORE_ACCESS_KEY / _SECRET_KEY for Garage (SEC-3)
+    volumes:
+      - ./config:/etc/lendisk
+      - /srv/lendisk:/var/lib/lendisk   # lendisk.db and run/ only; objects are in Garage
+    healthcheck:
+      test: ["CMD", "lendisk", "status", "--quiet"]
+      interval: 60s
+      timeout: 10s
+      retries: 3

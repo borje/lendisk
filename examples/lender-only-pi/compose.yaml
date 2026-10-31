@@ -1,0 +1,26 @@
+# Carla: lender-only profile (PEER-9) on a Raspberry Pi 4 with a USB disk.
+# Backs up nothing, lends to two friends. Nothing listens on loopback
+# except metrics; there is no replication worker and no external replica,
+# so no env_file is needed.
+
+services:
+  lendisk:
+    image: ghcr.io/lendisk/lendisk:0.10     # multi-arch: arm64 for the Pi 4 (COMPAT-2)
+    container_name: lendisk
+    restart: unless-stopped
+    network_mode: host
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      LENDISK_CONFIG: /etc/lendisk/lendisk.toml
+    volumes:
+      - ./config:/etc/lendisk
+      - /mnt/usb/lendisk:/var/lib/lendisk   # ext4 on the USB disk: xattrs required (EP-12)
+    healthcheck:
+      test: ["CMD", "lendisk", "status", "--quiet"]
+      interval: 60s
+      timeout: 10s
+      retries: 3

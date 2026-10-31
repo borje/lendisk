@@ -1,0 +1,36 @@
+# Carla · lender-only · DESIGN.md v0.10.1
+#
+# `lendisk init --lender-only` wrote role = "lender". The tool-facing
+# endpoint and the borrower-side machinery are off; `lendisk status`
+# shows only lent space (PEER-9). Carla then ran:
+#   lendisk invite --quota 500G --retention 60d     # Anna
+#   lendisk invite --quota 200G --retention 60d     # Dag
+
+role = "lender"
+
+[endpoint]
+# No `listen`: nothing on loopback in this profile (PEER-9 AC).
+metrics = "127.0.0.1:9100"
+
+[store]
+backend          = "posix"
+path             = "/var/lib/lendisk/store"   # on the USB disk; lent-<id>-<sealed> directories (SEC-16)
+free_space_floor = "5%"
+
+[tunnel]
+port   = 9000
+region = "ams"
+
+[relays]
+map_url           = "https://relays.lendisk.example/derpmap.json"
+accept_peer_hints = false
+
+[lending]
+retention_min = "60d"        # Carla's window is longer than the 30-day default
+global_cap    = "700G"       # the disk is 1 TB; keep headroom for versions (RET-1)
+
+[alerts]
+command = "/etc/lendisk/hooks/ntfy.sh"
+
+[log]
+level = "info"

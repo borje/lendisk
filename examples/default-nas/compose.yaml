@@ -1,0 +1,39 @@
+# Anna: the default install on a Synology-class NAS behind home NAT.
+# Plain files on the NAS volume, restic, replicas at two friends and a
+# Backblaze B2 bucket. One service, one binary, no child process.
+
+services:
+  lendisk:
+    image: ghcr.io/lendisk/lendisk:0.10
+    container_name: lendisk
+    restart: unless-stopped
+
+    # tailcat must see the real network: behind Docker's bridge the node
+    # would be two NATs deep and hole punching would mostly fail (G-1).
+    # It also makes 127.0.0.1:9000 the host's loopback, where restic looks.
+    network_mode: host
+
+    # OPS-7: unprivileged. The uid must own ./config and the store volume.
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+
+    environment:
+      LENDISK_CONFIG: /etc/lendisk/lendisk.toml
+
+    # Third-party credentials only ever come from the environment (SEC-3).
+    # Keep this file root-owned, mode 0600, outside the config volume.
+    env_file:
+      - lendisk.env
+
+    volumes:
+      - ./config:/etc/lendisk               # identity key, bucket keys, lendisk.toml (0700)
+      - /volume1/lendisk:/var/lib/lendisk   # store/ as plain files, lendisk.db, run/
+
+    healthcheck:
+      test: ["CMD", "lendisk", "status", "--quiet"]
+      interval: 60s
+      timeout: 10s
+      retries: 3

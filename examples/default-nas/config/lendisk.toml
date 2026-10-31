@@ -1,0 +1,62 @@
+# Anna · default install · DESIGN.md v0.10.1
+#
+# Peers and buckets are not here: `lendisk invite`, `lendisk peer add`
+# and `lendisk bucket add` create them and they live in lendisk.db.
+# After init, Anna ran:
+#   lendisk bucket add laptop --profile restic --replicas bjorn,carla,b2 --min-replicas 2
+#   lendisk invite --quota 500G --retention 30d        # once for Björn, once for Dag
+
+role = "full"
+
+[endpoint]
+listen  = "127.0.0.1:9000"   # S3 for restic and Kopia on this host (EP-1, EP-5)
+metrics = "127.0.0.1:9100"   # Prometheus (OPS-4)
+
+[store]
+# One store serves both roles (D15): Anna's own buckets and every
+# lent-<id>-<sealed> buckets her friends write sit side by side as plain files.
+backend          = "posix"
+path             = "/var/lib/lendisk/store"
+free_space_floor = "5%"      # LEND-2: refuse borrowers' writes below this
+
+[tunnel]
+port   = 9000                # inside the WireGuard tunnel; lender-facing S3 + control API
+region = "ams"               # DERP bootstrap region chosen at init; part of the address (SEC-14)
+
+[relays]
+map_url           = "https://relays.lendisk.example/derpmap.json"
+accept_peer_hints = false    # NET-5a: only relays Anna configured may see her traffic
+
+[lending]
+retention_min = "30d"        # RET-1: borrowers may ask for longer, never shorter
+global_cap    = "1200G"      # LEND-1: optional cap on total lent space
+
+[replication]
+upload_limit   = "20M"       # REPL-7: global cap on upstream bandwidth
+schedule       = "01:00-07:00, 12:00-13:00"   # when replication may run
+part_size      = "16M"       # REPL-6: multipart part, resumes at the next part
+
+[replication.peer_limits]
+bjorn = "8M"                 # REPL-7: Björn is relayed through DERP; be gentle
+
+# External replica (S3-1). Credential from the environment:
+#   LENDISK_REPLICA_B2_ACCESS_KEY / LENDISK_REPLICA_B2_SECRET_KEY
+# Use an application key WITHOUT delete permission (S3-5); the bucket
+# has versioning on and a lifecycle rule hiding versions after 30 days
+# (S3-4), which `replica add` checked and offered to create.
+[[replica]]
+name         = "b2"
+type         = "s3"
+endpoint     = "https://s3.eu-central-003.backblazeb2.com"
+region       = "eu-central-003"
+bucket       = "anna-lendisk"
+prefix       = "laptop"
+max_bytes    = "300G"        # S3-7: alert at 90%, pause at 100%
+price_per_gb = 0.006         # S3-7: status shows an estimated monthly cost
+
+[alerts]
+command = "/etc/lendisk/hooks/ntfy.sh"    # OPS-3: receives JSON on stdin
+webhook = "https://hc-ping.com/your-uuid" # OPS-3: healthchecks.io style
+
+[log]
+level = "info"               # OPS-5: structured, to stdout

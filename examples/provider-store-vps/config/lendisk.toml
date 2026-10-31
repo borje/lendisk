@@ -1,0 +1,50 @@
+# Dag · store is a Hetzner Object Storage bucket · DESIGN.md v0.10.1
+#
+# After init:
+#   lendisk bucket add kopia-dag --profile kopia --replicas anna,carla
+#   lendisk invite --quota 400G --retention 30d     # Björn
+#
+# Probe result recorded at init: versioning yes, lifecycle yes, object
+# lock yes, checksum verification yes, conditional PUT yes, server-side
+# copy yes. Björn's replica here is "retention: store-enforced"; Björn
+# never sees the Hetzner credential (PEER-8, SEC-3).
+
+role = "full"
+
+[endpoint]
+listen  = "127.0.0.1:9000"
+metrics = "127.0.0.1:9100"
+
+[store]
+backend  = "s3"
+endpoint = "https://fsn1.your-objectstorage.com"
+region   = "fsn1"
+# Not on the local network: `init` and `store set` warn (EP-16). Backups
+# from tools on this VPS run at the VPS-to-Hetzner link speed.
+allow_remote = true
+
+[tunnel]
+port   = 9000
+region = "fra"
+
+[relays]
+map_url           = "https://relays.lendisk.example/derpmap.json"
+accept_peer_hints = false
+
+[peers.addresses]
+# NET-3: Dag has a static public address; friends can be told to dial it
+# directly by adding it to their peer record. Nothing to set on Dag's side.
+
+[lending]
+retention_min = "30d"
+global_cap    = "400G"
+
+[replication]
+upload_limit = "50M"
+schedule     = "always"
+
+[alerts]
+webhook = "https://hc-ping.com/your-uuid"
+
+[log]
+level = "info"
