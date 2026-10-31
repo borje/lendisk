@@ -1,11 +1,12 @@
 # lendisk — requirements
 
-Status: draft v0.9.1, 2026-10-30. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.9.2, 2026-10-31. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
 own and its friends' buckets alike (EP-16); v0.9.1 reads third-party
-credentials from the environment (SEC-3). The design
+credentials from the environment (SEC-3); v0.9.2 lets backup tools on
+other machines on the local network use the node (EP-17). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -195,7 +196,9 @@ credit and no accounting beyond showing each side what they give and get
 - A single service for Linux, with every binary it needs shipped
   together, plus a container image for NAS appliances (COMPAT-2).
 - CLI plus one configuration file (OPS-6). No GUI and no web UI in v1.
-- macOS, Windows and FreeBSD are post-v1.
+- macOS, Windows and FreeBSD are post-v1 as platforms for the node. A
+  backup tool on any operating system may use a node over the local
+  network (EP-17).
 
 *Rationale:* the first users already run restic and a homelab. A GUI would
 double the surface for no change in the core problem.
@@ -285,7 +288,8 @@ double the surface for no change in the core problem.
 ### 4.3 Endpoint and local store
 
 - **EP-1** The node shall expose an S3-compatible endpoint to backup
-  tools, reachable from the local machine only. AC: restic's and Kopia's
+  tools, reachable from the local machine, and from other machines only
+  where the user enables it (EP-17). AC: restic's and Kopia's
   S3 backends, `rclone` and the AWS CLI all work with path-style
   addressing; `restic check --read-data` and `kopia repository
   validate-provider` pass.
@@ -304,7 +308,11 @@ double the surface for no change in the core problem.
   the S3 one; restic's S3 backend covers every use and the second
   endpoint added a credential, a listener and a test matrix for nothing.
   The ID is not reused.
-- **EP-5** The endpoint shall never listen on a non-loopback interface.
+- **EP-5** The endpoint shall listen on loopback only, unless the user
+  configures a network address for it (EP-17). No default, upgrade or
+  migration shall add a non-loopback listener the user did not
+  configure. AC: with no EP-17 address configured, `ss -lntp` shows the
+  endpoint on loopback only, on a fresh install and after an upgrade.
 - **EP-6** Buckets shall be created with `lendisk bucket add <name>
   --profile restic|kopia|generic --replicas peerA,peerB [--min-replicas
   N] [--mode full|evict]`. The command creates the bucket in the store,
@@ -377,6 +385,47 @@ double the surface for no change in the core problem.
   store on an S3 server on the LAN, scenarios 1, 7 and 10 pass, with
   scenario 7's lendisk-free read done by any S3 client against that
   server.
+- **EP-17** The user may configure the endpoint to listen on one or more
+  network addresses in addition to loopback (`endpoint.listen`, with
+  flag and env var equivalents, OPS-6), so that backup tools on other
+  machines on the local network use the node. Each must be a specific
+  address or interface; a wildcard address is refused. On a
+  non-loopback address:
+  - the endpoint shall be able to serve TLS, with a certificate the
+    user supplies or one the node generates, in which case it tells
+    the user what the backup tool needs in order to trust it. TLS is
+    the default; the user may turn it off per address. With TLS on, a
+    plaintext request is refused;
+  - with TLS off, configuring the address shall warn that request
+    metadata and object contents cross the network unencrypted, and
+    that only restic and Kopia buckets are protected by the backup
+    tool's own encryption (EP-8); `status` shall label the listener
+    "plaintext";
+  - every request shall carry a valid per-bucket credential (EP-6), as
+    on loopback; there is no anonymous access;
+  - `bucket add` shall print the configuration lines for the network
+    address as well as for loopback, and `status` shall list every
+    non-loopback listener.
+
+  The setting is refused in the lender-only profile (PEER-9). A backup
+  from another machine finishes at the speed of that machine's link to
+  the node rather than at local disk speed; it is still a backup to the
+  local copy, and offsite state is tracked as for any other (P-4).
+  AC: scenario 11 passes with TLS on and with TLS off; with TLS on a
+  plaintext request is refused; on either, a request without a valid
+  bucket credential is refused.
+
+  *Rationale:* the typical node is a household NAS, and the machines
+  that need backing up are the laptops around it. A tunnel to the
+  node's loopback works but has to be up for every scheduled backup.
+  Enabling a network address exposes the local copy to any machine on
+  that network holding a bucket credential; it does not weaken the
+  offsite guarantees, which rest on the lenders (P-7, RET-2). TLS is
+  not mandatory because restic and Kopia already encrypt and
+  authenticate what they store, the request signature never carries
+  the secret key, and on a home network a certificate every client
+  has to be told to trust is often more friction than the threat
+  warrants; the user decides, and `status` keeps the choice visible.
 
 ### 4.4 Replication
 
@@ -584,8 +633,10 @@ double the surface for no change in the core problem.
 - **SEC-2** Metadata a lender can observe, and that the product accepts
   leaking: object sizes and counts, timing of backups, borrower IP address
   unless relayed. This shall be documented for users.
-- **SEC-3** Secrets on disk shall be limited to the identity key and
-  the per-bucket endpoint credentials the node itself issues, mode 0600
+- **SEC-3** Secrets on disk shall be limited to the identity key, the
+  per-bucket endpoint credentials the node itself issues and the
+  private key of the endpoint's TLS certificate where one is used
+  (EP-17), mode 0600
   under the node's own directories. Third-party credentials, meaning
   the credential of a named S3 service used as the store (EP-16) and
   the credentials of external replicas (S3-1), shall be read from
@@ -612,14 +663,16 @@ double the surface for no change in the core problem.
   peer protocol, and every operation the underlying store could expose,
   against A and C; everything outside the NET-7 list is refused.
 - **SEC-8** The daemon shall expose no listener beyond those this
-  document names: the tool-facing endpoint and metrics on loopback
-  (EP-1, OPS-4) and the lender-facing service on the peer connection
-  (NET-7).
+  document names: the tool-facing endpoint on loopback and on any
+  network address the user configures for it (EP-1, EP-5, EP-17),
+  metrics on loopback (OPS-4) and the lender-facing service on the peer
+  connection (NET-7).
   Administrative, web or other auxiliary listeners of any embedded or
   bundled component shall be disabled, and a listener a bundled
   component cannot run without shall bind loopback or a unix socket
   only. AC: `ss -lntp` shows no lendisk or storage-engine listener on a
-  non-loopback address.
+  non-loopback address other than the endpoint addresses configured
+  under EP-17.
 - **SEC-9** The lender-facing surface shall be deny-by-default: the
   decorating layer admits the NET-7 list and nothing else, and every
   operation of the underlying store shall be classified as admitted,
@@ -842,9 +895,27 @@ current design (component behaviour, API assumptions) are in DESIGN.md
     snapshots` lists A's snapshots held at B. B's daemon refuses `restic
     prune`'s attempt to remove tombstoned data (RET-2) and refuses every
     operation outside the NET-7 list (SEC-9).
+11. **Backup from another machine.** A runs on a NAS. The user sets
+    `endpoint.listen` to the NAS's LAN address and adds bucket `laptop
+    --profile restic` with replica B; `bucket add` prints the lines for
+    that address, including how restic trusts the certificate. On a
+    laptop on the same LAN, `restic backup` against the NAS's address
+    succeeds, and `lendisk status` on A shows the snapshot
+    offsite-complete at B. `restic restore latest` from the laptop
+    succeeds. A plaintext request to that address is refused. With TLS
+    turned off for the address, the same backup and restore succeed
+    over plain HTTP and `status` labels the listener "plaintext".
 
 ## 8. Changes
 
+- **v0.9.2 (2026-10-31)** Backup tools on other machines. EP-17 added:
+  the user may give the endpoint network addresses besides loopback,
+  with per-bucket credentials and TLS by default (plaintext if the
+  user turns it off, labelled in `status`), so laptops can back up to
+  a NAS node. EP-5 changes meaning from "never" to "loopback
+  unless the user configures EP-17"; EP-1, SEC-8 and its AC, and P-9
+  reworded to match. SEC-3 admits the endpoint's TLS private key.
+  Scenario 11 added. No other requirement changed meaning.
 - **v0.9.1 (2026-10-30)** Third-party credentials come from the
   environment. SEC-3 now limits secrets on disk to the identity key and
   the node's own per-bucket credentials; the store credential (EP-16)

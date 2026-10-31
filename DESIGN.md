@@ -1,8 +1,10 @@
 # lendisk — design
 
-Status: draft v0.10.1, 2026-10-30. Companion to REQUIREMENTS.md v0.9.1,
+Status: draft v0.10.2, 2026-10-31. Companion to REQUIREMENTS.md v0.9.2,
 which made the two requirement changes this design needed (Q-T,
-resolved) and then moved third-party credentials to the environment.
+resolved), then moved third-party credentials to the environment, and
+then let backup tools on other machines use the node (EP-17; the LAN
+bridge, §3.3).
 
 ## 0. How to read this document
 
@@ -76,7 +78,7 @@ feature:
 
 | Role | Requirements | What they stress | Served by |
 |---|---|---|---|
-| **Local store**: the node's own copy, written by the user's backup tool | EP-1 to EP-15, P-5 | Synchronous and protocol-critical: full S3 behaviour for restic and Kopia, crash-safe exactly-once capture with no buffering, 200 MB/s, loopback only. The writer is trusted. | versitygw with the decorator's capture policy (D4, D15) |
+| **Local store**: the node's own copy, written by the user's backup tool | EP-1 to EP-15, P-5 | Synchronous and protocol-critical: full S3 behaviour for restic and Kopia, crash-safe exactly-once capture with no buffering, 200 MB/s, loopback only unless the user enables the LAN bridge (EP-17). The writer is trusted. | versitygw with the decorator's capture policy (D4, D15) |
 | **Replication**: moving each object to every replica | REPL-1 to REPL-11, §4.11, NET-2 to NET-5 | Asynchronous and robustness-critical: strict FIFO per replica, survival of days-long outages, resume, rate limits, a hash per object, reach behind NAT and to providers. Almost no S3 semantics. | an in-process S3 client (minio-go) driven by lendisk's queue (D12), dialling friends through tailcat (D5) |
 | **Lending store**: a friend's copy, written by a borrower who may be compromised | LEND-1 to LEND-7, RET-1 to RET-3, VER-1, NET-7, SEC-4 to SEC-15 | Enforcement-critical: quota, immutability, retention the borrower cannot bypass, a deny-by-default operation list, isolation between borrowers. | versitygw with the decorator's lender policy (D12, D15), behind the tunnel bridge (§3.7) |
 
@@ -102,7 +104,11 @@ what the decorator already exposes.
   binary and is one compose service. `network_mode: host` is
   recommended so the overlay is not behind a second NAT (G-1), and so
   `127.0.0.1:9000` is the host's loopback, which is where the backup
-  tool on the host looks. The image runs as an unprivileged user with
+  tool on the host looks. With host networking, an `endpoint.listen`
+  address (EP-17) is the host's own LAN address and needs no port
+  mapping; on a bridge network it is the container's address and the
+  user publishes that port on the host's LAN address, never on
+  `0.0.0.0`. The image runs as an unprivileged user with
   all capabilities dropped and a read-only root; the config directory
   and the data directory are the only volumes, and third-party
   credentials arrive as environment variables, not files (SEC-3). A
@@ -789,6 +795,45 @@ Q-V.
 - **EP-1** Embedded versitygw (D15) over the decorated backend,
   listening on `127.0.0.1:9000`. No unix socket: no backup tool can use
   one. Path-style addressing is versitygw's default.
+- **EP-5** versitygw is given `127.0.0.1:9000`, the internal
+  `tunnel.sock` (§3.7) and nothing else, whatever the configuration
+  says; network addresses are served only by the LAN bridge (EP-17),
+  so no versitygw option or default can open one.
+- **EP-17** The LAN bridge. versitygw is not given the network
+  addresses: its TLS settings apply to every listener it runs, which
+  would put the loopback listener behind TLS too, and a per-address
+  TLS choice is what EP-17 asks for. Instead lendisk listens on each
+  `[[endpoint.listen]]` entry itself (`address = "192.168.1.10:9000"`
+  or `interface = "eth0"` with a port; `tls = "generate"`, the
+  default, `"files"` with `cert` and `key` paths, or `"off"`). An
+  interface name is resolved to its addresses at start and on change;
+  `0.0.0.0`, `::` and an empty host are refused at config load. Each
+  accepted connection is served as HTTP (after a `crypto/tls`
+  handshake where TLS is on; a plaintext request on a TLS port gets
+  the TLS alert, nothing is proxied) and every request is proxied,
+  unbuffered, to versitygw's loopback listener with the `Host` header
+  and every signed header unchanged, as the tunnel bridge does (§3.7,
+  Q-G). versitygw verifies the signature against the per-bucket
+  credential exactly as on loopback; lendisk adds no check of its own
+  and needs none, since the writer is trusted (§2). A request under
+  `/_lendisk/` is refused on this bridge. With `tls = "generate"`,
+  lendisk creates a self-signed ECDSA P-256 certificate whose SANs are
+  the configured addresses and the host name, valid ten years, at
+  `<config>/endpoint.crt` with its key at `<config>/endpoint.key`
+  (0600); it is regenerated when the address set changes, and
+  `lendisk endpoint cert` prints its path and SHA-256 fingerprint.
+  `bucket add` prints, for each network address, `restic -r
+  s3:https://<address>/<bucket>` with `--cacert <path to a copy of
+  endpoint.crt>` for a generated certificate, or `s3:http://…` with the
+  plaintext warning for `tls = "off"`. With TLS off the request is
+  still SigV4-signed, and restic and Kopia send the `aws-chunked`
+  streaming form, which signs every chunk, so a machine on the LAN can
+  read object bytes and replay a captured request for up to SigV4's
+  15-minute window, but cannot forge one or learn the secret key.
+  Contents of restic and Kopia buckets are encrypted by the tool;
+  `generic` buckets are not, which is what the warning says.
+  In the lender-only profile (PEER-9) an `endpoint.listen` entry is
+  refused at config load.
 - **EP-2** The decorator enqueues on a successful `PutObject` or
   `CompleteMultipartUpload`, and a delete on a successful
   `DeleteObject` or each successful entry of `DeleteObjects`. Parts and
@@ -1038,7 +1083,9 @@ Q-V.
   Store settings are one `[store]` section (`backend = "posix"` with a
   `path`, or `backend = "s3"` with endpoint; its credential comes from
   the environment, SEC-3), used for both roles; replication settings,
-  including the limits and the timetable, are `[replication]`.
+  including the limits and the timetable, are `[replication]`; network
+  addresses for the endpoint are `[[endpoint.listen]]` entries (EP-17),
+  none by default.
 - **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the
   replica client included); active RSS adds one part buffer (16 MiB by
   default) per transfer in flight. Q-M measures both.
@@ -1061,17 +1108,24 @@ Q-V.
   `status`, and refuses to start a store or replica whose variables
   are unset. Replica credentials are also carried in the encrypted
   node manifest (S3-1) for recovery. They are read by the process that
-  uses them and never passed to another.
+  uses them and never passed to another. The endpoint's TLS key
+  (EP-17), where TLS is on, is `<config>/endpoint.key` at mode 0600
+  when generated; a user-supplied key stays at the path the config
+  names, and lendisk refuses to start if that file is readable by
+  anyone but the service user. It is not in the manifest: a recovered
+  node generates a new certificate, and clients are given the new one.
 - **SEC-7** The hostile-peer test exercises every S3 operation through
   the tunnel bridge and every control API endpoint, from an allowed
   peer's identity and from an unknown one.
 - **SEC-8** versitygw's admin API, web UI and website endpoints are not
-  configured. lendisk's listeners are loopback S3 (TCP), loopback
+  configured. lendisk's listeners are loopback S3 (TCP), the LAN
+  bridge on each configured `endpoint.listen` address (EP-17), loopback
   metrics, the tailcat tunnel (one port inside it), the internal
   `tunnel.sock`, and the loopback listener `peer forward` opens while
   that command runs (NET-7b). There is no child process and no other
-  socket. Every listener is one REQUIREMENTS.md names, so SEC-8 needs
-  no change. Checked with `ss -lntp` and `ss -lxp`.
+  socket. Every listener is one REQUIREMENTS.md names (SEC-8 as
+  reworded in v0.9.2 for EP-17). Checked with `ss -lntp` and `ss
+  -lxp`, with and without an `endpoint.listen` entry.
 - **SEC-9** The classification table covers every `backend.Backend`
   method at the pinned versitygw version, each marked admitted,
   refused or unreachable for a borrower's account, with a test that
@@ -1293,7 +1347,10 @@ design and disappear with it.
   through versitygw and the decorator on `posix` on NVMe (EP-13, 200
   MB/s) and on a Raspberry Pi 4, including chunk-signature
   verification, and the replication rate from the store to a friend
-  through the replica client and the tunnel on the Pi.
+  through the replica client and the tunnel on the Pi. Also the LAN
+  bridge (EP-17) on the Pi over gigabit, with TLS on and off, to see
+  whether the extra proxy hop or the TLS cost, not the link, is the
+  limit.
 - **Q-M (gate, open, measured with G-3)** Idle and active RSS of lendisk
   with a 1 TiB, 500k-object store and 10 peers, against OPS-7's 256 MiB
   idle, and with four transfers in flight.
