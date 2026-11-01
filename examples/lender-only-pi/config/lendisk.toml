@@ -1,9 +1,11 @@
-# Carla · lender-only · DESIGN.md v0.10.1
+# Carla · lender-only · DESIGN.md v0.11
 #
-# `lendisk init --lender-only` wrote role = "lender". The tool-facing
-# endpoint and the borrower-side machinery are off; `lendisk status`
-# shows only lent space (PEER-9). Carla then ran:
-#   lendisk invite --quota 500G --retention 60d     # Anna
+# `lendisk init --lender-only` wrote role = "lender": a node with no
+# buckets yet (PEER-9). The tool-facing endpoint and the borrower-side
+# machinery are off. Her friendships are symmetric like anyone's, so
+# Anna and Dag lend her the same amount back; it stays unused until
+# she adds a bucket, and `lendisk status` shows it as unused. Carla ran:
+#   lendisk peer add <Anna's invite>                # 250 GB each way
 #   lendisk invite --quota 200G --retention 60d     # Dag
 
 role = "lender"
@@ -27,7 +29,8 @@ accept_peer_hints = false
 
 [lending]
 retention_min = "60d"        # Carla's window is longer than the 30-day default
-global_cap    = "700G"       # the disk is 1 TB; keep headroom for versions (RET-1)
+max_total     = "700G"       # the disk is 1 TB; keep headroom for versions (RET-1)
+max_per_peer  = "350G"
 
 [alerts]
 command = "/etc/lendisk/hooks/ntfy.sh"

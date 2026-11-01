@@ -1,13 +1,16 @@
 # lendisk — requirements
 
-Status: draft v0.9.3, 2026-10-31. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.10, 2026-11-01. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
 own and its friends' buckets alike (EP-16); v0.9.1 reads third-party
 credentials from the environment (SEC-3); v0.9.2 lets backup tools on
 other machines on the local network use the node (EP-17); v0.9.3 hides
-bucket names from lenders (SEC-16). The design
+bucket names from lenders (SEC-16); v0.10 replaces per-bucket replica
+lists with copies placed across a pool of friends, makes every
+friendship one symmetric quota, and turns external S3 buckets into
+overflow for what friends cannot hold. The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -39,8 +42,11 @@ the requirement; the binary name is a working title (DESIGN.md §1).
 lendisk lets a small group of people who know each other lend each other disk
 space for offsite backups. Each participant runs one node. A backup tool
 (restic, Kopia, or anything that speaks S3) talks to the node as if it were
-an ordinary S3 endpoint. The node keeps a local copy of the repository and replicates it to the peers who
-have lent you space, over an overlay network that works behind NAT.
+an ordinary S3 endpoint. The node keeps a local copy of the repository
+and spreads offsite copies of it over the friends you lend space to and
+who lend space to you, over an overlay network that works behind NAT.
+Your own disk is what you pay with: you lend roughly as much as your
+copies take up at your friends.
 
 The person holding your copy never needs to be trusted with your data: the
 backup tool encrypts and authenticates everything before it leaves your
@@ -68,13 +74,19 @@ Original requirements this document grew from:
 | **Local store** | The node's own copy of its buckets, held in the storage engine. One per node, never shared. |
 | **Bucket** | One backup repository as the backup tool sees it: a namespace of keys in the local store. Formerly "repo". |
 | **Tool profile** | Per-bucket setting (`restic`, `kopia`, `generic`) that selects validation rules and what "snapshot" means. |
-| **Replica** | A copy of a bucket held by one lender or in one external S3 bucket. |
-| **Replication set** | The replicas a bucket is replicated to. |
-| **Offsite-complete** | A point in a bucket's write sequence up to which every object is acknowledged by at least `min_replicas` replicas. Tool profiles map this to "snapshot X is offsite". |
+| **Friendship** | The relationship between two peers who lend to each other. It has one quota, the same in both directions (P-8). |
+| **Symmetric quota** | The one number of a friendship: what each side lends the other. |
+| **Pool** | Everywhere a node can place its copies: its friends, plus any overflow targets. |
+| **Overflow target** | An external S3-compatible bucket that holds only the copies a node's friends cannot hold (§4.11). Never a complete repository by design. |
+| **Copies** | Per-bucket setting `copies` (default 2): how many distinct places in the pool must hold each object. A **copy** is one such instance, at one friend or one overflow target. |
+| **Placement** | Which friends or overflow targets hold each object of a bucket. Metadata objects are placed everywhere; data objects on `copies` places (REPL-12). |
+| **Replica** | What one friend or overflow target holds of a bucket: all its metadata and the data objects placed there. Since v0.10 a replica is not, by itself, a complete repository. |
+| **Offsite-complete** | A point in a bucket's write sequence up to which every object is acknowledged by `copies` distinct places in the pool. Tool profiles map this to "snapshot X is offsite". |
+| **Protectable size** | The largest repository a node's pool can hold at `copies` copies, given its friends' quotas and repository sizes (LEND-7). |
 | **Object** | One key in a bucket with its bytes. For restic, a key such as `data/ab/abcd…`. |
 | **Tombstone** | A deleted object the lender keeps for the retention window. |
 | **Recovery phrase** | 24 words from which the identity is derived. |
-| **Node manifest** | An encrypted record of a node's peers and buckets, stored on every lender for recovery. |
+| **Node manifest** | An encrypted record of a node's friends, overflow targets and buckets, stored on every lender for recovery. |
 | **Lending store** | The lender's copy of borrowers' buckets, each reachable only by the borrower it belongs to, over the peer connection. |
 | **Peer protocol** | Everything that crosses between two nodes: the replica operations (NET-7), challenges, manifest, quota and version exchange. |
 
@@ -97,26 +109,29 @@ for a week") solves availability for a circle of 2–10 friends.
 ### P-2. Trust is pairwise, directional and never transitive
 
 There is no group, no network and no shared membership list. Each node
-holds a set of pairwise relationships, each one created by one invite and
-each one pointing one way (lender → borrower). Nothing a node does is
-visible to, or depends on, a node it has no relationship with.
+holds a set of pairwise friendships, each one created by one invite.
+A friendship has two directions (A's data at B, B's data at A), and
+each node is the only one that decides where its own data goes. Nothing
+a node does is visible to, or depends on, a node it has no friendship
+with.
 
 Concretely, with four people A, B, C and D:
 
-- A can lend to B and C and never hear of D. If B also lends to D, A's
-  data and D's data sit apart on B, each reachable only with its owner's
+- A can be friends with B and C and never hear of D. If B is also
+  friends with D, A's data and D's data sit apart on B, each reachable only with its owner's
   identity (PEER-8). A and D never connect, are never listed to each
   other, and cannot tell that the other exists.
 - A lender never forwards. B does not replicate A's data onward to C or D,
-  even if B trusts them. If A wants a second copy, A invites C directly.
-  This rules out "re-replicate automatically when a peer disappears"; the
-  replacement is an alert and a manual invite (OPS-2).
-- A can lend to B without B lending to A. Mutual lending is two invites;
-  `--mutual` creates both in one handshake but they stay two
-  relationships that can be revoked separately.
+  even if B trusts them. When B disappears, A's own node places the
+  copies B held onto A's other friends (REPL-13); B is never asked to.
+  A new invite is needed only when A's pool has run out of room (OPS-2).
+- Every friendship is mutual, with one quota for both directions (P-8).
+  One invite creates it and one removal ends it. A node that backs up
+  nothing yet still has symmetric friendships; it just leaves its half
+  unused (PEER-9).
 - A's node manifest (ID-4) is encrypted to A's key and stored on A's
-  lenders. It lists A's peers; B can see that a manifest exists and its
-  size, not its contents.
+  lenders. It lists A's friends; B can see that a manifest exists and
+  its size, not its contents.
 - The only transitive exposure is the relay. If A reaches B through a
   relay D runs, D sees A's and B's IP addresses and traffic volume, and
   nothing else: the connection is encrypted end to end between A and B,
@@ -124,8 +139,8 @@ Concretely, with four people A, B, C and D:
   which relays its node will use (NET-5a) and can refuse any relay it
   does not trust with that metadata.
 
-For a fully mutual group of n friends this costs n(n−1)/2 `--mutual`
-invites: ten for five people. That is accepted: a "group invite" would be
+For a group of n friends who all lend to each other this costs
+n(n−1)/2 invites: ten for five people. That is accepted: a "group invite" would be
 transitive trust by another name.
 
 *Rationale:* a shared group key or a signed membership list held by an
@@ -150,17 +165,25 @@ separately (§4.4). A lender being offline has no effect on a backup
 
 ### P-5. Zero lock-in on both sides
 
-With no lendisk running anywhere, the borrower's local copy and each
-lender's replica are each readable by the backup tool through the
-storage engine alone: an unmodified, freely available open-source
-program, started on the same directories, with the steps in the user
-guide, or, where the store is an S3 service the user named (EP-16),
-any S3 client with the store's credential (LEND-6, EP-15, scenario 7).
-Each copy can also be written out as
-plain files in the backup tool's own on-disk layout (`lendisk export`,
-REPL-8, LEND-6), and a lender can hand you a disk. An external S3
-replica is likewise a repository the tool opens with no lendisk
-installed (S3-2).
+With no lendisk running anywhere, the borrower's local copy is readable
+by the backup tool through the storage engine alone: an unmodified,
+freely available open-source program, started on the same directories,
+with the steps in the user guide, or, where the store is an S3 service
+the user named (EP-16), any S3 client with the store's credential
+(LEND-6, EP-15, scenario 7). Each lender's replica is readable the
+same way, and holds every metadata object of the bucket and the data
+objects placed there (REPL-12).
+
+The offsite copies together are a complete repository: with `copies`
+= c and the bucket spread over N friends and overflow targets, the
+replicas of any N − c + 1 of them hold every object. Copying their
+keys into one place (a plain union: the same key always has the same
+bytes, EP-11) gives a repository the backup tool opens with no lendisk
+installed. Each replica can be written out as plain files in the
+backup tool's own on-disk layout (`lendisk export`, REPL-8, LEND-6),
+so enough lenders can each hand you a disk and the union of those
+disks is your repository. An overflow target's objects are in the
+tool's layout too (S3-2).
 
 *Rationale:* v0.7 required plain files readable with nothing running.
 v0.8 relaxed this to admit a storage engine with its own on-disk
@@ -171,12 +194,19 @@ the user and their bytes. v0.9 admits an S3 service the user names as
 the store, so that someone who already runs or pays for one keeps
 their own and their friends' data in it; access is then standard S3
 with the user's own credential, as S3-2 already promises for an
-external replica.
+external replica. v0.10 gave up "one lender's replica is a complete
+repository" so that a bucket's copies can be spread over a pool by
+capacity instead of mirrored to named friends (REPL-12): a restore
+without lendisk now needs N − c + 1 replicas instead of one. The
+promise kept is the same: plain keys in the tool's own layout, readable
+with free software and nothing of lendisk's.
 
 ### P-6. Recovery needs the phrase, one lender's address and the backup tool's password
 
 Nothing else needs to be kept or remembered. Everything else about a
-node is rebuilt from what its lenders hold (ID-4, ID-5, NET-7a).
+node is rebuilt from what its lenders hold (ID-4, ID-5, NET-7a). The
+one lender's manifest names every other place in the pool; restoring
+every object needs enough of them reachable (P-5).
 
 ### P-7. Offsite data outlives the borrower's machine by the retention window
 
@@ -186,11 +216,33 @@ no operation that purges early, so an attacker who owns the borrower's
 machine can delete the local copy and queue deletes, but cannot destroy
 offsite data within the window (RET-1, RET-2, SEC-4).
 
-### P-8. No enforced reciprocity
+### P-8. Reciprocity is pairwise, and paid in disk
 
-A lender sets a quota per borrower at invite time. There is no ratio, no
-credit and no accounting beyond showing each side what they give and get
-(LEND-7). Friends sort this out themselves.
+Every friendship has one quota, and each side lends the other exactly
+that much (PEER-1, LEND-1). Each lender enforces it. Your disk is what
+you pay with: with a repository of size S kept at c copies, you need
+c × S at your friends and lend about c × S in return.
+
+The balance is per friendship and nowhere else. There is no ratio across
+friends, no credit, no ledger and nothing passed from one friendship to
+another: "E lends to A so that A lends to F" would be transitive trust
+by another name (P-2). Symmetry is on the agreed quota, not on what is
+used: a friend who backs up less than the quota allows leaves the rest
+of their half unused, and `status` shows it so the two can lower the
+number (LEND-7).
+
+The consequence for unequal sizes is accepted. A friend can usefully
+hold at most one copy of your repository, so a friend whose own backup
+is small can only take, and so only give, a small quota. A node is
+fully protected at c copies only while its repository is at most about
+1/c of its friends' repositories combined (LEND-7). Beyond that it
+needs more or bigger friends, or an overflow target that costs money
+instead of disk (§4.11).
+
+*Rationale:* v0.9 left reciprocity to the friends. Making each
+friendship one number that both sides lend keeps the accounting inside
+the pair, where P-2 wants it, and makes "you pay with your own disk"
+automatic: what you lend in total equals what you get.
 
 ### P-9. v1 audience: self-hosting Linux users, CLI only
 
@@ -219,52 +271,66 @@ double the surface for no change in the core problem.
   key kept in the config directory (mode 0600). The phrase itself is never
   stored.
 - **ID-4** Every node shall maintain a node manifest containing its peer
-  list (IDs and the hints needed to reach each peer), bucket list,
-  replication sets and settings. The manifest is encrypted with a key
+  list (IDs and the hints needed to reach each peer), its overflow
+  targets, its bucket list with each bucket's `copies`, and settings.
+  The placement of objects (REPL-12) is not in the manifest; it is
+  rebuilt by listing the replicas. The manifest is encrypted with a key
   derived from the identity and pushed to every lender whenever it
   changes.
 - **ID-5** `lendisk recover` shall rebuild a node from (a) the recovery
   phrase and (b) the address of any one lender: a single string that
   carries the lender's key and whatever is needed to reach it. It shall
-  fetch the manifest, re-establish all peers and list all buckets. AC: on
+  fetch the manifest, re-establish all peers and overflow targets, list
+  all buckets and rebuild the placement by listing every replica. AC: on
   a fresh VM with nothing but the phrase, one lender address and the
-  restic password, `restic restore` of the latest snapshot succeeds.
+  restic password, with the bucket spread over three friends at two
+  copies and one of them offline, `restic restore` of the latest
+  snapshot succeeds.
 - **ID-6** Recovery shall support read-through restore: `restic restore`
-  against the recovered node fetches objects from a lender on demand, with
-  no requirement to download the entire repository first. Fetched objects
-  are cached locally.
+  against the recovered node fetches each object on demand from any
+  reachable place that holds it, with no requirement to download the
+  entire repository first. Fetched objects are cached locally.
 - **ID-7** `lendisk recovery-sheet` shall print a page meant for paper:
-  the phrase, the node ID, the addresses of all lenders, the restore
-  commands, and for each bucket the name it has at its lenders
-  (SEC-16). It shall remind the user that the restic password is a
+  the phrase, the node ID, the addresses of all lenders and overflow
+  targets, the restore commands, for each bucket the name it has at its
+  lenders (SEC-16), and how many of the replicas a restore without
+  lendisk needs (N − c + 1, P-5). It shall remind the user that the restic password is a
   separate secret. The sheet shall be regenerated (and the user alerted)
   whenever a lender's address changes.
 
 ### 4.2 Peers and invites
 
-- **PEER-1** A lender shall create an invite with `lendisk invite --quota
-  500G [--retention 30d]`. The invite is a single string containing the
-  lender's address (its key and the hints needed to reach it), the
-  offered quota and a single-use secret valid for a configurable time
-  (default 7 days). The lender shall accept a connection from a node it
-  does not know only while that node presents an unexpired invite.
-- **PEER-2** A borrower shall redeem an invite with `lendisk peer add
-  <invite>`. The two nodes complete a mutual handshake; afterwards each
-  stores the other as a peer. AC: a replayed invite is rejected.
-- **PEER-3** The peer relationship shall be directional. A single invite
-  makes one side lender and the other borrower; mutual lending needs an
-  invite in each direction. The CLI should offer `--mutual` to generate
-  the reverse invite in the same handshake.
-- **PEER-4** `lendisk peer list` shall show for each peer: role(s), quota
-  given and used, quota received and used, reachability (direct/relayed/
-  offline), last seen, last verified, protocol version.
-- **PEER-5** Either side shall be able to end a relationship with
-  `lendisk peer remove`. Removal by the lender gives the borrower a notice
-  and starts the retention window; data is purged when it expires. Removal
-  by the borrower deletes the replica after the window.
-- **PEER-6** A lender shall be able to lower a borrower's quota. If the new
-  quota is below current use, the lender's daemon stops accepting new
-  objects and notifies both sides; nothing already stored is deleted.
+- **PEER-1** A node shall create an invite with `lendisk invite --quota
+  100G [--retention 30d]`. The invite is a single string containing the
+  inviting node's address (its key and the hints needed to reach it),
+  the symmetric quota offered and a single-use secret valid for a
+  configurable time (default 7 days). The node shall accept a connection
+  from a node it does not know only while that node presents an
+  unexpired invite.
+- **PEER-2** The invited node shall redeem an invite with `lendisk peer
+  add <invite>`, which shows the quota and asks the user to confirm that
+  they lend the same amount back. The two nodes complete a mutual
+  handshake; afterwards each stores the other as a friend with that
+  quota, lender and borrower at once. AC: a replayed invite is rejected.
+- **PEER-3** Every relationship shall be a friendship: mutual, with one
+  quota that each side lends the other (P-8). There are no one-way
+  relationships. Before v0.10 a relationship was directional and
+  `--mutual` created two; both are gone.
+- **PEER-4** `lendisk peer list` shall show for each friend: the quota,
+  how much of it each side uses, reachability (direct/relayed/offline),
+  last seen, last verified, protocol version, and the friend's
+  repository size as reported for LEND-7.
+- **PEER-5** Either side shall be able to end a friendship with
+  `lendisk peer remove`. Each side then holds the other's replica for
+  the retention window and purges it when the window expires; each side
+  is notified, and each side's node re-places the copies the other held
+  (REPL-13).
+- **PEER-6** Either side shall be able to lower a friendship's quota,
+  which lowers it in both directions; raising it needs both sides'
+  consent (LEND-8). If the new quota is below current use on either
+  side, that side's node stops accepting new objects from the other and
+  notifies both; nothing already stored is deleted, and the borrower's
+  node re-places what no longer fits (REPL-13).
 - **PEER-7** A node shall support at least 20 peers and 20 buckets.
 - **PEER-8** Each borrower's data on a lender shall be isolated from every
   other borrower's and from the lender's own, and addressable only with
@@ -274,18 +340,23 @@ double the surface for no change in the core problem.
 - **PEER-9** The binary shall support a lender-only profile (`lendisk init
   --lender-only`, or `role = "lender"` in config) that disables the
   tool-facing endpoints and the borrower-side machinery; the lender-facing
-  service still runs. It is the install for the friend who contributes a
-  disk and backs up nothing. AC: in this profile nothing listens on
-  loopback and `lendisk status` shows only lent space.
+  service still runs. It is the install for a node with no buckets: the
+  friend who contributes a disk and backs up nothing yet. Its
+  friendships are symmetric like any other (PEER-3); the space its
+  friends lend it back stays unused until it adds a bucket, which
+  needs no change to any friendship. AC: in this profile nothing
+  listens on loopback and `lendisk status` shows lent space and the
+  unused quota received.
 - **PEER-10** A node shall never disclose its peer list, or the existence
   of any peer, to another peer. There is no peer discovery, no gossip and
-  no "friends of friends". AC: with A→B and B→D relationships, A's node
+  no "friends of friends". AC: with friendships A–B and B–D, A's node
   has no record of D and D's has none of A, in logs, status output, the
   persisted state or on the wire.
 - **PEER-11** A lender shall never replicate a borrower's objects to any
   third node. Replication is initiated only by the owner of the data.
-- **PEER-12** Each relationship shall be revocable independently of any
-  other, including the two halves of a `--mutual` pair.
+- **PEER-12** Each friendship shall be revocable independently of any
+  other. A friendship is revoked as a whole; its two directions are not
+  revoked separately (PEER-3).
 
 ### 4.3 Endpoint and local store
 
@@ -316,14 +387,16 @@ double the surface for no change in the core problem.
   configure. AC: with no EP-17 address configured, `ss -lntp` shows the
   endpoint on loopback only, on a fresh install and after an upgrade.
 - **EP-6** Buckets shall be created with `lendisk bucket add <name>
-  --profile restic|kopia|generic --replicas peerA,peerB [--min-replicas
-  N] [--mode full|evict]`. The command creates the bucket in the store,
-  issues credentials scoped to it, and prints the configuration lines
-  for the chosen tool. `min_replicas` defaults to 1. When a bucket has
-  exactly one replica, `bucket add`, `status` and the daily summary shall
-  say so and recommend a second (a friend or an external S3 bucket,
-  §4.11); this nudge is suppressed once a second replica exists or the
-  user sets `min_replicas = 1` explicitly.
+  --profile restic|kopia|generic [--copies N] [--mode full|evict]`. The
+  command creates the bucket in the store, issues credentials scoped to
+  it, and prints the configuration lines for the chosen tool. The user
+  does not name the friends: copies are placed across the whole pool
+  (REPL-12). `copies` defaults to 2 and can be changed later; a change
+  places or removes copies to match (REPL-13). With `copies = 1`,
+  `bucket add`, `status` and the daily summary shall say that one lost
+  friend loses data and recommend 2; the nudge is suppressed when the
+  user sets `copies = 1` explicitly. When the pool has fewer than
+  `copies` places, `bucket add` shall say so (OPS-2).
 - **EP-7** Tool profiles shall define: how to recognise snapshot or
   manifest keys (restic: `snapshots/*`; Kopia: `xn*`/`xs*` manifest
   blobs and `kopia.repository`), which keys are metadata and never
@@ -336,13 +409,13 @@ double the surface for no change in the core problem.
 - **EP-9** Two storage modes shall exist per bucket. In `full` (default)
   the local copy is complete and restores never need a peer. In `evict`,
   pack objects shall be removed from the local store only after
-  `min_replicas` replicas have acknowledged them, and never while a tool
+  `copies` places have acknowledged them, and never while a tool
   lock is present (restic `locks/*`; Kopia has no server-side lock, so
   eviction waits for the bucket to be idle for a configurable interval).
   Metadata objects are never evicted.
-- **EP-10** Reads of an evicted or missing object shall be served from a
-  replica on demand through the endpoint, and the fetched object stored
-  locally.
+- **EP-10** Reads of an evicted or missing object shall be served on
+  demand through the endpoint from any reachable place that holds it,
+  and the fetched object stored locally.
 - **EP-11** Immutability policy: a write to a key that a replica has
   already acknowledged, with content whose hash differs, shall raise an
   alert, shall not be replicated, and shall be reported in `status` with
@@ -382,7 +455,7 @@ double the surface for no change in the core problem.
   (P-4, scenario 1). Where the service lacks a property the lender's
   guarantees rest on (versioning, object lock, checksum verification),
   the daemon shall provide it itself and `status` shall label the
-  weaker mode, as S3-4 does for external replicas. The borrower never
+  weaker mode, as S3-4 does for overflow targets. The borrower never
   holds the lender's store credential (PEER-8, SEC-3). AC: with the
   store on an S3 server on the LAN, scenarios 1, 7 and 10 pass, with
   scenario 7's lendisk-free read done by any S3 client against that
@@ -432,22 +505,30 @@ double the surface for no change in the core problem.
 ### 4.4 Replication
 
 - **REPL-1** Every object written to a bucket shall be queued for
-  replication to each replica in the replication set, in the order it
-  was written. Per-replica queues are strictly FIFO. Because restic and
-  Kopia both write packs before indexes before the snapshot or manifest,
-  FIFO alone keeps every replica consistent at every watermark. AC: a
-  lender never holds a restic snapshot or Kopia manifest whose
-  referenced packs and index it does not also hold.
-- **REPL-2** Deletes shall be replicated as delete operations in the same
-  queue, after any writes that preceded them.
+  replication to the places its placement chose (REPL-12), in the order
+  it was written. Per-place queues are strictly FIFO. Because no single
+  place holds every data object, FIFO alone no longer keeps the copies
+  consistent; in addition, a metadata object (as the tool profile
+  defines it, EP-7: restic indexes and snapshots, Kopia index and
+  manifest blobs) shall be sent to any place only after every data
+  object written before it has been acknowledged by `copies` places.
+  Restic and Kopia both write packs before indexes before the snapshot
+  or manifest, so this keeps the pool consistent at every point. AC:
+  with N places and `copies` = c, the replicas of any N − c + 1 places
+  together never hold a restic snapshot or Kopia manifest whose
+  referenced packs and index they do not also hold.
+- **REPL-2** Deletes shall be replicated as delete operations to every
+  place holding the object, in that place's queue after any writes that
+  preceded them.
 - **REPL-3** The replication queue shall be persisted and survive
   restarts, crashes and days-long peer outages. In `full` mode the queue
   is unbounded; in `evict` mode the local disk holds every
   unacknowledged pack.
 - **REPL-4** A snapshot shall be marked offsite-complete when it and every
-  object queued before it are acknowledged by at least `min_replicas`
-  replicas. `lendisk status` shall list each bucket's latest snapshot, its
-  offsite-complete state, and the replication lag per replica.
+  object queued before it are acknowledged by `copies` distinct places.
+  `lendisk status` shall list each bucket's latest snapshot, its
+  offsite-complete state, the replication lag per place, and how many
+  bytes are held at fewer than `copies` places.
 - **REPL-5** `lendisk status --wait <bucket>` (exit code 0 when offsite-
   complete, non-zero on timeout) shall exist so that backup scripts can
   block on replication.
@@ -457,9 +538,10 @@ double the surface for no change in the core problem.
 - **REPL-7** The node shall support per-peer and global upload/download
   rate limits and a time-of-day schedule (e.g. "replicate 01:00–07:00").
 - **REPL-8** Initial seeding shall be possible without the network:
-  `lendisk export <bucket> <path>` writes the replica to a removable disk and
-  `lendisk import` on the lender ingests it. Queued operations continue
-  from where the export ended.
+  `lendisk export <bucket> --for <peer> <path>` writes to a removable
+  disk the objects placed at that friend (the bucket's metadata and its
+  share of data objects), and `lendisk import` on the friend ingests
+  it. Queued operations continue from where the export ended.
 - **REPL-9** Replication shall never block the endpoint. A lender being
   offline shall have no effect on a backup to the local copy.
 - **REPL-10** Every object sent to a replica shall carry a cryptographic
@@ -472,22 +554,58 @@ double the surface for no change in the core problem.
   verification (VER-1, VER-2) and the immutability policy (EP-11) check
   against. The hash shall be computed the same way for friends and for
   external buckets.
-- **REPL-11** Offsite-complete shall be tracked as a per-bucket,
-  per-replica watermark in the write sequence. Tool profiles (EP-7) map
-  watermarks to snapshot or manifest keys so `status` can say "snapshot
-  abc123 is offsite at B and C"; for `generic` buckets `status` shows the
-  timestamp of the last acknowledged write.
+- **REPL-11** Offsite-complete shall be tracked as a per-bucket
+  watermark in the write sequence: the latest point up to which every
+  object has `copies` acknowledgements. Per-place lag is tracked beside
+  it for `status` and alerts. Tool profiles (EP-7) map the watermark to
+  snapshot or manifest keys so `status` can say "snapshot abc123 is
+  offsite at 2 copies"; for `generic` buckets `status` shows the
+  timestamp of the last fully placed write.
+- **REPL-12** Placement. Every metadata object of a bucket shall be
+  placed at every friend in the pool. Each data object shall be placed
+  at `copies` distinct places, chosen by the node from its friends by
+  free quota, preferring friends that are reachable. Overflow targets
+  (§4.11) shall be chosen only for copies that no friend has room for.
+  The user may assign friends to failure domains (`peer set <id>
+  --domain <name>`, for two friends in one house or at one provider);
+  copies of one object should then be in distinct domains, and `status`
+  shall say when they cannot be. The placement shall be recorded by the
+  node and shall be recoverable by listing the replicas (ID-5). AC:
+  with friends B, C and D at quotas 100, 50 and 50 GB, a 100 GB bucket
+  at `copies = 2` is fully placed, with every data object at B and at
+  one of C or D.
+- **REPL-13** Re-placement. The node shall move copies, never letting an
+  object fall below the copies it has while doing so, when:
+  - a friend is removed (PEER-5), lowers the quota below use (PEER-6),
+    or fails verification (VER-1): its copies are placed elsewhere
+    straight away;
+  - a friend has been unreachable longer than a threshold (default 7
+    days, configurable): its copies are placed elsewhere, and the
+    friend's replica is trimmed to what it still holds by placement
+    when it returns;
+  - friends gain room (a quota raised, a friend added): copies held at
+    an overflow target move to friends and are then deleted at the
+    overflow target;
+  - `copies` changes (EP-6).
+
+  The bytes come from the local copy, or in `evict` mode from another
+  place holding the object. Moves obey the rate limits and schedule
+  (REPL-7). Re-placement is the owner's node acting on its own data; no
+  lender ever sends a borrower's object to another node (PEER-11).
+  AC: scenario 13.
 
 ### 4.5 Lending and quotas
 
-- **LEND-1** Quota shall be set per borrower in bytes, counting live
-  objects plus tombstones. There should be an optional global cap for
-  total lent space.
+- **LEND-1** Quota shall be set per friendship in bytes, and each side
+  shall enforce it on what the other stores with it, counting live
+  objects plus tombstones. There shall be a global cap for total lent
+  space (`lending.max_total`), which no friendship's quota may push past.
 - **LEND-2** When a borrower reaches quota, or the lender's filesystem is
   below a configurable free-space floor (default 5%), the lender shall
   refuse new objects with an error the borrower can distinguish from
-  every other failure. The borrower pauses that replica's queue, raises
-  an alert and retries hourly. Nothing is deleted.
+  every other failure. The borrower stops placing new copies there,
+  places them elsewhere in the pool where it can (REPL-12), raises an
+  alert and retries hourly. Nothing is deleted.
 - **LEND-3** A borrower shall be able to see remaining quota at each lender
   (`lendisk peer list`).
 - **LEND-4** A lender shall verify every received object against the hash
@@ -498,20 +616,52 @@ double the surface for no change in the core problem.
 - **LEND-5** A lender may rate-limit each borrower independently.
 - **LEND-6** The lender's replica shall be readable without lendisk:
   each borrower's buckets are ordinary buckets in the lender's storage
-  engine, beside the lender's own (EP-16), which the backup tool opens
+  engine, beside the lender's own (EP-16), which the backup tool reads
   with the engine alone or, for a named S3 service, with any S3 client
-  (P-5), plus the tombstones and an index of hashes. `lendisk export` on the lender
-  shall write any borrower's bucket as plain files: for a restic bucket
-  a restic repository readable with `restic -r <path>`, for a Kopia
-  bucket (`--kopia-layout`) the sharded layout Kopia's filesystem
-  backend expects. The lender-only profile (PEER-9) uses the same
-  binaries and the same store.
-- **LEND-7** Capacity planning shall be built in. `lendisk init` shall
-  ask for the expected repository size and intended number of lenders
-  `k`, and suggest how much to lend in return. `lendisk status` shall
-  show, in one place, local copy size, space consumed at each lender,
-  space lent and used by each borrower, and the ratio consumed/lent. The
-  user guide shall state the rule of thumb.
+  (P-5), plus the tombstones and an index of hashes. A replica holds
+  all of the bucket's metadata and the data objects placed there
+  (REPL-12); the union of enough replicas is the repository (P-5).
+  `lendisk export` on the lender shall write any borrower's bucket as
+  plain files in the tool's layout: the restic repository layout, or
+  for a Kopia bucket (`--kopia-layout`) the sharded layout Kopia's
+  filesystem backend expects, so that exports from several lenders
+  copied into one directory form a repository `restic -r <path>` or
+  Kopia opens. The lender-only profile (PEER-9) uses the same binaries
+  and the same store.
+- **LEND-7** Capacity planning shall be built in.
+  - `lendisk init` shall ask for the expected repository size S and
+    `copies` c, and say how much to lend in total: c × S, plus the
+    retention margin (tombstones held for the window, RET-1).
+  - Friends shall tell each other their repository size (the total of
+    their own buckets, as a number) through the quota exchange (NET-7).
+  - `lendisk status` shall show, in one place: local copy size; space
+    used at each friend and at each overflow target; space lent and
+    used by each friend; and the **protectable size**, the largest S
+    for which Σ over friends of min(S, quota) plus the overflow
+    targets' room is at least c × S (one friend can hold at most one
+    copy of an object, hence the min). Beside it, the most the circle
+    could protect with fair quotas: the same sum with each
+    quota replaced by min(S, friend's repository size), since a friend
+    has no use for more of your disk than its own repository.
+  - For each friendship where one side has used less than half of the
+    quota for 30 days, `status` shall say so, so the friends can lower
+    the number.
+  - The user guide shall state the rule of thumb: you are fully
+    protected at c copies while your repository is at most your
+    friends' repositories combined divided by c, and your disk holds
+    about (1 + c) × S.
+- **LEND-8** Quota negotiation. Each node shall have a ceiling per friend
+  (`lending.max_per_peer`) and the global cap (LEND-1). Either side may
+  propose a new quota for a friendship; the other side's node accepts
+  it if it is within that side's ceilings, and otherwise asks its user
+  (`lendisk peer quota <peer> --accept`). The daemon may propose an
+  increase on its own, within its own ceilings, when its protectable
+  size falls below its repository size. A decrease takes effect at
+  once on both sides (PEER-6). No node's lent space ever grows beyond
+  ceilings its own user set. AC: two nodes with ceilings of 200 GB
+  and a friendship at 50 GB; when one repository grows past what the
+  pool can protect, the quota rises to the needed amount with no user
+  action, and stops at 200 GB.
 
 ### 4.6 Deletion, retention and verification
 
@@ -530,15 +680,17 @@ double the surface for no change in the core problem.
   attacker's `forget --prune` can be reversed.
 - **VER-1** The borrower's daemon shall challenge each lender daily per
   bucket with a proof the lender cannot answer without holding the bytes:
-  a random object, a random byte range and a fresh nonce; the lender's
-  answer is checked against the local copy. A failed challenge raises an
-  alert and marks the replica unverified.
+  a random object among those placed there, a random byte range and a
+  fresh nonce; the lender's answer is checked against the local copy. A
+  failed challenge raises an alert, marks the replica unverified and
+  starts re-placement of its copies (REPL-13).
 - **VER-2** In `evict` mode, where no local copy exists, verification shall
   instead download a random sample of objects (default 0.1% of bytes per
   week, configurable) and check their hashes against the index recorded
   at acknowledgement (REPL-10).
 - **VER-3** `lendisk verify <bucket> --peer <id> [--full]` shall run the
-  challenge on demand, and `--full` shall check every object by hash.
+  challenge on demand, and `--full` shall check by hash every object
+  placed at that peer.
 - **VER-4** `lendisk status` shall show, per replica, when it was last
   successfully verified.
 - **VER-5** The daemon shall check its own local store for bit-rot at a
@@ -546,7 +698,7 @@ double the surface for no change in the core problem.
   sample and comparing with the index, by the storage engine's own
   integrity check, or both; a lender does the same for each replica it
   holds. A mismatch raises an alert, and on the borrower side the
-  object is re-fetched from a replica (EP-10).
+  object is re-fetched from a place that holds it (EP-10).
 
 ### 4.7 Network
 
@@ -585,8 +737,8 @@ double the surface for no change in the core problem.
   tombstones) and undelete. Every other operation shall be refused
   before it reaches storage. Beside these, the peer protocol shall
   provide: challenge (VER-1), manifest (ID-4, fetchable with nothing but
-  the identity, before any bucket exists), quota (LEND-3) and version
-  (NET-6). AC: the peer protocol specification fits on a few pages; the
+  the identity, before any bucket exists), quota (LEND-3, the repository
+  size of LEND-7 and the proposals of LEND-8) and version (NET-6). AC: the peer protocol specification fits on a few pages; the
   hostile-peer test (SEC-7) shows every operation outside this list
   refused.
 - **NET-7a** Authentication between peers shall rest on node identity
@@ -595,11 +747,14 @@ double the surface for no change in the core problem.
   with nothing beyond the phrase and the lender's address; no per-pair
   credential appears in any file on either side.
 - **NET-7b** `lendisk peer forward <peer> <addr>` should expose a friend's
-  replica on a local address through the peer connection, so a backup
-  tool on the borrower's machine can read it directly, with no lendisk
+  replica on a local address through the peer connection, so a tool on
+  the borrower's machine can read it directly, with no lendisk
   replication code in the path (scenario 10). It shall print, for each
   of the borrower's buckets held by that peer, the bucket's name at the
-  lender (SEC-16) and the tool's repository string using it.
+  lender (SEC-16), and the commands that copy that replica's keys into
+  a local directory with a standard S3 client. Run against N − c + 1
+  friends, these give a directory the backup tool opens as a
+  repository (P-5).
 - **NET-8** The overlay network shall sit behind an internal interface so
   that it can be replaced without touching replication, storage or the
   CLI.
@@ -608,13 +763,19 @@ double the surface for no change in the core problem.
 
 - **OPS-1** `lendisk status [--json]` shall report: identity, peers and
   reachability, each bucket's latest snapshot and offsite-complete state,
-  replication lag and queue size, quota use in both directions, last
-  verification, and pending alerts.
+  bytes held at fewer than `copies` places, replication lag and queue
+  size, quota use in both directions, space used at overflow targets,
+  the protectable size (LEND-7), last verification, re-placement in
+  progress, and pending alerts.
 - **OPS-2** The daemon shall raise alerts for: lender unreachable longer
   than 24h (configurable), replication lag exceeding a threshold (default
   48h), a failed verification, quota above 90%, quota exhausted, retention
-  purge due within 7 days after a peer removal, and a peer on an
-  unsupported version.
+  purge due within 7 days after a peer removal, a peer on an
+  unsupported version, the repository above 90% of the protectable
+  size, an overflow target starting to receive copies, objects below
+  `copies` places for longer than the REPL-13 threshold, and fewer
+  places in the pool than `copies` (the only case where a new
+  friendship is needed rather than re-placement, P-2).
 - **OPS-3** Alerts shall be delivered through a configurable command hook
   (receives JSON on stdin) and a webhook URL. Built-in email or push is out
   of scope; the hook covers ntfy, healthchecks.io, mail, etc.
@@ -636,8 +797,9 @@ double the surface for no change in the core problem.
   shall not weaken it, e.g. by requiring the restic password anywhere.)
 - **SEC-2** Metadata a lender can observe, and that the product accepts
   leaking: object sizes and counts, timing of backups, borrower IP address
-  unless relayed, how many buckets the borrower keeps at that lender, and
-  which backup tool wrote each one (its key layout is recognisable). The
+  unless relayed, how many buckets the borrower keeps at that lender,
+  which backup tool wrote each one (its key layout is recognisable), and
+  the borrower's total repository size (LEND-7). The
   names of the borrower's buckets are not on this list (SEC-16). This
   shall be documented for users.
 - **SEC-3** Secrets on disk shall be limited to the identity key, the
@@ -646,14 +808,14 @@ double the surface for no change in the core problem.
   (EP-17), mode 0600
   under the node's own directories. Third-party credentials, meaning
   the credential of a named S3 service used as the store (EP-16) and
-  the credentials of external replicas (S3-1), shall be read from
+  the credentials of overflow targets (S3-1), shall be read from
   environment variables when the daemon starts, supplied by the service
   manager or container runtime, and the daemon shall never write them
   to disk; the configuration file names the variables, not the values.
   No per-bucket or per-peer credential shall be held anywhere else; the
   store credential grants access to the node's own store and nothing
   else, and no peer ever receives it. The encrypted node manifest
-  (ID-4) may carry external replica credentials for recovery.
+  (ID-4) may carry overflow target credentials for recovery.
 - **SEC-4** A compromised borrower machine shall not be able to cause
   offsite data loss within the retention window (RET-2) nor to read
   another borrower's data on a shared lender (PEER-8).
@@ -662,9 +824,10 @@ double the surface for no change in the core problem.
   directory (key names are validated).
 - **SEC-6** Invite secrets shall be single-use and time-limited (PEER-1).
 - **SEC-7** Compromise of one peer shall affect only the relationships
-  that peer is part of. With A→B, A→C and B→D: a compromised B can lose
-  or withhold A's replica at B (detected by VER-1) and sees A's traffic
-  metadata, and nothing else. It cannot reach A's replica at C, cannot
+  that peer is part of. With friendships A–B, A–C and B–D: a compromised
+  B can lose or withhold A's replica at B (detected by VER-1, and the
+  copies re-placed by REPL-13) and sees A's traffic metadata, and
+  nothing else. It cannot reach A's replica at C, cannot
   impersonate A to C, and cannot cause C or D to learn anything about A.
   AC: a test with a hostile B node exercising every operation of the
   peer protocol, and every operation the underlying store could expose,
@@ -774,33 +937,47 @@ waits for a reconnect would each turn a component choice into a hole.
   (LEND-6) shall be documented too: one file per key at its key path
   under the bucket's directory.
 
-### 4.11 External S3 replicas
+### 4.11 External overflow targets
 
-An external S3-compatible bucket is a replication target alongside
-friends and counts towards `min_replicas`. The borrower shall use the
-same replica abstraction, resume behaviour and undelete for both kinds.
-The requirements in this section that are specific to **external**
-buckets are credentials (S3-1, S3-5, S3-8), provider-side retention
-(S3-4) and cost (S3-7); for friends, quota, retention and verification
-follow §4.5 and §4.6 because the lender enforces them.
+An external S3-compatible bucket can be added to the pool as an
+**overflow target**: a place that holds the copies a node's friends
+cannot hold, and only those (REPL-12). It is the second choice, always.
+A friend's node enforces retention the borrower cannot bypass (RET-2);
+an external bucket does so only where the provider has versioning and
+the credential lacks delete permission (S3-4, S3-5), and costs money
+instead of disk. So copies go to friends whenever friends have room,
+and copies at an overflow target move back to friends as soon as they
+do (REPL-13). An overflow target counts as one place towards `copies`.
+It is never configured as a complete extra copy of a bucket.
 
-- **S3-1** `lendisk replica add s3 <name> --endpoint … --bucket …
-  --prefix …` shall register a bucket as a replication target; it then
-  appears in `--replicas` lists and in `status` like a peer. The
+The borrower shall use the same replica abstraction, resume behaviour
+and undelete for friends and overflow targets. The requirements in this
+section that are specific to overflow targets are credentials (S3-1,
+S3-5, S3-8), provider-side retention (S3-4) and cost (S3-7); for
+friends, quota, retention and verification follow §4.5 and §4.6 because
+the lender enforces them.
+
+- **S3-1** `lendisk overflow add s3 <name> --endpoint … --bucket …
+  --prefix …` shall add a bucket to the pool as an overflow target; it
+  then appears in `status` beside the friends, with what it holds. The
   credential is read from the environment (SEC-3) and carried in the
   encrypted node manifest (ID-4), so recovery through a friend also
   recovers bucket access: `recover` shows it once for the user to place
   in the environment and does not write it.
-- **S3-2** The replica layout in the bucket shall be the backup tool's
-  standard layout under the prefix. AC: `restic -r
-  s3:<endpoint>/<bucket>/<prefix> snapshots` works with no lendisk
-  installed.
+- **S3-2** The objects in the bucket shall be in the backup tool's
+  standard layout under the prefix, one key per object as the tool
+  wrote it, so that the bucket is one of the replicas a lendisk-free
+  restore can combine (P-5). Whenever it holds data objects it also
+  holds all of the bucket's metadata (REPL-12). AC: copying the keys
+  under the prefix and those of the friends' replicas into one
+  directory gives a repository `restic -r <directory> snapshots` opens
+  with no lendisk installed.
 - **S3-3** Uploads shall carry a content checksum the provider verifies,
   so the store rejects corrupted transfers. Large objects shall be
   uploaded in resumable parts.
 - **S3-4** Retention at an external bucket shall be enforced by the
   provider, using object versioning and a lifecycle rule that expires
-  non-current versions after the retention window. `replica add` shall
+  non-current versions after the retention window. `overflow add` shall
   check that versioning is enabled and warn if not; it shall offer to
   create the lifecycle rule when the credential allows it. `undelete`
   shall restore objects deleted within the window (RET-3). For providers
@@ -808,32 +985,43 @@ follow §4.5 and §4.6 because the lender enforces them.
   tombstones: deletes are recorded locally and issued to the bucket only
   after the retention window. This protects against accidental deletion
   but not against a compromised borrower, and `status` shall label such
-  replicas "retention: client-side".
+  targets "retention: client-side". Copies moved back to friends
+  (REPL-13) are deleted at the target the same way, so they stay
+  recoverable for the window.
 - **S3-5** The documentation shall tell the user to create a credential
-  with put/get/list but no delete permission, and `replica add` shall
-  test for and report delete permission, recommending it be removed.
-  With such a credential, restic's `prune` through lendisk produces
-  tombstones that only the lifecycle rule ever purges.
+  that can put, get, list and mark objects deleted, but not remove
+  object versions, and `overflow add` shall test for and report
+  version-removal permission, recommending it be removed. With such a
+  credential, restic's `prune` through lendisk and the drain-back of
+  REPL-13 produce tombstones that only the lifecycle rule ever purges.
+  Where a provider cannot grant the one without the other, `status`
+  shall say which the user chose.
 - **S3-6** Verification shall compare the provider's stored checksums
   against local, and download a random sample as in VER-2. A bucket
   cannot answer a challenge (VER-1), and this document accepts that this
   trusts the provider's checksum.
 - **S3-7** There is no lender-side quota. The user shall set `max_bytes`
-  on the replica; the daemon raises an alert at 90% and pauses the queue
-  at 100%, as in LEND-2. `status` shall show an estimated monthly cost if
-  the user provides a price per GB.
+  on the overflow target, which is the room it adds to the pool
+  (LEND-7); the daemon raises an alert at 90% and stops placing copies
+  there at 100%, as in LEND-2. `status` shall show what the target holds
+  now and an estimated monthly cost if the user provides a price per GB.
 - **S3-8** `lendisk recovery-sheet` (ID-7) shall include the bucket
   endpoint and prefix, and state that the access key is needed; it shall
   not print the secret key unless `--with-secrets` is given.
-- **S3-9** An existing restic repository already in a bucket should be
-  adoptable as a replica (`replica add s3 … --adopt`): the daemon lists
-  it, treats its objects as acknowledged, and reconciles against the
-  local copy.
+- **S3-9** Removed in v0.10. It adopted an existing complete repository
+  in a bucket as a replica; an overflow target holds only what friends
+  cannot, so there is nothing for a complete repository to be adopted
+  as. The ID is not reused.
 
 ## 5. Out of scope for v1
 
 - Open network, discovery of strangers, payments or credits.
-- Erasure coding across peers.
+- Balances or credit carried from one friendship to another (P-8).
+- One-way lending; every friendship is symmetric (PEER-3).
+- Erasure coding across peers. Placement (REPL-12) spreads whole
+  objects; no object is split.
+- An external bucket as a complete extra copy; external buckets are
+  overflow only (§4.11).
 - GUI or web UI.
 - macOS, Windows, FreeBSD builds.
 - sftp as an endpoint.
@@ -866,66 +1054,147 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 7. Acceptance scenarios
 
-1. **First backup.** Two nodes, A behind NAT at home, B behind NAT at a
-   friend's. B invites A with 500 GB. A adds bucket `laptop --profile
-   restic` with replica B. `restic backup` on A, whose store is the
-   default directory, finishes at local disk speed. Within the
-   bandwidth available, `lendisk status` shows the
-   snapshot offsite-complete.
+1. **First backup.** Four nodes A, B, C and D, each behind NAT, each
+   with about 100 GB to back up. Each pair is friends at 70 GB (six
+   invites). A adds bucket `laptop --profile restic`, at the default
+   `copies = 2`. `restic backup` on A, whose store is the default
+   directory, finishes at local disk speed. Within the bandwidth
+   available, `lendisk status` shows the snapshot offsite-complete,
+   every data object at two of B, C and D, the metadata at all three,
+   and a protectable size of 105 GB.
 2. **Friend offline.** B is powered off for three days. `restic backup` on
-   A keeps working. Status shows lag; at 24h an alert fires. When B
-   returns, the queue drains and the snapshot becomes offsite-complete.
+   A keeps working, and new data objects are placed at C and D. Status
+   shows lag for B; at 24h an alert fires. When B returns, its queue
+   drains (metadata and the objects still placed there). Had B stayed
+   away past the REPL-13 threshold, A would have re-placed B's copies
+   at C and D, within their quotas, without an invite.
 3. **Total loss.** A's house burns down. On a new machine: `lendisk
-   recover` with the phrase and B's address from the paper sheet;
-   `restic -r s3:... restore latest` succeeds via read-through without
-   downloading the whole repository.
+   recover` with the phrase and B's address from the paper sheet; the
+   manifest from B names C and D, and the placement is rebuilt by
+   listing them. With D offline, `restic -r s3:... restore latest`
+   succeeds via read-through from B and C without downloading the
+   whole repository.
 4. **Ransomware.** An attacker on A runs `restic forget --keep-last 0
    --prune` and wipes A's disk. Within 30 days, A recovers as in scenario 3
    and runs `lendisk undelete laptop`; all snapshots are back.
 5. **Bad lender.** B silently deletes half of A's packs. Within a day, the
-   daily challenge fails and A is alerted that the replica is unverified.
-6. **Quota.** A exceeds 500 GB at B. The local backup still succeeds;
-   status shows replication paused for quota; B raises the quota and
-   replication resumes without intervention on A.
-7. **Zero lock-in.** With lendisk stopped on both sides: on B, the
-   storage engine alone is started on B's store directories following
-   the user guide, or B's store is an S3 service B named (EP-16), and
-   `restic -r s3:…` against it with B's credential lists A's snapshots
-   from A's laptop replica, found under the name A's recovery sheet
-   gives for it (SEC-16); on A, the same on A's store lists them from
-   A's own copy. Alternatively `lendisk export` has written either copy
-   to a directory and `restic -r <directory> snapshots` works on the
-   plain files with nothing running at all. No lendisk code runs on
-   either side.
-8. **Partial trust.** A lends to B and C; B lends to D; A and D have no
-   relationship. D cannot connect to A (rejected before any application
-   data is exchanged), cannot list or read A's data on B, and does not
-   appear anywhere in A's state. A's `peer list` shows B and C only.
-   Revoking A→B leaves A→C untouched and B's replica of A's data is
-   purged after the retention window.
+   daily challenge fails, A is alerted that the replica is unverified,
+   and A's node re-places B's copies at C and D (REPL-13).
+6. **Quota.** A's repository grows past what its pool holds at two
+   copies. The local backup still succeeds; status shows the protectable
+   size below the repository size and copies paused for quota. A's
+   daemon proposes a larger quota to B, C and D (LEND-8); B and C accept
+   within their ceilings, both directions of those friendships grow, and
+   replication resumes without further intervention on A.
+7. **Zero lock-in.** With lendisk stopped everywhere: on A, the storage
+   engine alone is started on A's store directories following the user
+   guide, or A's store is an S3 service A named (EP-16), and `restic -r
+   s3:…` against it lists A's snapshots from A's own copy. Then the
+   same is done on B and on C, with B's and C's credentials, and the
+   keys of A's laptop replica, found on each under the name A's
+   recovery sheet gives for it (SEC-16), are copied into one directory
+   with a standard S3 client; `restic -r <directory> check
+   --read-data` passes, with D never consulted. Alternatively `lendisk
+   export` has written B's and C's replicas to directories, and
+   `restic -r` on the two copied into one works on the plain files
+   with nothing running at all. No lendisk code runs anywhere.
+8. **Partial trust.** A is friends with B and C; B is friends with D; A
+   and D have no friendship. D cannot connect to A (rejected before any
+   application data is exchanged), cannot list or read A's data on B,
+   and does not appear anywhere in A's state. A's `peer list` shows B
+   and C only. Removing the friendship A–B leaves A–C untouched; B's
+   replica of A's data and A's replica of B's are purged after the
+   retention window. Every object of A's is then at C alone, and A is
+   alerted that the pool has fewer places than `copies`.
 9. **Kopia.** A creates bucket `photos --profile kopia`, runs `kopia
    repository create s3 …` against the S3 endpoint and takes a snapshot.
-   Status shows the manifest offsite-complete at B. Kopia maintenance
-   deletes old packs; B tombstones them. A restores a file on a fresh
-   machine via read-through after `lendisk recover`.
-10. **Restore straight from a friend.** On A, `lendisk peer forward B
-    127.0.0.1:9100` prints the repository string for `laptop` at B,
-    and `restic -r` with it lists A's snapshots held at B. B's daemon refuses `restic
-    prune`'s attempt to remove tombstoned data (RET-2) and refuses every
-    operation outside the NET-7 list (SEC-9).
+   Status shows the manifest offsite-complete at two copies. Kopia
+   maintenance deletes old packs; each place holding one tombstones it.
+   A restores a file on a fresh machine via read-through after
+   `lendisk recover`.
+10. **Restore straight from friends.** On A, `lendisk peer forward B
+    127.0.0.1:9100` and `lendisk peer forward C 127.0.0.1:9101` print
+    the name of `laptop` at each and the commands that copy each
+    replica's keys into a local directory; after both, `restic -r
+    <directory> snapshots` lists A's snapshots, with no lendisk
+    replication code in the path. B's daemon refuses `restic prune`'s
+    attempt, through the forward, to remove tombstoned data (RET-2) and
+    refuses every operation outside the NET-7 list (SEC-9).
 11. **Backup from another machine.** A runs on a NAS. The user sets
     `endpoint.listen` to the NAS's LAN address and adds bucket `laptop
-    --profile restic` with replica B; `bucket add` prints the lines for
-    that address, including how restic trusts the certificate. On a
-    laptop on the same LAN, `restic backup` against the NAS's address
-    succeeds, and `lendisk status` on A shows the snapshot
-    offsite-complete at B. `restic restore latest` from the laptop
+    --profile restic`; `bucket add` prints the lines for that address,
+    including how restic trusts the certificate. On a laptop on the
+    same LAN, `restic backup` against the NAS's address succeeds, and
+    `lendisk status` on A shows the snapshot offsite-complete at two
+    copies. `restic restore latest` from the laptop
     succeeds. A plaintext request to that address is refused. With TLS
     turned off for the address, the same backup and restore succeed
     over plain HTTP and `status` labels the listener "plaintext".
+12. **Overflow.** E has 400 GB to back up and four friends A, B, C and
+    D with about 100 GB each, every friendship at 100 GB. `status` on E
+    shows a protectable size of 200 GB at two copies, and says that
+    fair quotas cannot raise it (each friend's repository is 100 GB).
+    E adds a B2 bucket with `lendisk overflow add s3 … --max-bytes 400G`;
+    the protectable size becomes 400 GB, an alert says the overflow
+    target is receiving copies, and the snapshot becomes
+    offsite-complete with every data object at one friend and at B2.
+    Later F, who backs up 400 GB, becomes E's friend at 400 GB. E's
+    node moves the copies at B2 to F, deletes them at B2 (tombstoned
+    for the window by the provider's versioning, S3-4), and `status`
+    shows the overflow target empty.
+13. **Friend leaves.** In scenario 1's circle, with every node's
+    ceiling (LEND-8) at 150 GB, D leaves: the friendships with D are
+    removed. A's pool is B and C at 70 GB, a protectable size of 70 GB,
+    below A's 100 GB. A's node proposes 100 GB to B and C, which accept
+    within their ceilings; A re-places the copies D held at B and C,
+    never dropping an object below the copies it had, and `status`
+    shows the latest snapshot offsite-complete at two copies again. No
+    invite was needed.
 
 ## 8. Changes
 
+- **v0.10 (2026-11-01)** Pooled placement, symmetric quotas, overflow.
+  - **Placement instead of replica lists.** A bucket now has `copies`
+    (default 2) instead of `--replicas` and `min_replicas`. Data
+    objects are spread over the pool by free quota, and metadata goes
+    everywhere (REPL-12, new). The owner's node re-places copies when
+    a friend leaves, stays away, fails verification or shrinks its
+    quota, and when friends gain room (REPL-13, new).
+  - **Changed meaning:**
+    - EP-6, EP-9, EP-10, REPL-1 (metadata waits for `copies`
+      acknowledgements of earlier data; new AC), REPL-2, REPL-4,
+      REPL-8, REPL-11 (one watermark per bucket).
+    - ID-4, ID-5 (new AC), ID-6, ID-7.
+    - VER-1 (a failure starts re-placement), VER-3, VER-5.
+    - LEND-2, LEND-6, OPS-1, OPS-2.
+    - Glossary: "replication set" removed; friendship, symmetric quota,
+      pool, overflow target, copies, placement and protectable size
+      added.
+  - **P-5 weakened:** a single lender's replica is no longer a complete
+    repository. A lendisk-free restore combines any N − c + 1 replicas.
+    NET-7b, S3-2 and scenarios 7 and 10 reworded to match. P-6 notes it.
+  - **Reciprocity:** P-8 is replaced by "reciprocity is pairwise, and
+    paid in disk".
+    - Every relationship is a friendship with one quota lent in both
+      directions, enforced by each side (PEER-1, PEER-2, PEER-3,
+      PEER-6, PEER-12, LEND-1).
+    - `--mutual` and one-way relationships are removed. P-2, PEER-4,
+      PEER-5, PEER-10 and SEC-7 are reworded to match.
+    - PEER-9 is kept as a node with no buckets.
+    - LEND-7 is rewritten around the protectable size.
+    - LEND-8 added: quota negotiation within ceilings each user sets.
+    - SEC-2 adds the repository size a friend learns. NET-7's quota
+      call carries it.
+  - **External buckets become overflow targets.** §4.11 is retitled.
+    S3-1 (`overflow add`), S3-2, S3-4 and S3-7 are reworded; S3-9 is
+    removed. S3-5 now allows delete markers but not version removal,
+    because drain-back must delete; it had asked for no delete
+    permission at all, which also stopped `prune` from tombstoning.
+  - **Renamed only:** "external replica" becomes "overflow target" in
+    EP-16 and SEC-3; no change of meaning.
+  - **Elsewhere:** §5 gains four out-of-scope lines. Scenarios 1, 2, 3,
+    5, 6, 8, 9 and 11 are reworded; 12 (overflow) and 13 (friend
+    leaves) are added. §1 reworded.
 - **v0.9.3 (2026-10-31)** Bucket names hidden from lenders. SEC-16
   added: the name a lender sees for a borrower's bucket is derived from
   the borrower's identity and reveals nothing about the real name, and

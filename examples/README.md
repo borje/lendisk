@@ -1,7 +1,7 @@
 # lendisk deployment examples
 
-These files follow DESIGN.md v0.10.1 and REQUIREMENTS.md v0.9.1
-(2026-10-30). The daemon does not exist yet, so the TOML keys and the
+These files follow DESIGN.md v0.11 and REQUIREMENTS.md v0.10
+(2026-11-01). The daemon does not exist yet, so the TOML keys and the
 image name are the proposed surface, kept consistent with the design
 text: one static binary, one `[store]` section for both roles,
 third-party credentials from the environment and never from a file the
@@ -10,8 +10,8 @@ behind Docker's own NAT (D2, G-1).
 
 | Folder | Who | What it shows |
 |---|---|---|
-| `default-nas/` | Anna, Synology NAS behind home NAT | The default install: plain files on the NAS, restic, two friends plus a Backblaze B2 replica |
-| `lender-only-pi/` | Carla, Raspberry Pi with a USB disk | The lender-only profile (PEER-9): backs up nothing, lends to two friends, 60-day window |
+| `default-nas/` | Anna, Synology NAS behind home NAT | The default install: plain files on the NAS, restic, copies spread over three friends, a Backblaze B2 bucket as overflow |
+| `lender-only-pi/` | Carla, Raspberry Pi with a USB disk | The lender-only profile (PEER-9): a node with no buckets yet, symmetric friendships with two people, 60-day window |
 | `garage-on-lan/` | Björn, homelab behind CGNAT | A store the user already runs: Garage as a second compose service, named as the `s3` backend (EP-16) |
 | `provider-store-vps/` | Dag, small VPS with a public IP | A provider as the store, Hetzner Object Storage behind the `s3` backend, Kopia, the WAN-speed warning accepted |
 | `systemd/` | Any of the above without Docker | The unit file and the root-owned environment file that SEC-3 assumes |
@@ -19,8 +19,8 @@ behind Docker's own NAT (D2, G-1).
 ## What is in the config file and what is not
 
 The TOML file holds static settings: role, listeners, the store, relay
-policy, replication limits and schedule, external replicas, alert hooks.
-Peers and buckets are not in it. They are created with `lendisk invite`,
+policy, replication limits and schedule, lending ceilings, overflow
+targets, alert hooks. Friendships and buckets are not in it. They are created with `lendisk invite`,
 `lendisk peer add` and `lendisk bucket add` and live in `lendisk.db`
 (PEER-1, EP-6), and the node manifest carries them for recovery (ID-4).
 
@@ -30,9 +30,9 @@ environment variables, and the defaults are:
 | Variable | Used for |
 |---|---|
 | `LENDISK_STORE_ACCESS_KEY`, `LENDISK_STORE_SECRET_KEY` | the `s3` backend store credential (EP-16) |
-| `LENDISK_REPLICA_<NAME>_ACCESS_KEY`, `LENDISK_REPLICA_<NAME>_SECRET_KEY` | each external replica, `<NAME>` upper-cased (S3-1) |
+| `LENDISK_OVERFLOW_<NAME>_ACCESS_KEY`, `LENDISK_OVERFLOW_<NAME>_SECRET_KEY` | each overflow target, `<NAME>` upper-cased (S3-1) |
 
-The daemon refuses to start a store or replica whose variables are
+The daemon refuses to start a store or overflow target whose variables are
 unset, redacts them from logs and `status`, and never writes them to
 disk. With compose they arrive through `env_file`; the file on the host
 should be root-owned, mode 0600. With systemd they arrive through
@@ -70,6 +70,9 @@ docker compose up -d
 docker compose exec lendisk lendisk status
 ```
 
-`init` asks for the expected repository size and how many lenders you
-plan to have, and suggests how much to lend back (LEND-7). Write the
+`init` asks for the expected repository size and `copies`, and
+suggests how much to lend in total: `copies` × size plus 20% for
+tombstones (LEND-7). The friendships between the four example
+households are Anna–Björn 200 GB, Anna–Carla 250 GB, Anna–Dag 150 GB,
+Björn–Dag 200 GB and Carla–Dag 200 GB, each lent both ways. Write the
 phrase down; nothing in these folders can recover it.

@@ -1,6 +1,6 @@
 # Anna: the default install on a Synology-class NAS behind home NAT.
-# Plain files on the NAS volume, restic, replicas at two friends and a
-# Backblaze B2 bucket. One service, one binary, no child process.
+# Plain files on the NAS volume, restic, copies spread over three
+# friends with a Backblaze B2 bucket as overflow. One service, one binary, no child process.
 
 services:
   lendisk:

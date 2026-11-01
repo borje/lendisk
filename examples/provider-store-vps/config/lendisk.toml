@@ -1,8 +1,10 @@
-# Dag · store is a Hetzner Object Storage bucket · DESIGN.md v0.10.1
+# Dag · store is a Hetzner Object Storage bucket · DESIGN.md v0.11
 #
 # After init:
-#   lendisk bucket add kopia-dag --profile kopia --replicas anna,carla
-#   lendisk invite --quota 400G --retention 30d     # Björn
+#   lendisk peer add <Anna's invite>                # 150 GB each way
+#   lendisk peer add <Björn's invite>               # 200 GB each way
+#   lendisk peer add <Carla's invite>               # 200 GB each way
+#   lendisk bucket add kopia-dag --profile kopia    # copies = 2
 #
 # Probe result recorded at init: versioning yes, lifecycle yes, object
 # lock yes, checksum verification yes, conditional PUT yes, server-side
@@ -37,7 +39,8 @@ accept_peer_hints = false
 
 [lending]
 retention_min = "30d"
-global_cap    = "400G"
+max_total     = "600G"
+max_per_peer  = "250G"
 
 [replication]
 upload_limit = "50M"

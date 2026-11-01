@@ -1,10 +1,14 @@
-# Anna · default install · DESIGN.md v0.10.1
+# Anna · default install · DESIGN.md v0.11
 #
-# Peers and buckets are not here: `lendisk invite`, `lendisk peer add`
-# and `lendisk bucket add` create them and they live in lendisk.db.
-# After init, Anna ran:
-#   lendisk bucket add laptop --profile restic --replicas bjorn,carla,b2 --min-replicas 2
-#   lendisk invite --quota 500G --retention 30d        # once for Björn, once for Dag
+# Friendships and buckets are not here: `lendisk invite`, `lendisk peer
+# add` and `lendisk bucket add` create them and they live in lendisk.db.
+# Every friendship is one quota that both sides lend each other (P-8).
+# After init (S ≈ 250 GB at 2 copies: lend 1.2 × 2 × 250 = 600 GB), Anna ran:
+#   lendisk invite --quota 200G --retention 30d     # Björn
+#   lendisk invite --quota 250G --retention 30d     # Carla
+#   lendisk invite --quota 150G --retention 30d     # Dag
+#   lendisk bucket add laptop --profile restic      # copies = 2, placed over the pool
+#   lendisk overflow add s3 b2 …                    # only for what friends cannot hold
 
 role = "full"
 
@@ -29,7 +33,8 @@ accept_peer_hints = false    # NET-5a: only relays Anna configured may see her t
 
 [lending]
 retention_min = "30d"        # RET-1: borrowers may ask for longer, never shorter
-global_cap    = "1200G"      # LEND-1: optional cap on total lent space
+max_total     = "600G"       # LEND-1: the sum of all friendships' quotas
+max_per_peer  = "300G"       # LEND-8: proposals up to this are accepted automatically
 
 [replication]
 upload_limit   = "20M"       # REPL-7: global cap on upstream bandwidth
@@ -39,19 +44,22 @@ part_size      = "16M"       # REPL-6: multipart part, resumes at the next part
 [replication.peer_limits]
 bjorn = "8M"                 # REPL-7: Björn is relayed through DERP; be gentle
 
-# External replica (S3-1). Credential from the environment:
-#   LENDISK_REPLICA_B2_ACCESS_KEY / LENDISK_REPLICA_B2_SECRET_KEY
-# Use an application key WITHOUT delete permission (S3-5); the bucket
-# has versioning on and a lifecycle rule hiding versions after 30 days
-# (S3-4), which `replica add` checked and offered to create.
-[[replica]]
+# Overflow target (§4.11, S3-1): second choice, used only for copies
+# Björn, Carla and Dag have no room for, and drained back to them when
+# they do (REPL-13). Credential from the environment:
+#   LENDISK_OVERFLOW_B2_ACCESS_KEY / LENDISK_OVERFLOW_B2_SECRET_KEY
+# Use an application key that can hide files but not delete versions
+# (S3-5); the bucket has versioning on and a lifecycle rule removing
+# hidden versions after 30 days (S3-4), which `overflow add` checked
+# and offered to create.
+[[overflow]]
 name         = "b2"
 type         = "s3"
 endpoint     = "https://s3.eu-central-003.backblazeb2.com"
 region       = "eu-central-003"
 bucket       = "anna-lendisk"
-prefix       = "laptop"
-max_bytes    = "300G"        # S3-7: alert at 90%, pause at 100%
+prefix       = "anna"        # each bucket under <prefix>/<sealed name>/
+max_bytes    = "300G"        # S3-7: room it adds to the pool; alert at 90%, stop at 100%
 price_per_gb = 0.006         # S3-7: status shows an estimated monthly cost
 
 [alerts]

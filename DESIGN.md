@@ -1,11 +1,13 @@
 # lendisk — design
 
-Status: draft v0.10.3, 2026-10-31. Companion to REQUIREMENTS.md v0.9.3,
+Status: draft v0.11, 2026-11-01. Companion to REQUIREMENTS.md v0.10,
 which made the two requirement changes this design needed (Q-T,
 resolved), then moved third-party credentials to the environment,
 then let backup tools on other machines use the node (EP-17; the LAN
-bridge, §3.3), and then hid bucket names from lenders (SEC-16; sealed
-names, §3).
+bridge, §3.3), then hid bucket names from lenders (SEC-16; sealed
+names, §3), and then replaced per-bucket replica lists with placement
+over a pool of symmetric friendships, with external buckets as
+overflow (D6, §3.4, §4).
 
 ## 0. How to read this document
 
@@ -22,7 +24,9 @@ with those decisions: this is where component names, ports, paths,
 headers, formats and algorithms live, and it is the first place to
 edit when a decision changes. §4 derives the capacity numbers. §5
 holds the open gates on the current design and the questions already
-closed. `architecture.html` is an overview drawn from this document.
+closed. `architecture.html` is an overview drawn from this document;
+it still shows v0.10's per-bucket replica lists and one-way
+relationships and is to be redrawn for v0.11.
 
 History: v0.4 generalised the product from restic-only to any
 S3-speaking backup tool. v0.5 replaced the Garage sidecar and capturing
@@ -49,8 +53,13 @@ taken at capture; the tunnel has one port. One process, one binary.
 v0.10.1 made the identity a bare X25519 key, with no Ed25519 and no
 signatures anywhere, and reads third-party credentials from the
 environment. v0.10.3 sends a borrower's buckets to lenders under
-sealed names, so a lender no longer learns what they are called. The
-trust model is unchanged throughout.
+sealed names, so a lender no longer learns what they are called.
+v0.11 follows REQUIREMENTS.md v0.10: a bucket asks for `copies`
+instead of naming replicas, each data object is placed on that many
+friends by free quota and metadata on all of them (D6), the owner's
+node re-places copies when the pool changes, every friendship is one
+symmetric quota, and an external bucket only takes what friends
+cannot hold. The trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -82,7 +91,7 @@ feature:
 | Role | Requirements | What they stress | Served by |
 |---|---|---|---|
 | **Local store**: the node's own copy, written by the user's backup tool | EP-1 to EP-15, P-5 | Synchronous and protocol-critical: full S3 behaviour for restic and Kopia, crash-safe exactly-once capture with no buffering, 200 MB/s, loopback only unless the user enables the LAN bridge (EP-17). The writer is trusted. | versitygw with the decorator's capture policy (D4, D15) |
-| **Replication**: moving each object to every replica | REPL-1 to REPL-11, §4.11, NET-2 to NET-5 | Asynchronous and robustness-critical: strict FIFO per replica, survival of days-long outages, resume, rate limits, a hash per object, reach behind NAT and to providers. Almost no S3 semantics. | an in-process S3 client (minio-go) driven by lendisk's queue (D12), dialling friends through tailcat (D5) |
+| **Replication**: placing each object in the pool and moving it there | REPL-1 to REPL-13, §4.11, NET-2 to NET-5 | Asynchronous and robustness-critical: placement by free quota, re-placement when the pool changes, strict FIFO per place with a metadata barrier, survival of days-long outages, resume, rate limits, a hash per object, reach behind NAT and to providers. Almost no S3 semantics. | an in-process S3 client (minio-go) driven by lendisk's queue (D12), dialling friends through tailcat (D5) |
 | **Lending store**: a friend's copy, written by a borrower who may be compromised | LEND-1 to LEND-7, RET-1 to RET-3, VER-1, NET-7, SEC-4 to SEC-16 | Enforcement-critical: quota, immutability, retention the borrower cannot bypass, a deny-by-default operation list, isolation between borrowers. | versitygw with the decorator's lender policy (D12, D15), behind the tunnel bridge (§3.7) |
 
 The two stores need the same S3 surface and differ only in policy, so
@@ -135,12 +144,12 @@ of targets REQUIREMENTS.md does not ask for.
 *Serves:* P-4, P-5, REPL-9, EP-9, EP-10, ID-6.
 
 The backup tool writes to the local daemon at disk speed. The daemon keeps
-the full repository locally and replicates every object to replicas in
-the background.
+the full repository locally and places every object in the pool in the
+background (D6).
 
 *Rejected:* synchronous pass-through to a peer. Backups would run at WAN
 upload speed, fail whenever the peer is offline, and give the user no local
-copy. Local staging gives 3-2-1 (one local copy, N offsite) for free and
+copy. Local staging gives 3-2-1 (one local copy, `copies` offsite) for free and
 makes most restores fast.
 
 The two storage modes (`full`, `evict`) are a requirement (EP-9); this
@@ -319,19 +328,71 @@ as such in status output (NET-4). Nodes ship with the project's DERP
 map, can be pointed at any `derper`, and may optionally include
 Tailscale's hosted relays as a last-resort bootstrap (NET-5).
 
-### D6. Replication: whole-repository mirrors, configurable factor
+### D6. Replication: per-object placement over a pool, by free quota
 
-*Serves:* P-5, REPL-1, REPL-4, LEND-6, LEND-7.
+*Serves:* P-5, P-8, REPL-1, REPL-4, REPL-11 to REPL-13, LEND-6, LEND-7,
+§4.11. Replaces v0.10's whole-repository mirrors.
 
-Each bucket is mirrored in full to each replica in its replication set.
-`min_replicas` (default 1, recommended 2) defines when a snapshot counts as
-offsite-complete.
+A node's **pool** is its friends plus its overflow targets. Every
+place in the pool has a capacity (the friendship's quota, or an
+overflow target's `max_bytes`), a use (live plus tombstoned bytes,
+counted by the borrower and reconciled with the lender's `quota`
+answer), a last-reachable time and a failure domain (the friend's
+`domain`, or a domain of its own).
 
-*Rejected:* erasure coding across peers. It reduces storage cost but
-makes a restore depend on k-of-n peers being online, and friends' NASes
-are not reliable enough for that. Mirrors also keep the zero-lock-in
-guarantee: a lender can hand you a disk. The capacity cost is derived
-in §4.
+- **Metadata objects** (by the tool profile, EP-7) are placed at every
+  friend, and at an overflow target once it holds any data object of
+  the bucket. They are about 1% of a restic or Kopia repository, and
+  having them everywhere makes each replica a readable, listable
+  repository of what it holds and makes recovery's listing complete
+  from any lender.
+- **Data objects** are placed at `copies` places, chosen at capture
+  time:
+  1. Candidates are friends with free capacity for the object,
+     reachable within the last hour (`replication.reroute_after`).
+  2. Take the candidate with the largest *free fraction*
+     (free ÷ capacity), then the next largest in a domain not yet
+     used, and so on, until `copies` are chosen. If domains run out,
+     continue in used domains and mark the object "same domain" for
+     `status`.
+  3. If fewer than `copies` friends qualify, fill the rest from
+     overflow targets by free bytes.
+  4. If there are still too few places, place what can be placed and
+     record the deficit for the re-placement worker (§3.4).
+
+  Largest free fraction fills every friend at the same rate, so no
+  friend fills early while others are empty. It also reaches the
+  REPL-12 AC without special cases: with quotas 100, 50 and 50 GB and
+  100 GB at two copies, keeping the three fractions equal means B
+  takes every object and C and D half each.
+- The placement is the table `placement` in `lendisk.db` (bucket,
+  sequence, key, place, state: `queued`, `acked`, `moving`,
+  `dropping`). It is never in the manifest: after `recover` it is
+  rebuilt by listing each place's copy of each sealed bucket, with the
+  hash from `x-amz-meta-lendisk-sha256` (§3.10).
+- Copies are moved only by the borrower's own node (P-2, PEER-11): the
+  re-placement worker of §3.4.
+
+*Rejected:*
+- **Whole-repository mirrors to named replicas** (v0.10 and earlier).
+  They needed one friend with room for the whole repository per copy,
+  and the user had to name friends per bucket and re-plan by hand when
+  one left. Their one advantage, that a single lender holds a complete
+  repository, REQUIREMENTS.md v0.10 gave up (P-5).
+- **Erasure coding across peers.** It reduces storage cost but makes a
+  restore depend on k-of-n peers being online, and friends' NASes are
+  not reliable enough for that. Every object would be shards, so no
+  replica would hold anything the backup tool can read; placement keeps
+  whole objects in the tool's layout.
+- **Deterministic placement** (weighted rendezvous hashing of key and
+  friend list). It needs no table, but every quota or friend change
+  moves objects, and it cannot react to a friend being full or offline.
+  Recovery lists the replicas anyway, so the table costs nothing there.
+- **Placement by absolute free bytes.** It also meets the AC, but a
+  large friend takes all the early objects and a small one stays empty,
+  which makes friendships look unbalanced in `status` (LEND-7).
+
+The capacity cost and the feasibility rule are derived in §4.
 
 ### D10. Language and licence: Go, because of D5 and D15
 
@@ -376,7 +437,7 @@ bundled program, not reimplemented. The daemon is glue around these:
 |---|---|---|---|
 | Backup format, client, encryption | **restic**, **Kopia**, unmodified | BSD-2 / Apache | Never imported; only their S3 usage and key naming conventions are relied on, via tool profiles. |
 | S3 front end and stores | **versitygw** via `embedgw`, pinned and vendored | Apache-2.0 | D15. SigV4 incl. `aws-chunked`, routing, multipart, listings, versioning, object lock; `backend/posix` and `backend/s3`. |
-| Replication transfers, every replica | **minio-go** | Apache-2.0 | D12. In-process S3 client, confined to one package behind the replica interface; the AWS SDK for Go v2 is the replacement if it is withdrawn. |
+| Replication transfers, every place in the pool | **minio-go** | Apache-2.0 | D12. In-process S3 client, confined to one package behind the replica interface; the AWS SDK for Go v2 is the replacement if it is withdrawn. |
 | Rate limiting | `golang.org/x/time/rate` | BSD-3 | REPL-7's token bucket around each uploaded part. |
 | Overlay network and NAT traversal | **`github.com/tailscale/tailcat`** | BSD-3 | D5. |
 | Relay | **`tailscale.com/cmd/derper`** | BSD-3 | `lendisk relay` is a thin wrapper. |
@@ -423,7 +484,7 @@ taken, with the AWS SDK for Go v2 as the obvious replacement.
 ### D12. Every replica is S3; an in-process client moves the bytes
 
 *Serves:* NET-7, NET-7a, NET-7b, REPL-1, REPL-6, REPL-7, REPL-10,
-LEND-2, LEND-4, RET-1 to RET-3, S3-1 to S3-9, P-5, P-7.
+LEND-2, LEND-4, RET-1 to RET-3, S3-1 to S3-8, P-5, P-7.
 
 A replication target is anything that implements the replica interface
 (`Put`, `Get` with range, `Head`, `List`, `Delete`, `Undelete`,
@@ -431,9 +492,9 @@ A replication target is anything that implements the replica interface
 into the daemon (**minio-go**, §3.4), and two kinds of target behind
 it:
 
-- an **external bucket**: any S3-compatible bucket the user configures,
-  in support tiers (§3.11), with versioning and lifecycle where the
-  provider has them;
+- an **overflow target**: any S3-compatible bucket the user adds to the
+  pool, in support tiers (§3.11), with versioning and lifecycle where
+  the provider has them;
 - a **friend's node**, dialled through the tailcat tunnel (§3.7). The
   friend's daemon serves S3 from the same embedded versitygw that fronts
   its own store (D15), through the lender-side policy in the decorator:
@@ -441,9 +502,10 @@ it:
   borrower cannot bypass (RET-1, RET-2) and a deny-by-default operation
   allow-list (SEC-9).
 
-Both kinds appear in a bucket's replication set and count towards
-`min_replicas`. The friend kind differs from the external kind in two
-methods only: `Verify` is the challenge (VER-1), and `Undelete` goes
+Both kinds are places in the pool and count towards `copies`; D6
+decides which objects each one gets, and overflow targets only get
+what friends cannot hold. The friend kind differs from the overflow
+kind in two methods only: `Verify` is the challenge (VER-1), and `Undelete` goes
 over the control API when the friend's store has no versioning
 (§3.6). Everything that moves bytes is the same code.
 
@@ -513,7 +575,7 @@ so there is still no second trust decision, only a second encoding of
 the same one. The borrower's client uses the derived secret directly;
 it is never written to a file.
 
-**Retention for external buckets** is delegated to the provider where
+**Retention for overflow targets** is delegated to the provider where
 the bucket has versioning (S3-4): versioning plus a lifecycle rule
 provide tombstones, and the borrower is told to use a credential
 **without delete permission** (S3-5), which makes the copy immune to a
@@ -522,7 +584,11 @@ can make (RET-2 relies on the friend's daemon being honest and intact).
 A bucket without versioning (Garage) gets lendisk-side tombstones and
 the "retention: client-side" label. For friends, the lender's decorator
 keeps retention, with delete markers in versitygw's versioning or its
-own tombstones depending on the store (§3.6).
+own tombstones depending on the store (§3.6). Overflow stays second
+choice all the same (REQUIREMENTS.md §4.11): the strong case needs a
+tier-1 provider and a correctly scoped credential, both of which are the
+user's to get right, a tier-2 target only has client-side tombstones,
+and every byte there costs money.
 
 Costs accepted:
 
@@ -686,7 +752,7 @@ Known costs and their handling:
   small-hardware design, but lendisk had to verify and re-sign every
   signature itself, the default store was Garage's block format, and
   two processes were always needed. Garage remains a tier-2 store
-  behind `backend/s3` and an external replica target; it has no
+  behind `backend/s3` and an overflow target; it has no
   versioning, so lendisk-side tombstones apply there.
 - **versitygw as a supervised child** over a unix socket, with
   lendisk's proxy in front (the sidecar variant considered on
@@ -767,34 +833,63 @@ Q-V.
   (SEC-14). `recover` derives the key
   from the phrase, dials the lender, fetches the manifest over the
   control API (no S3 credential needed yet), then derives the per-pair
-  S3 credentials (§3.7) for every lender listed. External replica
+  S3 credentials (§3.7) for every lender listed. Overflow target
   credentials found in the manifest are shown once, for the user to
-  put in the environment (SEC-3); they are not written to disk.
+  put in the environment (SEC-3); they are not written to disk. The
+  `placement` table (D6) is then rebuilt by listing each reachable
+  place's copy of each sealed bucket; a place that is offline is
+  listed when it returns, and until then its objects count as held
+  wherever else a listing found them.
 - **ID-6** Read-through is the decorator's `GetObject`/`HeadObject`
   miss path (EP-10); after `recover` every object is a miss until
-  fetched.
+  fetched, from the first reachable place `placement` names.
 - **ID-7** The sheet is generated from the manifest; a lender's `tc…`
   string changes only when its key or its configured bootstrap region
   changes (SEC-14), so regeneration is rare. Each bucket is listed with
   its sealed name and the `lent-<id16>-<sealed>` name it has in every
   lender's store (SEC-16), which is what a restore with lendisk stopped
-  (P-5) needs.
+  (P-5) needs, together with the number of replicas it must combine
+  (N − c + 1, from the pool size and the bucket's `copies`) and the
+  command that combines them: `rclone copy` or `aws s3 sync` from each
+  replica into one directory, `--ignore-existing` after the first.
 
 ### 3.2 Peers and invites
 
-- **PEER-1** The invite string carries the lender's `tc…` address, the
-  quota, the retention offer and a single-use secret. The lender's
-  admission hook admits a key derived from the secret, in the `invite`
-  role, until the invite is redeemed or expires (§3.9); the borrower
-  dials with that key to call `redeem`, after which its real key
-  replaces it.
-- **PEER-2** On redemption the lender records the relationship (borrower
-  key, quota, retention) in `lendisk.db`. From then on the borrower's
-  node ID is an account in lendisk's `IAMService`, with its derived
-  secret (NET-7a) computed on demand and never stored. Buckets the
-  borrower creates, always under their sealed names (SEC-16), are
-  created by the decorator under the `lent-<id16>-` name and owned by
-  that account alone.
+- **PEER-1** The invite string carries the inviting node's `tc…`
+  address, the symmetric quota, the retention offer and a single-use
+  secret. Its admission hook admits a key derived from the secret, in
+  the `invite` role, until the invite is redeemed or expires (§3.9);
+  the invited node dials with that key to call `redeem`, after which
+  its real key replaces it.
+- **PEER-2** `redeem` carries the invited node's `tc…` address, its
+  retention offer and the user's confirmation of the quota. Both nodes
+  then write the same friendship row in `lendisk.db` (peer key,
+  address, quota, each side's retention, ceiling, domain), and each
+  becomes an account in the other's `IAMService`: each is the other's
+  lender and borrower. The derived secret (NET-7a) serves both
+  directions: the X25519 shared secret is the same either way, the
+  access key is the borrowing side's node ID, and the tunnel bridge
+  binds that access key to the connection's peer key (SEC-12), so
+  neither side can use the other's credential. It is computed on
+  demand and never stored. Buckets a borrower
+  creates, always under their sealed names (SEC-16), are created by the
+  decorator under the `lent-<id16>-` name and owned by that account
+  alone.
+- **PEER-3, PEER-6, LEND-8** The quota is one column of the friendship
+  row and both sides hold the same value. Changes go through the
+  control API `quota` endpoint: `propose(n)` from either side, answered
+  `accepted` when `n` is within the receiver's `lending.max_per_peer` and
+  leaves `lending.max_total` intact, otherwise `pending` until its user
+  runs `lendisk peer quota <peer> --accept` (or rejects it). A decrease
+  is not a proposal: it is applied by the side that makes it and pushed
+  as `lower(n)`, which the other side applies at once (SEC-15's 60
+  seconds apply). If the push cannot be delivered, the lowering side
+  enforces the lower number on its side alone and repeats the push on
+  every connection until it is acknowledged, so the two rows converge.
+  The automatic proposer runs after each placement pass: when a bucket
+  has a deficit (D6, step 4), it proposes to the friends with the
+  smallest free fraction an increase that would cover the deficit at
+  `copies`, never beyond its own ceilings.
 - **PEER-8** Two walls. The decorator maps every bucket name through
   the borrower's own mapping table, so a borrower can only name its own
   buckets; and versitygw's bucket-ownership check refuses an account
@@ -803,7 +898,9 @@ Q-V.
   the mapping table.
 - **PEER-9** The lender-only profile skips the loopback S3 listener and
   runs no replication worker; versitygw still runs, behind the tunnel
-  bridge only.
+  bridge only. Its friendship rows are like any other; the quota its
+  friends lend it back has no buckets to fill, and `status` shows it as
+  unused. Adding a bucket later is a change of `role` and a restart.
 - **PEER-10** Peers are rows in `lendisk.db`; nothing in the control API
   or the S3 surface returns them.
 
@@ -869,11 +966,13 @@ Q-V.
   lendisk's `IAMService` (`Config.IAMService`, which takes precedence
   over versitygw's own IAM options). versitygw's `IAMDir` is not used.
 - **EP-10** The decorator's `GetObject`/`HeadObject` turn a not-found
-  from the backend into a ranged fetch from a replica through the
-  replica interface (D12; a ranged `GetObject` by the replica client), write the object
-  into the store, and return it. In `evict` mode the eviction worker
-  deletes a pack from the store once `min_replicas` have acknowledged
-  it and no tool lock is present.
+  from the backend into a fetch through the replica interface (D12; a
+  ranged `GetObject` by the replica client) from a place `placement`
+  names as `acked` for the key, friends before overflow targets and
+  the most recently reachable first, falling through to the next on
+  failure; they write the object into the store and return it. In
+  `evict` mode the eviction worker deletes a pack from the store once
+  `copies` places have acknowledged it and no tool lock is present.
 - **EP-12** On `posix`, `init` checks xattr support and the free-space
   floor on the store directory and refuses otherwise. On `s3`, it runs
   the capability probe (D15) and warns when the endpoint is not on the
@@ -893,16 +992,59 @@ Q-V.
 
 ### 3.4 Replication
 
+- **REPL-12, placement at capture.** When the decorator completes a
+  queue row (EP-3), the placer runs D6's choice for it in the same
+  SQLite transaction: a metadata key gets a `placement` row per friend
+  (and per overflow target already holding data of the bucket), a data
+  key gets `copies` rows. Each `placement` row in state `queued` is an
+  entry in that place's FIFO.
 - **REPL-1 to REPL-3** The queue is a SQLite table with one FIFO
-  sequence per replica. The worker uploads one object at a time per
-  replica in sequence order, several replicas in parallel, and moves
-  the watermark only when every earlier entry is acknowledged.
-- **The replica client.** One minio-go client per replica, built from
+  sequence per place, ordered by the bucket's write sequence. The
+  worker uploads one object at a time per place in sequence order,
+  several places in parallel. A delete (REPL-2) is a row in the FIFO of
+  every place whose `placement` row for the key is `acked` or
+  `queued`; a `queued` put that has not started is simply cancelled.
+- **REPL-1, the metadata barrier.** A metadata row at sequence `m` is
+  eligible to send only when the bucket's watermark (REPL-11) has
+  reached `m − 1`, so every earlier data object already has `copies`
+  acknowledgements. Because the place's FIFO waits behind it, a lagging
+  data copy holds back every place's metadata, so data rows are
+  re-routed early: a `queued` data row at a place unreachable for
+  longer than `replication.reroute_after` (1 hour) is given to another
+  place by D6's choice. Re-routing an unsent row moves no bytes.
+  Restic and Kopia write packs, then indexes, then the snapshot or
+  manifest, so the barrier costs one round of acknowledgements per
+  backup run, not per object.
+- **REPL-13, the re-placement worker.** It runs after every change to
+  the pool (friend added or removed, quota changed, a verification
+  failed, an overflow target added) and hourly. It computes for each
+  object the places that hold or will hold it (`acked`, `queued`, not
+  `dropping`) and:
+  - for each object with fewer than `copies` such places, places the
+    missing copies by D6's choice, excluding the current holders; the
+    put reads from the local store, or in `evict` mode streams from a
+    holder through the replica client;
+  - for each copy at a place being drained (a friend removed, failed,
+    unreachable for longer than `replication.replace_after`, 7 days,
+    or above its lowered quota; an overflow target when a friend has
+    room; any place beyond `copies` after `copies` is lowered), first
+    places the replacement as above and, only when that is `acked`,
+    marks the old row `dropping` and queues a delete there. A copy
+    never drops below what it had, and an object never has fewer than
+    `copies` places except while there is nowhere to put one.
+  - Drain-back from overflow targets is lowest priority and runs only
+    inside the replication schedule (REPL-7), oldest objects first.
+  A friend that returns after `replace_after` has its rows already
+  `dropping`; its queue sends the deletes, and what it held becomes
+  tombstones for the window (RET-1) like any other delete. The worker
+  and the placer share one lock per bucket, so the two never decide
+  about one object at once.
+- **The replica client.** One minio-go client per place in the pool, built from
   the configuration and the manifest. A friend is the friend's tunnel
   address as endpoint, path-style, the derived credential (NET-7a), the
   bucket's sealed name in place of its own (SEC-16), and an HTTP
   transport whose dial function is the tailcat `Client` for
-  that peer (§3.7). An external bucket is the endpoint, bucket, prefix
+  that peer (§3.7). An overflow target is the endpoint, bucket, prefix
   and credential the user registered (S3-1). The clients are built in
   one package, which is the only code that imports minio-go (D12).
 - **Operations.** `Put` streams the object from the store through the
@@ -923,17 +1065,19 @@ Q-V.
   interruption the worker lists the parts of the open upload, checks
   them against the row, and continues at the next part. Objects below
   the part size (16 MiB, configurable) restart whole. The same for
-  friends and external buckets.
+  friends and overflow targets.
 - **REPL-7** Per-peer and global limits are token buckets
   (`golang.org/x/time/rate`) wrapped around the reader of each part;
   the time-of-day schedule is checked before each part, so a closing
   window stops a transfer within one part. Both change at runtime from
   the configuration.
-- **REPL-8** `export` pages through the bucket through the decorator
-  and writes one file per key at its key path (or Kopia's sharded
-  layout); `import` on the lender walks the directory and puts each
-  file into the borrower's bucket through the decorator, recording
-  hashes in the index as acknowledged.
+- **REPL-8** `export --for <peer>` pages through the bucket through the
+  decorator and writes one file per key at its key path (or Kopia's
+  sharded layout), for each key with a `placement` row at that peer;
+  `import` on the lender walks the directory and puts each file into
+  the borrower's bucket through the decorator, and the borrower marks
+  those rows `acked` once a listing of the peer confirms them with the
+  right hashes.
 - **REPL-10** The hash is SHA-256, taken by the decorator from the
   write stream at capture (EP-3) and kept on the queue row; the worker
   sends it with the object as `x-amz-meta-lendisk-sha256` and stores
@@ -943,16 +1087,23 @@ Q-V.
   and send is rejected and alerted rather than replicated.
   REQUIREMENTS.md v0.9 reworded REPL-10 to allow the hash to be taken
   when the tool writes the object, for exactly this.
-- **REPL-11** The watermark is the queue sequence number of the last
-  acknowledged write per replica.
+- **REPL-11** The bucket's watermark is the highest sequence `w` such
+  that every object up to `w` has `copies` `acked` placement rows; it
+  advances as acknowledgements arrive and is the offsite-complete point
+  (REPL-4). Per-place lag (the oldest `queued` row's age) is kept beside
+  it for `status` and OPS-2.
 
 ### 3.5 Lending and quotas
 
-- **LEND-1** The decorator keeps a per-borrower byte counter in
+- **LEND-1** The decorator keeps a per-friend byte counter in
   `lendisk.db` (live objects plus non-current versions or tombstones,
   updated on every completed put and every purge) and reconciles it
-  daily against a listing. The optional global cap is a second counter
-  over all borrowers.
+  daily against a listing, and enforces the friendship's quota on it.
+  `lending.max_total` is a second counter over all friends; a quota
+  proposal that would make the sum of quotas exceed it is not accepted
+  automatically (LEND-8). The borrower side keeps its own count of what
+  it has stored at each place, for D6's free fraction, and corrects it
+  from the lender's `quota` answer.
 - **LEND-2** The decorator refuses `PutObject`, `CreateMultipartUpload`
   and `CreateBucket` with S3 error code `QuotaExceeded`, HTTP 507, when
   the counter would exceed quota or `statfs` on the store is below the
@@ -973,7 +1124,15 @@ Q-V.
   files on `posix` (EP-15); `lendisk export <bucket> --borrower <id>
   <path>` writes the tool's own layout from either backend kind
   (REPL-8).
-- **LEND-7** The suggestion is `1.2 × k × R`; the derivation is §4.
+- **LEND-7** `init` suggests `lending.max_total` = `c × S` plus the
+  retention margin of §4. The control API `quota` answer carries the
+  quota, both sides' use and the answering node's repository size (sum
+  of its own buckets' live bytes, rounded to 1 GB). The protectable
+  size is computed by bisection on `S` over Σ min(S, quotaⱼ) +
+  Σ overflow `max_bytes` ≥ c × S, and the fair-quota bound with
+  min(S, quotaⱼ) replaced by min(S, sizeⱼ); the derivation is §4. The
+  "under half used for 30 days" note compares the daily use samples
+  both sides already report in `quota`.
 
 ### 3.6 Deletion, retention and verification
 
@@ -1061,7 +1220,7 @@ Q-V.
   `version`, `undelete`) is plain HTTP under `/_lendisk/` on the same
   tunnel port, authenticated by the tunnel peer key and checked per
   request against `lendisk.db` (SEC-11). The borrower replicates to a
-  friend with the same replica client it uses for external buckets,
+  friend with the same replica client it uses for overflow targets,
   dialling through tailcat as below. AC check: from an allowed peer,
   `restic -r s3:http://<lender>:9000/<bucket> snapshots` works with the
   derived credential.
@@ -1099,13 +1258,16 @@ Q-V.
 ### 3.8 Operations and observability
 
 - **OPS-4** `prometheus/client_golang` on a loopback port. Transfer
-  counters (bytes, objects, retries, lag, per replica) come from the
+  counters (bytes, objects, retries, lag, per place) come from the
   replication worker.
 - **OPS-6** The configuration file is TOML; state lives in `lendisk.db`.
   Store settings are one `[store]` section (`backend = "posix"` with a
   `path`, or `backend = "s3"` with endpoint; its credential comes from
   the environment, SEC-3), used for both roles; replication settings,
-  including the limits and the timetable, are `[replication]`; network
+  including the limits, the timetable, `reroute_after` and
+  `replace_after`, are `[replication]`; the ceilings are `[lending]`
+  (`max_total`, `max_per_peer`); a friend's domain is `domain` in its
+  `[[peer]]` entry; overflow targets are `[[overflow]]` entries; network
   addresses for the endpoint are `[[endpoint.listen]]` entries (EP-17),
   none by default.
 - **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the
@@ -1118,16 +1280,16 @@ Q-V.
 ### 3.9 Security
 
 - **SEC-3** Per-bucket S3 keys live in `lendisk.db`; versitygw's
-  `IAMDir` is not used. A `backend/s3` store credential and external
-  replica credentials are read from environment variables at start:
+  `IAMDir` is not used. A `backend/s3` store credential and overflow
+  target credentials are read from environment variables at start:
   `LENDISK_STORE_ACCESS_KEY` and `LENDISK_STORE_SECRET_KEY` for the
-  store, `LENDISK_REPLICA_<NAME>_ACCESS_KEY` and
-  `LENDISK_REPLICA_<NAME>_SECRET_KEY` for each external replica, with
+  store, `LENDISK_OVERFLOW_<NAME>_ACCESS_KEY` and
+  `LENDISK_OVERFLOW_<NAME>_SECRET_KEY` for each overflow target, with
   the variable names overridable per entry in the config file. They
   are supplied by systemd's `EnvironmentFile=` (a root-owned file the
   service user cannot read) or the container runtime's secrets;
   lendisk never writes them to disk, redacts them from logs and
-  `status`, and refuses to start a store or replica whose variables
+  `status`, and refuses to start a store or overflow target whose variables
   are unset. Replica credentials are also carried in the encrypted
   node manifest (S3-1) for recovery. They are read by the process that
   uses them and never passed to another. The endpoint's TLS key
@@ -1247,13 +1409,13 @@ Q-V.
   `x-amz-meta-lendisk-sha256`, so the hash index can be rebuilt from
   the store.
 
-### 3.11 External replicas
+### 3.11 Overflow targets
 
 Support tiers, all through the replica client (D12):
 
 | Tier | Targets | Retention | Testing |
 |---|---|---|---|
-| 1 | S3 with versioning (B2, Wasabi, Hetzner, R2, RustFS) | provider-enforced (S3-4), credential without delete (S3-5) | CI per provider |
+| 1 | S3 with versioning (B2, Wasabi, Hetzner, R2, RustFS) | provider-enforced (S3-4), credential without permanent delete (S3-5) | CI per provider |
 | 2 | S3 without versioning (Garage) | client-side tombstones, labelled | CI against Garage |
 
 Non-S3 targets (SFTP, B2's native API, WebDAV, OAuth remotes such as
@@ -1261,62 +1423,112 @@ Google Drive) are not in v1: REQUIREMENTS.md §4.11 asks for S3
 buckets, and rclone behind the same replica interface is the v1.1
 route to the rest (D12).
 
-- **S3-1** `replica add s3 <name> …` stores the endpoint, bucket and
-  prefix in the config file and reads the credential from the
-  environment (SEC-3), testing it before the replica is accepted; the
-  credential is carried in the encrypted manifest for recovery, and the
-  client is built from all of these at start.
+An overflow target is a place in the pool like a friend (D6), with
+`max_bytes` as its capacity, and is only a candidate for a data copy
+when fewer than `copies` friends have room (D6, step 3). The
+re-placement worker drains it back to friends whenever they have room
+(§3.4). `status` shows what it holds, the objects for which it is one
+of the `copies`, and the estimated cost (S3-7).
+
+- **S3-1** `overflow add s3 <name> --endpoint … --bucket … --prefix …
+  --max-bytes …` writes an `[[overflow]]` entry to the config file and
+  reads the credential from the environment (SEC-3), testing it before
+  the target is accepted; the credential is carried in the encrypted
+  manifest for recovery, and the client is built from all of these at
+  start. Each of the node's buckets is a sub-prefix
+  `<prefix>/<sealed name>/` (SEC-16), with keys below it as the tool
+  wrote them (S3-2).
 - **S3-3** Uploads carry the SHA-256 as the request checksum where the
   provider verifies one and Content-MD5 otherwise, plus lendisk's
   SHA-256 as metadata. Large objects use multipart with the resume of
   §3.4.
 - **S3-4** Buckets without versioning get lendisk-side tombstones: the
   delete is recorded locally and issued after the window; `status`
-  labels the replica "retention: client-side".
+  labels the target "retention: client-side". Drain-back deletes go
+  the same way.
+- **S3-5** Drain-back has to delete at the target, so the recommended
+  credential may create delete markers (`s3:DeleteObject` without a
+  version id) but not remove versions (`s3:DeleteObjectVersion`), and
+  the lifecycle rule purges non-current versions after the window.
+  `overflow add` tests both permissions and reports them. Where a
+  provider cannot separate the two (Q-AC), the choice is the user's:
+  with no delete permission at all, drained copies stay at the target
+  as dead weight until the user removes them, and `status` counts them.
 - **S3-6** Stored checksums are read with `StatObject` (the ETag,
   where it is an MD5 of a single-part object) and compared where the
   type matches; sample downloads (VER-2) are the check everywhere.
-- **S3-9** Adoption lists the bucket with `ListObjects` and seeds the
-  acknowledged-hash index from `x-amz-meta-lendisk-sha256` where
-  present, otherwise by hashing a download.
 
 ## 4. Capacity planning
 
-Mirroring (D6) sets the disk cost. Let `R` be the repository size:
-source data after deduplication and compression (typically 0.5–1.0× the
-source; ~1× for photos and video), plus the snapshot history the user's
-`forget` policy keeps. Let `k` be the number of lenders.
+Placement (D6) and symmetric quotas (P-8) set the disk cost. Let `S`
+be the repository size: source data after deduplication and
+compression (typically 0.5–1.0× the source; ~1× for photos and video),
+plus the snapshot history the user's `forget` policy keeps. Let `c` be
+`copies` and `n` the number of friends.
 
-**What a borrower consumes elsewhere:** `k × R`, plus headroom at each
-lender for tombstones (RET-1) and the lender's free-space floor
-(LEND-2). A lender should set quota ≈ `1.2 × R` per borrower.
+**What a node stores elsewhere:** `c × S` of data objects, plus the
+metadata (~1% of `S`) at each of the other `n − c` friends, plus
+tombstones for the retention window (RET-1). Tombstones are the
+margin: restic `prune` and Kopia maintenance rewrite packs, and the
+old ones stay at every place that held them for the window. Weekly
+pruning of a repository with a few percent churn a week gives 10–20%
+of `S` in tombstones at 30 days; this document plans with 20%.
+
+**What it lends:** by symmetry, the same total, spread over its
+friendships: `1.2 × c × S`. That is `init`'s suggestion for
+`lending.max_total` (LEND-7).
 
 **What a node needs on its own disk:**
 
 | | `full` mode (default) | `evict` mode |
 |---|---|---|
-| Local copy | `R` | ~1% of `R` for metadata, plus a buffer for packs not yet acknowledged by `min_replicas` lenders (at least one backup run of new data) |
-| Space lent | user's choice; fair share is `1.2 × k × R` | same |
+| Local copy | `S` | ~1% of `S` for metadata, plus a buffer for packs not yet acknowledged by `copies` places (at least one backup run of new data) |
+| Space lent | `1.2 × c × S` | same |
+| Total, `c = 2` | `3.4 × S` | `2.4 × S` plus the buffer |
 
-Worked example, 100 GB of source data, `R ≈ 100 GB`, two lenders:
+**Feasibility.** Each friend can hold at most one copy of an object, so
+with quotas `qⱼ` and overflow room `O` the pool holds `S` at `c`
+copies only if
 
-- consumes ~200 GB at friends (240 GB with headroom);
-- needs ~100 GB locally in `full` mode, ~1 GB plus buffer in `evict`;
-- fair share to lend back: ~240 GB;
-- total own disk: ~340 GB (`full`) or ~240 GB (`evict`).
+    Σⱼ min(S, qⱼ) + O ≥ c × S
 
-Two friends backing each other up (`k = 1`): ~220 GB each per 100 GB
-of data.
+and the protectable size (LEND-7) is the largest `S` that satisfies it.
+A friend has no use for more of your disk than its own repository
+`Sⱼ` needs, so fair quotas satisfy `qⱼ ≤ Sⱼ`; with friends no bigger
+than you, the rule becomes: **you are fully protected while `S ≤ ΣSⱼ /
+c`**, your backup at most half your friends' combined at two copies.
+Beyond that, quotas cannot fix it fairly; overflow or more friends
+can.
 
-**Rule of thumb for users (LEND-7):** lend `k` times what you back up,
-plus 20%. Reciprocity is not enforced (P-8); this is the number that
-makes a symmetric group work. An external replica counts in `k` but
-costs money instead of lent disk: one friend plus one bucket means
-lending ~1.2 × R and paying for ~R.
+Worked examples, `c = 2`:
 
-Erasure coding would reduce the multiplier to roughly 1.5–2×; D6 rejects
-it because restores would then depend on several friends being online at
-once.
+1. **Four friends, 100 GB each.** Every pair at 80 GB. Each node lends
+   and receives 240 GB; protectable size 3 × 80 / 2 = 120 GB, so 20 GB
+   of the room is tombstone margin. Disk per node: 100 + 240 = 340 GB.
+2. **E with 200 GB among four friends with 100 GB.** E's friendships at
+   100 GB each: protectable 4 × 100 / 2 = 200 GB, exactly E's size, so
+   E has no tombstone margin and runs at the limit (OPS-2 alerts above
+   90%). Each small friend gets 100 GB from E and needs about 140 GB
+   more, ~47 GB with each of the other three. E's disk: 200 + 400 = 600
+   GB; each small friend's: 100 + 240 = 340 GB.
+3. **E with 400 GB among the same four.** Fair quotas cap each
+   friendship at 100 GB: protectable 200 GB. With an overflow target
+   at `max_bytes` 400 GB (plus margin), every data object has one copy
+   at a friend and one at the target: 400 + 400 ≥ 800. At about $6 per
+   TB-month that is ~$2.40 a month. A fifth friend with 400 GB of
+   their own, at a 400 GB quota, empties the target: 4 × 100 + 400 ≥
+   800.
+
+**Rule of thumb for users (LEND-7):** lend `c` times what you back up,
+plus 20% (2.4× at two copies), and your disk holds about 3.4× your
+backup. You are fully protected while your backup is at most your
+friends' backups combined divided by `c`; past that, `status` says so
+and an overflow bucket covers the rest.
+
+Erasure coding would reduce the multiplier to roughly 1.5–2×; D6
+rejects it because restores would then depend on several friends
+being online at once, and no replica would hold anything the backup
+tool can read.
 
 ## 5. Gates and resolved questions
 
@@ -1324,8 +1536,8 @@ Release gates on the product (field connectivity, soak, small hardware)
 are G-1 to G-3 in REQUIREMENTS.md §6. The gates here are on the current
 design and disappear with it.
 
-- **Q-A (resolved)** `min_replicas` defaults to 1 with a nudge towards a
-  second replica (EP-6).
+- **Q-A (resolved)** `copies` defaults to 2, with a nudge when set to 1
+  (EP-6). Until v0.10 it was `min_replicas`, defaulting to 1.
 - **Q-B (resolved)** Relays are reused, not built: DERP via tailcat
   (D5). The project runs a few `derper` instances; the cost is a couple
   of small VPSes. Tailscale's hosted relays are a bootstrap convenience
@@ -1454,3 +1666,20 @@ design and disappear with it.
   a bind mount in CI. Fallback: a second `posix` backend instance for
   `lent-*` buckets with a mux by bucket name, for that configuration
   only.
+- **Q-AA (open, tuned with G-1)** Placement and re-placement
+  parameters (D6, §3.4): `reroute_after` (1 hour), `replace_after` (7
+  days), the hourly re-placement pass, and free fraction as the
+  placement key. G-1's households give real offline patterns; the
+  question is how much re-placement traffic a friend's normal weekend
+  away causes, and whether `replace_after` should scale with how often
+  that friend has come back before.
+- **Q-AB (resolved)** The repository size exchanged for LEND-7 tells a
+  friend one number it could already estimate from what it holds of
+  the bucket's metadata. REQUIREMENTS.md v0.10 lists it in SEC-2; it is
+  rounded to 1 GB (§3.5).
+- **Q-AC (gate, open)** Drain-back deletes at overflow targets (§3.11,
+  S3-5). Check per tier-1 provider (B2, Wasabi, Hetzner, R2) whether a
+  credential can allow delete markers but not version removal, and
+  whether the lifecycle rule then purges the drained copies after the
+  window. Where it cannot, the user chooses between a credential that
+  can remove versions and drained copies left in place.

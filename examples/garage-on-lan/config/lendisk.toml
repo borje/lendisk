@@ -1,8 +1,10 @@
-# Björn · store is the Garage he already runs · DESIGN.md v0.10.1
+# Björn · store is the Garage he already runs · DESIGN.md v0.11
 #
 # After init:
-#   lendisk bucket add photos --profile restic --replicas anna,dag --min-replicas 2 --mode evict
-#   lendisk invite --quota 500G --retention 30d     # Anna
+#   lendisk peer add <Anna's invite>                # 200 GB each way
+#   lendisk invite --quota 200G --retention 30d     # Dag
+#   lendisk bucket add photos --profile restic --mode evict   # copies = 2
+# With two friends and two copies, every pack is at both Anna and Dag.
 #
 # `init` ran the capability probe against Garage (EP-12, D15) and
 # recorded: versioning no, lifecycle yes, object lock no, checksum
@@ -36,7 +38,8 @@ accept_peer_hints = false
 
 [lending]
 retention_min = "30d"
-global_cap    = "600G"
+max_total     = "600G"
+max_per_peer  = "300G"
 
 [replication]
 upload_limit = "5M"          # CGNAT upstream is thin; Anna is reached through a relay
@@ -44,7 +47,7 @@ schedule     = "00:00-06:00"
 part_size    = "16M"
 
 [eviction]
-# EP-9: packs leave the local store once min_replicas have acknowledged
+# EP-9: packs leave the local store once `copies` places have acknowledged
 # them and no restic lock is present. Metadata never leaves.
 idle_before_evict = "15m"
 
