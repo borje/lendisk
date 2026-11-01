@@ -1,8 +1,9 @@
 # lendisk — design
 
-Status: draft v0.11, 2026-11-01. Companion to REQUIREMENTS.md v0.10,
-which made the two requirement changes this design needed (Q-T,
-resolved), then moved third-party credentials to the environment,
+Status: draft v0.11.1, 2026-11-01. Companion to REQUIREMENTS.md v0.10.1.
+REQUIREMENTS.md v0.9 made the two requirement changes this design
+needed (Q-T, resolved); its later versions moved third-party
+credentials to the environment,
 then let backup tools on other machines use the node (EP-17; the LAN
 bridge, §3.3), then hid bucket names from lenders (SEC-16; sealed
 names, §3), and then replaced per-bucket replica lists with placement
@@ -24,9 +25,7 @@ with those decisions: this is where component names, ports, paths,
 headers, formats and algorithms live, and it is the first place to
 edit when a decision changes. §4 derives the capacity numbers. §5
 holds the open gates on the current design and the questions already
-closed. `architecture.html` is an overview drawn from this document;
-it still shows v0.10's per-bucket replica lists and one-way
-relationships and is to be redrawn for v0.11.
+closed. `architecture.html` is an overview drawn from this document.
 
 History: v0.4 generalised the product from restic-only to any
 S3-speaking backup tool. v0.5 replaced the Garage sidecar and capturing
@@ -59,7 +58,13 @@ instead of naming replicas, each data object is placed on that many
 friends by free quota and metadata on all of them (D6), the owner's
 node re-places copies when the pool changes, every friendship is one
 symmetric quota, and an external bucket only takes what friends
-cannot hold. The trust model is unchanged throughout.
+cannot hold. v0.11.1 corrects contradictions a review found in v0.11:
+the metadata barrier waits for actual placements, placement prefers an
+unreachable friend over overflow only until `replace_after`, metadata
+is backfilled to new places, capacity counts metadata at every place,
+undelete at overflow targets copies a version instead of removing
+markers, and the global quota cap cannot be overridden. The trust
+model is unchanged throughout.
 
 ## 1. Name
 
@@ -203,9 +208,11 @@ What changed versus a restic-only design, and the replacement for each:
   in the write sequence (REPL-11). Tool profiles (`restic`, `kopia`)
   recognise snapshot or manifest keys and present the watermark as
   "snapshot X"; `generic` shows a timestamp.
-- *Write ordering* (REPL-1) generalises unchanged: restic and Kopia both
-  write packs, then indexes, then the snapshot or manifest, so FIFO
-  replication keeps the replica consistent at every watermark.
+- *Write ordering* (REPL-1): restic and Kopia both write packs, then
+  indexes, then the snapshot or manifest. No single place holds every
+  pack, so per-place FIFO is not enough on its own; the metadata
+  barrier of §3.4 holds each metadata object until the data before it
+  is placed, which keeps the pool consistent at every watermark.
 - *Multipart uploads* are enqueued on `CompleteMultipartUpload` only;
   parts and aborted uploads never reach the queue (EP-2).
 - *Zero lock-in* (P-5) holds on both sides, at its v0.7 strength on the
@@ -348,23 +355,31 @@ answer), a last-reachable time and a failure domain (the friend's
   from any lender.
 - **Data objects** are placed at `copies` places, chosen at capture
   time:
-  1. Candidates are friends with free capacity for the object,
-     reachable within the last hour (`replication.reroute_after`).
+  1. Candidates are friends with free capacity for the object.
+     Free capacity is the quota less what is stored there, less the
+     bucket's metadata not yet sent there.
   2. Take the candidate with the largest *free fraction*
-     (free ÷ capacity), then the next largest in a domain not yet
-     used, and so on, until `copies` are chosen. If domains run out,
-     continue in used domains and mark the object "same domain" for
-     `status`.
-  3. If fewer than `copies` friends qualify, fill the rest from
-     overflow targets by free bytes.
+     (free ÷ capacity), friends reachable within the last hour
+     (`replication.reroute_after`) before the others, then the next in
+     a domain not yet used, and so on, until `copies` are chosen. If
+     domains run out, continue in used domains and mark the object
+     "same domain" for `status`. An unreachable friend with room is
+     still chosen when the reachable ones are not enough, and its copy
+     waits for it (§3.4), unless it has been unreachable longer than
+     `replace_after` or is being drained: then it is not a candidate
+     at all.
+  3. Only if fewer than `copies` friends, reachable or not, have room,
+     fill the rest from overflow targets by free bytes. An overflow
+     target that gets its first data object of a bucket gets every
+     metadata object of the bucket first (§3.4).
   4. If there are still too few places, place what can be placed and
      record the deficit for the re-placement worker (§3.4).
 
   Largest free fraction fills every friend at the same rate, so no
-  friend fills early while others are empty. It also reaches the
-  REPL-12 AC without special cases: with quotas 100, 50 and 50 GB and
-  100 GB at two copies, keeping the three fractions equal means B
-  takes every object and C and D half each.
+  friend fills early while others are empty. For the REPL-12 AC
+  (quotas 100, 55 and 55 GB; 100 GB with about 1 GB of metadata at two
+  copies) equal fractions put about 96 GB at B and 53 GB each at C and
+  D, metadata included, all within quota.
 - The placement is the table `placement` in `lendisk.db` (bucket,
   sequence, key, place, state: `queued`, `acked`, `moving`,
   `dropping`). It is never in the manifest: after `recover` it is
@@ -578,7 +593,7 @@ it is never written to a file.
 **Retention for overflow targets** is delegated to the provider where
 the bucket has versioning (S3-4): versioning plus a lifecycle rule
 provide tombstones, and the borrower is told to use a credential
-**without delete permission** (S3-5), which makes the copy immune to a
+**that cannot remove versions** (S3-5), which makes the copy immune to a
 compromised borrower machine, a stronger promise than a friend's node
 can make (RET-2 relies on the friend's daemon being honest and intact).
 A bucket without versioning (Garage) gets lendisk-side tombstones and
@@ -878,9 +893,11 @@ Q-V.
 - **PEER-3, PEER-6, LEND-8** The quota is one column of the friendship
   row and both sides hold the same value. Changes go through the
   control API `quota` endpoint: `propose(n)` from either side, answered
-  `accepted` when `n` is within the receiver's `lending.max_per_peer` and
-  leaves `lending.max_total` intact, otherwise `pending` until its user
-  runs `lendisk peer quota <peer> --accept` (or rejects it). A decrease
+  `accepted` when `n` is within the receiver's `lending.max_per_peer`
+  and keeps the sum of its quotas within `lending.max_total`; `pending`
+  when only the per-friend ceiling is exceeded, until its user runs
+  `lendisk peer quota <peer> --accept` (or rejects it); `refused` when
+  the global cap would be exceeded, which `--accept` cannot override. A decrease
   is not a proposal: it is applied by the side that makes it and pushed
   as `lower(n)`, which the other side applies at once (SEC-15's 60
   seconds apply). If the push cannot be delivered, the lowering side
@@ -1005,13 +1022,20 @@ Q-V.
   every place whose `placement` row for the key is `acked` or
   `queued`; a `queued` put that has not started is simply cancelled.
 - **REPL-1, the metadata barrier.** A metadata row at sequence `m` is
-  eligible to send only when the bucket's watermark (REPL-11) has
-  reached `m − 1`, so every earlier data object already has `copies`
-  acknowledgements. Because the place's FIFO waits behind it, a lagging
-  data copy holds back every place's metadata, so data rows are
-  re-routed early: a `queued` data row at a place unreachable for
-  longer than `replication.reroute_after` (1 hour) is given to another
-  place by D6's choice. Re-routing an unsent row moves no bytes.
+  eligible to send only when every data object before `m` has no
+  `queued` placement row left: each is `acked` at every place it is
+  placed at, which is `copies` places or, where D6 recorded a deficit,
+  fewer. A deficit therefore lowers the copies but does not stop the
+  pool: places with room keep receiving data and metadata. The bucket's
+  watermark (REPL-11) still requires `copies`. Because the place's FIFO
+  waits behind a held metadata row, a lagging data copy holds back
+  every place's metadata, so data rows are re-routed early: a `queued`
+  data row at a friend unreachable for longer than
+  `replication.reroute_after` (1 hour) is given to another *friend*
+  with room by D6's choice, never to an overflow target while the
+  unreachable friend still has room (REPL-12); with no such friend it
+  waits, the lag shows in `status`, and `replace_after` applies.
+  Re-routing an unsent row moves no bytes.
   Restic and Kopia write packs, then indexes, then the snapshot or
   manifest, so the barrier costs one round of acknowledgements per
   backup run, not per object.
@@ -1024,6 +1048,11 @@ Q-V.
     missing copies by D6's choice, excluding the current holders; the
     put reads from the local store, or in `evict` mode streams from a
     holder through the replica client;
+  - for each metadata object missing at a friend, or at an overflow
+    target holding data of the bucket, adds the row. A new friend thus
+    receives the bucket's existing metadata, in sequence order and
+    ahead of any newer data, before the placer counts it as holding a
+    copy;
   - for each copy at a place being drained (a friend removed, failed,
     unreachable for longer than `replication.replace_after`, 7 days,
     or above its lowered quota; an overflow target when a friend has
@@ -1099,9 +1128,8 @@ Q-V.
   `lendisk.db` (live objects plus non-current versions or tombstones,
   updated on every completed put and every purge) and reconciles it
   daily against a listing, and enforces the friendship's quota on it.
-  `lending.max_total` is a second counter over all friends; a quota
-  proposal that would make the sum of quotas exceed it is not accepted
-  automatically (LEND-8). The borrower side keeps its own count of what
+  `lending.max_total` bounds the sum of all friendships' quotas; a
+  quota proposal that would exceed it is refused (LEND-8). The borrower side keeps its own count of what
   it has stored at each place, for D6's free fraction, and corrects it
   from the lender's `quota` answer.
 - **LEND-2** The decorator refuses `PutObject`, `CreateMultipartUpload`
@@ -1128,9 +1156,10 @@ Q-V.
   retention margin of §4. The control API `quota` answer carries the
   quota, both sides' use and the answering node's repository size (sum
   of its own buckets' live bytes, rounded to 1 GB). The protectable
-  size is computed by bisection on `S` over Σ min(S, quotaⱼ) +
-  Σ overflow `max_bytes` ≥ c × S, and the fair-quota bound with
-  min(S, quotaⱼ) replaced by min(S, sizeⱼ); the derivation is §4. The
+  size is computed by bisection on `S` over Σ min(D, quotaⱼ − m) +
+  Σ (overflow `max_bytes` − m) ≥ c × D, with `m` the bucket's metadata
+  bytes from the index and `D = S − m`, and the fair-quota bound with
+  `quotaⱼ` replaced by `sizeⱼ`; the derivation is §4. The
   "under half used for 30 days" note compares the daily use samples
   both sides already report in `quota`.
 
@@ -1158,10 +1187,13 @@ Q-V.
 - **RET-3** `undelete` for a friend removes delete markers with
   `RemoveObject` by version id where the friend's store versions (the
   one versioned delete NET-7 admits), and calls the control API
-  `undelete` (bucket, since) where it keeps tombstones. For an external
-  bucket it removes delete markers the same way where the bucket
-  versions; elsewhere it clears the borrower's own client-side
-  tombstones (S3-4).
+  `undelete` (bucket, since) where it keeps tombstones. For an
+  overflow target that versions, it does not remove the delete marker,
+  since S3-5's credential cannot remove versions: it copies the last
+  version before the marker onto the same key (`CopyObject` with the
+  source version id), which makes it current again and leaves the
+  marker to the lifecycle rule. Elsewhere it clears the borrower's own
+  client-side tombstones (S3-4).
 - **VER-1** The challenge is a control API call: the borrower sends an
   object key, a byte range and a nonce; the lender reads the range
   through its decorator and returns HMAC-SHA256(nonce, bytes); the
@@ -1448,8 +1480,9 @@ of the `copies`, and the estimated cost (S3-7).
   the same way.
 - **S3-5** Drain-back has to delete at the target, so the recommended
   credential may create delete markers (`s3:DeleteObject` without a
-  version id) but not remove versions (`s3:DeleteObjectVersion`), and
-  the lifecycle rule purges non-current versions after the window.
+  version id) and read earlier versions (`s3:GetObjectVersion`, for
+  undelete, §3.6) but not remove versions (`s3:DeleteObjectVersion`),
+  and the lifecycle rule purges non-current versions after the window.
   `overflow add` tests both permissions and reports them. Where a
   provider cannot separate the two (Q-AC), the choice is the user's:
   with no delete permission at all, drained copies stay at the target
@@ -1486,11 +1519,15 @@ friendships: `1.2 × c × S`. That is `init`'s suggestion for
 | Space lent | `1.2 × c × S` | same |
 | Total, `c = 2` | `3.4 × S` | `2.4 × S` plus the buffer |
 
-**Feasibility.** Each friend can hold at most one copy of an object, so
-with quotas `qⱼ` and overflow room `O` the pool holds `S` at `c`
-copies only if
+**Feasibility.** Each friend can hold at most one copy of an object,
+and every place also holds the metadata `m` (about 1% of `S`). With
+`D = S − m`, quotas `qⱼ` and overflow room `Oₖ`, the pool holds `S` at
+`c` copies only if
 
-    Σⱼ min(S, qⱼ) + O ≥ c × S
+    Σⱼ min(D, qⱼ − m) + Σₖ (Oₖ − m) ≥ c × D
+
+Below, `m` is left out where the example has margin to spare, and
+counted where a fit is close.
 
 and the protectable size (LEND-7) is the largest `S` that satisfies it.
 A friend has no use for more of your disk than its own repository
@@ -1503,21 +1540,25 @@ can.
 Worked examples, `c = 2`:
 
 1. **Four friends, 100 GB each.** Every pair at 80 GB. Each node lends
-   and receives 240 GB; protectable size 3 × 80 / 2 = 120 GB, so 20 GB
-   of the room is tombstone margin. Disk per node: 100 + 240 = 340 GB.
+   and receives 240 GB against the 200 GB its two copies take, so 40 GB
+   of the room is tombstone and metadata margin; the protectable size is
+   about 120 GB. Disk per node: 100 + 240 = 340 GB.
 2. **E with 200 GB among four friends with 100 GB.** E's friendships at
-   100 GB each: protectable 4 × 100 / 2 = 200 GB, exactly E's size, so
-   E has no tombstone margin and runs at the limit (OPS-2 alerts above
-   90%). Each small friend gets 100 GB from E and needs about 140 GB
+   100 GB each. Counting the ~2 GB of metadata at each friend, the data
+   room is 4 × 98 = 392 GB against 2 × 198 = 396 needed: the protectable
+   size is about 198 GB, just below E's 200, so about 4 GB of data sits
+   at one copy and OPS-2 alerts. E needs a little overflow, or quotas
+   of about 102 GB, and more than that for tombstone margin. Each small friend gets 100 GB from E and needs about 140 GB
    more, ~47 GB with each of the other three. E's disk: 200 + 400 = 600
    GB; each small friend's: 100 + 240 = 340 GB.
-3. **E with 400 GB among the same four.** Fair quotas cap each
-   friendship at 100 GB: protectable 200 GB. With an overflow target
-   at `max_bytes` 400 GB (plus margin), every data object has one copy
-   at a friend and one at the target: 400 + 400 ≥ 800. At about $6 per
-   TB-month that is ~$2.40 a month. A fifth friend with 400 GB of
-   their own, at a 400 GB quota, empties the target: 4 × 100 + 400 ≥
-   800.
+3. **E with 380 GB among the same four** (scenario 12). Fair quotas
+   cap each friendship at 100 GB: with `m` ≈ 4 GB, 4 × 96 = 384 GB of
+   data room, so `D` ≤ 192 and the protectable size is just under 200
+   GB. An overflow target at `max_bytes` 450 GB adds 446: 384 + 446 =
+   830 ≥ 2 × 376, so every data object has one copy at a friend and the
+   other at a friend or the target. At about $6 per TB-month that is
+   under $3 a month. A fifth friend with 400 GB of their own, at a 400
+   GB quota, empties the target: 384 + min(376, 396) = 760 ≥ 752.
 
 **Rule of thumb for users (LEND-7):** lend `c` times what you back up,
 plus 20% (2.4× at two copies), and your disk holds about 3.4× your
@@ -1682,4 +1723,6 @@ design and disappear with it.
   credential can allow delete markers but not version removal, and
   whether the lifecycle rule then purges the drained copies after the
   window. Where it cannot, the user chooses between a credential that
-  can remove versions and drained copies left in place.
+  can remove versions and drained copies left in place. Check also that
+  undelete's server-side copy of an earlier version onto the same key
+  (§3.6) works with that credential at each provider.

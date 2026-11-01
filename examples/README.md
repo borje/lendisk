@@ -1,6 +1,6 @@
 # lendisk deployment examples
 
-These files follow DESIGN.md v0.11 and REQUIREMENTS.md v0.10
+These files follow DESIGN.md v0.11.1 and REQUIREMENTS.md v0.10.1
 (2026-11-01). The daemon does not exist yet, so the TOML keys and the
 image name are the proposed surface, kept consistent with the design
 text: one static binary, one `[store]` section for both roles,

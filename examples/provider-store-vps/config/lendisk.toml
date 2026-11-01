@@ -1,4 +1,4 @@
-# Dag · store is a Hetzner Object Storage bucket · DESIGN.md v0.11
+# Dag · store is a Hetzner Object Storage bucket · DESIGN.md v0.11.1
 #
 # After init:
 #   lendisk peer add <Anna's invite>                # 150 GB each way
@@ -14,7 +14,8 @@
 role = "full"
 
 [endpoint]
-listen  = "127.0.0.1:9000"
+# S3 for backup tools on this host is always 127.0.0.1:9000 (EP-1, EP-5).
+# LAN addresses, if any, would be [[endpoint.listen]] entries (EP-17).
 metrics = "127.0.0.1:9100"
 
 [store]

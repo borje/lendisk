@@ -1,6 +1,6 @@
 # lendisk — requirements
 
-Status: draft v0.10, 2026-11-01. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.10.1, 2026-11-01. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
@@ -10,7 +10,8 @@ other machines on the local network use the node (EP-17); v0.9.3 hides
 bucket names from lenders (SEC-16); v0.10 replaces per-bucket replica
 lists with copies placed across a pool of friends, makes every
 friendship one symmetric quota, and turns external S3 buckets into
-overflow for what friends cannot hold. The design
+overflow for what friends cannot hold; v0.10.1 corrects
+contradictions in v0.10 found by a consistency review. The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -124,7 +125,9 @@ Concretely, with four people A, B, C and D:
 - A lender never forwards. B does not replicate A's data onward to C or D,
   even if B trusts them. When B disappears, A's own node places the
   copies B held onto A's other friends (REPL-13); B is never asked to.
-  A new invite is needed only when A's pool has run out of room (OPS-2).
+  A new invite is needed only when A's pool cannot hold its copies:
+  fewer places than `copies`, or too little room even after quota
+  proposals (LEND-8) and overflow (OPS-2).
 - Every friendship is mutual, with one quota for both directions (P-8).
   One invite creates it and one removal ends it. A node that backs up
   nothing yet still has symmetric friendships; it just leaves its half
@@ -176,7 +179,8 @@ objects placed there (REPL-12).
 
 The offsite copies together are a complete repository: with `copies`
 = c and the bucket spread over N friends and overflow targets, the
-replicas of any N − c + 1 of them hold every object. Copying their
+replicas of any N − c + 1 of them (any one, when N ≤ c) hold every
+object. Copying their
 keys into one place (a plain union: the same key always has the same
 bytes, EP-11) gives a repository the backup tool opens with no lendisk
 installed. Each replica can be written out as plain files in the
@@ -232,8 +236,10 @@ of their half unused, and `status` shows it so the two can lower the
 number (LEND-7).
 
 The consequence for unequal sizes is accepted. A friend can usefully
-hold at most one copy of your repository, so a friend whose own backup
-is small can only take, and so only give, a small quota. A node is
+hold at most one copy of your repository, and a friend whose own backup
+is small has no use for much of your disk, so a fair quota between you
+is small; a larger one costs that friend disk it gets nothing for. A
+node is
 fully protected at c copies only while its repository is at most about
 1/c of its friends' repositories combined (LEND-7). Beyond that it
 needs more or bigger friends, or an overflow target that costs money
@@ -511,12 +517,16 @@ double the surface for no change in the core problem.
   consistent; in addition, a metadata object (as the tool profile
   defines it, EP-7: restic indexes and snapshots, Kopia index and
   manifest blobs) shall be sent to any place only after every data
-  object written before it has been acknowledged by `copies` places.
-  Restic and Kopia both write packs before indexes before the snapshot
-  or manifest, so this keeps the pool consistent at every point. AC:
-  with N places and `copies` = c, the replicas of any N − c + 1 places
-  together never hold a restic snapshot or Kopia manifest whose
-  referenced packs and index they do not also hold.
+  object written before it has been acknowledged by every place it is
+  placed at: `copies` places, or fewer while the pool lacks room for
+  them (REPL-12), in which case `status` shows those objects as below
+  `copies`. Restic and Kopia both write packs before indexes before the
+  snapshot or manifest, so this keeps the pool consistent at every
+  point. AC: with N places and `copies` = c, and every object at c
+  places, the replicas of any N − c + 1 places together never hold a
+  restic snapshot or Kopia manifest whose referenced packs and index
+  they do not also hold; and with too little room for c, every place
+  that has room still receives its data and metadata.
 - **REPL-2** Deletes shall be replicated as delete operations to every
   place holding the object, in that place's queue after any writes that
   preceded them.
@@ -562,18 +572,26 @@ double the surface for no change in the core problem.
   offsite at 2 copies"; for `generic` buckets `status` shows the
   timestamp of the last fully placed write.
 - **REPL-12** Placement. Every metadata object of a bucket shall be
-  placed at every friend in the pool. Each data object shall be placed
-  at `copies` distinct places, chosen by the node from its friends by
-  free quota, preferring friends that are reachable. Overflow targets
-  (§4.11) shall be chosen only for copies that no friend has room for.
+  placed at every friend in the pool, including friends added later,
+  and at every overflow target that holds data of the bucket, before
+  or together with its first data object there. Each data object shall
+  be placed at `copies` distinct places, chosen by the node from its
+  friends by free quota, preferring friends that are reachable. A
+  friend with room counts as room even while unreachable, its copies
+  waiting for it or going to another friend, until it has been
+  unreachable past the REPL-13 threshold; from then on it is no longer
+  room and gets no new copies. Overflow targets (§4.11) shall be
+  chosen only for copies that no friend, reachable or not, has room
+  for.
   The user may assign friends to failure domains (`peer set <id>
   --domain <name>`, for two friends in one house or at one provider);
   copies of one object should then be in distinct domains, and `status`
   shall say when they cannot be. The placement shall be recorded by the
   node and shall be recoverable by listing the replicas (ID-5). AC:
-  with friends B, C and D at quotas 100, 50 and 50 GB, a 100 GB bucket
-  at `copies = 2` is fully placed, with every data object at B and at
-  one of C or D.
+  with friends B, C and D at quotas 100, 55 and 55 GB, a 100 GB restic
+  bucket at `copies = 2` is fully placed, with no data object twice at
+  one friend, every metadata object at all three, and no friend above
+  its quota.
 - **REPL-13** Re-placement. The node shall move copies, never letting an
   object fall below the copies it has while doing so, when:
   - a friend is removed (PEER-5), lowers the quota below use (PEER-6),
@@ -636,13 +654,15 @@ double the surface for no change in the core problem.
     their own buckets, as a number) through the quota exchange (NET-7).
   - `lendisk status` shall show, in one place: local copy size; space
     used at each friend and at each overflow target; space lent and
-    used by each friend; and the **protectable size**, the largest S
-    for which Σ over friends of min(S, quota) plus the overflow
-    targets' room is at least c × S (one friend can hold at most one
-    copy of an object, hence the min). Beside it, the most the circle
-    could protect with fair quotas: the same sum with each
-    quota replaced by min(S, friend's repository size), since a friend
-    has no use for more of your disk than its own repository.
+    used by each friend; and the **protectable size**. With D the
+    data part of a repository of size S and m its metadata (held at
+    every place, about 1% for restic and Kopia), it is the largest S
+    for which Σ over friends of min(D, quota − m), plus each overflow
+    target's room less m, is at least c × D (one friend can hold at
+    most one copy of an object, hence the min). Beside it, the most the
+    circle could protect with fair quotas: the same sum with each quota
+    replaced by the friend's repository size, since a friend has no use
+    for more of your disk than its own repository.
   - For each friendship where one side has used less than half of the
     quota for 30 days, `status` shall say so, so the friends can lower
     the number.
@@ -653,15 +673,20 @@ double the surface for no change in the core problem.
 - **LEND-8** Quota negotiation. Each node shall have a ceiling per friend
   (`lending.max_per_peer`) and the global cap (LEND-1). Either side may
   propose a new quota for a friendship; the other side's node accepts
-  it if it is within that side's ceilings, and otherwise asks its user
-  (`lendisk peer quota <peer> --accept`). The daemon may propose an
-  increase on its own, within its own ceilings, when its protectable
-  size falls below its repository size. A decrease takes effect at
-  once on both sides (PEER-6). No node's lent space ever grows beyond
-  ceilings its own user set. AC: two nodes with ceilings of 200 GB
-  and a friendship at 50 GB; when one repository grows past what the
-  pool can protect, the quota rises to the needed amount with no user
-  action, and stops at 200 GB.
+  it if it is within that side's `lending.max_per_peer` and keeps the
+  sum of its quotas within `lending.max_total`. A proposal above the
+  per-friend ceiling but within the global cap waits for its user
+  (`lendisk peer quota <peer> --accept`); one that would exceed the
+  global cap is refused until the user raises the cap. The daemon may
+  propose an increase on its own, within its own ceilings, when its
+  protectable size falls below its repository size. A decrease takes
+  effect at once on both sides (PEER-6). No node's lent space ever
+  grows beyond `lending.max_total`, and never beyond `max_per_peer`
+  without its user's explicit acceptance. AC: three nodes A, B and C,
+  each pair friends at 50 GB, every ceiling 200 GB per friend and 400
+  GB in total; when A's repository grows past what B and C protect,
+  both quotas with A rise to what is needed with no user action, and
+  stop at 200 GB.
 
 ### 4.6 Deletion, retention and verification
 
@@ -774,8 +799,9 @@ double the surface for no change in the core problem.
   unsupported version, the repository above 90% of the protectable
   size, an overflow target starting to receive copies, objects below
   `copies` places for longer than the REPL-13 threshold, and fewer
-  places in the pool than `copies` (the only case where a new
-  friendship is needed rather than re-placement, P-2).
+  places in the pool than `copies`. These last two are the only cases
+  re-placement cannot fix: the pool needs a new friendship, a higher
+  quota or overflow (P-2).
 - **OPS-3** Alerts shall be delivered through a configurable command hook
   (receives JSON on stdin) and a webhook URL. Built-in email or push is out
   of scope; the hook covers ntfy, healthchecks.io, mail, etc.
@@ -967,8 +993,9 @@ the lender enforces them.
 - **S3-2** The objects in the bucket shall be in the backup tool's
   standard layout under the prefix, one key per object as the tool
   wrote it, so that the bucket is one of the replicas a lendisk-free
-  restore can combine (P-5). Whenever it holds data objects it also
-  holds all of the bucket's metadata (REPL-12). AC: copying the keys
+  restore can combine (P-5). Once it holds data objects of a bucket it
+  also holds all of that bucket's metadata, sent before or together
+  with the first of them (REPL-12). AC: copying the keys
   under the prefix and those of the friends' replicas into one
   directory gives a repository `restic -r <directory> snapshots` opens
   with no lendisk installed.
@@ -980,7 +1007,9 @@ the lender enforces them.
   non-current versions after the retention window. `overflow add` shall
   check that versioning is enabled and warn if not; it shall offer to
   create the lifecycle rule when the credential allows it. `undelete`
-  shall restore objects deleted within the window (RET-3). For providers
+  shall restore objects deleted within the window (RET-3), with the
+  credential S3-5 recommends: by making the last version before the
+  delete current again, not by removing the delete marker. For providers
   without versioning, the daemon shall fall back to lendisk-side
   tombstones: deletes are recorded locally and issued to the bucket only
   after the retention window. This protects against accidental deletion
@@ -989,8 +1018,8 @@ the lender enforces them.
   (REPL-13) are deleted at the target the same way, so they stay
   recoverable for the window.
 - **S3-5** The documentation shall tell the user to create a credential
-  that can put, get, list and mark objects deleted, but not remove
-  object versions, and `overflow add` shall test for and report
+  that can put, get (including earlier versions), list and mark objects
+  deleted, but not remove object versions, and `overflow add` shall test for and report
   version-removal permission, recommending it be removed. With such a
   credential, restic's `prune` through lendisk and the drain-back of
   REPL-13 produce tombstones that only the lifecycle rule ever purges.
@@ -1061,13 +1090,16 @@ current design (component behaviour, API assumptions) are in DESIGN.md
    directory, finishes at local disk speed. Within the bandwidth
    available, `lendisk status` shows the snapshot offsite-complete,
    every data object at two of B, C and D, the metadata at all three,
-   and a protectable size of 105 GB.
+   and a protectable size of about 104 GB (70 GB from each of three
+   friends, less the metadata each holds).
 2. **Friend offline.** B is powered off for three days. `restic backup` on
    A keeps working, and new data objects are placed at C and D. Status
    shows lag for B; at 24h an alert fires. When B returns, its queue
    drains (metadata and the objects still placed there). Had B stayed
    away past the REPL-13 threshold, A would have re-placed B's copies
-   at C and D, within their quotas, without an invite.
+   at C and D without an invite; at 70 GB each they hold only 70 GB of
+   A's 100 GB at two copies, so A's node would first propose higher
+   quotas (LEND-8), as in scenario 13.
 3. **Total loss.** A's house burns down. On a new machine: `lendisk
    recover` with the phrase and B's address from the paper sheet; the
    manifest from B names C and D, and the placement is rebuilt by
@@ -1130,15 +1162,16 @@ current design (component behaviour, API assumptions) are in DESIGN.md
     succeeds. A plaintext request to that address is refused. With TLS
     turned off for the address, the same backup and restore succeed
     over plain HTTP and `status` labels the listener "plaintext".
-12. **Overflow.** E has 400 GB to back up and four friends A, B, C and
-    D with about 100 GB each, every friendship at 100 GB. `status` on E
-    shows a protectable size of 200 GB at two copies, and says that
-    fair quotas cannot raise it (each friend's repository is 100 GB).
-    E adds a B2 bucket with `lendisk overflow add s3 … --max-bytes 400G`;
-    the protectable size becomes 400 GB, an alert says the overflow
-    target is receiving copies, and the snapshot becomes
-    offsite-complete with every data object at one friend and at B2.
-    Later F, who backs up 400 GB, becomes E's friend at 400 GB. E's
+12. **Overflow.** E has 380 GB to back up (about 4 GB of it metadata)
+    and four friends A, B, C and D with about 100 GB each, every
+    friendship at 100 GB. `status` on E shows a protectable size just
+    under 200 GB at two copies, and says that fair quotas cannot raise
+    it (each friend's repository is 100 GB). E adds a B2 bucket with
+    `lendisk overflow add s3 … --max-bytes 450G`; the protectable size
+    rises above 380 GB, an alert says the overflow target is receiving
+    copies, and the snapshot becomes offsite-complete with every data
+    object at two places, one of them a friend. Later F, who backs up
+    400 GB, becomes E's friend at 400 GB. E's
     node moves the copies at B2 to F, deletes them at B2 (tombstoned
     for the window by the provider's versioning, S3-4), and `status`
     shows the overflow target empty.
@@ -1153,6 +1186,20 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.10.1 (2026-11-01)** Contradictions in v0.10 corrected after a
+  consistency review. Changed meaning: REPL-1's barrier waits for the
+  places an object is actually placed at, so a pool short of room still
+  receives what fits, and its AC is conditioned to match; REPL-12
+  counts an unreachable friend with room before overflow until the
+  REPL-13 threshold, backfills metadata to new places, and its AC
+  leaves room for the metadata every place holds; LEND-7's formula
+  subtracts that metadata; LEND-1 and LEND-8 never let a quota exceed
+  the global cap, and LEND-8's AC uses three nodes; S3-4 undeletes by
+  making the last version current again, so S3-5's credential (which
+  may now read earlier versions) suffices; S3-2 says when metadata
+  arrives. Reworded: P-2 and OPS-2 agree on when a new friendship is
+  needed; P-5 covers N ≤ c; P-8's quota sentence; scenarios 1, 2 and
+  12 corrected.
 - **v0.10 (2026-11-01)** Pooled placement, symmetric quotas, overflow.
   - **Placement instead of replica lists.** A bucket now has `copies`
     (default 2) instead of `--replicas` and `min_replicas`. Data

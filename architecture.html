@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>lendisk architecture v0.11</title>
+<title>lendisk architecture v0.11.1</title>
 <style>
   :root {
     --bg: #fafaf8;
@@ -120,9 +120,9 @@
 </head>
 <body>
 <main>
-<h1>lendisk architecture · v0.11</h1>
-<p class="sub">The chosen architecture as of 2026-11-01, as described in DESIGN.md v0.11. The process is the one v0.10 drew; what changed is what replication does with it. A bucket asks for <code>copies</code> instead of naming replicas: each data object is placed on that many friends by free quota and the metadata on all of them, and the node itself re-places copies when a friend leaves or goes quiet. Every friendship is one quota that both friends lend each other. An external S3 bucket is no longer a replica but an overflow target that only takes what friends cannot hold. Unchanged from v0.10: versitygw is embedded as the S3 front end over a lendisk decorator; the store is versitygw's <code>posix</code> backend on a local directory or its <code>s3</code> backend against any S3 service the user names; one store serves both roles, so a friend's buckets live wherever your own do, posix or Garage alike; replication is an in-process S3 client that dials friends through tailcat directly, so there is no rclone child, no rc socket and no loopback forwards; the object hash is taken from the write stream at capture, so each object is read once per place it goes to; and the tunnel has one port. One process, one binary.</p>
-<p class="note">Status: DESIGN.md v0.11 describes this drawing, against REQUIREMENTS v0.10. That version gave up one promise on purpose: a single lender's copy is no longer a complete repository (P-5). A restore without lendisk combines the copies of any N − c + 1 places, where N is the number of places in the pool and c is <code>copies</code>. Non-S3 targets remain v1.1 candidates behind the same replica interface.</p>
+<h1>lendisk architecture · v0.11.1</h1>
+<p class="sub">The chosen architecture as of 2026-11-01, as described in DESIGN.md v0.11.1. The process is the one v0.10 drew; what changed is what replication does with it. A bucket asks for <code>copies</code> instead of naming replicas: each data object is placed on that many friends by free quota and the metadata on all of them, and the node itself re-places copies when a friend leaves or goes quiet. Every friendship is one quota that both friends lend each other. An external S3 bucket is no longer a replica but an overflow target that only takes what friends cannot hold. Unchanged from v0.10: versitygw is embedded as the S3 front end over a lendisk decorator; the store is versitygw's <code>posix</code> backend on a local directory or its <code>s3</code> backend against any S3 service the user names; one store serves both roles, so a friend's buckets live wherever your own do, posix or Garage alike; replication is an in-process S3 client that dials friends through tailcat directly, so there is no rclone child, no rc socket and no loopback forwards; the object hash is taken from the write stream at capture, so each object is read once per place it goes to; and the tunnel has one port. One process, one binary.</p>
+<p class="note">Status: DESIGN.md v0.11.1 describes this drawing, against REQUIREMENTS v0.10.1. That version gave up one promise on purpose: a single lender's copy is no longer a complete repository (P-5). A restore without lendisk combines the copies of any N − c + 1 places, where N is the number of places in the pool and c is <code>copies</code>. Non-S3 targets remain v1.1 candidates behind the same replica interface.</p>
 
 <figure>
 <svg viewBox="0 0 1000 1005" role="img" aria-label="A backup tool writes S3 to the lendisk process on loopback; friends reach it through the tailcat tunnel on one port. Inside the process, embedded versitygw terminates SigV4 using lendisk's IAM service, then calls lendisk's backend decorator, which captures writes and hashes the stream for your buckets and applies the allow-list, quota, hash checks and retention for borrowers' buckets. The decorator calls one versitygw backend for the whole node: posix, plain files on local disk, or s3, which re-signs to any S3 service. Below the process is the one store, a local directory or an S3-compatible service, holding your buckets and your friends' buckets side by side. The replication worker places each object on copies places in the pool, reads it through the decorator and sends it with an in-process S3 client to friends' nodes through the tailcat tunnel, with a DERP relay as fallback, or, only for what friends cannot hold, to an external overflow bucket over the internet." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11">
@@ -415,7 +415,7 @@
 <h2>Four friends, four configurations</h2>
 <p class="sub" style="margin-bottom:12px">The same binary in four households, each using a different corner of the design. Every line is a friendship: mutual, one quota lent in both directions, created by one invite. Nobody names replicas; each node spreads its copies over its friends by free quota. Carla and Björn have no friendship and never learn of each other. Every household keeps its own buckets and its friends' buckets in the same store.</p>
 <figure id="fig2">
-<svg viewBox="0 0 1000 660" role="img" aria-label="Four nodes joined by five friendships, each one quota lent both ways: Anna and Björn 200 GB, relayed through DERP because Björn is behind CGNAT; Anna and Carla 250 GB; Anna and Dag 150 GB; Björn and Dag 200 GB; Carla and Dag 200 GB. Anna runs the default install on a Synology NAS with plain files; her 320 GB restic bucket at two copies fills her friends' 600 GB, so 40 GB of copies sit in a Backblaze B2 overflow bucket. Björn keeps everything in the Garage on his LAN, uses evict mode, and with two friends and two copies every pack is at both Anna and Dag. Carla runs a lender-only Raspberry Pi with no buckets yet; the 450 GB her friends lend her back is unused. Dag runs a VPS with a public IP, uses Kopia, keeps his store in Hetzner Object Storage, and spreads his 80 GB over Anna, Björn and Carla." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5">
+<svg viewBox="0 0 1000 660" role="img" aria-label="Four nodes joined by five friendships, each one quota lent both ways: Anna and Björn 200 GB, relayed through DERP because Björn is behind CGNAT; Anna and Carla 250 GB; Anna and Dag 150 GB; Björn and Dag 200 GB; Carla and Dag 200 GB. Anna runs the default install on a Synology NAS with plain files; her 320 GB restic bucket at two copies fills her friends' 600 GB, so about 46 GB, copies plus metadata, sit in a Backblaze B2 overflow bucket. Björn keeps everything in the Garage on his LAN, uses evict mode, and with two friends and two copies every pack is at both Anna and Dag. Carla runs a lender-only Raspberry Pi with no buckets yet; the 450 GB her friends lend her back is unused. Dag runs a VPS with a public IP, uses Kopia, keeps his store in Hetzner Object Storage, and spreads his 80 GB over Anna, Björn and Carla." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5">
   <defs>
     <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10z" fill="var(--accent)"/>
@@ -435,7 +435,7 @@
     <text x="132" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/posix · /volume1/lendisk</text>
     <text x="132" y="163" fill="var(--muted)">laptop · 320 GB · restic · full</text>
     <text x="132" y="178" fill="var(--muted)">copies 2 · friends' 600 GB full</text>
-    <text x="132" y="193" fill="var(--muted)">40 GB of copies at B2 overflow</text>
+    <text x="132" y="193" fill="var(--muted)">~46 GB of copies at B2 overflow</text>
     <text x="132" y="208" fill="var(--muted)">plain files: hand over the disk</text>
     <text x="132" y="223" fill="var(--muted)">versioning dir · object lock</text>
     <text x="325" y="130" font-weight="600" font-size="11.5">lent buckets, same store</text>
@@ -449,7 +449,7 @@
   <g fill="var(--muted)">
     <text x="40" y="258">listens: loopback S3 · tunnel · metrics</text>
     <text x="40" y="273">friends: Björn 200 (relayed) · Carla 250 · Dag 150 GB · overflow: B2</text>
-    <text x="40" y="288">status: offsite at 2 copies · protectable 300 GB, 450 GB with B2</text>
+    <text x="40" y="288">status: offsite at 2 copies · protectable ~300 GB, ~450 with B2</text>
   </g>
 
   <!-- Björn -->
@@ -550,7 +550,7 @@
   <g text-anchor="middle">
     <text x="500" y="249" font-weight="600" font-size="11.5">Backblaze B2</text>
     <text x="500" y="264" fill="var(--muted)">Anna's overflow</text>
-    <text x="500" y="277" fill="var(--muted)">40 of 300 GB</text>
+    <text x="500" y="277" fill="var(--muted)">~46 of 300 GB</text>
     <text x="500" y="290" fill="var(--muted)">versioned · 30 d</text>
   </g>
   <rect x="445" y="430" width="110" height="62" rx="5" fill="var(--store-soft)" stroke="var(--store)" stroke-width="1"/>
@@ -591,7 +591,7 @@
   <span class="acc">friendship, one quota both ways</span>
   <span class="dash">relayed path</span>
 </div>
-<figcaption>Figure 2. Four households, one binary, one store each, five friendships. Anna is the default: plain files on the NAS, her friends' buckets beside her own. Her 320 GB at two copies needs 640 GB; her three friends lend her 600, so the placer fills them evenly and puts the last 40 GB of copies in her B2 overflow bucket, which will drain back to friends as soon as a quota rises (LEND-8) or a friend joins. Björn keeps everything, his own and his friends', in the Garage he already runs, so retention at Björn is client-side tombstones; with two friends and two copies, every pack he evicts is at both Anna and Dag. Carla has no buckets yet: Anna and Dag lend her back what she lends them, and it waits unused. Dag's store is a Hetzner bucket behind <code>backend/s3</code> on a VPS; his 80 GB is spread over three friends, so any two of them hold all of it. Carla and Björn do not exist to each other.</figcaption>
+<figcaption>Figure 2. Four households, one binary, one store each, five friendships. Anna is the default: plain files on the NAS, her friends' buckets beside her own. Her 320 GB at two copies needs 640 GB, and the ~3 GB of metadata in it goes to every place, not just two; her three friends lend her 600, so the placer fills them evenly and puts the rest, about 46 GB, in her B2 overflow bucket, which will drain back to friends as soon as a quota rises (LEND-8) or a friend joins. Björn keeps everything, his own and his friends', in the Garage he already runs, so retention at Björn is client-side tombstones; with two friends and two copies, every pack he evicts is at both Anna and Dag. Carla has no buckets yet: Anna and Dag lend her back what she lends them, and it waits unused. Dag's store is a Hetzner bucket behind <code>backend/s3</code> on a VPS; his 80 GB is spread over three friends, so any two of them hold all of it. Carla and Björn do not exist to each other.</figcaption>
 </figure>
 
 <h3>Who uses what</h3>
@@ -604,8 +604,8 @@
   <tr><td>Tool and mode</td><td>restic, full</td><td>restic, evict (EP-9)</td><td>—</td><td>Kopia, full</td></tr>
   <tr><td>Friends, quota each way</td><td>Björn 200, Carla 250, Dag 150 GB</td><td>Anna 200, Dag 200 GB</td><td>Anna 250, Dag 200 GB</td><td>Anna 150, Björn 200, Carla 200 GB</td></tr>
   <tr><td>Ceilings (LEND-8)</td><td>600 GB total, 300 per friend</td><td>600, 300</td><td>700, 350</td><td>600, 250</td></tr>
-  <tr><td><code>copies</code> and where they are</td><td>2: Björn, Carla, Dag full; 40 GB at B2</td><td>2: every pack at Anna and Dag</td><td>—</td><td>2: Anna 44, Björn 58, Carla 58 GB</td></tr>
-  <tr><td>Overflow</td><td>B2, <code>max_bytes</code> 300 GB, 40 in use</td><td>none</td><td>none</td><td>none</td></tr>
+  <tr><td><code>copies</code> and where they are</td><td>2: Björn, Carla, Dag full; ~46 GB at B2</td><td>2: every pack at Anna and Dag</td><td>—</td><td>2: Anna 44, Björn 58, Carla 58 GB</td></tr>
+  <tr><td>Overflow</td><td>B2, <code>max_bytes</code> 300 GB, ~46 in use</td><td>none</td><td>none</td><td>none</td></tr>
   <tr><td>Retention at this lender</td><td>30 d, delete markers, object lock (store-enforced)</td><td>30 d, lendisk tombstones (client-side, Garage has no versioning)</td><td>60 d, object lock on posix (store-enforced)</td><td>30 d, Hetzner versioning + lifecycle (store-enforced)</td></tr>
   <tr><td>Network</td><td>home NAT; direct to Carla and Dag, relayed to Björn</td><td>CGNAT; relayed to Anna, direct out to Dag</td><td>home NAT; hole-punched</td><td>public IP, dialled directly (NET-3)</td></tr>
   <tr><td>Verification</td><td>challenges Björn, Carla and Dag daily on the objects placed there; B2 by checksum sample (S3-6)</td><td>challenges Anna and Dag; evict mode samples 0.1%/week (VER-2)</td><td>answers challenges; samples its own disk (VER-5)</td><td>challenges Anna, Björn and Carla</td></tr>
@@ -720,7 +720,7 @@ object metadata lendisk writes everywhere
   <tr><td>Changing a quota</td><td>The lender alone</td><td>Proposed through the control API, accepted within each user's ceilings; lowering applies to both</td><td>LEND-8</td></tr>
   <tr><td>External buckets</td><td>A full replica, counted towards <code>min_replicas</code></td><td>Overflow target: only what friends cannot hold, drained back when they can</td><td>§4.11, S3-1, S3-2, S3-5, S3-7</td></tr>
   <tr><td>One lender's disk</td><td>A complete repository</td><td>All metadata and a share of packs; any N − c + 1 together are complete</td><td>P-5, LEND-6</td></tr>
-  <tr><td>Capacity in <code>status</code></td><td>Consumed/lent ratio</td><td>Protectable size: Σ min(S, quota) + overflow ≥ c × S</td><td>LEND-7</td></tr>
+  <tr><td>Capacity in <code>status</code></td><td>Consumed/lent ratio</td><td>Protectable size: Σ min(D, quota − m) + overflow room − m ≥ c × D, with m the metadata every place holds</td><td>LEND-7</td></tr>
   <tr><td><code>lendisk.db</code></td><td>Queue, watermark per replica</td><td>Queue, <code>placement</code> table, one watermark per bucket, friendships with one quota</td><td>REPL-11</td></tr>
 </table>
 </div>

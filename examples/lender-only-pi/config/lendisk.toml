@@ -1,4 +1,4 @@
-# Carla · lender-only · DESIGN.md v0.11
+# Carla · lender-only · DESIGN.md v0.11.1
 #
 # `lendisk init --lender-only` wrote role = "lender": a node with no
 # buckets yet (PEER-9). The tool-facing endpoint and the borrower-side

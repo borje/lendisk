@@ -1,4 +1,4 @@
-# Anna · default install · DESIGN.md v0.11
+# Anna · default install · DESIGN.md v0.11.1
 #
 # Friendships and buckets are not here: `lendisk invite`, `lendisk peer
 # add` and `lendisk bucket add` create them and they live in lendisk.db.
@@ -13,7 +13,8 @@
 role = "full"
 
 [endpoint]
-listen  = "127.0.0.1:9000"   # S3 for restic and Kopia on this host (EP-1, EP-5)
+# S3 for backup tools on this host is always 127.0.0.1:9000 (EP-1, EP-5).
+# LAN addresses, if any, would be [[endpoint.listen]] entries (EP-17).
 metrics = "127.0.0.1:9100"   # Prometheus (OPS-4)
 
 [store]
