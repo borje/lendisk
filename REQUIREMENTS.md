@@ -162,9 +162,9 @@ as such (EP-8).
 ### P-4. "Backup finished" and "backup is offsite" are two events
 
 The product never blurs them. A backup completes against the local copy
-at local disk speed; the offsite state is tracked and reported
-separately (§4.4). A lender being offline has no effect on a backup
-(REPL-9).
+at the speed of the node's own store, never waiting on a lender; the
+offsite state is tracked and reported separately (§4.4). A lender
+being offline has no effect on a backup (REPL-9).
 
 ### P-5. Zero lock-in on both sides
 
@@ -1054,7 +1054,6 @@ the lender enforces them.
 - GUI or web UI.
 - macOS, Windows, FreeBSD builds.
 - sftp as an endpoint.
-- Object storage behind a friend's lender.
 - Backup tools without an S3 backend (Borg, rdiff-backup).
 - Tool profiles beyond restic and Kopia in CI (others run as
   `generic`).

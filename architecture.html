@@ -250,7 +250,7 @@
     <text x="630" y="490" fill="var(--muted)">Delete → delete marker · lock retain-until</text>
     <text x="630" y="505" fill="var(--muted)">or a lendisk tombstone, store permitting</text>
   </g>
-  <text x="495" y="540" text-anchor="middle" fill="var(--muted)">bucket mapper · one backend, both roles · lendisk.db is a cache</text>
+  <text x="495" y="540" text-anchor="middle" fill="var(--muted)">bucket mapper · one backend, both roles · lendisk.db holds the mapping</text>
   <g stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)">
     <line x1="300" y1="335" x2="300" y2="365"/>
     <line x1="630" y1="335" x2="630" y2="365"/>
@@ -292,10 +292,10 @@
   <rect x="785" y="333" width="165" height="130" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
   <g text-anchor="middle">
     <text x="867" y="352" font-weight="600" font-size="12.5">lendisk.db</text>
-    <text x="867" y="367" fill="var(--muted)">SQLite · rebuildable cache</text>
+    <text x="867" y="367" fill="var(--muted)">SQLite · authoritative state</text>
     <text x="867" y="387">queue rows with SHA-256</text>
     <text x="867" y="403">placement · watermarks</text>
-    <text x="867" y="419">friends · invites · manifests</text>
+    <text x="867" y="419">friends · invites · sealed names</text>
     <text x="867" y="435">bucket keys · tombstones</text>
     <text x="867" y="451">quota counters · ceilings</text>
   </g>
@@ -440,8 +440,8 @@
     <text x="132" y="223" fill="var(--muted)">versioning dir · object lock</text>
     <text x="325" y="130" font-weight="600" font-size="11.5">lent buckets, same store</text>
     <text x="325" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">/volume1/lendisk/lent-*</text>
-    <text x="325" y="163" fill="var(--muted)">lent/björn · s7qe… · 180 GB</text>
-    <text x="325" y="178" fill="var(--muted)">lent/dag · sm3a… · 44 GB</text>
+    <text x="325" y="163" fill="var(--muted)">lent-‹björn›-s7qe… · 180 GB</text>
+    <text x="325" y="178" fill="var(--muted)">lent-‹dag› · sm3a… · 44 GB</text>
     <text x="325" y="193" fill="var(--muted)">Carla: 250 GB, unused so far</text>
     <text x="325" y="208" fill="var(--muted)">delete → delete marker</text>
     <text x="325" y="223" fill="var(--muted)">retention: store-enforced</text>
@@ -470,8 +470,8 @@
     <text x="677" y="223" fill="var(--muted)">restores read-through</text>
     <text x="870" y="130" font-weight="600" font-size="11.5">lent buckets, same Garage</text>
     <text x="870" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">garage.lan:3900 · lent-* buckets</text>
-    <text x="870" y="163" fill="var(--muted)">lent/anna · s4k2… · 200 GB</text>
-    <text x="870" y="178" fill="var(--muted)">lent/dag · sm3a… · 58 GB</text>
+    <text x="870" y="163" fill="var(--muted)">lent-‹anna›-s4k2… · 200 GB</text>
+    <text x="870" y="178" fill="var(--muted)">lent-‹dag› · sm3a… · 58 GB</text>
     <text x="870" y="193" fill="var(--muted)">Garage has no versioning:</text>
     <text x="870" y="208" fill="var(--muted)">tombstones kept by lendisk</text>
     <text x="870" y="223" fill="var(--muted)">retention: client-side</text>
@@ -498,14 +498,14 @@
     <text x="132" y="565" fill="var(--muted)">no friendship</text>
     <text x="325" y="470" font-weight="600" font-size="11.5">lent buckets, the store</text>
     <text x="325" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/posix · /mnt/usb/lendisk</text>
-    <text x="325" y="503" fill="var(--muted)">lent/anna · s4k2… · 250 GB</text>
-    <text x="325" y="518" fill="var(--muted)">lent/dag · sm3a… · 58 GB</text>
+    <text x="325" y="503" fill="var(--muted)">lent-‹anna›-s4k2… · 250 GB</text>
+    <text x="325" y="518" fill="var(--muted)">lent-‹dag› · sm3a… · 58 GB</text>
     <text x="325" y="533" fill="var(--muted)">all metadata + a share of packs</text>
     <text x="325" y="548" fill="var(--muted)">object lock: delete + 60 d</text>
     <text x="325" y="563" fill="var(--muted)">weekly 0.1% sample scrub</text>
   </g>
   <g fill="var(--muted)">
-    <text x="40" y="598">listens: tunnel only · SEC-8 AC: no loopback listener</text>
+    <text x="40" y="598">listens: tunnel only · PEER-9 AC: nothing on loopback</text>
     <text x="40" y="613">friends: Anna 250 · Dag 200 GB · knows nothing of Björn</text>
     <text x="40" y="628">status: both replicas verified today · 450 GB received, unused</text>
   </g>
@@ -528,8 +528,8 @@
     <text x="677" y="563" fill="var(--muted)">warned at init</text>
     <text x="870" y="470" font-weight="600" font-size="11.5">lent buckets, same bucket</text>
     <text x="870" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">Hetzner bucket · lent-* prefix</text>
-    <text x="870" y="503" fill="var(--muted)">lent/anna · s4k2… · 150 GB</text>
-    <text x="870" y="518" fill="var(--muted)">lent/björn · s7qe… · 180 GB</text>
+    <text x="870" y="503" fill="var(--muted)">lent-‹anna›-s4k2… · 150 GB</text>
+    <text x="870" y="518" fill="var(--muted)">lent-‹björn› · s7qe… · 180 GB</text>
     <text x="870" y="533" fill="var(--muted)">versioning + lifecycle there</text>
     <text x="870" y="548" fill="var(--muted)">retention: store-enforced</text>
     <text x="870" y="563" fill="var(--muted)">friends never see the key</text>
@@ -622,7 +622,7 @@
   <li><strong>Pairwise trust (P-2).</strong> Five friendships, five invites. Carla and Björn share no friendship and appear nowhere in each other's state, even though both hold data for Anna and Dag.</li>
   <li><strong>Every network case.</strong> Hole-punched (Anna and Carla), relayed through DERP because of CGNAT (Anna and Björn, shown as such in both nodes' status), and a static public address dialled directly (everyone to Dag). In every case the borrower's S3 client dials through its own tailcat <code>Client</code>; nothing listens on loopback for replication.</li>
   <li><strong>A friend leaving.</strong> If Dag left, Anna's re-placer would have nowhere to put his 150 GB but B2; Björn's photos would fall to one copy and his <code>status</code> would say a new friendship is needed, the only case that needs an invite (OPS-2). Nothing is lost meanwhile: Dag keeps what he held for the retention window.</li>
-  <li><strong>Recovery for each.</strong> Anna rebuilds from her phrase and Carla's address; the manifest names Björn, Dag and B2, and the placement is rebuilt by listing them. Dag rebuilds from his phrase and any friend's address, and his manifest brings back the Hetzner credential. With nothing of lendisk running, Anna's laptop is the keys of any three of her four places copied into one directory (N − c + 1 = 3), each found under the name on her recovery sheet.</li>
+  <li><strong>Recovery for each.</strong> Anna rebuilds from her phrase and Carla's address; the manifest names Björn, Dag and B2, and the placement is rebuilt by listing them. Dag rebuilds from his phrase and any friend's address, and gives lendisk the Hetzner credential again through the environment; the manifest carries only overflow credentials (SEC-3). With nothing of lendisk running, Anna's laptop is the keys of any three of her four places copied into one directory (N − c + 1 = 3), each found under the name on her recovery sheet.</li>
 </ul>
 
 <h2>The capability profile</h2>
@@ -633,7 +633,7 @@
   <tr><td>Versioning</td><td><code>GetBucketVersioning</code></td><td>Deletes are delete markers; undelete removes the marker; listings hide marked objects natively.</td><td>lendisk tombstones: copy aside if server-side copy is cheap, else deferred delete hidden by the decorator.</td><td>retention: store / client-side</td></tr>
   <tr><td>Lifecycle</td><td><code>PutBucketLifecycleConfiguration</code> on a probe prefix</td><td>Store expires non-current versions after the window.</td><td>lendisk purger issues the deletes.</td><td>purge: store / daemon</td></tr>
   <tr><td>Object Lock</td><td><code>GetObjectLockConfiguration</code></td><td>Retain-until set on delete; the lender's own credential cannot purge early.</td><td>RET-2 rests on the lender's daemon.</td><td>retention: store-enforced / daemon-enforced</td></tr>
-  <tr><td>Checksum verification</td><td>PUT with a wrong <code>x-amz-checksum-sha256</code>, expect <code>BadDigest</code></td><td>Decorator trusts the store's check; index rebuildable from <code>GetObjectAttributes</code>.</td><td>Decorator's capture hash is the check.</td><td>integrity: store / daemon</td></tr>
+  <tr><td>Checksum verification</td><td>PUT with a wrong <code>x-amz-checksum-sha256</code>, expect <code>BadDigest</code></td><td>Store checks too; the decorator's capture hash is checked either way (LEND-4).</td><td>Decorator's capture hash is the only check.</td><td>integrity: store and daemon / daemon</td></tr>
   <tr><td>Conditional PUT</td><td><code>If-None-Match: *</code> on an existing probe key</td><td>Store refuses overwrites itself.</td><td>Decorator checks its index first.</td><td>immutability: store / daemon</td></tr>
   <tr><td>Server-side copy</td><td><code>CopyObject</code> of a probe object, timed</td><td>Cheap tombstone moves, undelete and exports.</td><td>Download and re-upload for those operations.</td><td>copy: server / client</td></tr>
 </table>
@@ -653,6 +653,7 @@ the store, default (backend/posix)
 the store behind backend/s3
   s3://laptop/…, s3://lent-&lt;id16&gt;-&lt;sealed&gt;/…  one upstream bucket per lendisk bucket, yours and theirs alike
   s3://&lt;bucket&gt;/&lt;prefix&gt;/laptop/…             or prefixes in one bucket, if backend/s3 allows (Q-V)
+  s3://lent-…/.lendisk/tomb/&lt;key&gt;/&lt;time&gt;     without versioning (Garage): a tombstoned object moved aside before an overwrite (RET-1)
   restic -r s3:&lt;endpoint&gt;/laptop snapshots    any S3 client, lendisk stopped
 
 an overflow target
@@ -663,7 +664,6 @@ a lendisk-free restore of "laptop"
 
 object metadata lendisk writes everywhere
   x-amz-meta-lendisk-sha256                  content hash, taken from the write stream at capture; the index is rebuildable
-  x-amz-meta-lendisk-deleted                 deletion time, only for lendisk-side tombstones
 </pre>
 
 <h2>Support tiers</h2>

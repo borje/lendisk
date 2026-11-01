@@ -127,7 +127,8 @@ what the decorator already exposes.
   user publishes that port on the host's LAN address, never on
   `0.0.0.0`. The image runs as an unprivileged user with
   all capabilities dropped and a read-only root; the config directory
-  and the data directory are the only volumes, and third-party
+  and the data directory are the only volumes (plus the store
+  directory when the user names one outside `<data>`), and third-party
   credentials arrive as environment variables, not files (SEC-3). A
   user who already runs
   an S3 store adds it as a second service on the bridge network,
@@ -180,7 +181,8 @@ point.
 The same gateway, reached through a lendisk bridge inside the tunnel
 (§3.7), is what a friend's node talks to (D12). Everything the product
 adds to S3 (capture, read-through, quota, immutability, retention, the
-deny-by-default allow-list) lives in the decorator; versitygw parses
+deny-by-default allow-list) lives in the decorator, behind the tunnel
+bridge's per-request peer checks (SEC-11, SEC-12); versitygw parses
 and authenticates, its backends store.
 
 Why S3 and only S3:
@@ -650,9 +652,8 @@ Costs accepted:
 - **Go CDK's `blob` package**: no versioning or delete-marker
   operations, and it sits on the AWS SDK anyway.
 
-External buckets are tested in CI against an S3 store with versioning
-(RustFS, and B2 as the provider) and against Garage; friend replicas
-with two nodes over tailcat.
+Overflow targets are tested in CI per the support tiers of §3.11;
+friend replicas with two nodes over tailcat.
 
 ### D15. Stores: versitygw embedded, `posix` or `s3` backend per store
 
@@ -701,7 +702,8 @@ What this buys over the v0.8 Garage design:
   no admin socket, RPC port or metadata engine to configure.
 
 **The capability profile.** Behind `backend/posix` every feature the
-lender uses is native. Behind `backend/s3` they depend on the upstream,
+lender uses is native except lifecycle, which lendisk's purger does
+(RET-1). Behind `backend/s3` they depend on the upstream,
 so each store has a profile. For a tested store (Garage, RustFS, B2)
 the profile ships as data and the probes below confirm it at `init` and
 `store set`; for any other store the probes decide it. The result is
@@ -713,7 +715,7 @@ feature:
 | Versioning | `GetBucketVersioning` | Deletes are delete markers; undelete removes the marker. | lendisk tombstones (§3.6). | retention: store / client-side |
 | Lifecycle | `PutBucketLifecycleConfiguration` on a probe prefix | Store expires non-current versions after the window. | lendisk's purger issues the deletes. | purge: store / daemon |
 | Object Lock | `GetObjectLockConfiguration` | Retain-until set on delete; the lender's own credential cannot purge early. | RET-2 rests on the lender's daemon. | retention: store-enforced / daemon-enforced |
-| Checksum verification | PUT with a wrong `x-amz-checksum-sha256`, expect `BadDigest` | The decorator trusts the store's check. | The decorator hashes the stream. | integrity: store / daemon |
+| Checksum verification | PUT with a wrong `x-amz-checksum-sha256`, expect `BadDigest` | The store checks too; the decorator still hashes the stream (LEND-4). | The decorator's hash is the only check. | integrity: store and daemon / daemon |
 | Conditional PUT | `If-None-Match: *` on an existing probe key | Store refuses overwrites itself. | The decorator checks its index first. | immutability: store / daemon |
 | Server-side copy | `CopyObject` of a probe object, timed | Cheap tombstone moves, undelete and exports. | Download and re-upload for those. | copy: server / client |
 
@@ -780,7 +782,8 @@ Known costs and their handling:
 - **MinIO**: AGPL, heavier, community edition archived in 2026.
 - **SeaweedFS**: a filer plus volume servers for a single-node job.
 - **Any of these as a cluster spanning friends**: rejected for the
-  trust reasons in D11; a cluster is one trust domain.
+  pairwise trust of P-2 (REQUIREMENTS.md); a cluster is one trust
+  domain.
 
 ## 3. Realisation, by requirement area
 
@@ -989,7 +992,10 @@ Q-V.
   the most recently reachable first, falling through to the next on
   failure; they write the object into the store and return it. In
   `evict` mode the eviction worker deletes a pack from the store once
-  `copies` places have acknowledged it and no tool lock is present.
+  `copies` places have acknowledged it and no tool lock is present
+  (restic `locks/*`); for Kopia, which has no server-side lock, once
+  the bucket has also had no writes for the configured idle interval
+  (EP-9).
 - **EP-12** On `posix`, `init` checks xattr support and the free-space
   floor on the store directory and refuses otherwise. On `s3`, it runs
   the capability probe (D15) and warns when the endpoint is not on the
@@ -1198,9 +1204,10 @@ Q-V.
   object key, a byte range and a nonce; the lender reads the range
   through its decorator and returns HMAC-SHA256(nonce, bytes); the
   borrower computes the same over its local copy.
-- **VER-2** Samples are ranged `GetObject` calls by the replica
+- **VER-2** Samples are whole-object `GetObject` calls by the replica
   client, hashed by lendisk and compared with the index.
-- **VER-5** The sampler hashes a weekly 0.1% of stored objects through
+- **VER-5** The sampler hashes a weekly sample of at least 0.1% of the
+  stored bytes through
   the decorator and compares with the index, on both sides; neither
   backend has a scrub of its own. On a mismatch the borrower deletes
   and re-fetches the object (EP-10).
@@ -1311,7 +1318,8 @@ Q-V.
 
 ### 3.9 Security
 
-- **SEC-3** Per-bucket S3 keys live in `lendisk.db`; versitygw's
+- **SEC-3** Per-bucket S3 keys live in `lendisk.db`, which lendisk
+  creates at mode 0600; versitygw's
   `IAMDir` is not used. A `backend/s3` store credential and overflow
   target credentials are read from environment variables at start:
   `LENDISK_STORE_ACCESS_KEY` and `LENDISK_STORE_SECRET_KEY` for the
