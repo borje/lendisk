@@ -1,4 +1,8 @@
-# Dag · store is a Hetzner Object Storage bucket · DESIGN.md v0.11.1
+# Dag · store is a Hetzner Object Storage bucket · DESIGN.md v0.12
+#
+# POST-V1 EXAMPLE. The `s3` store backend (EP-16) is not in v1; this
+# folder is kept for v1.1. In v1 Dag's store is plain files on the VPS
+# disk (see default-nas), with the same friends and the same Kopia bucket.
 #
 # After init:
 #   lendisk peer add <Anna's invite>                # 150 GB each way
@@ -6,10 +10,9 @@
 #   lendisk peer add <Carla's invite>               # 200 GB each way
 #   lendisk bucket add kopia-dag --profile kopia    # copies = 2
 #
-# Probe result recorded at init: versioning yes, lifecycle yes, object
-# lock yes, checksum verification yes, conditional PUT yes, server-side
-# copy yes. Björn's replica here is "retention: store-enforced"; Björn
-# never sees the Hetzner credential (PEER-8, SEC-3).
+# Björn's replica here is kept by lendisk's tombstones under
+# .lendisk/tomb/, as on every store; Hetzner's versioning is not used
+# for it. Björn never sees the Hetzner credential (PEER-8, SEC-3).
 
 role = "full"
 
@@ -34,14 +37,12 @@ region = "fra"
 map_url           = "https://relays.lendisk.example/derpmap.json"
 accept_peer_hints = false
 
-[peers.addresses]
 # NET-3: Dag has a static public address; friends can be told to dial it
 # directly by adding it to their peer record. Nothing to set on Dag's side.
 
 [lending]
 retention_min = "30d"
 max_total     = "600G"
-max_per_peer  = "250G"
 
 [replication]
 upload_limit = "50M"

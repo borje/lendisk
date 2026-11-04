@@ -1,4 +1,4 @@
-# Carla · lender-only · DESIGN.md v0.11.1
+# Carla · lender-only · DESIGN.md v0.12
 #
 # `lendisk init --lender-only` wrote role = "lender": a node with no
 # buckets yet (PEER-9). The tool-facing endpoint and the borrower-side
@@ -11,8 +11,8 @@
 role = "lender"
 
 [endpoint]
-# No `listen`: nothing on loopback in this profile (PEER-9 AC).
-metrics = "127.0.0.1:9100"
+# Nothing on loopback in this profile (PEER-9 AC): no S3 endpoint and no
+# metrics listener. A `listen` or `metrics` entry is refused at config load.
 
 [store]
 backend          = "posix"
@@ -29,8 +29,7 @@ accept_peer_hints = false
 
 [lending]
 retention_min = "60d"        # Carla's window is longer than the 30-day default
-max_total     = "700G"       # the disk is 1 TB; keep headroom for versions (RET-1)
-max_per_peer  = "350G"
+max_total     = "700G"       # the disk is 1 TB; keep headroom for tombstones (RET-1)
 
 [alerts]
 command = "/etc/lendisk/hooks/ntfy.sh"

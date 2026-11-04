@@ -120,12 +120,12 @@
 </head>
 <body>
 <main>
-<h1>lendisk architecture · v0.11.1</h1>
-<p class="sub">The chosen architecture as of 2026-11-01, as described in DESIGN.md v0.11.1. The process is the one v0.10 drew; what changed is what replication does with it. A bucket asks for <code>copies</code> instead of naming replicas: each data object is placed on that many friends by free quota and the metadata on all of them, and the node itself re-places copies when a friend leaves or goes quiet. Every friendship is one quota that both friends lend each other. An external S3 bucket is no longer a replica but an overflow target that only takes what friends cannot hold. Unchanged from v0.10: versitygw is embedded as the S3 front end over a lendisk decorator; the store is versitygw's <code>posix</code> backend on a local directory or its <code>s3</code> backend against any S3 service the user names; one store serves both roles, so a friend's buckets live wherever your own do, posix or Garage alike; replication is an in-process S3 client that dials friends through tailcat directly, so there is no rclone child, no rc socket and no loopback forwards; the object hash is taken from the write stream at capture, so each object is read once per place it goes to; and the tunnel has one port. One process, one binary.</p>
-<p class="note">Status: DESIGN.md v0.11.1 describes this drawing, against REQUIREMENTS v0.10.1. That version gave up one promise on purpose: a single lender's copy is no longer a complete repository (P-5). A restore without lendisk combines the copies of any N − c + 1 places, where N is the number of places in the pool and c is <code>copies</code>. Non-S3 targets remain v1.1 candidates behind the same replica interface.</p>
+<h1>lendisk architecture · v0.12</h1>
+<p class="sub">The chosen architecture as of 2026-11-04, as described in DESIGN.md v0.12. The process is the one v0.11 drew, with less in it. A bucket asks for <code>copies</code>: each data object is placed on that many friends by free quota and the metadata on all of them, and the node itself re-places copies when a friend leaves or goes quiet. Every friendship is one quota that both friends lend each other, each side's own number, the smaller one in force. An external S3 bucket is an overflow target that only takes what friends cannot hold. What v0.12 took out: versitygw's versioning and object lock are off everywhere and the decorator alone keeps retention, with tombstones moved aside under <code>.lendisk/tomb/</code>; the store is versitygw's <code>posix</code> backend on a local directory, and an S3 service as the node's own store (EP-16) is post-v1; evict mode, failure domains and quota negotiation over the wire are post-v1 or gone; and lendisk owns every listener, proxying all of them to versitygw on one internal unix socket. Unchanged: versitygw embedded as the S3 front end over a lendisk decorator; one store for both roles, a friend's buckets beside your own; replication as an in-process S3 client that dials friends through tailcat directly; the object hash taken from the write stream at capture; one tunnel port. One process, one binary.</p>
+<p class="note">Status: DESIGN.md v0.12 describes this drawing, against REQUIREMENTS v0.11. That version gave up one promise on purpose: a single lender's copy is no longer a complete repository (P-5). A restore without lendisk combines the copies of any N − c + 1 places, where N is the number of places in the pool and c is <code>copies</code>. Non-S3 targets remain v1.1 candidates behind the same replica interface.</p>
 
 <figure>
-<svg viewBox="0 0 1000 1005" role="img" aria-label="A backup tool writes S3 to the lendisk process on loopback; friends reach it through the tailcat tunnel on one port. Inside the process, embedded versitygw terminates SigV4 using lendisk's IAM service, then calls lendisk's backend decorator, which captures writes and hashes the stream for your buckets and applies the allow-list, quota, hash checks and retention for borrowers' buckets. The decorator calls one versitygw backend for the whole node: posix, plain files on local disk, or s3, which re-signs to any S3 service. Below the process is the one store, a local directory or an S3-compatible service, holding your buckets and your friends' buckets side by side. The replication worker places each object on copies places in the pool, reads it through the decorator and sends it with an in-process S3 client to friends' nodes through the tailcat tunnel, with a DERP relay as fallback, or, only for what friends cannot hold, to an external overflow bucket over the internet." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11">
+<svg viewBox="0 0 1000 1005" role="img" aria-label="A backup tool writes S3 to the lendisk process on loopback; friends reach it through the tailcat tunnel on one port. Inside the process, lendisk's one bridge accepts every connection, on loopback, on a LAN address and in the tunnel, and proxies it to embedded versitygw on an internal unix socket. versitygw terminates SigV4 using lendisk's IAM service, then calls lendisk's backend decorator, which captures writes and hashes the stream for your buckets and applies the allow-list, quota, hash checks and tombstone retention for borrowers' buckets. The decorator calls one versitygw backend for the whole node: posix, plain files on local disk. Below the process is the one store, a local directory holding your buckets and your friends' buckets side by side. The replication worker places each object on copies places in the pool, reads it through the decorator and sends it with an in-process S3 client to friends' nodes through the tailcat tunnel, with a DERP relay as fallback, or, only for what friends cannot hold, to an external overflow bucket over the internet." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="11">
   <defs>
     <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10z" fill="currentColor"/>
@@ -177,22 +177,22 @@
   <g text-anchor="middle">
     <text x="110" y="170" font-weight="600" font-size="12.5">control plane</text>
     <text x="110" y="186" fill="var(--muted)">CLI · status · alerts</text>
-    <text x="110" y="199" fill="var(--muted)">metrics on loopback</text>
-    <text x="360" y="170" font-weight="600" font-size="12.5">loopback listener</text>
-    <text x="360" y="186" fill="var(--muted)">127.0.0.1:9000, TCP only</text>
-    <text x="360" y="199" fill="var(--muted)">versitygw's own listener (address string)</text>
-    <text x="727" y="170" font-weight="600" font-size="12.5">tailcat Server · lendisk tunnel bridge · one port</text>
+    <text x="110" y="199" fill="var(--muted)">metrics on loopback (not in lender-only)</text>
+    <text x="360" y="170" font-weight="600" font-size="12.5">lendisk bridge · loopback and LAN listeners</text>
+    <text x="360" y="186" fill="var(--muted)">127.0.0.1:9000 · each endpoint.listen address, TLS</text>
+    <text x="360" y="199" fill="var(--muted)">proxied unbuffered to versitygw on run/gw.sock</text>
+    <text x="727" y="170" font-weight="600" font-size="12.5">tailcat Server · the same bridge in the tunnel · one port</text>
     <text x="727" y="186" fill="var(--muted)">AllowClient: known peers + pending invites · peer key per conn</text>
-    <text x="727" y="199" fill="var(--muted)">/_lendisk/ answered here · S3: access key = peer key, then to versitygw</text>
+    <text x="727" y="199" fill="var(--muted)">/_lendisk/ answered here · S3: access key = peer key, then to gw.sock</text>
   </g>
 
   <!-- column 1: housekeeping, profiles, export -->
   <rect x="25" y="240" width="170" height="95" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
   <g text-anchor="middle">
     <text x="110" y="260" font-weight="600" font-size="12.5">housekeeping</text>
-    <text x="110" y="277" fill="var(--muted)">purger · reconciler · evictor</text>
-    <text x="110" y="292" fill="var(--muted)">sampler · profile check</text>
-    <text x="110" y="307" fill="var(--muted)">retention · quota counters</text>
+    <text x="110" y="277" fill="var(--muted)">purger · reconciler</text>
+    <text x="110" y="292" fill="var(--muted)">sampler · re-placer</text>
+    <text x="110" y="307" fill="var(--muted)">tombstones · quota counters</text>
     <text x="110" y="322" fill="var(--muted)">all via the decorator</text>
   </g>
   <line x1="110" y1="205" x2="110" y2="240" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)"/>
@@ -200,7 +200,7 @@
   <g text-anchor="middle">
     <text x="110" y="385" font-weight="600" font-size="12.5">tool profiles</text>
     <text x="110" y="402" fill="var(--muted)">restic · kopia · generic</text>
-    <text x="110" y="417" fill="var(--muted)">snapshot keys · metadata keys</text>
+    <text x="110" y="417" fill="var(--muted)">snapshot · metadata · local-only keys</text>
     <text x="110" y="432" fill="var(--muted)">encryption guarantee: yes/no</text>
   </g>
   <rect x="25" y="478" width="170" height="67" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
@@ -215,8 +215,8 @@
   <text x="760" y="253" text-anchor="end" font-weight="700" font-size="9.5" letter-spacing="1" fill="var(--vgw)">LIBRARY</text>
   <g text-anchor="middle">
     <text x="495" y="259" font-weight="600" font-size="12.5">versitygw, embedded (embedgw) · the S3 front end</text>
-    <text x="495" y="276" fill="var(--muted)">terminates SigV4 incl. aws-chunked · routing · multipart · listings · versioning · object lock</text>
-    <text x="495" y="293" fill="var(--muted)">IAMService is lendisk's: per-bucket keys on loopback,</text>
+    <text x="495" y="276" fill="var(--muted)">terminates SigV4 incl. aws-chunked · routing · multipart · listings · versioning and lock off</text>
+    <text x="495" y="293" fill="var(--muted)">listens only on run/gw.sock · IAMService is lendisk's: per-bucket keys on loopback,</text>
     <text x="495" y="308" fill="var(--muted)">derived per-pair keys in the tunnel (must equal the peer key)</text>
     <text x="495" y="325" font-weight="600">no lendisk code touches a signature</text>
   </g>
@@ -247,8 +247,8 @@
     <text x="630" y="445" fill="var(--muted)">account must equal peer key</text>
     <text x="630" y="460" fill="var(--muted)">short allow-list, deny by default</text>
     <text x="630" y="475" fill="var(--muted)">symmetric quota → 507 · SHA-256 verified</text>
-    <text x="630" y="490" fill="var(--muted)">Delete → delete marker · lock retain-until</text>
-    <text x="630" y="505" fill="var(--muted)">or a lendisk tombstone, store permitting</text>
+    <text x="630" y="490" fill="var(--muted)">Delete → moved to .lendisk/tomb/, hidden</text>
+    <text x="630" y="505" fill="var(--muted)">purged after the window · same-hash re-put ok</text>
   </g>
   <text x="495" y="540" text-anchor="middle" fill="var(--muted)">bucket mapper · one backend, both roles · lendisk.db holds the mapping</text>
   <g stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)">
@@ -266,14 +266,14 @@
     <rect x="505" y="610" width="250" height="62" rx="5"/>
   </g>
   <g text-anchor="middle">
-    <text x="360" y="628" font-weight="600" font-size="12.5">backend/posix · default</text>
+    <text x="360" y="628" font-weight="600" font-size="12.5">backend/posix · the v1 store</text>
     <text x="360" y="644" fill="var(--muted)">plain files at &lt;dir&gt;/&lt;bucket&gt;/&lt;key&gt;</text>
-    <text x="360" y="659" fill="var(--muted)">versioning dir · xattr metadata · no network</text>
-    <text x="630" y="628" font-weight="600" font-size="12.5">backend/s3 · or any S3 store</text>
-    <text x="630" y="644" fill="var(--muted)">re-signs to the endpoint you name</text>
-    <text x="630" y="659" fill="var(--muted)">one credential · multipart passed through</text>
+    <text x="360" y="659" fill="var(--muted)">xattr metadata · no versioning dir · no network</text>
+    <text x="630" y="628" font-weight="600" font-size="12.5" fill="var(--muted)">backend/s3 · post-v1 (EP-16)</text>
+    <text x="630" y="644" fill="var(--muted)">any S3 service as the node's own store</text>
+    <text x="630" y="659" fill="var(--muted)">drafted in DESIGN.md D15; not in v1</text>
   </g>
-  <text x="495" y="587" text-anchor="middle" font-size="10" fill="var(--muted)">either one, chosen at init · no mux</text>
+  <text x="495" y="587" text-anchor="middle" font-size="10" fill="var(--muted)">one backend, no mux</text>
   <g stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)">
     <line x1="300" y1="555" x2="300" y2="590"/>
     <line x1="630" y1="555" x2="630" y2="590"/>
@@ -284,7 +284,7 @@
   <g text-anchor="middle">
     <text x="867" y="259" font-weight="600" font-size="12.5">peer control API</text>
     <text x="867" y="275" fill="var(--muted)" font-size="10">redeem · challenge · manifest</text>
-    <text x="867" y="289" fill="var(--muted)" font-size="10">quota · version · undelete</text>
+    <text x="867" y="289" fill="var(--muted)" font-size="10">quota · version · undelete · list</text>
     <text x="867" y="306" fill="var(--muted)" font-size="10">auth: peer key, per request</text>
   </g>
   <line x1="867" y1="205" x2="867" y2="240" stroke="currentColor" stroke-width="1.2" marker-end="url(#a1)"/>
@@ -297,7 +297,7 @@
     <text x="867" y="403">placement · watermarks</text>
     <text x="867" y="419">friends · invites · sealed names</text>
     <text x="867" y="435">bucket keys · tombstones</text>
-    <text x="867" y="451">quota counters · ceilings</text>
+    <text x="867" y="451">quota counters · overflow targets</text>
   </g>
 
   <rect x="785" y="473" width="165" height="115" rx="5" fill="var(--accent-soft)" stroke="var(--accent)"/>
@@ -327,7 +327,7 @@
 
   <!-- band A: the one store, outside the process -->
   <rect x="220" y="755" width="550" height="100" rx="8" fill="var(--store-soft)" stroke="var(--store)" stroke-width="1.5"/>
-  <text x="232" y="849" font-weight="700" font-size="9.5" letter-spacing="1" fill="var(--store)">YOUR STORE · ONE FOR BOTH ROLES · YOUR BUCKETS AND lent-* BUCKETS TOGETHER</text>
+  <text x="232" y="849" font-weight="700" font-size="9.5" letter-spacing="1" fill="var(--store)">YOUR STORE · ONE FOR BOTH ROLES · YOUR BUCKETS AND lent-* BUCKETS TOGETHER · PLAIN FILES</text>
   <g stroke="var(--store)" stroke-width="1" fill="var(--box)">
     <rect x="235" y="769" width="250" height="62" rx="5"/>
     <rect x="505" y="769" width="250" height="62" rx="5"/>
@@ -336,9 +336,9 @@
     <text x="360" y="788" font-weight="600" font-size="12.5">a directory on this machine</text>
     <text x="360" y="805" fill="var(--muted)">restic -r &lt;dir&gt;/laptop, nothing running</text>
     <text x="360" y="820" fill="var(--muted)">hand over the disk</text>
-    <text x="630" y="788" font-weight="600" font-size="12.5">any S3-compatible service</text>
-    <text x="630" y="805" fill="var(--muted)">LAN: Garage · MinIO · RustFS · versitygw</text>
-    <text x="630" y="820" fill="var(--muted)">provider: B2 · R2 · Wasabi · Hetzner</text>
+    <text x="630" y="788" font-weight="600" font-size="12.5">lent-* buckets beside yours</text>
+    <text x="630" y="805" fill="var(--muted)">.lendisk/tomb/ in each: deleted objects,</text>
+    <text x="630" y="820" fill="var(--muted)">kept for the window, hidden from the borrower</text>
   </g>
   <g stroke="var(--accent)" stroke-width="2" marker-end="url(#a1-acc)">
     <line x1="300" y1="680" x2="300" y2="769"/>
@@ -347,8 +347,8 @@
   <g font-size="10" fill="var(--muted)">
     <text x="308" y="728">filesystem calls</text>
     <text x="308" y="741">plain files, xattrs</text>
-    <text x="638" y="728">S3 · re-signed with the store credential</text>
-    <text x="638" y="741">over LAN or internet</text>
+    <text x="638" y="728">filesystem calls, the same backend</text>
+    <text x="638" y="741">tombstones moved aside, never versions</text>
   </g>
 
   <!-- band B: replication targets -->
@@ -394,28 +394,28 @@
   <span>control and acknowledgements</span>
   <span class="dash">fallback</span>
 </div>
-<figcaption>Figure 1. One node, both roles, one process. Green is code lendisk owns. Blue is versitygw linked in as a library: the front end above the decorator, one backend below it. Purple is Tailscale's data plane, tailcat inside the process and DERP outside it. Amber is the one store the user chose at <code>init</code>: a directory by default, or an S3 service the user already runs or pays for; your buckets and your friends' buckets sit in it side by side. The replication worker is an ordinary S3 client inside the process. The placer picks <code>copies</code> places for each data object from the pool, friends first by the largest share of quota still free, and the worker reads the object once through the decorator and sends it to each place: to a friend through the tailcat dialer, or, only when no friend has room, to an overflow bucket over the internet. Metadata goes to every friend, and only after the data it refers to has its copies. The green decorator between the two blue blocks is the only place lendisk sees a storage call, and it sees every one.</figcaption>
+<figcaption>Figure 1. One node, both roles, one process. Green is code lendisk owns. Blue is versitygw linked in as a library: the front end above the decorator, one backend below it. Purple is Tailscale's data plane, tailcat inside the process and DERP outside it. Amber is the one store: a directory the user chose at <code>init</code>, with your buckets and your friends' buckets side by side as plain files; an S3 service as the store is post-v1 (EP-16). The replication worker is an ordinary S3 client inside the process. The placer picks <code>copies</code> places for each data object from the pool, friends first by the largest share of quota still free, and the worker reads the object once through the decorator and sends it to each place: to a friend through the tailcat dialer, or, only when no friend has room, to an overflow bucket over the internet. Metadata goes to every friend, and only after the data it refers to has its copies. The green decorator between the two blue blocks is the only place lendisk sees a storage call, and it sees every one.</figcaption>
 </figure>
 
 <h2>What the picture encodes</h2>
 <ul>
-  <li><strong>versitygw is the S3 front end, in-process.</strong> It owns the loopback listener, parses every request, verifies every SigV4 signature including restic's and Kopia's <code>aws-chunked</code> streaming form, and implements multipart, listings, versioning and object lock. lendisk supplies an <code>IAMService</code> and writes no protocol code. <code>embedgw</code> takes listener addresses, not a <code>net.Listener</code>, so the loopback listener is versitygw's own and the tunnel side goes through a lendisk bridge. Unchanged from v0.9.</li>
-  <li><strong>The tunnel has one port and the bridge is where peer identity is enforced.</strong> lendisk accepts each tailcat connection, learns its peer key, and checks the relationship on every request. Requests under <code>/_lendisk/</code> are the control API and are answered by lendisk; no S3 bucket can have that name, since bucket names start with a letter or digit. Every other request is an S3 request, passed on to versitygw's internal unix socket only if its access key is the peer key, with the signed headers untouched (SEC-10 to SEC-15). One listener, one middleware, one hostile-peer harness target.</li>
+  <li><strong>versitygw is the S3 front end, in-process, on one internal socket.</strong> It parses every request, verifies every SigV4 signature including restic's and Kopia's <code>aws-chunked</code> streaming form, and implements multipart and listings; its versioning and object lock are off on every bucket. lendisk supplies an <code>IAMService</code> and writes no protocol code. <code>embedgw</code> takes listener addresses, not a <code>net.Listener</code>, so versitygw is given <code>&lt;data&gt;/run/gw.sock</code> and nothing else: it opens no TCP port.</li>
+  <li><strong>One bridge owns every listener.</strong> lendisk listens on <code>127.0.0.1:9000</code>, on each <code>[[endpoint.listen]]</code> LAN address (TLS by default), and on the one tunnel port inside tailcat, and proxies every request unbuffered to <code>gw.sock</code> with the signed headers untouched. In the tunnel the bridge learns the connection's peer key, checks the relationship on every request, answers <code>/_lendisk/</code> itself (the control API: <code>redeem</code>, <code>challenge</code>, <code>manifest</code>, <code>quota</code>, <code>version</code>, <code>undelete</code>, <code>list</code>) and passes an S3 request on only if its access key is the peer key (SEC-10 to SEC-15). On loopback and the LAN it refuses <code>/_lendisk/</code> and node-ID access keys and otherwise just proxies. One code path, one hostile-peer harness target, one extra in-process hop that Q-L measures.</li>
   <li><strong>Credentials are resolved by lendisk, never stored by versitygw.</strong> On loopback the <code>IAMService</code> returns the per-bucket key from <code>lendisk.db</code>. For a borrower it derives the per-pair secret from the two node keys on demand (NET-7a), and only when a relationship exists. Unchanged from v0.9.</li>
   <li><strong>The decorator is the one lendisk seam, and it hashes at capture.</strong> It implements versitygw's <code>backend.Backend</code> interface and wraps the one real backend. For your buckets it records a pending queue row, wraps the write stream in a SHA-256 as it passes to the backend, makes the call, marks the row done with the hash, and turns a not-found into a read-through from a replica. EP-11 needs the hash at write time anyway, to notice a changed acknowledged key, so taking it here costs no extra read. For borrowers' buckets it applies the allow-list, quota, hash verification, immutability and retention. Capture is in-process and crash-safe exactly as in v0.7 (EP-3).</li>
-  <li><strong>One backend per node, serving both roles.</strong> The user picks <code>backend/posix</code> or <code>backend/s3</code> at <code>init</code>, and the node's own buckets and every borrower's <code>lent-*</code> bucket go into the same store. On a disk, they are sibling directories. On a Garage, they are sibling buckets. This is what every household in figure 2 already did in v0.9; making it the rule removes the mux between two backend instances and gate Q-W. A friend who wants lent buckets on a second disk mounts it at the bucket directory (gate below).</li>
-  <li><strong>The capability profile is declared for tested stores and probed for the rest.</strong> The POSIX backend has versioning, object lock, checksum verification and conditional writes natively. Behind <code>backend/s3</code> those depend on the upstream. Garage, RustFS and B2 are tested, so their profiles ship as data and the probes at <code>init</code> and <code>store set</code> confirm them; for any other store the probes decide. <code>status</code> labels the weaker modes, as S3-4 already does for overflow targets.</li>
-  <li><strong>Placement decides where each object goes; nobody names replicas.</strong> When the decorator completes a capture, the placer gives a data object <code>copies</code> places: the friends with the largest share of their quota still free, in different failure domains where the user set them, and an overflow target only for copies no friend can take. A metadata object (restic indexes and snapshots, Kopia index and manifest blobs) goes to every friend, but only once every earlier data object has its copies, so any N − c + 1 places together always hold a consistent repository (REPL-1). The <code>placement</code> table in <code>lendisk.db</code> records it, and recovery rebuilds it by listing the friends.</li>
+  <li><strong>One backend per node, serving both roles.</strong> <code>backend/posix</code> on the directory the user named at <code>init</code>; the node's own buckets and every borrower's <code>lent-*</code> bucket are sibling directories in it. One backend instance, no mux, gate Q-W closed. A friend who wants lent buckets on a second disk mounts it at the bucket directory (gate below). <code>backend/s3</code>, the same gateway re-signing to an S3 service the user already runs or pays for, is drafted in D15 and is post-v1 (EP-16).</li>
+  <li><strong>Retention is the decorator's alone; store features are not used.</strong> Versioning, object lock, conditional writes and checksum verification in versitygw are either off or ignored: the decorator already hashes every stream, already checks its index before a write, and RET-2 only guards against the borrower, so a store-enforced mode would protect against nothing the requirements ask for. A borrower's delete moves the object to <code>.lendisk/tomb/&lt;key&gt;/&lt;time&gt;</code> in the same bucket, records a row in <code>tombstones</code>, hides the key from that borrower, and the purger removes it after the window. A put to a tombstoned key with the same hash is accepted and the tomb dropped; a different hash is refused (LEND-4). One path on every store, no probe, no <code>status</code> labels, and gate Q-I.4 closed.</li>
+  <li><strong>Placement decides where each object goes; nobody names replicas.</strong> When the decorator completes a capture, the placer gives a data object <code>copies</code> places: the friends with the largest share of their quota still free, and an overflow target only for copies no friend can take. A metadata object (restic indexes and snapshots, Kopia index blobs) goes to every friend, but only once every earlier data object has its copies, so any N − c + 1 places together always hold a consistent repository (REPL-1). Local-only keys (restic <code>locks/</code>, Kopia <code>_log</code>) are never replicated. The <code>placement</code> table in <code>lendisk.db</code> records it, and recovery rebuilds it from each friend's <code>list</code> answer, which carries key, size and hash.</li>
   <li><strong>The owner's node moves copies, never the lender.</strong> When a friend is removed, fails a challenge, lowers the quota or stays unreachable for seven days, the re-placer copies its objects to the rest of the pool first and deletes them there second, so nothing drops below the copies it had. The same worker drains overflow back to friends when they gain room. A lender still never forwards (P-2, PEER-11).</li>
-  <li><strong>Every friendship is one number, enforced on both sides.</strong> The decorator's quota counter is per friend and the quota is the same in both directions (P-8). Raising it is a proposal through the control API's <code>quota</code> call, accepted automatically within the ceilings each user set (LEND-8); lowering it applies at once to both.</li>
+  <li><strong>Every friendship is one number, enforced on both sides.</strong> Each side holds its own number for the friendship (<code>lendisk peer quota &lt;peer&gt; &lt;bytes&gt;</code>), the control API's <code>quota</code> call exchanges them, and the smaller is the quota in force in both directions (P-8, LEND-8). Lowering takes effect at once; raising takes effect once both have raised. There are no proposals and no pending state: when the pool is short, <code>status</code> and an alert name the friend and the number that would cover it, and the two people talk.</li>
   <li><strong>Replication is an S3 client in the process.</strong> The worker takes the next object from a place's FIFO queue, reads it through the decorator, and uploads it with <code>minio-go</code>, with the SHA-256 from the queue row as <code>x-amz-meta-lendisk-sha256</code> and as the request checksum where the target verifies one. Multipart with per-part progress on the queue row gives resume at part granularity (REPL-6). A token-bucket limiter and a time-of-day timetable in lendisk give REPL-7. minio-go was chosen on 2026-10-30 for its fit with S3-compatible stores; its owner risk (D11) is accepted, and if the library is withdrawn a new decision is taken, with the AWS SDK for Go v2 as the obvious replacement behind the same interface. For a friend, the client's HTTP transport dials through the tailcat <code>Client</code>, so there is no loopback forward, no child process, no rc socket and no second binary. The lender-only profile simply has no queue: it is a node with no buckets yet.</li>
-  <li><strong>A lender can lend space it does not own.</strong> Point the one store at a B2 bucket through <code>backend/s3</code> and lend part of it; quota, immutability and retention are still the decorator's. The borrower never holds a credential to it. Unchanged from v0.9.</li>
+  <li><strong>Post-v1: lending space you do not own.</strong> Pointing the one store at a Garage or a provider bucket through <code>backend/s3</code> and lending part of it is EP-16, kept in the documents and the examples for v1.1. Evict mode (EP-9) is post-v1 for the same reason: v1 has one store kind and one storage mode.</li>
 </ul>
 
 <h2>Four friends, four configurations</h2>
 <p class="sub" style="margin-bottom:12px">The same binary in four households, each using a different corner of the design. Every line is a friendship: mutual, one quota lent in both directions, created by one invite. Nobody names replicas; each node spreads its copies over its friends by free quota. Carla and Björn have no friendship and never learn of each other. Every household keeps its own buckets and its friends' buckets in the same store.</p>
 <figure id="fig2">
-<svg viewBox="0 0 1000 660" role="img" aria-label="Four nodes joined by five friendships, each one quota lent both ways: Anna and Björn 200 GB, relayed through DERP because Björn is behind CGNAT; Anna and Carla 250 GB; Anna and Dag 150 GB; Björn and Dag 200 GB; Carla and Dag 200 GB. Anna runs the default install on a Synology NAS with plain files; her 320 GB restic bucket at two copies fills her friends' 600 GB, so about 46 GB, copies plus metadata, sit in a Backblaze B2 overflow bucket. Björn keeps everything in the Garage on his LAN, uses evict mode, and with two friends and two copies every pack is at both Anna and Dag. Carla runs a lender-only Raspberry Pi with no buckets yet; the 450 GB her friends lend her back is unused. Dag runs a VPS with a public IP, uses Kopia, keeps his store in Hetzner Object Storage, and spreads his 80 GB over Anna, Björn and Carla." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5">
+<svg viewBox="0 0 1000 660" role="img" aria-label="Four nodes joined by five friendships, each one quota lent both ways: Anna and Björn 200 GB, relayed through DERP because Björn is behind CGNAT; Anna and Carla 250 GB; Anna and Dag 150 GB; Björn and Dag 200 GB; Carla and Dag 200 GB. Anna runs the default install on a Synology NAS with plain files; her 320 GB restic bucket at two copies fills her friends' 600 GB, so about 46 GB, copies plus metadata, sit in a Backblaze B2 overflow bucket. Björn runs a homelab server behind CGNAT with plain files, and with two friends and two copies every pack is at both Anna and Dag. Carla runs a lender-only Raspberry Pi with no buckets yet; the 450 GB her friends lend her back is unused. Dag runs a VPS with a public IP and plain files on its disk, uses Kopia, and spreads his 80 GB over Anna, Björn and Carla." font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="10.5">
   <defs>
     <marker id="a3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0 0L10 5L0 10z" fill="var(--accent)"/>
@@ -437,17 +437,17 @@
     <text x="132" y="178" fill="var(--muted)">copies 2 · friends' 600 GB full</text>
     <text x="132" y="193" fill="var(--muted)">~46 GB of copies at B2 overflow</text>
     <text x="132" y="208" fill="var(--muted)">plain files: hand over the disk</text>
-    <text x="132" y="223" fill="var(--muted)">versioning dir · object lock</text>
+    <text x="132" y="223" fill="var(--muted)">no versioning, no lock</text>
     <text x="325" y="130" font-weight="600" font-size="11.5">lent buckets, same store</text>
     <text x="325" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">/volume1/lendisk/lent-*</text>
     <text x="325" y="163" fill="var(--muted)">lent-‹björn›-s7qe… · 180 GB</text>
     <text x="325" y="178" fill="var(--muted)">lent-‹dag› · sm3a… · 44 GB</text>
     <text x="325" y="193" fill="var(--muted)">Carla: 250 GB, unused so far</text>
-    <text x="325" y="208" fill="var(--muted)">delete → delete marker</text>
-    <text x="325" y="223" fill="var(--muted)">retention: store-enforced</text>
+    <text x="325" y="208" fill="var(--muted)">delete → .lendisk/tomb/, 30 d</text>
+    <text x="325" y="223" fill="var(--muted)">hidden, then purged</text>
   </g>
   <g fill="var(--muted)">
-    <text x="40" y="258">listens: loopback S3 · tunnel · metrics</text>
+    <text x="40" y="258">listens: bridge on loopback · tunnel · metrics</text>
     <text x="40" y="273">friends: Björn 200 (relayed) · Carla 250 · Dag 150 GB · overflow: B2</text>
     <text x="40" y="288">status: offsite at 2 copies · protectable ~300 GB, ~450 with B2</text>
   </g>
@@ -455,31 +455,31 @@
   <!-- Björn -->
   <rect x="570" y="60" width="405" height="240" rx="7" fill="var(--box)" stroke="currentColor" stroke-width="1.5"/>
   <text x="585" y="80" font-weight="700" font-size="12.5">Björn · homelab server · behind CGNAT</text>
-  <text x="585" y="96" fill="var(--muted)">Garage already on the LAN · restic · evict mode · lends 400 GB in all</text>
+  <text x="585" y="96" fill="var(--muted)">plain files on the server's disk · restic · lends 400 GB in all</text>
   <g fill="var(--box)" stroke="var(--store)" stroke-width="1">
     <rect x="585" y="112" width="185" height="128" rx="5"/>
     <rect x="780" y="112" width="180" height="128" rx="5"/>
   </g>
   <g text-anchor="middle">
     <text x="677" y="130" font-weight="600" font-size="11.5">own buckets</text>
-    <text x="677" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/s3 → garage.lan:3900</text>
-    <text x="677" y="163" fill="var(--muted)">photos · 180 GB · restic · evict</text>
+    <text x="677" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/posix · /srv/lendisk</text>
+    <text x="677" y="163" fill="var(--muted)">photos · 180 GB · restic · full</text>
     <text x="677" y="178" fill="var(--muted)">copies 2 over 2 friends:</text>
     <text x="677" y="193" fill="var(--muted)">every pack at Anna and Dag</text>
-    <text x="677" y="208" fill="var(--muted)">evicted after 2 acks</text>
-    <text x="677" y="223" fill="var(--muted)">restores read-through</text>
-    <text x="870" y="130" font-weight="600" font-size="11.5">lent buckets, same Garage</text>
-    <text x="870" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">garage.lan:3900 · lent-* buckets</text>
+    <text x="677" y="208" fill="var(--muted)">placement degenerates</text>
+    <text x="677" y="223" fill="var(--muted)">to mirroring</text>
+    <text x="870" y="130" font-weight="600" font-size="11.5">lent buckets, same store</text>
+    <text x="870" y="147" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">/srv/lendisk/lent-*</text>
     <text x="870" y="163" fill="var(--muted)">lent-‹anna›-s4k2… · 200 GB</text>
     <text x="870" y="178" fill="var(--muted)">lent-‹dag› · sm3a… · 58 GB</text>
-    <text x="870" y="193" fill="var(--muted)">Garage has no versioning:</text>
-    <text x="870" y="208" fill="var(--muted)">tombstones kept by lendisk</text>
-    <text x="870" y="223" fill="var(--muted)">retention: client-side</text>
+    <text x="870" y="193" fill="var(--muted)">delete → .lendisk/tomb/, 30 d</text>
+    <text x="870" y="208" fill="var(--muted)">hidden, then purged</text>
+    <text x="870" y="223" fill="var(--muted)">Garage on the LAN: post-v1</text>
   </g>
   <g fill="var(--muted)">
-    <text x="585" y="258">listens: loopback S3 · tunnel · metrics</text>
+    <text x="585" y="258">listens: bridge on loopback · tunnel · metrics</text>
     <text x="585" y="273">friends: Anna 200 (relayed) · Dag 200 GB · knows nothing of Carla</text>
-    <text x="585" y="288">status: photos offsite at 2 copies · 175 GB of packs evicted</text>
+    <text x="585" y="288">status: photos offsite at 2 copies · protectable 200 GB</text>
   </g>
 
   <!-- Carla -->
@@ -501,11 +501,11 @@
     <text x="325" y="503" fill="var(--muted)">lent-‹anna›-s4k2… · 250 GB</text>
     <text x="325" y="518" fill="var(--muted)">lent-‹dag› · sm3a… · 58 GB</text>
     <text x="325" y="533" fill="var(--muted)">all metadata + a share of packs</text>
-    <text x="325" y="548" fill="var(--muted)">object lock: delete + 60 d</text>
+    <text x="325" y="548" fill="var(--muted)">delete → .lendisk/tomb/, 60 d</text>
     <text x="325" y="563" fill="var(--muted)">weekly 0.1% sample scrub</text>
   </g>
   <g fill="var(--muted)">
-    <text x="40" y="598">listens: tunnel only · PEER-9 AC: nothing on loopback</text>
+    <text x="40" y="598">listens: tunnel only · no metrics · PEER-9 AC: nothing on loopback</text>
     <text x="40" y="613">friends: Anna 250 · Dag 200 GB · knows nothing of Björn</text>
     <text x="40" y="628">status: both replicas verified today · 450 GB received, unused</text>
   </g>
@@ -513,29 +513,29 @@
   <!-- Dag -->
   <rect x="570" y="400" width="405" height="240" rx="7" fill="var(--box)" stroke="currentColor" stroke-width="1.5"/>
   <text x="585" y="420" font-weight="700" font-size="12.5">Dag · small VPS with a public IP · no NAT</text>
-  <text x="585" y="436" fill="var(--muted)">Kopia · store is Hetzner Object Storage · lends 550 GB of it in all</text>
+  <text x="585" y="436" fill="var(--muted)">Kopia · plain files on the VPS disk · lends 550 GB in all</text>
   <g fill="var(--box)" stroke="var(--store)" stroke-width="1">
     <rect x="585" y="452" width="185" height="128" rx="5"/>
     <rect x="780" y="452" width="180" height="128" rx="5"/>
   </g>
   <g text-anchor="middle">
     <text x="677" y="470" font-weight="600" font-size="11.5">own buckets</text>
-    <text x="677" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/s3 → Hetzner bucket</text>
+    <text x="677" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">backend/posix · /var/lib/lendisk/store</text>
     <text x="677" y="503" fill="var(--muted)">kopia-dag · 80 GB · Kopia · full</text>
     <text x="677" y="518" fill="var(--muted)">copies 2 over 3 friends:</text>
     <text x="677" y="533" fill="var(--muted)">Anna 44 · Björn 58 · Carla 58 GB</text>
-    <text x="677" y="548" fill="var(--muted)">remote store: WAN speed,</text>
-    <text x="677" y="563" fill="var(--muted)">warned at init</text>
-    <text x="870" y="470" font-weight="600" font-size="11.5">lent buckets, same bucket</text>
-    <text x="870" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">Hetzner bucket · lent-* prefix</text>
+    <text x="677" y="548" fill="var(--muted)">any 2 of the 3 restore</text>
+    <text x="677" y="563" fill="var(--muted)">local disk speed</text>
+    <text x="870" y="470" font-weight="600" font-size="11.5">lent buckets, same store</text>
+    <text x="870" y="487" font-family="ui-monospace, Menlo, Consolas, monospace" font-size="9.5">/var/lib/lendisk/store/lent-*</text>
     <text x="870" y="503" fill="var(--muted)">lent-‹anna›-s4k2… · 150 GB</text>
     <text x="870" y="518" fill="var(--muted)">lent-‹björn› · s7qe… · 180 GB</text>
-    <text x="870" y="533" fill="var(--muted)">versioning + lifecycle there</text>
-    <text x="870" y="548" fill="var(--muted)">retention: store-enforced</text>
-    <text x="870" y="563" fill="var(--muted)">friends never see the key</text>
+    <text x="870" y="533" fill="var(--muted)">delete → .lendisk/tomb/, 30 d</text>
+    <text x="870" y="548" fill="var(--muted)">hidden, then purged</text>
+    <text x="870" y="563" fill="var(--muted)">a provider as the store: post-v1</text>
   </g>
   <g fill="var(--muted)">
-    <text x="585" y="598">listens: loopback S3 · tunnel, dialled directly · metrics</text>
+    <text x="585" y="598">listens: bridge on loopback · tunnel, dialled directly · metrics</text>
     <text x="585" y="613">friends: Anna 150 · Björn 200 · Carla 200 GB</text>
     <text x="585" y="628">status: manifest offsite at 2 copies · 3 places, any 2 restore</text>
   </g>
@@ -553,12 +553,9 @@
     <text x="500" y="277" fill="var(--muted)">~46 of 300 GB</text>
     <text x="500" y="290" fill="var(--muted)">versioned · 30 d</text>
   </g>
-  <rect x="445" y="430" width="110" height="62" rx="5" fill="var(--store-soft)" stroke="var(--store)" stroke-width="1"/>
-  <g text-anchor="middle">
-    <text x="500" y="447" font-weight="600" font-size="11.5">Hetzner Object</text>
-    <text x="500" y="461" font-weight="600" font-size="11.5">Storage</text>
-    <text x="500" y="476" fill="var(--muted)">Dag's bucket</text>
-    <text x="500" y="489" fill="var(--muted)">both roles live here</text>
+  <g text-anchor="middle" fill="var(--muted)" font-size="10">
+    <text x="500" y="461">every node: one directory,</text>
+    <text x="500" y="474">plain files, both roles</text>
   </g>
 
   <!-- friendships: both directions -->
@@ -569,7 +566,6 @@
     <path d="M850 300 V400" marker-end="url(#a3)" marker-start="url(#a3)"/>
     <path d="M700 400 V350 H300 V300" marker-end="url(#a3)" marker-start="url(#a3)"/>
     <path d="M570 610 H430" marker-end="url(#a3)" marker-start="url(#a3)"/>
-    <path d="M585 461 H555" marker-end="url(#a3)"/>
   </g>
   <path d="M430 263 H445" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="2 3" marker-end="url(#a3)"/>
   <g font-size="10" fill="var(--muted)">
@@ -591,7 +587,7 @@
   <span class="acc">friendship, one quota both ways</span>
   <span class="dash">relayed path</span>
 </div>
-<figcaption>Figure 2. Four households, one binary, one store each, five friendships. Anna is the default: plain files on the NAS, her friends' buckets beside her own. Her 320 GB at two copies needs 640 GB, and the ~3 GB of metadata in it goes to every place, not just two; her three friends lend her 600, so the placer fills them evenly and puts the rest, about 46 GB, in her B2 overflow bucket, which will drain back to friends as soon as a quota rises (LEND-8) or a friend joins. Björn keeps everything, his own and his friends', in the Garage he already runs, so retention at Björn is client-side tombstones; with two friends and two copies, every pack he evicts is at both Anna and Dag. Carla has no buckets yet: Anna and Dag lend her back what she lends them, and it waits unused. Dag's store is a Hetzner bucket behind <code>backend/s3</code> on a VPS; his 80 GB is spread over three friends, so any two of them hold all of it. Carla and Björn do not exist to each other.</figcaption>
+<figcaption>Figure 2. Four households, one binary, one store each, five friendships. Anna is the default: plain files on the NAS, her friends' buckets beside her own. Her 320 GB at two copies needs 640 GB, and the ~3 GB of metadata in it goes to every place, not just two; her three friends lend her 600, so the placer fills them evenly and puts the rest, about 46 GB, in her B2 overflow bucket, which will drain back to friends as soon as both sides of a friendship raise their number (LEND-8) or a friend joins. Björn keeps everything, his own and his friends', as plain files on his homelab server; with two friends and two copies, every pack is at both Anna and Dag. Carla has no buckets yet: Anna and Dag lend her back what she lends them, and it waits unused. Dag's store is plain files on his VPS; his 80 GB is spread over three friends, so any two of them hold all of it. Every lender keeps a borrower's deleted objects under <code>.lendisk/tomb/</code> for its window. Carla and Björn do not exist to each other.</figcaption>
 </figure>
 
 <h3>Who uses what</h3>
@@ -599,62 +595,46 @@
 <table>
   <tr><th></th><th>Anna</th><th>Björn</th><th>Carla</th><th>Dag</th></tr>
   <tr><td>Profile</td><td>full</td><td>full</td><td>lender-only (PEER-9): no buckets yet</td><td>full</td></tr>
-  <tr><td>The one store</td><td><code>backend/posix</code>, NAS volume</td><td><code>backend/s3</code>, Garage on the LAN</td><td><code>backend/posix</code>, USB disk</td><td><code>backend/s3</code>, Hetzner bucket (remote, warned)</td></tr>
-  <tr><td>Store profile</td><td>native</td><td>declared: Garage</td><td>native</td><td>declared: S3 with versioning, probed</td></tr>
-  <tr><td>Tool and mode</td><td>restic, full</td><td>restic, evict (EP-9)</td><td>—</td><td>Kopia, full</td></tr>
-  <tr><td>Friends, quota each way</td><td>Björn 200, Carla 250, Dag 150 GB</td><td>Anna 200, Dag 200 GB</td><td>Anna 250, Dag 200 GB</td><td>Anna 150, Björn 200, Carla 200 GB</td></tr>
-  <tr><td>Ceilings (LEND-8)</td><td>600 GB total, 300 per friend</td><td>600, 300</td><td>700, 350</td><td>600, 250</td></tr>
+  <tr><td>The one store</td><td><code>backend/posix</code>, NAS volume</td><td><code>backend/posix</code>, server disk</td><td><code>backend/posix</code>, USB disk</td><td><code>backend/posix</code>, VPS disk</td></tr>
+  <tr><td>Tool</td><td>restic</td><td>restic</td><td>—</td><td>Kopia</td></tr>
+  <tr><td>Friends, quota each way (the smaller of the two numbers)</td><td>Björn 200, Carla 250, Dag 150 GB</td><td>Anna 200, Dag 200 GB</td><td>Anna 250, Dag 200 GB</td><td>Anna 150, Björn 200, Carla 200 GB</td></tr>
+  <tr><td><code>lending.max_total</code></td><td>600 GB</td><td>600 GB</td><td>700 GB</td><td>600 GB</td></tr>
   <tr><td><code>copies</code> and where they are</td><td>2: Björn, Carla, Dag full; ~46 GB at B2</td><td>2: every pack at Anna and Dag</td><td>—</td><td>2: Anna 44, Björn 58, Carla 58 GB</td></tr>
   <tr><td>Overflow</td><td>B2, <code>max_bytes</code> 300 GB, ~46 in use</td><td>none</td><td>none</td><td>none</td></tr>
-  <tr><td>Retention at this lender</td><td>30 d, delete markers, object lock (store-enforced)</td><td>30 d, lendisk tombstones (client-side, Garage has no versioning)</td><td>60 d, object lock on posix (store-enforced)</td><td>30 d, Hetzner versioning + lifecycle (store-enforced)</td></tr>
+  <tr><td>Retention at this lender</td><td>30 d tombstones</td><td>30 d tombstones</td><td>60 d tombstones</td><td>30 d tombstones</td></tr>
   <tr><td>Network</td><td>home NAT; direct to Carla and Dag, relayed to Björn</td><td>CGNAT; relayed to Anna, direct out to Dag</td><td>home NAT; hole-punched</td><td>public IP, dialled directly (NET-3)</td></tr>
-  <tr><td>Verification</td><td>challenges Björn, Carla and Dag daily on the objects placed there; B2 by checksum sample (S3-6)</td><td>challenges Anna and Dag; evict mode samples 0.1%/week (VER-2)</td><td>answers challenges; samples its own disk (VER-5)</td><td>challenges Anna, Björn and Carla</td></tr>
+  <tr><td>Verification</td><td>challenges Björn, Carla and Dag daily on the objects placed there; B2 by sample download (VER-2, S3-6)</td><td>challenges Anna and Dag</td><td>answers challenges; samples its own disk (VER-5)</td><td>challenges Anna, Björn and Carla</td></tr>
 </table>
 </div>
 
 <h3>What the four exercise</h3>
 <ul>
-  <li><strong>Every store kind at once, one per node.</strong> Plain files (Anna, Carla), an S3 server the user already runs (Björn), a provider as the store (Dag), and a provider as an overflow target (Anna's B2). Three declared store profiles, one backend per node, no mux.</li>
-  <li><strong>Every retention mode.</strong> Store-enforced through object lock on plain files (Anna, Carla), store-enforced through versioning and lifecycle at a provider (Dag, and Anna's B2 with a key that cannot remove versions), and client-side tombstones where the store has none (Björn). <code>status</code> on each borrower shows which it got.</li>
+  <li><strong>One store kind, four disks.</strong> Plain files on a NAS volume, a server disk, a USB disk and a VPS disk; a provider appears only as an overflow target (Anna's B2). One backend per node, no mux, no probe. Björn's Garage and Dag's Hetzner bucket as the store are the post-v1 examples (EP-16).</li>
+  <li><strong>One retention mode at friends.</strong> Every lender's decorator moves a deleted object to <code>.lendisk/tomb/</code> and purges it after its own window: 30 days at Anna, Björn and Dag, 60 at Carla. Only the overflow target differs: Anna's B2 keeps versions with a lifecycle rule and a key that cannot remove them (S3-4, S3-5).</li>
   <li><strong>Placement at three pool sizes.</strong> Björn has two friends at two copies, so placement degenerates to mirroring. Dag has three friends with plenty of room, so his packs are spread and any two friends hold everything. Anna's friends are full, so the placer reaches for overflow, the second choice, and <code>status</code> warns that her repository is above what her friends alone can protect.</li>
   <li><strong>Symmetric quotas, including the unused half.</strong> Every friendship is one number. Carla has no buckets, so the 450 GB her friends lend her back is promised but unused; <code>status</code> on Anna and Dag shows it, and if Carla adds a bucket nothing about the friendships changes.</li>
-  <li><strong>Lending space you do not own.</strong> Dag's lent buckets are a prefix in a bucket he pays for. His friends' quotas, immutability and retention are enforced by Dag's daemon, and they never hold the Hetzner credential.</li>
   <li><strong>Pairwise trust (P-2).</strong> Five friendships, five invites. Carla and Björn share no friendship and appear nowhere in each other's state, even though both hold data for Anna and Dag.</li>
   <li><strong>Every network case.</strong> Hole-punched (Anna and Carla), relayed through DERP because of CGNAT (Anna and Björn, shown as such in both nodes' status), and a static public address dialled directly (everyone to Dag). In every case the borrower's S3 client dials through its own tailcat <code>Client</code>; nothing listens on loopback for replication.</li>
   <li><strong>A friend leaving.</strong> If Dag left, Anna's re-placer would have nowhere to put his 150 GB but B2; Björn's photos would fall to one copy and his <code>status</code> would say a new friendship is needed, the only case that needs an invite (OPS-2). Nothing is lost meanwhile: Dag keeps what he held for the retention window.</li>
-  <li><strong>Recovery for each.</strong> Anna rebuilds from her phrase and Carla's address; the manifest names Björn, Dag and B2, and the placement is rebuilt by listing them. Dag rebuilds from his phrase and any friend's address, and gives lendisk the Hetzner credential again through the environment; the manifest carries only overflow credentials (SEC-3). With nothing of lendisk running, Anna's laptop is the keys of any three of her four places copied into one directory (N − c + 1 = 3), each found under the name on her recovery sheet.</li>
+  <li><strong>Recovery for each.</strong> Anna rebuilds from her phrase and Carla's address; the manifest names Björn, Dag and B2, and the placement is rebuilt from each friend's <code>list</code> answer and a listing of B2. Dag rebuilds from his phrase and any friend's address; the manifest carries only overflow credentials (SEC-3), shown once for the environment. With nothing of lendisk running, Anna's laptop is the keys of any three of her four places copied into one directory (N − c + 1 = 3), each found under the name on her recovery sheet.</li>
 </ul>
 
-<h2>The capability profile</h2>
-<p class="sub" style="margin-bottom:10px">Applies to a store behind <code>backend/s3</code>. For a tested store (Garage, RustFS, B2) the profile ships as data and the probes confirm it at <code>init</code> and <code>store set</code>; for any other store the probes decide it. Recorded in <code>lendisk.db</code>, shown in <code>status</code>. The POSIX backend has every row natively. An overflow target is checked for two things only: whether versioning is on (S3-4) and whether the credential can remove versions (S3-5).</p>
-<div class="scroll">
-<table>
-  <tr><th>Capability</th><th>Probe</th><th>Upstream has it</th><th>Upstream lacks it</th><th><code>status</code> label</th></tr>
-  <tr><td>Versioning</td><td><code>GetBucketVersioning</code></td><td>Deletes are delete markers; undelete removes the marker; listings hide marked objects natively.</td><td>lendisk tombstones: copy aside if server-side copy is cheap, else deferred delete hidden by the decorator.</td><td>retention: store / client-side</td></tr>
-  <tr><td>Lifecycle</td><td><code>PutBucketLifecycleConfiguration</code> on a probe prefix</td><td>Store expires non-current versions after the window.</td><td>lendisk purger issues the deletes.</td><td>purge: store / daemon</td></tr>
-  <tr><td>Object Lock</td><td><code>GetObjectLockConfiguration</code></td><td>Retain-until set on delete; the lender's own credential cannot purge early.</td><td>RET-2 rests on the lender's daemon.</td><td>retention: store-enforced / daemon-enforced</td></tr>
-  <tr><td>Checksum verification</td><td>PUT with a wrong <code>x-amz-checksum-sha256</code>, expect <code>BadDigest</code></td><td>Store checks too; the decorator's capture hash is checked either way (LEND-4).</td><td>Decorator's capture hash is the only check.</td><td>integrity: store and daemon / daemon</td></tr>
-  <tr><td>Conditional PUT</td><td><code>If-None-Match: *</code> on an existing probe key</td><td>Store refuses overwrites itself.</td><td>Decorator checks its index first.</td><td>immutability: store / daemon</td></tr>
-  <tr><td>Server-side copy</td><td><code>CopyObject</code> of a probe object, timed</td><td>Cheap tombstone moves, undelete and exports.</td><td>Download and re-upload for those operations.</td><td>copy: server / client</td></tr>
-</table>
-</div>
+<h2>Store features the design does not use</h2>
+<p class="sub" style="margin-bottom:10px">v0.11 probed six store capabilities and labelled the weaker mode of each in <code>status</code>. v0.12 drops the probe: versioning and object lock are off on every bucket, the decorator's capture hash is the only integrity check, its index is the only immutability check, and retention is its tombstones on every store. The one probe that may return with the post-v1 <code>s3</code> backend is a timed server-side copy, as a performance hint for tombstone moves and exports. An overflow target is still checked for two things: whether versioning is on (S3-4) and whether the credential can remove versions (S3-5).</p>
 
 <h2>Where the bytes live</h2>
 <pre>
-the store, default (backend/posix)
+the store (backend/posix)
   &lt;dir&gt;/laptop/data/ab/abcd…                 your bucket "laptop", restic layout, plain files
   &lt;dir&gt;/laptop/snapshots/…
+  &lt;dir&gt;/laptop/locks/…                       local only, never replicated (EP-7)
   &lt;dir&gt;/photos/p1234…                        your bucket "photos", Kopia layout
   &lt;dir&gt;/lent-&lt;id16&gt;-&lt;sealed&gt;/…                a friend's bucket, beside yours: all its metadata, its share of packs
+  &lt;dir&gt;/lent-&lt;id16&gt;-&lt;sealed&gt;/.lendisk/tomb/&lt;key&gt;/&lt;time&gt;
+                                             an object the friend deleted, kept for the window, hidden from them (RET-1)
   &lt;dir&gt;/lendisk-manifests/&lt;borrower-id&gt;       the borrower's encrypted node manifest
-  &lt;versioning-dir&gt;/laptop/…                  non-current versions and delete markers (versitygw)
   restic -r &lt;dir&gt;/laptop snapshots           works with nothing running at all
-
-the store behind backend/s3
-  s3://laptop/…, s3://lent-&lt;id16&gt;-&lt;sealed&gt;/…  one upstream bucket per lendisk bucket, yours and theirs alike
-  s3://&lt;bucket&gt;/&lt;prefix&gt;/laptop/…             or prefixes in one bucket, if backend/s3 allows (Q-V)
-  s3://lent-…/.lendisk/tomb/&lt;key&gt;/&lt;time&gt;     without versioning (Garage): a tombstoned object moved aside before an overwrite (RET-1)
-  restic -r s3:&lt;endpoint&gt;/laptop snapshots    any S3 client, lendisk stopped
+  restic -r &lt;dir&gt;/lent-&lt;id16&gt;-&lt;sealed&gt;         a friend's replica the same way; .lendisk/ is ignored by the tool
 
 an overflow target
   s3://&lt;bucket&gt;/&lt;prefix&gt;/&lt;sealed&gt;/…           all metadata, and only the packs no friend had room for
@@ -670,16 +650,16 @@ object metadata lendisk writes everywhere
 <div class="scroll">
 <table>
   <tr><th>Tier</th><th>Store</th><th>Promise</th><th>Testing</th></tr>
-  <tr><td>1 · default</td><td><code>backend/posix</code> on a local directory</td><td>Every requirement, every acceptance scenario, plain files on disk, no store process.</td><td>Full suite in CI, including G-3 on a Pi 4.</td></tr>
-  <tr><td>2 · tested</td><td><code>backend/s3</code> against Garage, a MinIO-compatible store (RustFS), one provider (B2)</td><td>Every requirement, with behaviour per the declared profile.</td><td>Full suite in CI per store; declared profile asserted by the probes.</td></tr>
-  <tr><td>3 · any S3</td><td><code>backend/s3</code> against anything that passes the probe</td><td>Best effort. <code>status</code> shows the probed profile and the weaker modes.</td><td>Probe only; community reports.</td></tr>
+  <tr><td>1 · the v1 store</td><td><code>backend/posix</code> on a local directory</td><td>Every requirement, every acceptance scenario, plain files on disk, no store process.</td><td>Full suite in CI, including G-3 on a Pi 4.</td></tr>
+  <tr><td>2 · post-v1 (EP-16)</td><td><code>backend/s3</code> against Garage, a MinIO-compatible store (RustFS), one provider (B2)</td><td>Drafted in D15; not in v1.</td><td>None in v1.</td></tr>
+  <tr><td>3 · post-v1 (EP-16)</td><td><code>backend/s3</code> against any other S3 service</td><td>Drafted in D15; not in v1.</td><td>None in v1.</td></tr>
 </table>
 </div>
 <h3>Places in the pool</h3>
 <div class="scroll">
 <table>
   <tr><th>Kind</th><th>Target, through the in-process S3 client (minio-go)</th><th>Gets</th><th>Retention</th><th>Testing</th></tr>
-  <tr><td>Friend</td><td>A friend's node, as S3 through the tunnel</td><td>All metadata; data copies by free share of the quota</td><td>The friend's decorator: delete markers or tombstones, object lock where the store has it</td><td>Two nodes over tailcat in CI; placement with three and four.</td></tr>
+  <tr><td>Friend</td><td>A friend's node, as S3 through the tunnel</td><td>All metadata; data copies by free share of the quota</td><td>The friend's decorator: tombstones under <code>.lendisk/tomb/</code>, purged after the friend's window</td><td>Two nodes over tailcat in CI; placement with three and four.</td></tr>
   <tr><td>Overflow, tier 1</td><td>S3 with versioning (B2, Wasabi, Hetzner, R2, RustFS)</td><td>Only copies no friend has room for; drained back when they do</td><td>Provider-enforced, credential that cannot remove versions (Q-AC)</td><td>CI per provider.</td></tr>
   <tr><td>Overflow, tier 2</td><td>S3 without versioning (Garage)</td><td>Same</td><td>Client-side tombstones, labelled in <code>status</code></td><td>CI against Garage.</td></tr>
 </table>
@@ -690,26 +670,27 @@ object metadata lendisk writes everywhere
 <div class="scroll">
 <table>
   <tr><th>Listener</th><th>Where</th><th>Who</th><th>Authenticated by</th></tr>
-  <tr><td>S3, your buckets</td><td><code>127.0.0.1:9000</code>, served by embedded versitygw</td><td>Your backup tools</td><td>Per-bucket key from lendisk's <code>IAMService</code></td></tr>
-  <tr><td>LAN bridge (EP-17)</td><td>Only addresses the user configures, TLS by default</td><td>Backup tools on other machines on the LAN</td><td>Per-bucket key, as on loopback</td></tr>
-  <tr><td>Tunnel: S3 for friends and the control API</td><td>One tunnel port: lendisk's bridge answers <code>/_lendisk/</code> itself and proxies the rest to versitygw on <code>&lt;data&gt;/run/tunnel.sock</code></td><td>Friends admitted by the <code>AllowClient</code> hook, checked again per request; invite keys for <code>redeem</code> only</td><td>Peer key; for S3 the access key must equal it and versitygw verifies the derived SigV4 credential</td></tr>
-  <tr><td>Metrics</td><td>Loopback port</td><td>Prometheus</td><td>None, loopback only</td></tr>
-  <tr><td><code>peer forward</code> (NET-7b)</td><td>The loopback address the user names, only while the command runs</td><td>An S3 client copying a friend's replica for a lendisk-free restore</td><td>Dials the friend with the node's own key; the friend checks it</td></tr>
-  <tr><td>A user-provided store</td><td>Wherever the user runs it</td><td><code>backend/s3</code>, and whatever else the user allows</td><td>The user's credential; outside SEC-8's scope</td></tr>
+  <tr><td>S3, your buckets</td><td><code>127.0.0.1:9000</code>, lendisk's bridge, proxied to versitygw on <code>&lt;data&gt;/run/gw.sock</code></td><td>Your backup tools</td><td>Per-bucket key from lendisk's <code>IAMService</code>; <code>/_lendisk/</code> and node-ID access keys refused</td></tr>
+  <tr><td>LAN (EP-17)</td><td>Only addresses the user configures, TLS by default; the same bridge, same socket</td><td>Backup tools on other machines on the LAN</td><td>Per-bucket key, as on loopback</td></tr>
+  <tr><td>Tunnel: S3 for friends and the control API</td><td>One tunnel port: the same bridge answers <code>/_lendisk/</code> itself and proxies the rest to <code>gw.sock</code></td><td>Friends admitted by the <code>AllowClient</code> hook, checked again per request; invite keys for <code>redeem</code> only</td><td>Peer key; for S3 the access key must equal it and versitygw verifies the derived SigV4 credential</td></tr>
+  <tr><td>Internal: <code>&lt;data&gt;/run/gw.sock</code></td><td>Unix socket in a 0700 directory, the only thing versitygw listens on</td><td>lendisk's bridge</td><td>Filesystem permissions; nothing else can reach it</td></tr>
+  <tr><td>Metrics</td><td>Loopback port; absent in the lender-only profile (PEER-9)</td><td>Prometheus</td><td>None, loopback only</td></tr>
+  <tr><td><code>peer forward</code> (NET-7b)</td><td>The loopback address the user names, only while the command runs</td><td>An S3 client copying a friend's replica for a lendisk-free restore</td><td>Dials the friend with the node's own key; the friend checks it. The command prints the derived credential for the tool to use</td></tr>
+  <tr><td>tailcat's UDP socket</td><td>All interfaces, one port; WireGuard</td><td>Friends and DERP relays</td><td>WireGuard handshake by node key; the <code>AllowClient</code> hook</td></tr>
 </table>
 </div>
-<p class="sub" style="margin-top:8px">No admin socket, no child process, no rc socket, no replication forwards. versitygw's admin API, web UI and website endpoints are not configured. Every row is a listener REQUIREMENTS already names (EP-1, EP-17, OPS-4, NET-7, NET-7b), so SEC-8 needs no change.</p>
+<p class="sub" style="margin-top:8px">No admin socket, no child process, no rc socket, no replication forwards; versitygw opens no TCP port. versitygw's admin API, web UI and website endpoints are not configured. Every row is a listener REQUIREMENTS names (EP-1, EP-17, OPS-4, NET-7, NET-7b, NET-1), and <code>ss -lntup</code> shows nothing on a non-loopback address except the configured EP-17 addresses and tailcat's one UDP socket (SEC-8).</p>
 
 <h2>Five ways back to your data</h2>
 <ol>
   <li><strong>Normal.</strong> <code>restic restore</code> against <code>127.0.0.1:9000</code>; the store serves it, read-through fills any gap from whichever place holds the object.</li>
   <li><strong>From friends, directly.</strong> <code>lendisk peer forward</code> to N − c + 1 friends, copy each replica's keys into one directory with any S3 client, then <code>restic -r</code> on it; each friend's embedded gateway serves its store and refuses anything outside the allow-list.</li>
-  <li><strong>After total loss.</strong> <code>lendisk recover</code> with the phrase and one lender's address; the manifest brings back friends, buckets, <code>copies</code>, and the credentials of the store and every overflow target, and listing the friends rebuilds the placement. Read-through works with some friends offline, as long as every object has a reachable holder.</li>
+  <li><strong>After total loss.</strong> <code>lendisk recover</code> with the phrase and one lender's address; the manifest brings back friends, buckets, <code>copies</code> and the credentials of every overflow target, and each friend's <code>list</code> answer rebuilds the placement and the hash index. Read-through works with some friends offline, as long as every object has a reachable holder.</li>
   <li><strong>With no lendisk at all.</strong> On the default store, <code>restic -r &lt;dir&gt;/laptop</code> on your own plain files. From the pool, the keys of any N − c + 1 places copied into one directory, from their plain files or through any S3 client; the same key always has the same bytes, so the union is the repository.</li>
-  <li><strong>From disks in the post.</strong> <code>lendisk export</code> on each of N − c + 1 friends writes its replica in the tool's own layout; copied together, <code>restic -r /mnt/usb/laptop</code> opens them.</li>
+  <li><strong>From disks in the post.</strong> <code>lendisk export</code> on each of N − c + 1 friends, given the bucket's <code>lent-</code> name from your recovery sheet, writes its replica in the tool's own layout; copied together, <code>restic -r /mnt/usb/laptop</code> opens them.</li>
 </ol>
 
-<h2>What changed from the v0.10 drawing</h2>
+<h2>What changed from the v0.10 drawing, and what v0.12 took out again</h2>
 <div class="scroll">
 <table>
   <tr><th>Area</th><th>v0.10</th><th>This drawing</th><th>Requirement</th></tr>
@@ -717,22 +698,25 @@ object metadata lendisk writes everywhere
   <tr><td>Consistency</td><td>FIFO per replica was enough: each replica was complete</td><td>FIFO per place plus a barrier: metadata waits until earlier data has its copies</td><td>REPL-1</td></tr>
   <tr><td>A friend leaves or goes quiet</td><td>Alert, then a manual invite</td><td>The owner's node re-places the copies; an invite only when the pool is too small</td><td>REPL-13, P-2, OPS-2</td></tr>
   <tr><td>Relationships</td><td>One-way; <code>--mutual</code> made two</td><td>One friendship, one quota lent both ways, enforced on both sides</td><td>P-8, PEER-1 to PEER-6</td></tr>
-  <tr><td>Changing a quota</td><td>The lender alone</td><td>Proposed through the control API, accepted within each user's ceilings; lowering applies to both</td><td>LEND-8</td></tr>
+  <tr><td>Changing a quota</td><td>The lender alone</td><td>Each side sets its own number; the smaller is in force both ways; nothing is proposed over the wire</td><td>LEND-8</td></tr>
   <tr><td>External buckets</td><td>A full replica, counted towards <code>min_replicas</code></td><td>Overflow target: only what friends cannot hold, drained back when they can</td><td>§4.11, S3-1, S3-2, S3-5, S3-7</td></tr>
   <tr><td>One lender's disk</td><td>A complete repository</td><td>All metadata and a share of packs; any N − c + 1 together are complete</td><td>P-5, LEND-6</td></tr>
   <tr><td>Capacity in <code>status</code></td><td>Consumed/lent ratio</td><td>Protectable size: Σ min(D, quota − m) + overflow room − m ≥ c × D, with m the metadata every place holds</td><td>LEND-7</td></tr>
-  <tr><td><code>lendisk.db</code></td><td>Queue, watermark per replica</td><td>Queue, <code>placement</code> table, one watermark per bucket, friendships with one quota</td><td>REPL-11</td></tr>
+  <tr><td><code>lendisk.db</code></td><td>Queue, watermark per replica</td><td>Queue, <code>placement</code> table, one watermark per bucket, friendships with each side's number, overflow targets, tombstones</td><td>REPL-11</td></tr>
+  <tr><td>Retention at a lender</td><td>Store versioning, object lock where available, probed and labelled</td><td>The decorator's tombstones under <code>.lendisk/tomb/</code>, on every store</td><td>RET-1, RET-2</td></tr>
+  <tr><td>Listeners</td><td>versitygw's own loopback listener; a bridge for the tunnel; another for the LAN</td><td>One lendisk bridge for all three, over one internal unix socket</td><td>EP-1, EP-17, SEC-8</td></tr>
+  <tr><td>Rebuilding after recovery</td><td>S3 listing of each friend, one HEAD per object for the hash</td><td>The control API's <code>list</code>: key, size, hash, tombstoned-at, paged</td><td>ID-5, NET-7</td></tr>
+  <tr><td>Store kinds and modes</td><td><code>posix</code> or <code>s3</code>; <code>full</code> or <code>evict</code>; failure domains</td><td><code>posix</code>, <code>full</code>; the rest post-v1 or dropped</td><td>EP-9, EP-16, REPL-12</td></tr>
 </table>
 </div>
 
 <h2>Open gates</h2>
 <ul>
   <li><strong>The decorator can see the authenticated account (Q-I.2).</strong> <code>Config.IAMService</code> taking lendisk's implementation is confirmed; whether the account reaches the backend call is not. Fallback: a vendored patch carried as a Go module replace.</li>
-  <li><strong><code>backend/s3</code> pass-through (Q-V).</strong> Multipart and checksums are documented; whether versioning, object lock and conditional headers pass to the upstream unchanged is not, nor whether buckets can live as prefixes in one upstream bucket, as figure 2 draws for Dag.</li>
   <li><strong><code>backend.Backend</code> churn.</strong> Five versitygw minor releases in four months, no stability statement. Pinned and vendored, one file touches it, CI runs restic and Kopia end to end on every bump.</li>
-  <li><strong>Listing at 500k objects on the POSIX backend and Object Lock semantics on it (Q-X).</strong></li>
+  <li><strong>Listing at 500k objects on the POSIX backend (Q-X).</strong></li>
   <li><strong>The in-process replica client (Q-Y).</strong> Multipart resume after a restart, the limiter and timetable, memory per transfer on a Pi 4, and a friend's 507, 403 and 412 reaching the worker through the tailcat transport. rclone behind the same interface is the fallback.</li>
-  <li><strong>Lent buckets on a second disk under one posix root (Q-Z).</strong> versitygw's temp and versioning directories must stay on the bucket's filesystem; otherwise two posix roots and a mux for that case only.</li>
+  <li><strong>Lent buckets on a second disk under one posix root (Q-Z).</strong> versitygw's temp directory must stay on the bucket's filesystem, and so must the decorator's <code>.lendisk/tomb/</code> renames; otherwise two posix roots and a mux for that case only.</li>
   <li><strong>New: placement and re-placement parameters (Q-AA).</strong> Re-route unsent copies after an hour away, re-place sent ones after seven days, fill by free share. G-1's households show how much traffic a normal weekend away causes.</li>
   <li><strong>New: drain-back deletes at overflow targets (Q-AC).</strong> Draining needs a credential that can mark objects deleted but not remove versions. Whether B2, Wasabi, Hetzner and R2 can grant exactly that is checked per provider; where not, the user chooses.</li>
 </ul>

@@ -1,6 +1,6 @@
 # Carla: lender-only profile (PEER-9) on a Raspberry Pi 4 with a USB disk.
-# Backs up nothing yet, friends with two people. Nothing listens on loopback
-# except metrics; there is no replication worker and no overflow target,
+# Backs up nothing yet, friends with two people. Nothing listens on loopback,
+# not even metrics; there is no replication worker and no overflow target,
 # so no env_file is needed.
 
 services:

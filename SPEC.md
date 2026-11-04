@@ -9,7 +9,7 @@ The specification is two documents with different change rules:
   SEC-, COMPAT-, S3-), release gates G-1 to G-3 and the acceptance
   scenarios. Changing it changes the product; it gets a new version
   number and a changelog entry each time.
-- **[DESIGN.md](DESIGN.md)** — how it is built: decisions D2 to D13 with
+- **[DESIGN.md](DESIGN.md)** — how it is built: decisions D2 to D15 with
   the alternatives they beat, a per-requirement account of how each one
   is realised (components, ports, paths, headers, algorithms), the
   capacity derivation, and the open gates on the current design. Any of
@@ -21,5 +21,6 @@ a different component, protocol or language were chosen? If yes, it is
 design. Design references requirements by ID; requirements never
 reference design.
 
-Both are at draft v0.7, 2026-10-28, split from SPEC v0.6. `architecture.html`
-is an overview rendered from the design.
+REQUIREMENTS.md is at draft v0.11 and DESIGN.md at draft v0.12, both
+2026-11-04; they were split from SPEC v0.6 on 2026-10-28.
+`architecture.html` is an overview rendered from the design.

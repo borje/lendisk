@@ -1,6 +1,6 @@
 # lendisk — design
 
-Status: draft v0.11.1, 2026-11-01. Companion to REQUIREMENTS.md v0.10.1.
+Status: draft v0.12, 2026-11-04. Companion to REQUIREMENTS.md v0.11.
 REQUIREMENTS.md v0.9 made the two requirement changes this design
 needed (Q-T, resolved); its later versions moved third-party
 credentials to the environment,
@@ -63,8 +63,16 @@ the metadata barrier waits for actual placements, placement prefers an
 unreachable friend over overflow only until `replace_after`, metadata
 is backfilled to new places, capacity counts metadata at every place,
 undelete at overflow targets copies a version instead of removing
-markers, and the global quota cap cannot be overridden. The trust
-model is unchanged throughout.
+markers, and the global quota cap cannot be overridden. v0.12 follows
+REQUIREMENTS.md v0.11 and takes the design down to what v1 needs: the
+decorator is the only retention mechanism, with tombstones moved
+aside under `.lendisk/tomb/` and versitygw's versioning and object
+lock left off, so the capability profile is gone; `backend/s3` as the
+node's own store, and evict mode, are post-v1; quotas are two numbers
+people set and the smaller wins; failure domains are gone; lock files
+stay local; one lendisk bridge owns every listener in front of one
+internal socket; the control API gains `list`; the identity key is a
+plain file. The trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -97,7 +105,7 @@ feature:
 |---|---|---|---|
 | **Local store**: the node's own copy, written by the user's backup tool | EP-1 to EP-15, P-5 | Synchronous and protocol-critical: full S3 behaviour for restic and Kopia, crash-safe exactly-once capture with no buffering, 200 MB/s, loopback only unless the user enables the LAN bridge (EP-17). The writer is trusted. | versitygw with the decorator's capture policy (D4, D15) |
 | **Replication**: placing each object in the pool and moving it there | REPL-1 to REPL-13, §4.11, NET-2 to NET-5 | Asynchronous and robustness-critical: placement by free quota, re-placement when the pool changes, strict FIFO per place with a metadata barrier, survival of days-long outages, resume, rate limits, a hash per object, reach behind NAT and to providers. Almost no S3 semantics. | an in-process S3 client (minio-go) driven by lendisk's queue (D12), dialling friends through tailcat (D5) |
-| **Lending store**: a friend's copy, written by a borrower who may be compromised | LEND-1 to LEND-7, RET-1 to RET-3, VER-1, NET-7, SEC-4 to SEC-16 | Enforcement-critical: quota, immutability, retention the borrower cannot bypass, a deny-by-default operation list, isolation between borrowers. | versitygw with the decorator's lender policy (D12, D15), behind the tunnel bridge (§3.7) |
+| **Lending store**: a friend's copy, written by a borrower who may be compromised | LEND-1 to LEND-7, RET-1 to RET-3, VER-1, NET-7, SEC-4 to SEC-16 | Enforcement-critical: quota, immutability, retention the borrower cannot bypass, a deny-by-default operation list, isolation between borrowers. | versitygw with the decorator's lender policy (D12, D15), behind the bridge's tunnel listener (§3.7) |
 
 The two stores need the same S3 surface and differ only in policy, so
 one embedded gateway serves both and the decorator applies a different
@@ -105,9 +113,9 @@ policy per bucket. Replication needs none of that surface and all of a
 transfer client's robustness, so it is a separate component behind its
 own interface, even though it runs in the same process. The split also
 says where a component does not belong: the replica client lacks what
-the stores need (synchronous capture, versioning, object lock,
-conditional writes), and versitygw has nothing replication needs beyond
-what the decorator already exposes.
+the stores need (synchronous capture, tombstones, quota), and versitygw
+has nothing replication needs beyond what the decorator already
+exposes.
 
 ### D2. Packaging: one service, one static binary, one TOML file
 
@@ -129,14 +137,14 @@ what the decorator already exposes.
   all capabilities dropped and a read-only root; the config directory
   and the data directory are the only volumes (plus the store
   directory when the user names one outside `<data>`), and third-party
-  credentials arrive as environment variables, not files (SEC-3). A
-  user who already runs
-  an S3 store adds it as a second service on the bridge network,
-  publishing its S3 port on the host's loopback only, and names it as
-  the `s3` backend (D15).
+  credentials arrive as environment variables, not files (SEC-3).
+  Post-v1, a user who already runs an S3 store names it as the `s3`
+  backend (D15, EP-16).
 - Configuration is one TOML file (`BurntSushi/toml`); the CLI is
   `cobra`. Every setting has a flag and an env var (OPS-6). One
-  `[store]` section serves both roles (§3.8).
+  `[store]` section serves both roles (§3.8). The file holds what the
+  user sets; friendships, buckets and overflow targets are rows in
+  `lendisk.db`, never written into the file.
 - An upgrade is a file swap; the only state with migrations is
   `lendisk.db` (OPS-8).
 
@@ -158,10 +166,10 @@ upload speed, fail whenever the peer is offline, and give the user no local
 copy. Local staging gives 3-2-1 (one local copy, `copies` offsite) for free and
 makes most restores fast.
 
-The two storage modes (`full`, `evict`) are a requirement (EP-9); this
-decision is how they are served: in `evict` mode metadata (`config`,
-`keys`, `index`, `snapshots`, `locks`) stays local and evicted packs are
-fetched from a replica on demand through the same read path (EP-10).
+v1 has one storage mode: the local copy is complete (EP-9). The read
+path that serves a missing object from a replica (EP-10) exists for
+recovery and bit-rot repair; the post-v1 `evict` mode would reuse it
+(§3.3).
 
 ### D4. Endpoint: S3 served in-process by embedded versitygw
 
@@ -171,17 +179,17 @@ The backup tool talks S3 to the lendisk daemon on `127.0.0.1:9000`. The
 S3 protocol is served by **versitygw embedded in the daemon** (D15): it
 terminates every SigV4 signature, including the `aws-chunked`
 streaming form restic and Kopia send over plain HTTP, routes every
-request, and implements multipart, listings, versioning and object
-lock. Under it sits a lendisk-owned **decorator** of versitygw's
+request, and implements multipart and listings; its versioning and
+object lock are left off (§3.6). Under it sits a lendisk-owned **decorator** of versitygw's
 `backend.Backend` interface, which captures every write and delete
 into the replication queue and enforces the lender's policy. It is the
 only tool-facing endpoint: there is one local copy and one capture
 point.
 
-The same gateway, reached through a lendisk bridge inside the tunnel
-(§3.7), is what a friend's node talks to (D12). Everything the product
+The same gateway, reached through lendisk's bridge from every
+listener (§3.7), is what a friend's node talks to (D12). Everything the product
 adds to S3 (capture, read-through, quota, immutability, retention, the
-deny-by-default allow-list) lives in the decorator, behind the tunnel
+deny-by-default allow-list) lives in the decorator, behind the
 bridge's per-request peer checks (SEC-11, SEC-12); versitygw parses
 and authenticates, its backends store.
 
@@ -220,8 +228,9 @@ What changed versus a restic-only design, and the replacement for each:
 - *Zero lock-in* (P-5) holds on both sides, at its v0.7 strength on the
   default store: objects are plain files at their key paths, so with
   lendisk stopped `restic -r <store>/<bucket>` opens the borrower's own
-  copy and the lender's replica alike. Behind the `s3` backend, any S3
-  client with the store's credential reads the same layout.
+  copy and the lender's replica alike. Post-v1, behind the `s3`
+  backend, any S3 client with the store's credential reads the same
+  layout.
 - *The trust promise* is per tool profile (EP-7, EP-8). restic and Kopia
   always encrypt client-side, so the "lender never sees plaintext"
   guarantee holds. A `generic` bucket (rclone, `aws s3 cp`) is outside
@@ -346,8 +355,7 @@ A node's **pool** is its friends plus its overflow targets. Every
 place in the pool has a capacity (the friendship's quota, or an
 overflow target's `max_bytes`), a use (live plus tombstoned bytes,
 counted by the borrower and reconciled with the lender's `quota`
-answer), a last-reachable time and a failure domain (the friend's
-`domain`, or a domain of its own).
+answer) and a last-reachable time.
 
 - **Metadata objects** (by the tool profile, EP-7) are placed at every
   friend, and at an overflow target once it holds any data object of
@@ -362,10 +370,8 @@ answer), a last-reachable time and a failure domain (the friend's
      bucket's metadata not yet sent there.
   2. Take the candidate with the largest *free fraction*
      (free ÷ capacity), friends reachable within the last hour
-     (`replication.reroute_after`) before the others, then the next in
-     a domain not yet used, and so on, until `copies` are chosen. If
-     domains run out, continue in used domains and mark the object
-     "same domain" for `status`. An unreachable friend with room is
+     (`replication.reroute_after`) before the others, then the next,
+     until `copies` are chosen. An unreachable friend with room is
      still chosen when the reachable ones are not enough, and its copy
      waits for it (§3.4), unless it has been unreachable longer than
      `replace_after` or is being drained: then it is not a candidate
@@ -408,6 +414,11 @@ answer), a last-reachable time and a failure domain (the friend's
 - **Placement by absolute free bytes.** It also meets the AC, but a
   large friend takes all the early objects and a small one stays empty,
   which makes friendships look unbalanced in `status` (LEND-7).
+- **Failure domains** (v0.11 and earlier): a label per friend and a
+  tiebreaker so that two friends in one house would not both hold a
+  copy. Dropped from v1 with REQUIREMENTS.md v0.11 because nobody had
+  asked for it; it returns as a tiebreaker in step 2 when someone
+  does.
 
 The capacity cost and the feasibility rule are derived in §4.
 
@@ -453,7 +464,7 @@ bundled program, not reimplemented. The daemon is glue around these:
 | Concern | Component | Licence | Notes |
 |---|---|---|---|
 | Backup format, client, encryption | **restic**, **Kopia**, unmodified | BSD-2 / Apache | Never imported; only their S3 usage and key naming conventions are relied on, via tool profiles. |
-| S3 front end and stores | **versitygw** via `embedgw`, pinned and vendored | Apache-2.0 | D15. SigV4 incl. `aws-chunked`, routing, multipart, listings, versioning, object lock; `backend/posix` and `backend/s3`. |
+| S3 front end and store | **versitygw** via `embedgw`, pinned and vendored | Apache-2.0 | D15. SigV4 incl. `aws-chunked`, routing, multipart, listings; `backend/posix` (`backend/s3` post-v1). Its versioning and object lock are left off. |
 | Replication transfers, every place in the pool | **minio-go** | Apache-2.0 | D12. In-process S3 client, confined to one package behind the replica interface; the AWS SDK for Go v2 is the replacement if it is withdrawn. |
 | Rate limiting | `golang.org/x/time/rate` | BSD-3 | REPL-7's token bucket around each uploaded part. |
 | Overlay network and NAT traversal | **`github.com/tailscale/tailcat`** | BSD-3 | D5. |
@@ -465,10 +476,9 @@ bundled program, not reimplemented. The daemon is glue around these:
 
 What is written from scratch, because nothing exists: the backend
 decorator (capture, read-through, bucket mapping, quota, immutability,
-retention, the operation allow-list, the mux between two backends;
-D4, D15, §3.3, §3.5, §3.6), the `IAMService` (§3.3, §3.7), the tunnel
-bridge and the peer control API (§3.7, §3.9), the capability probe
-(D15), the replication queue and its ordering guarantee (REPL-1) with
+tombstones and the purger, the operation allow-list; D4, D15, §3.3,
+§3.5, §3.6), the `IAMService` (§3.3, §3.7), the bridge and the peer
+control API (§3.7, §3.9), the replication queue and its ordering guarantee (REPL-1) with
 the replica client's multipart resume loop, rate limiter and timetable
 (D12, §3.4), the challenge protocol (VER-1), the node manifest and recovery flow
 (§3.1), invites (PEER-1), tool profiles, `lendisk export`/`import`
@@ -522,9 +532,10 @@ it:
 Both kinds are places in the pool and count towards `copies`; D6
 decides which objects each one gets, and overflow targets only get
 what friends cannot hold. The friend kind differs from the overflow
-kind in two methods only: `Verify` is the challenge (VER-1), and `Undelete` goes
-over the control API when the friend's store has no versioning
-(§3.6). Everything that moves bytes is the same code.
+kind in three methods only: `Verify` is the challenge (VER-1), and
+`Undelete` and `List` go over the control API (§3.6, §3.7), since a
+friend's store has no versioning and its index knows more than a
+listing does. Everything that moves bytes is the same code.
 
 Why one implementation rather than a custom peer protocol beside S3
 (v0.5's design):
@@ -570,15 +581,17 @@ token-bucket limiter (`golang.org/x/time/rate`) around each part and a
 time-of-day timetable checked before each part (REPL-7); and the FIFO
 queue, which was lendisk's in every version.
 
-What stays outside S3: the **peer control API**, six lendisk endpoints
-served under `/_lendisk/` on the same tunnel port as S3 and
+What stays outside S3: the **peer control API**, seven lendisk
+endpoints served under `/_lendisk/` on the same tunnel port as S3 and
 authenticated by the tunnel peer key, checked against `lendisk.db` on
 every request (SEC-11): `redeem` (PEER-2, the invite handshake and the
 only endpoint an invite key may call, SEC-13), `challenge` (VER-1, S3
 has no HMAC challenge), `manifest` (ID-4, which must be fetchable
-before any S3 credential exists), `quota` (LEND-3), `version` (NET-6)
-and `undelete` (RET-3, for a friend whose store keeps lendisk-side
-tombstones).
+before any S3 credential exists), `quota` (LEND-3, LEND-8), `version`
+(NET-6), `undelete` (RET-3, the lender's tombstones are not S3
+versions) and `list` (the lender's index of a borrower's bucket: key,
+size, hash, tombstoned-at; a listing carries no hash and would need a
+request per object, §3.7).
 
 **Credentials.** versitygw requires SigV4, and D5 says the tunnel key is
 the identity. These are reconciled by deriving the pair's S3 credential
@@ -600,8 +613,8 @@ compromised borrower machine, a stronger promise than a friend's node
 can make (RET-2 relies on the friend's daemon being honest and intact).
 A bucket without versioning (Garage) gets lendisk-side tombstones and
 the "retention: client-side" label. For friends, the lender's decorator
-keeps retention, with delete markers in versitygw's versioning or its
-own tombstones depending on the store (§3.6). Overflow stays second
+keeps retention with its own tombstones, the same way on every store
+(§3.6). Overflow stays second
 choice all the same (REQUIREMENTS.md §4.11): the strong case needs a
 tier-1 provider and a correctly scoped credential, both of which are the
 user's to get right, a tier-2 target only has client-side tombstones,
@@ -665,75 +678,52 @@ package: `embedgw.RunVersityGW(ctx, backend, *Config)` serves the S3 API
 over any `backend.Backend`. lendisk passes its decorator (D4), which
 wraps one of versitygw's own backends, chosen once per node:
 
-- **`backend/posix`, the default.** Objects are plain files at
+- **`backend/posix`, the only v1 store.** Objects are plain files at
   `<dir>/<bucket>/<key>`, written temp-then-rename, with ETags and
-  metadata in xattrs, a versioning directory for non-current versions
-  and delete markers, and object lock. One process, no network, and P-5
-  at its v0.7 strength: `restic -r <dir>/<bucket>` works with nothing
-  running.
-- **`backend/s3`, any store.** The same gateway becomes a proxy that
-  re-signs each call with the store's own credential and forwards it to
-  an S3-compatible endpoint the user names: a Garage, MinIO-compatible
-  store or versitygw on the LAN, or a provider (B2, R2, Wasabi,
-  Hetzner). lendisk still writes no signature code.
+  metadata in xattrs. Versioning and object lock are left off on every
+  bucket (§3.6). One process, no network, and P-5 at its v0.7
+  strength: `restic -r <dir>/<bucket>` works with nothing running.
+- **`backend/s3`, post-v1 (EP-16).** The same gateway becomes a proxy
+  that re-signs each call with the store's own credential and forwards
+  it to an S3-compatible endpoint the user names: a Garage,
+  MinIO-compatible store or versitygw on the LAN, or a provider (B2,
+  R2, Wasabi, Hetzner). lendisk would still write no signature code.
+  Deferred with REQUIREMENTS.md v0.11; what this document says about
+  it is kept for that version and marked post-v1.
 
-**One store serves both roles.** The node picks `posix` or `s3` once,
-at `init`, and its own buckets and every borrower's `lent-*` bucket go
-into that store: sibling directories on a disk, sibling buckets in a
-Garage. This is the point of the product for the user who runs storage:
-a friend's data lands where their own does. It also means one backend
-instance, no mux, and Q-W closed. A lender who wants lent buckets on a
-second disk mounts it at the bucket directory (Q-Z). A store behind
-`backend/s3` that is not on the local network is allowed with a warning
-at `init` and `store set`: backups then run at WAN speed (EP-16).
+**One store serves both roles.** The node's own buckets and every
+borrower's `lent-*` bucket go into the one store: sibling directories
+on a disk. This is the point of the product for the user who runs
+storage: a friend's data lands where their own does. It also means one
+backend instance, no mux, and Q-W closed. A lender who wants lent
+buckets on a second disk mounts it at the bucket directory (Q-Z).
 
-What this buys over the v0.8 Garage design:
+**Store features lendisk does not use.** versitygw's versioning,
+object lock, conditional puts and upload checksum verification are all
+left off. The decorator keeps retention (§3.6), immutability (§3.5)
+and the hash check (LEND-4) itself, in one way on every store, so
+nothing the lender promises depends on what a store provides and
+nothing needs a probe. Object lock in particular would only guard
+against the lender's own daemon, which SEC-7 already trusts. Until
+v0.12 a capability profile probed six features per store and labelled
+the weaker mode in `status`; with the posix store alone and the
+decorator doing the work, the profile is gone. One probe would remain
+for the post-v1 `s3` store: whether `CopyObject` is cheap, which
+decides whether tombstone moves and exports copy server-side or
+through the client.
 
-- No signature code in lendisk: the ~500–800 security-critical lines of
-  the v0.8 proxy are versitygw's, tested against restic, Kopia and the
-  AWS SDKs by its own users.
-- Capture is synchronous and in the same process as the backend call. A
-  pending queue row is written before the backend call and completed
-  after it (EP-3), with no HTTP hop between capture and storage.
-- The default store is plain files again, and the store engine is
-  replaceable by configuration: anything S3-compatible fits under
-  `backend/s3`.
-- One lendisk process instead of lendisk plus a supervised Garage, and
-  no admin socket, RPC port or metadata engine to configure.
+**Support tiers for stores:** tier 1, the only tier in v1, is
+`backend/posix` on a local directory (every requirement and scenario,
+full CI including G-3 on a Pi 4). Post-v1: tier 2 is `backend/s3`
+against Garage, a MinIO-compatible store (RustFS) and one provider
+(B2), with the full suite per store; tier 3 is anything else that
+passes the copy probe, best effort.
 
-**The capability profile.** Behind `backend/posix` every feature the
-lender uses is native except lifecycle, which lendisk's purger does
-(RET-1). Behind `backend/s3` they depend on the upstream,
-so each store has a profile. For a tested store (Garage, RustFS, B2)
-the profile ships as data and the probes below confirm it at `init` and
-`store set`; for any other store the probes decide it. The result is
-recorded in `lendisk.db`, shown in `status`, and chooses the mode per
-feature:
-
-| Capability | Probe | Upstream has it | Upstream lacks it | `status` label |
-|---|---|---|---|---|
-| Versioning | `GetBucketVersioning` | Deletes are delete markers; undelete removes the marker. | lendisk tombstones (§3.6). | retention: store / client-side |
-| Lifecycle | `PutBucketLifecycleConfiguration` on a probe prefix | Store expires non-current versions after the window. | lendisk's purger issues the deletes. | purge: store / daemon |
-| Object Lock | `GetObjectLockConfiguration` | Retain-until set on delete; the lender's own credential cannot purge early. | RET-2 rests on the lender's daemon. | retention: store-enforced / daemon-enforced |
-| Checksum verification | PUT with a wrong `x-amz-checksum-sha256`, expect `BadDigest` | The store checks too; the decorator still hashes the stream (LEND-4). | The decorator's hash is the only check. | integrity: store and daemon / daemon |
-| Conditional PUT | `If-None-Match: *` on an existing probe key | Store refuses overwrites itself. | The decorator checks its index first. | immutability: store / daemon |
-| Server-side copy | `CopyObject` of a probe object, timed | Cheap tombstone moves, undelete and exports. | Download and re-upload for those. | copy: server / client |
-
-The probe runs through the decorator and versitygw's `backend/s3`, so it
-measures the pair, not the upstream alone (Q-V).
-
-**Support tiers for stores:** tier 1 is `backend/posix` on a local
-directory (every requirement and scenario, full CI including G-3 on a
-Pi 4); tier 2 is `backend/s3` against Garage, a MinIO-compatible store
-(RustFS) and one provider (B2), with the full suite per store and the
-declared profile asserted by the probes; tier 3 is anything else that
-passes the probe, best effort.
-
-The trust model (P-2) is untouched: the borrower-facing listener binds
-loopback only, the lender-facing side is reachable only through the
-tailcat tunnel and lendisk's bridge (§3.7), a store behind `backend/s3`
-is reached with a credential the borrower never holds, and everything
-that crosses between households is S3 plus the peer control API.
+The trust model (P-2) is untouched: every listener is lendisk's
+bridge (§3.7), the tool-facing ones bind loopback or an address the
+user named, the lender-facing one is reachable only through the
+tailcat tunnel, and everything that crosses between households is S3
+plus the peer control API.
 
 Known costs and their handling:
 
@@ -747,9 +737,9 @@ Known costs and their handling:
   the risk that made the v0.8 sidecar attractive; the price of avoiding
   it was the signature code.
 - *No `net.Listener`.* `embedgw`'s listener fields are address strings
-  (TCP, file-backed or abstract unix sockets). The loopback listener is
-  versitygw's own; the tunnel side is bridged by lendisk to an internal
-  unix socket in a 0700 directory (§3.7).
+  (TCP, file-backed or abstract unix sockets). versitygw is given one
+  internal unix socket in a 0700 directory and nothing else; every TCP
+  listener is lendisk's bridge in front of it (§3.7).
 - *xattrs are required* on the `posix` store. ext4, xfs, btrfs, zfs and
   Docker overlay2 volumes support them; SMB and some NAS exports do not.
   `init` tests the store directory and refuses one without them (EP-12).
@@ -768,9 +758,9 @@ Known costs and their handling:
   formerly D14). Indexed listings, per-bucket quotas, block scrub and a
   small-hardware design, but lendisk had to verify and re-sign every
   signature itself, the default store was Garage's block format, and
-  two processes were always needed. Garage remains a tier-2 store
-  behind `backend/s3` and an overflow target; it has no
-  versioning, so lendisk-side tombstones apply there.
+  two processes were always needed. Garage remains an overflow target
+  (and, post-v1, a tier-2 store); it has no versioning, so client-side
+  tombstones apply to it as an overflow target.
 - **versitygw as a supervised child** over a unix socket, with
   lendisk's proxy in front (the sidecar variant considered on
   2026-10-29). Removes the `backend.Backend` coupling at the cost of the
@@ -778,9 +768,16 @@ Known costs and their handling:
 - **RustFS** (Apache-2.0, 1.0 GA 2026-09-16): versioning, lifecycle and
   IAM, but its documentation recommends XFS and says to avoid ext4,
   btrfs and ZFS, needs 2 GB of memory to test, and ships a web console.
-  A tier-2 store behind `backend/s3`, not the engine.
+  A post-v1 tier-2 store behind `backend/s3`, not the engine.
 - **MinIO**: AGPL, heavier, community edition archived in 2026.
 - **SeaweedFS**: a filer plus volume servers for a single-node job.
+- **trove** (statewright/trove, MIT, reviewed 2026-11-03): a small Go S3
+  server with PostgreSQL metadata and SHA-256 content-addressed blobs.
+  Requires PostgreSQL; its packages are `internal/`, so it cannot be
+  embedded; no `aws-chunked` decoding or payload-hash check; no
+  versioning, object lock or conditional writes; S3 keys exist only in
+  the database, so the store is not plain files (P-5); a single commit
+  from one author.
 - **Any of these as a cluster spanning friends**: rejected for the
   pairwise trust of P-2 (REQUIREMENTS.md); a cluster is one trust
   domain.
@@ -793,12 +790,12 @@ narrows a requirement; if a line seems to, the requirement is wrong or
 this line is.
 
 Paths used below: `<config>` is the config directory (mode 0700),
-`<data>` the data directory. On the default `posix` backend the store
-is `<data>/store/` (or a directory the user names, such as a USB disk),
-holding the node's own buckets and the `lent-*` buckets side by side,
-with versitygw's versioning directory beside it; `lendisk.db` (SQLite)
-is in `<data>`; `<data>/run/` (mode 0700) holds the internal tunnel
-socket. Bucket naming: the node's own buckets keep their names. A borrower
+`<data>` the data directory. The store is `<data>/store/` (or a
+directory the user names, such as a USB disk), holding the node's own
+buckets and the `lent-*` buckets side by side, each lent bucket with a
+`.lendisk/tomb/` directory for its tombstones (§3.6); `lendisk.db`
+(SQLite) is in `<data>`; `<data>/run/` (mode 0700) holds the internal
+gateway socket `gw.sock`. Bucket naming: the node's own buckets keep their names. A borrower
 never sends a bucket's own name to a lender (SEC-16); it sends the
 bucket's **sealed name** `s<26>`, where `<26>` is the first 26
 characters, lowercase base32, of
@@ -815,9 +812,9 @@ reserved name `lendisk-manifests`. The borrower's `lendisk.db` and its
 encrypted manifest (ID-4) hold the name-to-sealed-name map; the
 lender's mapping table holds only sealed names and is authoritative on
 its side; the stored name is a stable label for reading the store with
-no lendisk running (P-5). Behind `backend/s3` the same names are upstream
-bucket names; placing them as prefixes inside one upstream bucket is
-Q-V.
+no lendisk running (P-5). Post-v1, behind `backend/s3`, the same names
+would be upstream bucket names; placing them as prefixes inside one
+upstream bucket is Q-V.
 
 ### 3.1 Identity and recovery
 
@@ -835,8 +832,8 @@ Q-V.
   HKDF-SHA256 of the BIP-39 seed with a fixed info string, clamped as
   X25519 requires. Two nodes from the same phrase derive the same key
   (the AC).
-- **ID-3** The private key file is encrypted with a key stored beside
-  it in the config directory, mode 0600. The phrase is never written.
+- **ID-3** The private key is a file in the config directory at mode
+  0600. The phrase is never written.
 - **ID-4** The manifest is encrypted with a key derived from the
   identity (HKDF over the private key with a fixed info string) and
   pushed to every lender through the control API `manifest` endpoint
@@ -854,10 +851,11 @@ Q-V.
   S3 credentials (§3.7) for every lender listed. Overflow target
   credentials found in the manifest are shown once, for the user to
   put in the environment (SEC-3); they are not written to disk. The
-  `placement` table (D6) is then rebuilt by listing each reachable
-  place's copy of each sealed bucket; a place that is offline is
-  listed when it returns, and until then its objects count as held
-  wherever else a listing found them.
+  `placement` table (D6) and the hash index are then rebuilt from the
+  control API `list` of each reachable place for each sealed bucket
+  (§3.7): one paged call per bucket and place, not a request per
+  object. A place that is offline is listed when it returns, and until
+  then its objects count as held wherever else a list found them.
 - **ID-6** Read-through is the decorator's `GetObject`/`HeadObject`
   miss path (EP-10); after `recover` every object is a miss until
   fetched, from the first reachable place `placement` names.
@@ -869,7 +867,8 @@ Q-V.
   (P-5) needs, together with the number of replicas it must combine
   (N − c + 1, from the pool size and the bucket's `copies`) and the
   command that combines them: `rclone copy` or `aws s3 sync` from each
-  replica into one directory, `--ignore-existing` after the first.
+  replica into one directory, excluding `.lendisk/`, `--ignore-existing`
+  after the first.
 
 ### 3.2 Peers and invites
 
@@ -880,9 +879,10 @@ Q-V.
   the invited node dials with that key to call `redeem`, after which
   its real key replaces it.
 - **PEER-2** `redeem` carries the invited node's `tc…` address, its
-  retention offer and the user's confirmation of the quota. Both nodes
-  then write the same friendship row in `lendisk.db` (peer key,
-  address, quota, each side's retention, ceiling, domain), and each
+  retention offer and the number its user chose (LEND-8). Both nodes
+  then write a friendship row in `lendisk.db` (peer key, address, own
+  number, the other's number as last reported, each side's retention),
+  and each
   becomes an account in the other's `IAMService`: each is the other's
   lender and borrower. The derived secret (NET-7a) serves both
   directions: the X25519 shared secret is the same either way, the
@@ -893,32 +893,34 @@ Q-V.
   creates, always under their sealed names (SEC-16), are created by the
   decorator under the `lent-<id16>-` name and owned by that account
   alone.
-- **PEER-3, PEER-6, LEND-8** The quota is one column of the friendship
-  row and both sides hold the same value. Changes go through the
-  control API `quota` endpoint: `propose(n)` from either side, answered
-  `accepted` when `n` is within the receiver's `lending.max_per_peer`
-  and keeps the sum of its quotas within `lending.max_total`; `pending`
-  when only the per-friend ceiling is exceeded, until its user runs
-  `lendisk peer quota <peer> --accept` (or rejects it); `refused` when
-  the global cap would be exceeded, which `--accept` cannot override. A decrease
-  is not a proposal: it is applied by the side that makes it and pushed
-  as `lower(n)`, which the other side applies at once (SEC-15's 60
-  seconds apply). If the push cannot be delivered, the lowering side
-  enforces the lower number on its side alone and repeats the push on
-  every connection until it is acknowledged, so the two rows converge.
-  The automatic proposer runs after each placement pass: when a bucket
-  has a deficit (D6, step 4), it proposes to the friends with the
-  smallest free fraction an increase that would cover the deficit at
-  `copies`, never beyond its own ceilings.
+- **PEER-3, PEER-6, LEND-8** Each side's number is a column of the
+  friendship row, beside the other side's number as last reported; the
+  quota is the smaller, recomputed whenever either changes, and it is
+  what the decorator enforces (LEND-1). `lendisk peer quota <peer>
+  <bytes>` sets the own number, refusing a value that would take the
+  sum of all numbers past `lending.max_total`. The control API `quota`
+  call carries, in each direction, the caller's number, its use of the
+  other's space and its repository size (LEND-7). A node applies the
+  other's number the moment it sees it, so a lowering is in force on
+  both sides after one call, which the lowering side makes at once
+  (SEC-15's 60 seconds) and repeats on every connection until
+  answered; a raising is in force once both numbers allow it. Nothing
+  is proposed, nothing is pending and the daemon never changes a
+  number by itself. When a bucket has a deficit (D6, step 4), `status`
+  and the OPS-2 alert name the friends with the smallest free fraction
+  and, per friendship, the number that would cover the deficit at
+  `copies`; the two people set it.
 - **PEER-8** Two walls. The decorator maps every bucket name through
   the borrower's own mapping table, so a borrower can only name its own
   buckets; and versitygw's bucket-ownership check refuses an account
   any bucket it does not own, so a mapping bug cannot cross into another
   borrower's data or the lender's own. `ListBuckets` is answered from
   the mapping table.
-- **PEER-9** The lender-only profile skips the loopback S3 listener and
-  runs no replication worker; versitygw still runs, behind the tunnel
-  bridge only. Its friendship rows are like any other; the quota its
+- **PEER-9** The lender-only profile skips the loopback S3 listener,
+  the metrics listener and the replication worker, so nothing listens
+  on loopback (its AC); an `endpoint.listen` or `metrics` entry is
+  refused at config load in this profile. versitygw still runs, behind
+  the bridge's tunnel listener only. Its friendship rows are like any other; the quota its
   friends lend it back has no buckets to fill, and `status` shows it as
   unused. Adding a bucket later is a change of `role` and a restart.
 - **PEER-10** Peers are rows in `lendisk.db`; nothing in the control API
@@ -926,18 +928,19 @@ Q-V.
 
 ### 3.3 Endpoint and local store
 
-- **EP-1** Embedded versitygw (D15) over the decorated backend,
-  listening on `127.0.0.1:9000`. No unix socket: no backup tool can use
-  one. Path-style addressing is versitygw's default.
-- **EP-5** versitygw is given `127.0.0.1:9000`, the internal
-  `tunnel.sock` (§3.7) and nothing else, whatever the configuration
-  says; network addresses are served only by the LAN bridge (EP-17),
-  so no versitygw option or default can open one.
-- **EP-17** The LAN bridge. versitygw is not given the network
-  addresses: its TLS settings apply to every listener it runs, which
-  would put the loopback listener behind TLS too, and a per-address
-  TLS choice is what EP-17 asks for. Instead lendisk listens on each
-  `[[endpoint.listen]]` entry itself (`address = "192.168.1.10:9000"`
+- **EP-1** lendisk's bridge (§3.7) listens on `127.0.0.1:9000` and
+  proxies to embedded versitygw (D15) over the decorated backend on
+  the internal socket. No unix socket is offered to tools: no backup
+  tool can use one. Path-style addressing is versitygw's default.
+- **EP-5** versitygw is given the internal `gw.sock` (§3.7) and
+  nothing else, whatever the configuration says; every TCP listener,
+  loopback included, is lendisk's bridge, so no versitygw option or
+  default can open one.
+- **EP-17** The bridge on the LAN. versitygw is not given the network
+  addresses, or any address: its TLS settings would apply to every
+  listener it ran, and a per-address TLS choice is what EP-17 asks
+  for. The bridge listens on each
+  `[[endpoint.listen]]` entry (`address = "192.168.1.10:9000"`
   or `interface = "eth0"` with a port; `tls = "generate"`, the
   default, `"files"` with `cert` and `key` paths, or `"off"`). An
   interface name is resolved to its addresses at start and on change;
@@ -945,12 +948,11 @@ Q-V.
   accepted connection is served as HTTP (after a `crypto/tls`
   handshake where TLS is on; a plaintext request on a TLS port gets
   the TLS alert, nothing is proxied) and every request is proxied,
-  unbuffered, to versitygw's loopback listener with the `Host` header
-  and every signed header unchanged, as the tunnel bridge does (§3.7,
-  Q-G). versitygw verifies the signature against the per-bucket
+  unbuffered, to `gw.sock` with the `Host` header and every signed
+  header unchanged, as on every other listener (§3.7, Q-G). versitygw verifies the signature against the per-bucket
   credential exactly as on loopback; lendisk adds no check of its own
   and needs none, since the writer is trusted (§2). A request under
-  `/_lendisk/` is refused on this bridge. With `tls = "generate"`,
+  `/_lendisk/` is refused on a loopback or LAN listener. With `tls = "generate"`,
   lendisk creates a self-signed ECDSA P-256 certificate whose SANs are
   the configured addresses and the host name, valid ten years, at
   `<config>/endpoint.crt` with its key at `<config>/endpoint.key`
@@ -985,21 +987,30 @@ Q-V.
   generated and stored by lendisk in `lendisk.db` and resolved by
   lendisk's `IAMService` (`Config.IAMService`, which takes precedence
   over versitygw's own IAM options). versitygw's `IAMDir` is not used.
+- **EP-7** Profiles are TOML files compiled into the binary and
+  overridable in `<config>/profiles/`; each lists the four key classes
+  as glob patterns and the encryption flag. The decorator classifies a
+  key at capture: a local-only key (restic `locks/*`, Kopia `_log*`)
+  gets no queue row at all; the others get placement rows as §3.4
+  says.
 - **EP-10** The decorator's `GetObject`/`HeadObject` turn a not-found
   from the backend into a fetch through the replica interface (D12; a
   ranged `GetObject` by the replica client) from a place `placement`
   names as `acked` for the key, friends before overflow targets and
   the most recently reachable first, falling through to the next on
-  failure; they write the object into the store and return it. In
-  `evict` mode the eviction worker deletes a pack from the store once
-  `copies` places have acknowledged it and no tool lock is present
-  (restic `locks/*`); for Kopia, which has no server-side lock, once
-  the bucket has also had no writes for the configured idle interval
-  (EP-9).
-- **EP-12** On `posix`, `init` checks xattr support and the free-space
-  floor on the store directory and refuses otherwise. On `s3`, it runs
-  the capability probe (D15) and warns when the endpoint is not on the
-  local network. `status` reports the pinned versitygw and tailcat
+  failure; they write the object into the store and return it. A miss
+  happens after `recover` (ID-6) and after VER-5 has removed a rotten
+  object; nothing else removes an object from the local store (EP-9).
+  *Post-v1, evict mode:* an eviction worker would delete a pack once
+  `copies` places have acknowledged it and no restic lock is present,
+  or for Kopia once the bucket has been idle for a configured
+  interval; re-placement would then stream from a holder through the
+  replica client, and the evicted part would be verified by VER-2's
+  sampling.
+- **EP-12** `init` checks xattr support and the free-space floor on
+  the store directory and refuses otherwise. Post-v1, on `s3`, it
+  would run the copy probe (D15) and warn when the endpoint is not on
+  the local network. `status` reports the pinned versitygw and tailcat
   versions.
 - **EP-13** Throughput is versitygw's chunk-signature verification plus
   the backend's writes; on `posix` with NVMe this is file I/O. Measured
@@ -1009,9 +1020,9 @@ Q-V.
 - **EP-15** On `posix` the store is plain files: `restic -r
   <data>/store/<bucket>` opens it with nothing running, and a borrower's
   replica on the lender, `restic -r <data>/store/lent-<id16>-<sealed>`,
-  likewise (scenario 7).
-  Behind `backend/s3`, any S3 client with the store's credential reads
-  the same keys.
+  likewise (scenario 7), with the `.lendisk/` directory ignored as
+  restic and Kopia ignore unknown names. Post-v1, behind `backend/s3`,
+  any S3 client with the store's credential would read the same keys.
 
 ### 3.4 Replication
 
@@ -1052,8 +1063,7 @@ Q-V.
   `dropping`) and:
   - for each object with fewer than `copies` such places, places the
     missing copies by D6's choice, excluding the current holders; the
-    put reads from the local store, or in `evict` mode streams from a
-    holder through the replica client;
+    put reads from the local store;
   - for each metadata object missing at a friend, or at an overflow
     target holding data of the bucket, adds the row. A new friend thus
     receives the bucket's existing metadata, in sequence order and
@@ -1089,7 +1099,8 @@ Q-V.
   queue row and the SHA-256 as the request checksum where the target
   verifies one. `Get` with a range is `GetObject` with a range option.
   `Head`, `List` and `Delete` map to `StatObject`, `ListObjects` (with
-  versions where needed) and `RemoveObject`. `Undelete` is §3.6.
+  versions at an overflow target) and `RemoveObject`. For a friend,
+  `List` is the control API call of §3.7 and `Undelete` is §3.6.
 - **Errors.** The client's S3 errors are mapped to the replica
   interface's: a `507 QuotaExceeded` from a friend's decorator becomes
   "paused for quota" (LEND-2); a `403` after a removal becomes
@@ -1102,7 +1113,9 @@ Q-V.
   the part size (16 MiB, configurable) restart whole. The same for
   friends and overflow targets.
 - **REPL-7** Per-peer and global limits are token buckets
-  (`golang.org/x/time/rate`) wrapped around the reader of each part;
+  (`golang.org/x/time/rate`) wrapped around the reader of each uploaded
+  part and of every download (read-through, VER-2 samples, `verify
+  --full`);
   the time-of-day schedule is checked before each part, so a closing
   window stops a transfer within one part. Both change at runtime from
   the configuration.
@@ -1111,8 +1124,8 @@ Q-V.
   sharded layout), for each key with a `placement` row at that peer;
   `import` on the lender walks the directory and puts each file into
   the borrower's bucket through the decorator, and the borrower marks
-  those rows `acked` once a listing of the peer confirms them with the
-  right hashes.
+  those rows `acked` once the peer's `list` (§3.7) returns them with
+  the right hashes.
 - **REPL-10** The hash is SHA-256, taken by the decorator from the
   write stream at capture (EP-3) and kept on the queue row; the worker
   sends it with the object as `x-amz-meta-lendisk-sha256` and stores
@@ -1131,11 +1144,11 @@ Q-V.
 ### 3.5 Lending and quotas
 
 - **LEND-1** The decorator keeps a per-friend byte counter in
-  `lendisk.db` (live objects plus non-current versions or tombstones,
+  `lendisk.db` (live objects plus tombstones,
   updated on every completed put and every purge) and reconciles it
   daily against a listing, and enforces the friendship's quota on it.
-  `lending.max_total` bounds the sum of all friendships' quotas; a
-  quota proposal that would exceed it is refused (LEND-8). The borrower side keeps its own count of what
+  `lending.max_total` bounds the sum of the node's own numbers; `peer
+  quota` refuses a value that would exceed it (LEND-8). The borrower side keeps its own count of what
   it has stored at each place, for D6's free fraction, and corrects it
   from the lender's `quota` answer.
 - **LEND-2** The decorator refuses `PutObject`, `CreateMultipartUpload`
@@ -1148,16 +1161,18 @@ Q-V.
   backend (SHA-256), compares with `x-amz-meta-lendisk-sha256` when the
   backend answers, and on mismatch deletes the object and returns
   `BadDigest`. The existing-key check happens before any byte is
-  stored: a key present in the index with a different hash is refused
-  with `PreconditionFailed`, using a conditional put where the store
-  supports one (D15, capability profile). A put without the hash is
-  refused on the tunnel side.
+  stored: a key present in the index, live or tombstoned, with a
+  different hash is refused with `PreconditionFailed`; with the same
+  hash the put is accepted, and a tombstone for the key is dropped
+  (§3.6). No store feature is relied on for this. A put without the
+  hash is refused on the tunnel side.
 - **LEND-6** The lending store is the set of `lent-<id16>-<sealed>`
   buckets in the node's one store, beside its own, plus versioning or
   tombstones and the hash index. With lendisk stopped they are plain
-  files on `posix` (EP-15); `lendisk export <bucket> --borrower <id>
-  <path>` writes the tool's own layout from either backend kind
-  (REPL-8).
+  files on `posix` (EP-15); `lendisk export --lent lent-<id16>-<sealed>
+  <path>` writes the tool's own layout, excluding `.lendisk/`, naming
+  the bucket as the store does since the lender does not know its real
+  name (REPL-8, SEC-16).
 - **LEND-7** `init` suggests `lending.max_total` = `c × S` plus the
   retention margin of §4. The control API `quota` answer carries the
   quota, both sides' use and the answering node's repository size (sum
@@ -1171,41 +1186,43 @@ Q-V.
 
 ### 3.6 Deletion, retention and verification
 
-- **RET-1** A borrower's `DeleteObject` on a store with versioning
-  (`posix` always; `s3` per the probe) places a delete marker and the
-  object becomes a non-current version; lendisk's purger removes
-  non-current versions older than the window where the store has no
-  lifecycle of its own. On object-lock-capable stores the decorator
-  sets retain-until at delete time, so the lender's own credential
-  cannot purge early. On a store without versioning the decorator keeps
-  tombstones instead: a row in `tombstones` (borrower, bucket, key,
-  hash, deleted at, purge after), the key hidden from that borrower's
-  reads and listings, and the real delete issued by the purger after
-  the window; a put with different content to a tombstoned key first
-  moves the stored object to `.lendisk/tomb/<key>/<unix-time>`.
-  Whether versitygw's `posix` versioning gives these semantics is
-  Q-I.4.
-- **RET-2** The decorator refuses `DeleteObject` with a version id
-  unless that version is a delete marker created within the window, and
-  admits no lifecycle, bucket-deletion, object-lock or admin call (§3.7
-  allow-list). Keys beginning with `.lendisk/` are refused from
-  borrowers.
-- **RET-3** `undelete` for a friend removes delete markers with
-  `RemoveObject` by version id where the friend's store versions (the
-  one versioned delete NET-7 admits), and calls the control API
-  `undelete` (bucket, since) where it keeps tombstones. For an
-  overflow target that versions, it does not remove the delete marker,
-  since S3-5's credential cannot remove versions: it copies the last
-  version before the marker onto the same key (`CopyObject` with the
-  source version id), which makes it current again and leaves the
-  marker to the lifecycle rule. Elsewhere it clears the borrower's own
-  client-side tombstones (S3-4).
+- **RET-1** Retention is the decorator's on every store; versitygw's
+  versioning is off on every bucket. A borrower's `DeleteObject` moves
+  the object to `.lendisk/tomb/<key>/<unix-time>` inside the same
+  bucket (a rename on `posix`, so it never crosses a filesystem) and
+  writes a row in `tombstones` (borrower, bucket, key, hash, deleted
+  at, purge after); from then on the key is absent from that
+  borrower's reads and listings, the tomb bytes count against quota
+  (LEND-1), and the purger unlinks the tomb copy after the window. A
+  put to a tombstoned key with the same hash is accepted and drops the
+  tombstone, unlinking the tomb copy; with a different hash it is
+  refused (LEND-4). A direct reader of the replica (P-5) sees the
+  bucket as the tool left it after its last delete, plus a `.lendisk/`
+  directory it ignores; export and the recovery sheet's copy command
+  exclude it.
+- **RET-2** The decorator admits no versioned, lifecycle,
+  bucket-deletion, object-lock or admin call (§3.7 allow-list), and
+  keys beginning with `.lendisk/` are refused from borrowers, so
+  nothing a borrower can send reaches the tomb directory or the
+  purger.
+- **RET-3** `undelete` for a friend is the control API `undelete`
+  (bucket, since): the lender moves each tomb copy deleted since that
+  time back to its key and drops the row; `list` shows beforehand what
+  that would restore. For an overflow target that versions, the
+  borrower does not remove the delete marker, since S3-5's credential
+  cannot remove versions: it copies the last version before the marker
+  onto the same key (`CopyObject` with the source version id), which
+  makes it current again and leaves the marker to the lifecycle rule.
+  Elsewhere it clears the borrower's own client-side tombstones
+  (S3-4).
 - **VER-1** The challenge is a control API call: the borrower sends an
   object key, a byte range and a nonce; the lender reads the range
   through its decorator and returns HMAC-SHA256(nonce, bytes); the
   borrower computes the same over its local copy.
 - **VER-2** Samples are whole-object `GetObject` calls by the replica
-  client, hashed by lendisk and compared with the index.
+  client, hashed by lendisk and compared with the index; the method
+  for overflow targets (S3-6), and for the evicted part of a bucket if
+  evict mode arrives post-v1.
 - **VER-5** The sampler hashes a weekly sample of at least 0.1% of the
   stored bytes through
   the decorator and compares with the index, on both sides; neither
@@ -1230,37 +1247,45 @@ Q-V.
   `tc…` relay hints are merged into the node's DERP map.
 - **NET-6** The version is carried by the control API `version`
   endpoint; the S3 surface is governed by its own stability.
-- **The tunnel bridge.** `embedgw` takes listener addresses, not a
-  `net.Listener` (D15), so the lender side is bridged. The tailcat
-  `Server` listens on one tunnel port, 9000. lendisk accepts each
-  connection itself, resolves its peer key (SEC-12) and serves HTTP on
-  it. A request whose path begins with `/_lendisk/` is the control API
-  and is answered by lendisk directly; no S3 bucket can have that name,
+- **The bridge.** `embedgw` takes listener addresses, not a
+  `net.Listener` (D15), so versitygw is given one internal unix
+  socket, `<data>/run/gw.sock`, and lendisk's bridge owns every
+  listener in front of it: `127.0.0.1:9000` (EP-1), each
+  `[[endpoint.listen]]` address with its TLS setting (EP-17), and the
+  one tunnel port, 9000, inside the tailcat `Server`. One code path
+  accepts a connection, learns what it is allowed (a per-bucket
+  credential on loopback and the LAN; a peer key on the tunnel,
+  SEC-12), serves HTTP on it, and proxies every S3 request, unbuffered,
+  to `gw.sock` with the `Host` header and every signed header passed
+  unchanged so the client's signature still verifies. On the tunnel, a
+  request whose path begins with `/_lendisk/` is the control API and
+  is answered by the bridge directly; no S3 bucket can have that name,
   since bucket names begin with a letter or digit, so the two surfaces
-  cannot collide. Every other request is an S3 request: it is checked
-  (SEC-11, SEC-12) and then proxied, unbuffered, to versitygw's
-  internal listener on
-  `<data>/run/tunnel.sock`, with the `Host` header and every signed
-  header passed unchanged so the client's signature still verifies.
-  versitygw terminates the signature; lendisk never computes one on
-  this path.
+  cannot collide. On loopback and the LAN that path is refused. Every
+  other tunnel request is an S3 request: it is checked (SEC-11,
+  SEC-12) and then proxied. versitygw terminates the signature;
+  lendisk never computes one on any path. The hop costs one in-process
+  proxy per request on every listener, loopback included (Q-L).
 - **NET-7** The decorator admits exactly these S3 operations from a
   borrower's account: `PutObject`, `CreateMultipartUpload`,
   `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`,
   `ListParts`, `GetObject` with Range, `HeadObject`, `HeadBucket`,
-  `ListObjectsV2`, `ListObjectVersions`, `ListBuckets` (own buckets
-  only), `CreateBucket` (counted against quota), `DeleteObject` without
-  a version id (a delete marker or a tombstone) and `DeleteObject` with
-  the version id of a delete marker inside the window (undelete). Every
-  other operation, including `DeleteObjects`, `CopyObject`,
-  `UploadPartCopy`, tagging, lifecycle, object-lock and any bucket
-  configuration call, is refused with `AccessDenied` before reaching the
-  backend. The control API (`redeem`, `challenge`, `manifest`, `quota`,
-  `version`, `undelete`) is plain HTTP under `/_lendisk/` on the same
-  tunnel port, authenticated by the tunnel peer key and checked per
-  request against `lendisk.db` (SEC-11). The borrower replicates to a
-  friend with the same replica client it uses for overflow targets,
-  dialling through tailcat as below. AC check: from an allowed peer,
+  `ListObjectsV2`, `ListBuckets` (own buckets only), `CreateBucket`
+  (counted against quota) and `DeleteObject` without a version id (a
+  tombstone, §3.6). Every other operation, including `DeleteObjects`,
+  `CopyObject`, `UploadPartCopy`, every versioned call, tagging,
+  lifecycle, object-lock and any bucket configuration call, is refused
+  with `AccessDenied` before reaching the backend. The control API
+  (`redeem`, `challenge`, `manifest`, `quota`, `version`, `undelete`,
+  `list`) is plain HTTP under `/_lendisk/` on the same tunnel port,
+  authenticated by the tunnel peer key and checked per request against
+  `lendisk.db` (SEC-11). `list` (bucket, after, limit) pages the
+  lender's index for that borrower's bucket from `lendisk.db`: key,
+  size, SHA-256 and, if tombstoned, when; it is what `recover` (ID-5),
+  `import` (REPL-8) and `undelete` previews read, so none of them
+  needs a request per object. The borrower replicates to a friend with
+  the same replica client it uses for overflow targets, dialling
+  through tailcat as below. AC check: from an allowed peer,
   `restic -r s3:http://<lender>:9000/<bucket> snapshots` works with the
   derived credential.
 - **NET-7a** The S3 credential for a borrower–lender pair is derived:
@@ -1281,8 +1306,11 @@ Q-V.
   so a backup tool can read a friend's replica directly. It is the only
   forward in the design, and it is the listener NET-7b itself names.
   Since the forward is a byte copy, the tool must name the sealed
-  bucket; the command prints, from the borrower's own map, one line per
-  bucket held at that peer, e.g.
+  bucket and sign with the derived credential; the command prints the
+  credential as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` lines
+  to paste into the shell, computed on demand (NET-7a) and never
+  written, and then, from the borrower's own map, one line per bucket
+  held at that peer, e.g.
   `laptop  restic -r s3:http://127.0.0.1:9100/s4k2…`.
 - **NET-8** The internal `Transport` interface is `Listen`,
   `Dial(peerKey)`, `Admit(func(peerKey) bool)`, `PeerOf(conn)`,
@@ -1296,19 +1324,24 @@ Q-V.
 
 ### 3.8 Operations and observability
 
-- **OPS-4** `prometheus/client_golang` on a loopback port. Transfer
+- **OPS-4** `prometheus/client_golang` on a loopback port, not started
+  in the lender-only profile (PEER-9). Transfer
   counters (bytes, objects, retries, lag, per place) come from the
   replication worker.
-- **OPS-6** The configuration file is TOML; state lives in `lendisk.db`.
-  Store settings are one `[store]` section (`backend = "posix"` with a
-  `path`, or `backend = "s3"` with endpoint; its credential comes from
-  the environment, SEC-3), used for both roles; replication settings,
-  including the limits, the timetable, `reroute_after` and
-  `replace_after`, are `[replication]`; the ceilings are `[lending]`
-  (`max_total`, `max_per_peer`); a friend's domain is `domain` in its
-  `[[peer]]` entry; overflow targets are `[[overflow]]` entries; network
-  addresses for the endpoint are `[[endpoint.listen]]` entries (EP-17),
-  none by default.
+- **OPS-6** The configuration file is TOML and holds what the user
+  sets; everything the daemon creates or learns is state in
+  `lendisk.db`: friendships with both numbers, buckets, overflow
+  targets, placement, probe results. The daemon never writes the
+  configuration file. Store settings are one `[store]` section
+  (`backend = "posix"` with a `path`; post-v1 `backend = "s3"` with an
+  endpoint and a credential from the environment, SEC-3), used for
+  both roles; replication settings, including the limits, the
+  timetable, `reroute_after` and `replace_after`, are `[replication]`;
+  the cap is `[lending]` (`max_total`); network addresses for the
+  endpoint are `[[endpoint.listen]]` entries (EP-17), none by default;
+  relays are `[relays]` and alert hooks `[alerts]`. There are no
+  `[[peer]]` or `[[overflow]]` entries: `peer add`, `peer quota` and
+  `overflow add` write `lendisk.db`.
 - **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the
   replica client included); active RSS adds one part buffer (16 MiB by
   default) per transfer in flight. Q-M measures both.
@@ -1318,14 +1351,15 @@ Q-V.
 
 ### 3.9 Security
 
-- **SEC-3** Per-bucket S3 keys live in `lendisk.db`, which lendisk
-  creates at mode 0600; versitygw's
-  `IAMDir` is not used. A `backend/s3` store credential and overflow
-  target credentials are read from environment variables at start:
-  `LENDISK_STORE_ACCESS_KEY` and `LENDISK_STORE_SECRET_KEY` for the
-  store, `LENDISK_OVERFLOW_<NAME>_ACCESS_KEY` and
-  `LENDISK_OVERFLOW_<NAME>_SECRET_KEY` for each overflow target, with
-  the variable names overridable per entry in the config file. They
+- **SEC-3** Per-bucket S3 keys and the secrets of unexpired invites
+  live in `lendisk.db`, which lendisk creates at mode 0600; versitygw's
+  `IAMDir` is not used. Overflow target credentials (and, post-v1, a
+  `backend/s3` store credential) are read from environment variables
+  at start: `LENDISK_OVERFLOW_<NAME>_ACCESS_KEY` and
+  `LENDISK_OVERFLOW_<NAME>_SECRET_KEY` for each overflow target, the
+  prefix overridable with `overflow add --env-prefix`, and
+  `LENDISK_STORE_ACCESS_KEY` and `LENDISK_STORE_SECRET_KEY` for a
+  post-v1 store. They
   are supplied by systemd's `EnvironmentFile=` (a root-owned file the
   service user cannot read) or the container runtime's secrets;
   lendisk never writes them to disk, redacts them from logs and
@@ -1342,14 +1376,16 @@ Q-V.
   the tunnel bridge and every control API endpoint, from an allowed
   peer's identity and from an unknown one.
 - **SEC-8** versitygw's admin API, web UI and website endpoints are not
-  configured. lendisk's listeners are loopback S3 (TCP), the LAN
-  bridge on each configured `endpoint.listen` address (EP-17), loopback
-  metrics, the tailcat tunnel (one port inside it), the internal
-  `tunnel.sock`, and the loopback listener `peer forward` opens while
-  that command runs (NET-7b). There is no child process and no other
-  socket. Every listener is one REQUIREMENTS.md names (SEC-8 as
-  reworded in v0.9.2 for EP-17). Checked with `ss -lntp` and `ss
-  -lxp`, with and without an `endpoint.listen` entry.
+  configured, and versitygw opens no TCP port at all. lendisk's
+  listeners are the bridge (§3.7) on loopback S3, on each configured
+  `endpoint.listen` address (EP-17) and on the one tunnel port inside
+  tailcat; loopback metrics, except in the lender-only profile; the
+  internal `gw.sock`; and the loopback listener `peer forward` opens
+  while that command runs (NET-7b). tailcat's one UDP socket on all
+  interfaces is the peer connection NET-1 names. There is no child
+  process and no other socket. Every listener is one REQUIREMENTS.md
+  names. Checked with `ss -lntup` and `ss -lxp`, with and without an
+  `endpoint.listen` entry.
 - **SEC-9** The classification table covers every `backend.Backend`
   method at the pinned versitygw version, each marked admitted,
   refused or unreachable for a borrower's account, with a test that
@@ -1410,7 +1446,7 @@ Q-V.
   redemption or expiry, lendisk commits the change to `lendisk.db`,
   clears the hook's cache, cancels the contexts of in-flight requests
   from that key and closes its connections (the bridge tracks them per
-  key, including the proxied half to `tunnel.sock`), and, when no
+  key, including the proxied half to `gw.sock`), and, when no
   relationship is left, calls `Server.DisconnectClient`. tailcat's
   disconnect alone does not reset connections, which would stall until
   they time out, so lendisk closes its own. Later requests are answered
@@ -1438,12 +1474,11 @@ Q-V.
 - **COMPAT-3** `bucket import` walks the directory and puts each file
   through the decorator, so it is captured but marked unacknowledged.
 - **COMPAT-4** The documented layout on `posix` is
-  `<store>/<bucket>/<key>` as plain files with versitygw's xattrs, its
-  `.sgwtmp/` and `.vgwlocks/` housekeeping directories and its
-  versioning directory; borrowers' buckets under `lent-<id16>-` and
-  their sealed names (SEC-16); the
-  reserved `lendisk-manifests` bucket; the `.lendisk/tomb/` prefix where
-  tombstones apply; `lendisk.db` and its tables; and the export layout
+  `<store>/<bucket>/<key>` as plain files with versitygw's xattrs and
+  its `.sgwtmp/` and `.vgwlocks/` housekeeping directories; borrowers'
+  buckets under `lent-<id16>-` and their sealed names (SEC-16), each
+  with its `.lendisk/tomb/` directory (§3.6); the reserved
+  `lendisk-manifests` bucket; `lendisk.db` and its tables; and the export layout
   (one file per key at its key path; Kopia's sharded form with
   `--kopia-layout`). Every object lendisk stores carries
   `x-amz-meta-lendisk-sha256`, so the hash index can be rebuilt from
@@ -1471,9 +1506,9 @@ re-placement worker drains it back to friends whenever they have room
 of the `copies`, and the estimated cost (S3-7).
 
 - **S3-1** `overflow add s3 <name> --endpoint … --bucket … --prefix …
-  --max-bytes …` writes an `[[overflow]]` entry to the config file and
-  reads the credential from the environment (SEC-3), testing it before
-  the target is accepted; the credential is carried in the encrypted
+  --max-bytes …` writes a row in `lendisk.db` (state, not
+  configuration, OPS-6) and reads the credential from the environment
+  (SEC-3), testing it before the target is accepted; the credential is carried in the encrypted
   manifest for recovery, and the client is built from all of these at
   start. Each of the node's buckets is a sub-prefix
   `<prefix>/<sealed name>/` (SEC-16), with keys below it as the tool
@@ -1521,11 +1556,15 @@ friendships: `1.2 × c × S`. That is `init`'s suggestion for
 
 **What a node needs on its own disk:**
 
-| | `full` mode (default) | `evict` mode |
-|---|---|---|
-| Local copy | `S` | ~1% of `S` for metadata, plus a buffer for packs not yet acknowledged by `copies` places (at least one backup run of new data) |
-| Space lent | `1.2 × c × S` | same |
-| Total, `c = 2` | `3.4 × S` | `2.4 × S` plus the buffer |
+| | v1 |
+|---|---|
+| Local copy | `S` |
+| Space lent | `1.2 × c × S` |
+| Total, `c = 2` | `3.4 × S` |
+
+A post-v1 evict mode (EP-9) would bring the local copy down to about
+1% of `S` for metadata plus a buffer for packs not yet acknowledged by
+`copies` places, about `2.4 × S` in all.
 
 **Feasibility.** Each friend can hold at most one copy of an object,
 and every place also holds the metadata `m` (about 1% of `S`). With
@@ -1616,8 +1655,8 @@ design and disappear with it.
 - **Q-I (gate, open)** The embedded design depends on five properties of
   versitygw at the pinned version:
   1. *Resolved:* `embedgw` takes listener address strings, not a
-     `net.Listener`. The tunnel side is bridged through an internal
-     unix socket (§3.7).
+     `net.Listener`. Every listener is lendisk's bridge in front of
+     one internal unix socket (§3.7).
   2. *Half resolved:* `Config.IAMService` takes an external
      `auth.IAMService` and overrides every built-in IAM option
      (confirmed). Open is whether the authenticated account reaches the
@@ -1627,10 +1666,9 @@ design and disappear with it.
   3. *No longer needed:* whether versitygw verifies
      `x-amz-checksum-sha256` on upload. REPL-10's hash travels as
      metadata and the decorator compares it itself (LEND-4).
-  4. The `posix` versioning directory produces delete markers on
-     `DeleteObject` and lists non-current versions with the semantics
-     RET-1 to RET-3 need. Fallback: the tombstone path of §3.6, which
-     exists anyway for stores without versioning.
+  4. *No longer needed:* whether `posix` versioning gives RET-1 to
+     RET-3 their semantics. Versioning is off; the decorator's
+     tombstones are the only path (§3.6).
   5. A backend can return a custom error (`QuotaExceeded`, HTTP 507)
      and a conditional-put refusal (`PreconditionFailed`). Fallback:
      `AccessDenied` with a distinguishing message the borrower parses.
@@ -1643,10 +1681,11 @@ design and disappear with it.
   through versitygw and the decorator on `posix` on NVMe (EP-13, 200
   MB/s) and on a Raspberry Pi 4, including chunk-signature
   verification, and the replication rate from the store to a friend
-  through the replica client and the tunnel on the Pi. Also the LAN
-  bridge (EP-17) on the Pi over gigabit, with TLS on and off, to see
-  whether the extra proxy hop or the TLS cost, not the link, is the
-  limit.
+  through the replica client and the tunnel on the Pi. Also the
+  bridge's hop, now on every listener: loopback against a direct
+  versitygw figure, and the LAN (EP-17) on the Pi over gigabit with
+  TLS on and off, to see whether the hop or the TLS cost, not the
+  link, is the limit.
 - **Q-M (gate, open, measured with G-3)** Idle and active RSS of lendisk
   with a 1 TiB, 500k-object store and 10 peers, against OPS-7's 256 MiB
   idle, and with four transfers in flight.
@@ -1679,7 +1718,7 @@ design and disappear with it.
   rclone design.
 - **Q-U (superseded)** The eight rclone-over-rc checks. They went with
   the v0.9 replication design (D12, alternatives); Q-Y replaces them.
-- **Q-V (gate, open)** `backend/s3` pass-through. Multipart and
+- **Q-V (post-v1, deferred with EP-16)** `backend/s3` pass-through. Multipart and
   checksums are documented; whether versioning, object lock and
   conditional headers pass to the upstream unchanged is not, and
   neither is whether lendisk's buckets can be placed as prefixes inside
@@ -1690,9 +1729,8 @@ design and disappear with it.
   `RunVersityGW` with one backend and no mux. The mux survives only as
   Q-Z's fallback.
 - **Q-X (gate, open, measured with G-3)** Listing time at 500k objects
-  in one bucket on `posix`, and object lock semantics on `posix`
-  (retain-until honoured against the lender's own credential). Both
-  testable in a day.
+  in one bucket on `posix`. Testable in a day. Object lock semantics
+  were part of this gate until v0.12; object lock is no longer used.
 - **Q-Y (gate, open)** The replica client (D12, §3.4), against the
   pinned minio-go, before the worker is built on it:
   1. A multipart upload killed with `SIGKILL` mid-part resumes at the
@@ -1709,9 +1747,10 @@ design and disappear with it.
   SDK for Go v2 behind the same interface (D12).
 - **Q-Z (open)** Lent buckets on a second disk under one `posix` root.
   A lender who mounts or links another disk at a `lent-*` bucket
-  directory needs versitygw's temp directory and versioning directory
-  to stay on the same filesystem as the bucket, or its temp-then-rename
-  and version moves cross a mount. Check in the pinned source and with
+  directory needs versitygw's temp directory to stay on the same
+  filesystem as the bucket, or its temp-then-rename crosses a mount;
+  the tombstone move (§3.6) stays inside the bucket and is safe either
+  way. Check in the pinned source and with
   a bind mount in CI. Fallback: a second `posix` backend instance for
   `lent-*` buckets with a mux by bucket name, for that configuration
   only.

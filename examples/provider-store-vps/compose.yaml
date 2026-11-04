@@ -1,3 +1,7 @@
+# POST-V1 EXAMPLE (EP-16). The `s3` store backend is not in v1; this
+# folder is kept for v1.1. In v1 Dag's store is plain files on the VPS
+# disk (see default-nas).
+#
 # Dag: a small VPS with a public IP and little disk. The store for both
 # roles is a Hetzner Object Storage bucket behind the `s3` backend
 # (EP-16): his own Kopia repository and the lent-* buckets Björn writes

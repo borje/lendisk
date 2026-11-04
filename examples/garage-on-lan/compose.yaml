@@ -1,11 +1,15 @@
+# POST-V1 EXAMPLE (EP-16). The `s3` store backend is not in v1; this
+# folder is kept for v1.1. In v1 Björn runs the default install with
+# plain files on his server's disk (see default-nas).
+#
 # Björn: homelab behind CGNAT, already runs Garage. lendisk uses it as the
 # store for both roles through the `s3` backend (EP-16, D15): his own
 # buckets and the lent-* buckets Anna writes land in the same Garage.
 #
 # Garage stays on Docker's bridge and publishes its S3 port on the host's
 # loopback only (SEC-8). lendisk, on the host network, reaches it there.
-# Garage has no versioning, so Björn's lending store gets lendisk-side
-# tombstones and `status` says "retention: client-side".
+# Retention for Anna's replica is lendisk's tombstones under
+# .lendisk/tomb/, as on every store; Garage's own features are not used.
 
 services:
   garage:

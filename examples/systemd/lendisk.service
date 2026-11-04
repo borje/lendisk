@@ -20,7 +20,7 @@ ExecStart=/usr/local/bin/lendisk serve --config /etc/lendisk/lendisk.toml
 Restart=on-failure
 RestartSec=5s
 
-# SEC-3: third-party credentials come from a root-owned file the service
+# SEC-3: third-party credentials (overflow targets) come from a root-owned file the service
 # user cannot read; systemd injects them as environment variables.
 EnvironmentFile=-/etc/lendisk.env
 
