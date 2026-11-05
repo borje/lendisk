@@ -826,14 +826,23 @@ upstream bucket is Q-V.
   manifest is AEAD-encrypted under a derived key (ID-4), and the
   per-pair S3 secret is a key agreement (NET-7a). If a feature ever
   needs signatures, it gets a separate signing key derived from the
-  same seed, not a change to the identity. The display form is base32
-  with a checksum.
+  same seed, not a change to the identity. The display form is
+  lowercase unpadded base32 of the 32 key bytes followed by a 3-byte
+  checksum, the first three bytes of
+  SHA-256(`"lendisk-node-id-v1"` ‖ key): 56 characters. Base32 works in
+  5-byte groups, so the first 16 characters depend on the key alone
+  and are the `id16` of lent bucket names. Parsing ignores case,
+  spaces and dashes and rejects a checksum mismatch.
 - **ID-2** The 24 words are BIP-39 (`go-bip39`); the private key is
-  HKDF-SHA256 of the BIP-39 seed with a fixed info string, clamped as
-  X25519 requires. Two nodes from the same phrase derive the same key
+  HKDF-SHA256 of the BIP-39 seed (empty passphrase, no salt) with the
+  info string `"lendisk-identity-v1"`, clamped as X25519 requires.
+  `init` shows the phrase once and asks for three of its words back
+  before writing anything; `init --restore` reads a phrase from stdin
+  instead. Two nodes from the same phrase derive the same key
   (the AC).
-- **ID-3** The private key is a file in the config directory at mode
-  0600. The phrase is never written.
+- **ID-3** The private key is `<config>/identity.key`, base64 of the
+  32 bytes, at mode 0600; lendisk refuses to load it if group or others
+  can read it. The phrase is never written.
 - **ID-4** The manifest is encrypted with a key derived from the
   identity (HKDF over the private key with a fixed info string) and
   pushed to every lender through the control API `manifest` endpoint
@@ -1347,7 +1356,15 @@ upstream bucket is Q-V.
   default) per transfer in flight. Q-M measures both.
 - **OPS-8** One binary; versitygw, tailcat and minio-go are vendored,
   so their upgrades are lendisk releases. State migrations are
-  `lendisk.db`'s, forward and one minor version back.
+  `lendisk.db`'s, forward and one minor version back. Each migration
+  is one integer schema step that records a *compat* level: the oldest
+  schema whose binary still runs safely on the result. A binary that
+  finds a newer database opens it unchanged if that level is at or
+  below its own schema, and refuses otherwise. Migrations in a minor
+  release are additive (new tables, nullable columns), so the previous
+  minor keeps working; a breaking step may lock out only schemas two
+  or more minors old, which a test enforces. The database is copied to
+  `lendisk.db.schema-<n>.bak` (`VACUUM INTO`) before migrating.
 
 ### 3.9 Security
 
