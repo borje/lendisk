@@ -257,8 +257,10 @@ relay.
 
 Chosen: **`github.com/tailscale/tailcat`** (BSD-3, released August 2026).
 It is Tailscale's open-source data plane (WireGuard, magicsock NAT
-traversal including UPnP/NAT-PMP/PCP port mapping, DERP relays) with no
-control plane, no account and no admin panel. Each node runs a tailcat
+traversal, DERP relays) with no control plane, no account and no admin
+panel. Tailscale's UPnP/NAT-PMP/PCP port mapper is not linked by
+tailcat, and v1 of lendisk does not link it either: many NAS owners
+keep UPnP off, so v1 cannot rely on it anyway (Q-R; post-v1, #46). Each node runs a tailcat
 `Server` with a saved key; its address string (`tc…`) encodes the public key
 and relay bootstrap info and is exactly what an invite needs to carry. Each
 node also dials peers as a `Client` with its own stable key, and every
@@ -1234,8 +1236,8 @@ upstream bucket is Q-V.
 - **NET-1** Every peer connection is a WireGuard tunnel via tailcat; the
   lender's `AllowClient` hook admits known peer keys and pending invite
   keys and nothing else (SEC-10).
-- **NET-2 to NET-4** magicsock hole punching with UPnP/NAT-PMP/PCP
-  (Q-R), DERP fallback; `PathInfo` is built on `Client.DiscoPing`,
+- **NET-2 to NET-4** magicsock hole punching, without port mapping in
+  v1 (Q-R), and DERP fallback; `PathInfo` is built on `Client.DiscoPing`,
   whose result names an endpoint only when the pong came over a direct
   path, and reports direct or relayed for `status`. `Client.Ping`
   always measures the DERP path and is not used for this.
@@ -1637,7 +1639,9 @@ design and disappear with it.
   timeout or its short-lived positioning cause problems for day-long
   transfers and weeks-idle peers? If G-2 fails here, options are
   application-level keepalives over the tunnel or a different
-  `Transport`.
+  `Transport`. At the pinned commit the two-minute timeout applies
+  only to incoming UDP flows; the tunnel port is TCP, which tailcat
+  gives no idle timeout (spike #3, 2026-11-05).
 - **Q-F (resolved, measured by G-3)** versitygw is embedded again
   (D15), via `embedgw.RunVersityGW(ctx, backend.Backend, *Config)` at
   v1.10.0. If G-3's listing measurement fails on `posix`, the decorator
@@ -1689,23 +1693,56 @@ design and disappear with it.
 - **Q-M (gate, open, measured with G-3)** Idle and active RSS of lendisk
   with a 1 TiB, 500k-object store and 10 peers, against OPS-7's 256 MiB
   idle, and with four transfers in flight.
-- **Q-Q (gate, open)** Which tailcat to pin. The admission API §3.9
-  relies on (`Server.AllowClient`, `KeySet`, `Server.PeerKey`,
-  `Server.DisconnectClient`) is on `main` as of 2026-10-07 but in no
-  tag: v0.7.0 (2026-09-18), the latest, has only `AllowedClients`,
-  which admits everyone while empty, an add method with no remove, and
-  no per-connection peer key. Pin a `main` commit until a tag carries
-  this API, then move to the tag. Every bump re-runs the SEC-10 to
-  SEC-13 tests, since admission semantics have already changed once.
-- **Q-R (open)** Does tailcat's engine run Tailscale's port mapper
-  (UPnP, NAT-PMP, PCP)? D5 and NET-2 assume so, but tailcat's
-  documentation mentions only STUN and hole punching. It matters for
-  NET-3 and for G-1's direct-path rate. Checked by reading the pinned
-  source and with a UPnP router in the G-1 field test.
+- **Q-Q (resolved 2026-11-05, spike #3)** Pinned tailcat `main` at
+  e00cdde (`v0.7.1-0.20261105151022-e00cdde6ff78`, with
+  `tailscale.com v1.105.0-pre.0.20261013225543-fb79793d99f5`; Go
+  1.27.2). The admission API §3.9 relies on (`Server.AllowClient`,
+  `KeySet`, `Server.PeerKey`, `Server.DisconnectClient`) came in on
+  2026-09-25 and 2026-09-26 and is still in no tag: v0.7.0
+  (2026-09-18), the latest, has only `AllowedClients`, which admits
+  everyone while empty, `AddAllowedClient` with no remove, and no
+  per-connection peer key. On `main` `AllowedClients` is removed.
+  Move to the first tag that carries this API. Every bump re-runs the
+  SEC-10 to SEC-13 tests, since admission semantics have already
+  changed once. The spike (`spikes/tailcat/`, local and real relays)
+  showed: a hook rejecting everything is asked about once a second,
+  the client never becomes a peer, and the listener accepts nothing;
+  with the pre-shared key disabled the address is the same across
+  restarts and holds only the node key, a disco key derived from it
+  and the region's relay nodes; `PeerKey` names the admitted key.
+  Two things §3.9 must keep in mind. The address embeds the region's
+  nodes, so SEC-14 saves the whole `DERPRegion`, not its ID; with only
+  `RegionID` the address follows the DERP map. And `DisconnectClient`
+  cuts only the server-to-client direction: the WireGuard session
+  stays, so the removed client's packets still reach open connections
+  and can open new UDP flows (with no `PeerKey`) for some seconds
+  after the call (8 in the spike); a new TCP connection does not
+  complete. lendisk serves no UDP
+  and SEC-11, SEC-12 and SEC-15 already cover the rest; SEC-15's
+  order matters, since a connection closed after the disconnect never
+  tells the client.
+- **Q-R (resolved 2026-11-06: not in v1; post-v1, #46)** Does tailcat's engine
+  run Tailscale's port mapper (UPnP, NAT-PMP, PCP)? No, at the pinned
+  e00cdde. magicsock creates one only when
+  `portmappertype.HookNewPortMapper` is set
+  (`wgengine/magicsock/magicsock.go:681-697`), which only importing
+  `tailscale.com/feature/portmapper` does; tailcat imports neither it
+  nor `feature/condregister/portmapper`, and its release builds add
+  `ts_omit_portmapper`. netcheck logs `portmap=?`. tailcat does not
+  set `DisablePortMapper`, so lendisk turns it on with one blank
+  import of `tailscale.com/feature/portmapper`; the spike's
+  `-tags portmapper` build does, and netcheck then probes all three.
+  Decided 2026-11-06: v1 does not link it. Many security-minded NAS
+  owners keep UPnP off, so direct paths cannot depend on it; v1 relies
+  on hole punching, explicit addresses (NET-3) and relays. Linking it
+  behind a switch is post-v1 (#46), if G-1 shows too many relayed
+  friendships among households that do have a mapping protocol on.
 - **Q-S (open, measured with G-3)** Each tailcat `Client` creates its
   own userspace WireGuard engine, with its own UDP socket, DERP
   connection and netstack, so a node with ten lenders runs eleven
-  engines with the server. Measure their RSS with Q-M against OPS-7.
+  engines with the server (confirmed in `Client.initLocked` at the
+  pinned commit; if the port mapper is ever linked, Q-R, each would
+  also run its own). Measure their RSS with Q-M against OPS-7.
   Fallback: dial lenders on demand and close a `Client` after an idle
   period, at the cost of a fresh hole punch per replication burst.
 - **Q-T (resolved)** REQUIREMENTS.md v0.9 made the two changes this
