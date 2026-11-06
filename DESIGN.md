@@ -1520,7 +1520,7 @@ upstream bucket is Q-V.
   passed since its last acknowledgement (`last_ok`, or the failure's
   start if it never answered). An unreachable friend with room is still
   chosen when the reachable ones are not enough; a gone one is not.
-  *The borrower's count* (`place_use`, schema 13) is the sum over a
+  *The borrower's count* (`place_use`, schema 12) is the sum over a
   place's `queued` and `acked` rows of `placement.size`: a put's bytes
   plus `state.ObjectOverhead` (4 KiB, the lender's per-object overhead,
   LEND-1), or 0 when the place's latest row of the key acknowledged the

@@ -217,9 +217,6 @@ var migrations = []Migration{
 		CREATE INDEX placement_refused ON placement (place) WHERE state = 'refused';`,
 	},
 	{
-		// Schema 13 in DESIGN: #28 takes 12 and merges first. Version 12
-		// here only until this branch is rebased onto #28, as versions
-		// must have no gaps; the rebase makes it 13.
 		Version: 12, Compat: 1, Release: "0.1",
 		SQL: `
 		-- Pooled placement (D6, REPL-1, REPL-12, #19). placement.state
