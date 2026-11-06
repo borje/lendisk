@@ -72,6 +72,16 @@ type StatusBucket struct {
 	Name    string `json:"name"`
 	Profile string `json:"profile"`
 	Copies  int    `json:"copies"`
+	// Queue is the bucket's replication queue (REPL-3).
+	Queue StatusQueue `json:"queue"`
+}
+
+// StatusQueue is a bucket's replication queue: captured writes and
+// deletes (EP-2), and writes still in flight to the store.
+type StatusQueue struct {
+	Objects int64 `json:"objects"`
+	Bytes   int64 `json:"bytes"`
+	Pending int64 `json:"pending"`
 }
 
 // StatusNode describes this node.
@@ -143,8 +153,14 @@ func (a *app) statusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			queues, err := db.QueueStats(cmd.Context())
+			if err != nil {
+				return err
+			}
 			for _, b := range bs {
-				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies})
+				q := queues[b.Name]
+				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
+					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}})
 			}
 			if asJSON {
 				enc := json.NewEncoder(a.out)
@@ -164,7 +180,12 @@ func (a *app) statusCmd() *cobra.Command {
 			}
 			fmt.Fprintf(a.out, "Buckets: %d\n", len(st.Buckets))
 			for _, b := range st.Buckets {
-				fmt.Fprintf(a.out, "  %s (%s, copies %d)\n", b.Name, b.Profile, b.Copies)
+				fmt.Fprintf(a.out, "  %s (%s, copies %d), queue %d objects, %d bytes", b.Name, b.Profile, b.Copies,
+					b.Queue.Objects, b.Queue.Bytes)
+				if b.Queue.Pending > 0 {
+					fmt.Fprintf(a.out, ", %d writes in flight", b.Queue.Pending)
+				}
+				fmt.Fprintln(a.out)
 			}
 			fmt.Fprintf(a.out, "versitygw %s\n", st.Versions.Versitygw)
 			return nil

@@ -1040,19 +1040,90 @@ upstream bucket is Q-V.
   `generic` buckets are not, which is what the warning says.
   In the lender-only profile (PEER-9) an `endpoint.listen` entry is
   refused at config load.
-- **EP-2** The decorator enqueues on a successful `PutObject` or
-  `CompleteMultipartUpload`, and a delete on a successful
-  `DeleteObject` or each successful entry of `DeleteObjects`. Parts and
-  aborted uploads do not pass through those methods.
+- **EP-2** The decorator (`internal/gateway`, `capture.go`) enqueues
+  on a successful `PutObject` or `CompleteMultipartUpload`, and a
+  delete on a successful `DeleteObject` or each entry `DeleteObjects`
+  reports deleted. Only the node's own buckets (rows in `buckets`) are
+  captured; `lent-*` buckets pass through. `UploadPart` is hashed (see
+  EP-3) but not queued, and `AbortMultipartUpload` drops the upload's
+  part hashes. The other ways to put content into an object (Q-H at
+  v1.10.0) are refused rather than captured, since their bytes never
+  pass the decorator as a stream: `CopyObject` (including the same-key
+  metadata replace) and `UploadPartCopy` answer `501 NotImplemented` on
+  an own bucket, from the decorator, which knows the bucket map; a
+  browser-form `POST` upload (a `POST` to a bucket that is not
+  `?delete`) is refused by the gate. restic, Kopia and the AWS CLI's
+  and rclone's uploads use none of them.
+  *Measured (EP-2 AC):* `TestCaptureOverhead` in `internal/gateway`
+  (opt-in, `LENDISK_OVERHEAD_MB`) times `restic backup` of random data
+  through the gateway with capture on and off, alternating, after a
+  warm-up run, and compares medians. On a 6-vCPU VM (Ryzen 7 8745HS,
+  SHA-NI, 3 GB RAM), restic 0.19.1, 2026-11-06: 512 MiB to ext4, five
+  runs each, 2.400 s with capture and 2.404 s without (−0.2%); 256 MiB
+  to tmpfs, where the disk hides nothing, seven runs each, 1.582 s and
+  1.610 s (−1.7%); a 1 GiB pair to ext4 gave +1.8% and +0.4% before the
+  disk filled. The difference is inside the run-to-run spread (about
+  ±5%): the hash runs on the gateway's goroutine at SHA-NI speed and
+  two SQLite writes per 16 MiB pack are noise. The AC's 10 GB did not
+  fit on the test machine's disk; the gate machine (G-3) should repeat
+  it at that size, and for Kopia with #7.
 - **EP-3** The decorator writes a pending queue row (bucket, key,
-  operation) before calling the backend and marks it complete after the
-  backend returns success; on failure it deletes the row. At startup,
-  pending rows are resolved with `HeadObject` against the backend. The
-  decorator does not buffer request bodies; it wraps the stream in a
-  SHA-256 as it passes to the backend and writes the hash to the
-  completed row, so the object is never read again to hash it
-  (REPL-10). EP-11 needs the hash at write time in any case, to notice
-  a changed acknowledged key.
+  operation, class) before calling the backend and marks it done after
+  the backend returns success; on failure it deletes the row. A request
+  whose row cannot be written or completed fails with a retryable 500
+  rather than go uncaptured. The decorator does not buffer request
+  bodies; it wraps the stream in a SHA-256 as it passes to the backend
+  (keeping versitygw's `ChecksumReader` visible through the wrapper, so
+  posix still verifies a trailing checksum) and writes the hash and the
+  byte count to the done row, so the object is never read again to hash
+  it (REPL-10). EP-11 needs the hash at write time in any case, to
+  notice a changed acknowledged key.
+  - *Which write is on disk.* Each captured `PutObject` stores a random
+    token as user metadata `lendisk-capture` (it is visible on `HEAD`
+    as `x-amz-meta-lendisk-capture`; tools ignore it), and the pending
+    row keeps it. A pending completion keeps the ETag the upload will
+    have, which versitygw computes from the part ETags in the request
+    (`backend.ComputeMultipartETagFromPartETags`).
+  - *Startup.* Before the gateway serves anything, `ResolvePending`
+    settles every pending row with `HeadObject`: a put is done if the
+    object carries the row's token (or ETag), and is otherwise removed;
+    a delete is done if the key is gone. A `PutObject` that reached the
+    store but not its row is hashed by reading the object once: the
+    only read capture makes of a stored object, and only after a crash.
+  - *Multipart.* There is no single stream to hash, and clients upload
+    parts in parallel. Each `UploadPart` stream is hashed as it passes
+    and its SHA-256 and size are saved (`upload_part`) before the part's
+    answer, so every part a client can name in a completion has one.
+    The completion copies the named parts, in order, to the row
+    (`queue_part`) with the pending row, and the object's hash is the
+    composite: SHA-256 over the parts' binary SHA-256 digests, hex, then
+    `-<parts>` (as S3's composite checksums). No byte is read twice.
+    The replica worker sends such an object with the same part
+    boundaries, each part with its SHA-256 trailer (§3.4), so the lender
+    can verify every part and recompute the composite (LEND-4). A
+    retried completion of an upload already queued is passed to the
+    store but not queued again.
+  - *Exactly once.* A put whose hash equals the key's latest done row,
+    a put, is not queued again (`FinishPut` drops it): this is the
+    client's retry after a crash it saw as a failure, and an identical
+    re-upload EP-11 accepts silently anyway.
+  - *AC.* `TestCrashDuringResticBackup` in `internal/cli` runs the
+    daemon as a real process (the test binary re-executed), SIGKILLs it
+    at random points during restic backups and restarts it, twelve
+    times, while the daemon also kills itself with probability 0.1 per
+    request in the window between the store's answer and the row's
+    completion, and restic is killed with it a third of the time (so
+    nothing retries what was in flight). Afterwards every object in the
+    store has exactly one queue entry, a put with the SHA-256 of its
+    bytes; no row is pending; every queued put is in the store; and no
+    `locks/*` key is queued. restic 0.19.1 sent no multipart upload in
+    these runs, even with 40 MiB packs, so the multipart paths are
+    covered by `TestCaptureWritesAndDeletes` and
+    `TestPendingResolvedAtStartup` instead.
+  - *Durability.* `lendisk.db` runs WAL with `synchronous=NORMAL`: a
+    process crash loses no committed row, a power loss may lose the
+    last ones. The store's own writes are not fsynced either; the
+    reconciler (EP-14) catches what a power loss leaves.
 - **EP-6** Bucket credentials are one access/secret pair per bucket,
   generated and stored by lendisk in `lendisk.db` (table `buckets`)
   and resolved by lendisk's `IAMService` (`Config.IAMService`, which
@@ -1066,12 +1137,21 @@ upstream bucket is Q-V.
   its own, and it cannot create buckets. `bucket add` writes the row
   and then creates the bucket directly through the posix backend, so it
   needs no running daemon; `bucket show` prints the lines again.
-- **EP-7** Profiles are TOML files compiled into the binary and
-  overridable in `<config>/profiles/`; each lists the four key classes
-  as glob patterns and the encryption flag. The decorator classifies a
-  key at capture: a local-only key (restic `locks/*`, Kopia `_log*`)
-  gets no queue row at all; the others get placement rows as §3.4
-  says.
+- **EP-7** Profiles are TOML files compiled into the binary
+  (`internal/profile/profiles/<name>.toml`) and overridable in
+  `<config>/profiles/`: a file there replaces the compiled-in profile
+  of its name or adds one, read when `serve` starts; a file with an
+  unknown key or an empty pattern stops the start, naming the file.
+  Each has `encrypted` and four lists of patterns, `local_only`,
+  `snapshot`, `metadata` and `data`, in which `*` matches any run of
+  characters, `/` included, and `?` one. A key's class is local-only,
+  else snapshot, else metadata, by the first list it matches, and data
+  otherwise; a snapshot key is placed as metadata. A bucket whose
+  profile has no file classifies every key as data. The compiled-in
+  files are `restic` and `generic`; `kopia` comes with #7. The
+  decorator classifies a key at capture: a local-only key (restic
+  `locks/*`, Kopia `_log*`) gets no queue row at all; the others get a
+  queue row with their class, and placement rows as §3.4 says.
 - **EP-10** The decorator's `GetObject`/`HeadObject` turn a not-found
   from the backend into a fetch through the replica interface (D12; a
   ranged `GetObject` by the replica client) from a place `placement`
@@ -1120,6 +1200,18 @@ upstream bucket is Q-V.
   several places in parallel. A delete (REPL-2) is a row in the FIFO of
   every place whose `placement` row for the key is `acked` or
   `queued`; a `queued` put that has not started is simply cancelled.
+  The capture side is table `queue` (schema 4): `seq` (an
+  autoincrement, the write sequence, assigned when the request reaches
+  the decorator, so a tool that waits for its packs before writing the
+  index gets the index after them), `bucket`, `key`, `op` (`put`,
+  `delete`), `class` (`snapshot`, `metadata`, `data`), `state`
+  (`pending`, `done`), and for a put `size` and `sha256`; `token`,
+  `etag` and `upload_id` serve EP-3. `queue_part` holds a multipart
+  object's parts (number, size, SHA-256) and `upload_part` those of
+  uploads still open. Rows are never removed by capture; `placement`
+  (#19) and the worker (#18) consume them. `status` shows each
+  bucket's queue (`queue.objects`, `queue.bytes`, `queue.pending` in
+  `status --json`).
 - **REPL-1, the metadata barrier.** A metadata row at sequence `m` is
   eligible to send only when every data object before `m` has no
   `queued` placement row left: each is `acked` at every place it is
@@ -1190,7 +1282,12 @@ upstream bucket is Q-V.
   `x-amz-checksum-algorithm: SHA256` and each part carries its own
   SHA-256 as an unsigned trailer (`PutObjectPartOptions.Trailer`, a
   placeholder of the final length filled by a hashing reader at EOF),
-  so each byte is still read once. minio-go's *signed* trailer is never
+  so each byte is still read once. An object captured from a multipart
+  upload (its hash is a composite, `<hex>-<n>`, EP-3) is always sent as
+  a multipart upload with the parts it was written with, from
+  `queue_part`: each part's trailer is then the SHA-256 taken at
+  capture, and the lender recomputes the composite from the parts it
+  received. minio-go's *signed* trailer is never
   used: its framing is refused by versitygw and Garage. A target that
   refuses checksums gets none, per target. `Get` with a range is `GetObject` with a range option.
   `Head`, `List` and `Delete` map to `StatObject`, `ListObjects` (with
@@ -1237,7 +1334,15 @@ upstream bucket is Q-V.
   with the hash (LEND-4), so a local copy that rotted between capture
   and send is rejected and alerted rather than replicated.
   REQUIREMENTS.md v0.9 reworded REPL-10 to allow the hash to be taken
-  when the tool writes the object, for exactly this.
+  when the tool writes the object, for exactly this. For an object the
+  tool wrote as a multipart upload the hash is the composite of its
+  parts' SHA-256 digests (EP-3), since the parts arrive in parallel and
+  a whole-object SHA-256 would need a second read; it is still computed
+  from the object's bytes, the same way for friends and overflow
+  targets. Two uploads of the same bytes with different part
+  boundaries therefore have different hashes: EP-11 (#22) must compare
+  like with like (a composite only with a composite of the same part
+  sizes) before calling a key changed.
 - **REPL-11** The bucket's watermark is the highest sequence `w` such
   that every object up to `w` has `copies` `acked` placement rows; it
   advances as acknowledgements arrive and is the offsite-complete point
@@ -1828,8 +1933,14 @@ design and disappear with it.
   `UploadPartCopy` writes a part only. `PutObjectTagging`,
   `DeleteObjectTagging`, `PutObjectAcl`, `PutObjectRetention` and
   `PutObjectLegalHold` change an object's metadata. `RestoreObject` and
-  `SelectObjectContent` are not implemented on `posix`. The full review
-  is still to do.
+  `SelectObjectContent` are not implemented on `posix`. *Settled for
+  content (#6):* `PutObject`, `CompleteMultipartUpload`, `DeleteObject`
+  and `DeleteObjects` are captured; `CopyObject` and `UploadPartCopy`
+  are refused on own buckets by the decorator and the browser-form
+  `POST` by the gate (§3.3 EP-2); posix's `DeleteObjects` deletes
+  through its own `DeleteObject`, not the decorator's, so nothing is
+  captured twice. The metadata-only methods are neither captured nor
+  refused yet; the rest of the review is still to do.
 - **Q-I (gate, resolved 2026-11-05)** The embedded design depends on
   five properties of versitygw at the pinned version. Pinned at
   **v1.10.0** (tag commit `72f75bd`, 2026-10-22), vendored; it needs Go

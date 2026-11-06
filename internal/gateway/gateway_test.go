@@ -20,20 +20,27 @@ func TestGateRefuses(t *testing.T) {
 	cases := []struct {
 		method, path, lock string
 		refused            bool
+		multiDelete        bool
 	}{
-		{"PATCH", "/list-users", "", true},
-		{"PATCH", "/laptop/key", "", true},
-		{"PUT", "/newbucket", "true", true},
-		{"PUT", "/newbucket", " TRUE ", true},
-		{"GET", "/_lendisk/version", "", true},
-		{"PUT", "/newbucket", "", false},
-		{"PUT", "/newbucket", "false", false},
-		{"PUT", "/laptop/data/ab", "", false},
-		{"GET", "/laptop/_lendisk/x", "", false}, // a key, not the control path
-		{"DELETE", "/laptop/locks/1", "", false},
+		{"PATCH", "/list-users", "", true, false},
+		{"PATCH", "/laptop/key", "", true, false},
+		{"PUT", "/newbucket", "true", true, false},
+		{"PUT", "/newbucket", " TRUE ", true, false},
+		{"GET", "/_lendisk/version", "", true, false},
+		{"PUT", "/newbucket", "", false, false},
+		{"PUT", "/newbucket", "false", false, false},
+		{"PUT", "/laptop/data/ab", "", false, false},
+		{"GET", "/laptop/_lendisk/x", "", false, false}, // a key, not the control path
+		{"DELETE", "/laptop/locks/1", "", false, false},
+		// Q-H: a browser-form POST upload; a multi-delete and the
+		// multipart calls are POSTs too and pass.
+		{"POST", "/laptop", "", true, false},
+		{"POST", "/laptop/", "", true, false},
+		{"POST", "/laptop", "", false, true},
+		{"POST", "/laptop/data/ab", "", false, false},
 	}
 	for _, c := range cases {
-		if got := refuse(c.method, c.path, c.lock) != ""; got != c.refused {
+		if got := refuse(request{method: c.method, path: c.path, objectLock: c.lock, multiDelete: c.multiDelete}) != ""; got != c.refused {
 			t.Errorf("%s %s lock=%q: refused=%v, want %v", c.method, c.path, c.lock, got, c.refused)
 		}
 	}

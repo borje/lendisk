@@ -1,7 +1,9 @@
 // Package gateway runs versitygw embedded in the daemon (D4, D15): the S3
 // protocol on one internal unix socket, <data>/run/gw.sock, over the posix
 // store, with lendisk's gate in front of its routing, lendisk's IAM service
-// for credentials and lendisk's decorator around the backend.
+// for credentials and lendisk's decorator around the backend, which
+// captures every write and delete of an own bucket into the replication
+// queue (EP-2, EP-3, EP-7, REPL-3, REPL-10).
 //
 // Rules a caller must keep:
 //   - versitygw opens no TCP port (EP-5, SEC-8); every TCP listener is the
@@ -12,6 +14,8 @@
 //     gate (SEC-8).
 //   - Errors returned to versitygw from the decorator must be unwrapped
 //     s3err.APIError values, or the client sees a retryable 500 (Q-I.5).
+//   - Queue rows a crash left pending are settled (Decorator.ResolvePending)
+//     before anything is served; Run does this.
 package gateway
 
 import (
@@ -33,6 +37,7 @@ import (
 	"github.com/versity/versitygw/embedgw"
 	"github.com/versity/versitygw/s3api"
 
+	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -66,7 +71,15 @@ type Gateway struct {
 	StoreDir string
 	Socket   string
 	DB       *state.DB
+	// Profiles classify own buckets' keys (EP-7); nil means the
+	// compiled-in ones.
+	Profiles profile.Set
 	Log      *slog.Logger
+
+	// AfterStore is the decorator's crash-window hook. Tests only.
+	AfterStore func()
+
+	noCapture bool // tests: the decorator passes everything through
 }
 
 // OpenBackend opens the posix backend on dir. AbsolutePaths is required:
@@ -107,6 +120,13 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	if err != nil {
 		return err
 	}
+	dec, err := g.decorator(ctx, be)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil // stopped while starting
+		}
+		return err
+	}
 	rootAccess, rootSecret := "lendisk-root-"+randomHex(8), randomHex(32)
 	cfg := &embedgw.Config{
 		RootUserAccess:    rootAccess,
@@ -125,17 +145,12 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	}
 
 	errc := make(chan error, 1)
-	go func() { errc <- embedgw.RunVersityGW(ctx, &Decorator{Backend: be}, cfg) }()
+	go func() { errc <- embedgw.RunVersityGW(ctx, dec, cfg) }()
+	// waitForSocket drains errc whenever it returns early, so versitygw
+	// never outlives Run (only one may run per process).
 	if err := waitForSocket(ctx, g.Socket, errc); err != nil {
-		var stopped *stoppedError
-		if ctx.Err() != nil && !errors.As(err, &stopped) {
-			// Stopped while starting: wait for versitygw to stop too, so it
-			// never outlives Run (only one may run per process).
-			<-errc
-			return nil
-		}
 		if ctx.Err() != nil {
-			return nil
+			return nil // stopped while starting
 		}
 		return err
 	}
@@ -148,6 +163,30 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		return nil
 	}
 	return err
+}
+
+// decorator wraps be and settles what a crash left pending before
+// anything is served (EP-3).
+func (g *Gateway) decorator(ctx context.Context, be backend.Backend) (*Decorator, error) {
+	d := &Decorator{Backend: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore}
+	if d.Profiles == nil {
+		set, err := profile.Load("")
+		if err != nil {
+			return nil, err
+		}
+		d.Profiles = set
+	}
+	if g.noCapture {
+		d.DB = nil
+	}
+	done, dropped, err := d.ResolvePending(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("capture: settling the queue rows left by the last run: %w", err)
+	}
+	if done+dropped > 0 {
+		g.Log.Info("capture: settled queue rows left by the last run", "done", done, "dropped", dropped)
+	}
+	return d, nil
 }
 
 func waitForSocket(ctx context.Context, sock string, errc <-chan error) error {
@@ -163,8 +202,11 @@ func waitForSocket(ctx context.Context, sock string, errc <-chan error) error {
 			if err == nil {
 				err = errors.New("gateway stopped before serving")
 			}
-			return &stoppedError{fmt.Errorf("gateway: %w", err)}
+			return fmt.Errorf("gateway: %w", err)
 		case <-ctx.Done():
+			// Stopped while starting: let versitygw finish, since only
+			// one may run per process and the next start would fail.
+			<-errc
 			return ctx.Err()
 		case <-time.After(20 * time.Millisecond):
 		}
@@ -173,11 +215,6 @@ func waitForSocket(ctx context.Context, sock string, errc <-chan error) error {
 		}
 	}
 }
-
-// stoppedError means versitygw already returned, so errc is drained.
-type stoppedError struct{ error }
-
-func (e *stoppedError) Unwrap() error { return e.error }
 
 func randomHex(n int) string {
 	b := make([]byte, n)

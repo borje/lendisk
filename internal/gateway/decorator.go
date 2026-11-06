@@ -11,14 +11,6 @@ import (
 	"github.com/versity/versitygw/backend"
 )
 
-// Decorator wraps the store's backend (D4). It passes everything through
-// for now; capture (#6), quota (#16) and tombstones (#17) are added as
-// overriding methods. Overrides must return unwrapped s3err.APIError
-// values for client-visible refusals (Q-I.5).
-type Decorator struct {
-	backend.Backend
-}
-
 // CreateBucket creates a bucket owned by the given access key, directly on
 // the backend, as `bucket add` does without the daemon (EP-6). The owner is
 // the only account versitygw lets use the bucket.

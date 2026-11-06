@@ -41,6 +41,9 @@ type app struct {
 	serving func(addr string)
 	// regions offers the tunnel's relay regions; nil means the public map.
 	regions transport.RegionSource
+	// afterStore is the capture crash-window hook (gateway.AfterStore);
+	// tests only.
+	afterStore func()
 }
 
 func (a *app) checker() store.Checker {

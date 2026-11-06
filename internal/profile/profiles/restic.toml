@@ -1,0 +1,21 @@
+# The restic profile (EP-7). restic names every file in its repository
+# by the SHA-256 of its content, under these prefixes. Patterns are globs
+# in which * matches any run of characters, slashes included, and ?
+# matches one. A key is local-only, else snapshot, else metadata, else
+# data, by the first list it matches; a key no rule matches is data.
+
+# restic encrypts everything it writes (EP-8).
+encrypted = true
+
+# Stored and served, never replicated: a replica has no use for another
+# machine's locks, and restic makes its own (REPL-12).
+local_only = ["locks/*"]
+
+# A snapshot's arrival means a backup is complete; status names it.
+snapshot = ["snapshots/*"]
+
+# Placed at every friend (REPL-12, D6).
+metadata = ["config", "keys/*", "index/*", "snapshots/*"]
+
+# Placed at `copies` places.
+data = ["data/*"]
