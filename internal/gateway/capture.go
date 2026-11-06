@@ -37,7 +37,10 @@ const MetaCapture = "lendisk-capture"
 // with the SHA-256 taken from the request stream as it passes (REPL-10),
 // or removed when the call fails; ResolvePending settles rows a crash
 // left, and ResolveStranded those a failed completion or removal left
-// while running. Bodies are never buffered or read twice.
+// while running. Bodies are never buffered or read twice. A captured
+// request holds its key's lock from before its row is written until the
+// row is settled, so one key's rows reach the store in sequence order
+// (#48).
 //
 // Overrides must return unwrapped s3err.APIError values for client-visible
 // refusals (Q-I.5).
@@ -52,6 +55,7 @@ type Decorator struct {
 	// settles. Tests only.
 	AfterStore func()
 
+	keys     keyLocks // one captured request per key at a time
 	mu       sync.Mutex
 	stranded map[int64]bool // rows to settle while running (strand)
 }
@@ -94,6 +98,7 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 		}
 		return d.Backend.PutObject(ctx, in)
 	}
+	defer d.keys.lock(*in.Bucket, *in.Key)()
 	token := randomHex(8)
 	in.Metadata = maps.Clone(in.Metadata)
 	if in.Metadata == nil {
@@ -138,6 +143,7 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 	}
 	bg := context.Background()
 	bucket, key, uploadID := *in.Bucket, *in.Key, *in.UploadId
+	defer d.keys.lock(bucket, key)()
 	// A retried completion is not queued twice: posix answers it from the
 	// finished object. A row left pending by a failed hash is finished now.
 	seq, st, found, err := d.DB.UploadEntry(bg, bucket, key, uploadID)
@@ -209,6 +215,7 @@ func (d *Decorator) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput) 
 	if !captured(class) {
 		return d.Backend.DeleteObject(ctx, in)
 	}
+	defer d.keys.lock(*in.Bucket, *in.Key)()
 	seq, err := d.begin(state.Capture{Bucket: *in.Bucket, Key: *in.Key, Op: state.OpDelete, Class: string(class)})
 	if err != nil {
 		return nil, err
@@ -245,6 +252,11 @@ func (d *Decorator) DeleteObjects(ctx context.Context, in *s3.DeleteObjectsInput
 	if len(cs) == 0 {
 		return d.Backend.DeleteObjects(ctx, in)
 	}
+	keys := make([]string, len(cs))
+	for i, c := range cs {
+		keys[i] = c.Key
+	}
+	defer d.keys.lock(*in.Bucket, keys...)()
 	bg := context.Background()
 	seqs, err := d.DB.BeginCaptures(bg, cs)
 	if err != nil {

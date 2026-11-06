@@ -1178,6 +1178,21 @@ upstream bucket is Q-V.
     (#47); writers wait for the lock up to `busy_timeout`, 30 s, which is
     a queue of millisecond transactions, never a held lock, since no
     transaction does I/O other than SQLite's own.
+  - *Same-key ordering.* `seq` is assigned when the row is written,
+    before the store call, so two overlapping writes to one key could
+    reach the store in the other order and leave the key's last done row
+    describing an object that is not on disk (#48). The decorator
+    therefore holds a per-key lock (`keyLocks`, a map of mutexes that
+    exist only while held or awaited) from before a captured request
+    writes its row until the row is done or removed: writes and deletes
+    of one key are applied in `seq` order, and the key's last done row
+    always describes the object on disk. Different keys never wait for
+    each other. `DeleteObjects` takes the locks of all its captured keys
+    in sorted order, so two of them cannot deadlock. restic and Kopia
+    never write one key concurrently, so the lock costs them one
+    uncontended mutex per request. `ResolveStranded` settles a row only
+    if its key's lock is free, and otherwise leaves it for the next
+    round.
   - *Multipart.* There is no single stream to hash, and clients upload
     parts in parallel, so parts are not hashed. The completion writes a
     pending row with the ETag the completion will give the object, the
@@ -1427,8 +1442,13 @@ upstream bucket is Q-V.
   capture replaced or deleted (`state.Superseded`) is cancelled, since
   the store no longer holds its bytes; deletes are always sent, and a
   key or bucket the friend lacks counts as deleted. A put reads
-  `<store>/<bucket>/<key>` from the `posix` store as it sends it; a size
-  other than the row's means a later write is in flight and waits. On
+  `<store>/<bucket>/<key>` from the `posix` store as it sends it. A size
+  other than the row's, or a missing file, while a later capture of the
+  key exists (`state.LaterCapture`) means that write is in flight: the
+  row waits, and is cancelled as superseded once that capture is done
+  (or sent, if it was dropped). With no later capture, the object
+  changed outside lendisk, and the row is `refused` like a `BadDigest`,
+  so it cannot stall the FIFO (#48). On
   acknowledgement the row becomes `acked` with its hash and the place
   `ok`. Nothing is acknowledged before the place answers, so a restart
   of either side sends the head row again whole; the friend stores the

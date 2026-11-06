@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/versity/versitygw/s3response"
 
+	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -90,6 +94,135 @@ func TestConcurrentCapturesAndAcksSeeNoErrors(t *testing.T) {
 	}
 	if p, _ := h.db.PendingCaptures(ctx); len(p) != 0 {
 		t.Fatalf("%d rows left pending", len(p))
+	}
+}
+
+// EP-3, REPL-1 (#48): overlapping writes to one key are applied in the
+// order of their queue rows, so the key's last done row always describes
+// the object on disk; multi-deletes naming the same keys in opposite
+// orders do not deadlock with them.
+func TestOverlappingWritesToOneKeyKeepTheQueueInStep(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	h.serve(false)
+	c := h.client("files")
+	ctx := context.Background()
+	b := aws.String("files")
+	keys := []string{"a", "b"}
+	var wg sync.WaitGroup
+	for w := range 6 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 8 {
+				key := keys[(w+i)%2]
+				// Different lengths too, so a mismatch shows in the size.
+				body := bytes.Repeat([]byte{byte('a' + w)}, 1+w*7+i)
+				if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: b, Key: &key, Body: bytes.NewReader(body)}); err != nil {
+					t.Errorf("put %s: %v", key, err)
+				}
+				if i%3 == 2 {
+					ids := []types.ObjectIdentifier{{Key: aws.String("a")}, {Key: aws.String("b")}}
+					if w%2 == 1 {
+						ids[0], ids[1] = ids[1], ids[0]
+					}
+					if _, err := c.DeleteObjects(ctx, &s3.DeleteObjectsInput{Bucket: b,
+						Delete: &types.Delete{Objects: ids}}); err != nil {
+						t.Errorf("multi-delete: %v", err)
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	last := map[string]state.Entry{}
+	for _, e := range h.entries("files") {
+		if e.State != state.StateDone {
+			t.Errorf("row %d left %s", e.Seq, e.State)
+		}
+		last[e.Key] = e
+	}
+	for _, key := range keys {
+		e := last[key]
+		got, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: b, Key: aws.String(key)})
+		if code(err) == "NoSuchKey" {
+			if e.Op != state.OpDelete {
+				t.Errorf("%s: gone from the store, last row %+v", key, e)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(got.Body)
+		got.Body.Close()
+		if e.Op != state.OpPut || e.SHA256 != sum(body) || e.Size != int64(len(body)) {
+			t.Errorf("%s: store holds %d bytes %s, last row %+v", key, len(body), sum(body), e)
+		}
+	}
+}
+
+// EP-3, REPL-1 (#48): the issue's interleaving, forced. X is stored as
+// row 1. A put of Y is stored and stalls before its row is completed; a
+// put of X arriving meanwhile must not be stored, queued or dropped as a
+// duplicate of row 1 until Y's row is done, so the key's last done row
+// is X, as on disk.
+func TestSameKeyWriteWaitsForTheOneInFlight(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	ctx := context.Background()
+	be, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, _ := profile.Load("")
+	stall, stalled := make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	put := func(body string) error {
+		n := int64(len(body))
+		_, err := d.PutObject(ctx, s3response.PutObjectInput{Bucket: aws.String("files"), Key: aws.String("k"),
+			ContentLength: &n, Body: bytes.NewReader([]byte(body))})
+		return err
+	}
+	if err := put("X"); err != nil {
+		t.Fatal(err)
+	}
+	d.AfterStore = func() {
+		if !first.Swap(true) {
+			close(stalled)
+			<-stall
+		}
+	}
+	errY := make(chan error, 1)
+	go func() { errY <- put("YY") }()
+	<-stalled
+	errX := make(chan error, 1)
+	go func() { errX <- put("X") }()
+	select {
+	case err := <-errX:
+		t.Errorf("the second put finished while the first was in flight (err %v)", err)
+		errX <- err
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(stall)
+	if err := <-errY; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errX; err != nil {
+		t.Fatal(err)
+	}
+	es := h.entries("files")
+	last := es[len(es)-1]
+	got, err := be.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String("files"), Key: aws.String("k")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(got.Body)
+	got.Body.Close()
+	if last.SHA256 != sum(body) {
+		t.Fatalf("store holds %q; last row %+v of %d", body, last, len(es))
+	}
+	if len(es) != 3 {
+		t.Errorf("%d rows, want X, Y, X", len(es))
 	}
 }
 

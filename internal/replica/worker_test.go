@@ -320,6 +320,47 @@ func TestImmutabilityAndRejectedHashAreRefused(t *testing.T) {
 	}
 }
 
+// REPL-1, REPL-10 (#48): a row whose object changed size or vanished
+// under it, with no later capture of the key to supersede it, is refused
+// rather than retried for ever; one whose key a capture in flight is
+// rewriting waits for that capture and is then cancelled.
+func TestChangedObjectDoesNotStallTheFIFO(t *testing.T) {
+	fx := newFixture(t, "B")
+	ctx := t.Context()
+	fx.write("laptop", "data/grown", "short")
+	os.WriteFile(filepath.Join(fx.store, "laptop", "data", "grown"), []byte("longer now"), 0o600)
+	fx.write("laptop", "data/vanished", "v")
+	os.Remove(filepath.Join(fx.store, "laptop", "data", "vanished"))
+	fx.write("laptop", "data/fine", "fine")
+	fx.write("laptop", "data/rewritten", "old")
+	// A rewrite of the key is in flight: stored, its row still pending.
+	later, err := fx.db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "data/rewritten", Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(fx.store, "laptop", "data", "rewritten"), []byte("newer"), 0o600)
+	fx.run()
+	waitFor(t, "data/fine sent", func() bool {
+		log, _, _, _ := fx.places["B"].snapshot()
+		return len(log) == 1
+	})
+	if st, _ := fx.db.PlaceStats(ctx, time.Now()); st["B"].Refused != 2 || st["B"].Queued != 1 {
+		t.Fatalf("stats %+v, want two refused and the rewritten row waiting", st["B"])
+	}
+	sum := sha256.Sum256([]byte("newer"))
+	if _, err := fx.db.FinishPut(ctx, later[0], 5, hex.EncodeToString(sum[:])); err != nil {
+		t.Fatal(err)
+	}
+	fx.drained("B")
+	log, _, _, _ := fx.places["B"].snapshot()
+	if len(log) != 2 || log[0] != "put laptop/data/fine" || log[1] != "put laptop/data/rewritten" {
+		t.Fatalf("sent %v", log)
+	}
+	if st, _ := fx.db.PlaceStats(ctx, time.Now()); st["B"].Refused != 2 {
+		t.Fatalf("stats %+v", st["B"])
+	}
+}
+
 // REPL-3: the FIFO is in lendisk.db, so a worker stopped mid-way and
 // started again continues where it was, sending nothing twice that was
 // acknowledged.

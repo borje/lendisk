@@ -95,7 +95,16 @@ func (d *Decorator) ResolveStranded(ctx context.Context) {
 	for _, seq := range seqs {
 		e, ok, err := d.DB.PendingCapture(ctx, seq)
 		if err == nil && ok {
-			_, err = d.resolve(ctx, e)
+			// A request writing the key now would race the read of the
+			// store: leave the row for the next call.
+			unlock, free := d.keys.tryLock(e.Bucket, e.Key)
+			if !free {
+				continue
+			}
+			if e, ok, err = d.DB.PendingCapture(ctx, seq); err == nil && ok {
+				_, err = d.resolve(ctx, e)
+			}
+			unlock()
 		}
 		if err != nil {
 			if ctx.Err() == nil {
