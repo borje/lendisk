@@ -14,6 +14,9 @@ type Alert struct {
 	Kind    string
 	Subject string // the friend's node ID, the bucket, or empty
 	Message string
+	// Raise counts the key's raises (1, 2, …): a delivery names it, so
+	// the send of an earlier raise never marks a later one.
+	Raise int64
 	// RaisedAt is when the condition was first seen; ClearedAt when it
 	// ended, zero while it holds.
 	RaisedAt, ClearedAt time.Time
@@ -72,12 +75,13 @@ func (db *DB) SyncAlerts(ctx context.Context, kinds []string, current []Alert, n
 			}
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO alert (key, kind, subject, message, raised_at)
-			VALUES (?, ?, ?, ?, ?)
+		if err := tx.QueryRowContext(ctx, `INSERT INTO alert (key, kind, subject, message, raise_no, raised_at)
+			VALUES (?, ?, ?, ?, 1, ?)
 			ON CONFLICT (key) DO UPDATE SET kind = excluded.kind, subject = excluded.subject,
-				message = excluded.message, raised_at = excluded.raised_at,
-				cleared_at = NULL, hook_at = NULL, webhook_at = NULL`,
-			a.Key, a.Kind, a.Subject, a.Message, now.Unix()); err != nil {
+				message = excluded.message, raise_no = alert.raise_no + 1, raised_at = excluded.raised_at,
+				cleared_at = NULL, hook_at = NULL, webhook_at = NULL
+			RETURNING raise_no`,
+			a.Key, a.Kind, a.Subject, a.Message, now.Unix()).Scan(&a.Raise); err != nil {
 			return nil, nil, err
 		}
 		a.RaisedAt, a.ClearedAt, a.HookAt, a.WebhookAt = time.Unix(now.Unix(), 0), time.Time{}, time.Time{}, time.Time{}
@@ -108,16 +112,17 @@ func (db *DB) ActiveAlerts(ctx context.Context) ([]Alert, error) {
 	return scanAlerts(rows)
 }
 
-// MarkAlertDelivered records that a's raise reached channel at now. It
-// does nothing when the alert was cleared or raised anew since: that
-// raise is delivered on its own.
+// MarkAlertDelivered records that a's raise (a.Raise) reached channel
+// at now. It does nothing when the alert was cleared or raised anew
+// since, even within the same second: that raise is delivered on its
+// own.
 func (db *DB) MarkAlertDelivered(ctx context.Context, a Alert, channel string, now time.Time) error {
 	col := map[string]string{ChannelHook: "hook_at", ChannelWebhook: "webhook_at"}[channel]
 	if col == "" {
 		return fmt.Errorf("unknown alert channel %q", channel)
 	}
 	_, err := db.ExecContext(ctx, `UPDATE alert SET `+col+` = ?
-		WHERE key = ? AND raised_at = ? AND cleared_at IS NULL`, now.Unix(), a.Key, a.RaisedAt.Unix())
+		WHERE key = ? AND raise_no = ? AND cleared_at IS NULL`, now.Unix(), a.Key, a.Raise)
 	return err
 }
 
@@ -144,7 +149,7 @@ func (db *DB) RefusedAtPlaces(ctx context.Context) (map[string]int64, error) {
 	return out, rows.Err()
 }
 
-const alertSelect = `SELECT key, kind, subject, message, raised_at, cleared_at, hook_at, webhook_at FROM alert`
+const alertSelect = `SELECT key, kind, subject, message, raise_no, raised_at, cleared_at, hook_at, webhook_at FROM alert`
 
 func scanAlerts(rows *sql.Rows) ([]Alert, error) {
 	defer rows.Close()
@@ -159,7 +164,7 @@ func scanAlerts(rows *sql.Rows) ([]Alert, error) {
 		var a Alert
 		var raised int64
 		var cleared, hook, webhook sql.NullInt64
-		if err := rows.Scan(&a.Key, &a.Kind, &a.Subject, &a.Message, &raised, &cleared, &hook, &webhook); err != nil {
+		if err := rows.Scan(&a.Key, &a.Kind, &a.Subject, &a.Message, &a.Raise, &raised, &cleared, &hook, &webhook); err != nil {
 			return nil, err
 		}
 		a.RaisedAt, a.ClearedAt, a.HookAt, a.WebhookAt = time.Unix(raised, 0), unix(cleared), unix(hook), unix(webhook)

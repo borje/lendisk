@@ -38,6 +38,12 @@ func (a *app) serveCmd() *cobra.Command {
 				return err
 			}
 			nodeID := id.NodeID().String()
+			if cfg.Alerts.Command != "" {
+				// Refused now, not at the first alert (OPS-3).
+				if err := alert.CheckCommand(cfg.Alerts.Command); err != nil {
+					return err
+				}
+			}
 
 			ctx := a.ctx
 			if ctx == nil {

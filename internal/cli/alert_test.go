@@ -98,6 +98,29 @@ func TestUnreachableFriendAlertedThroughHookWebhookAndStatus(t *testing.T) {
 	}
 }
 
+// OPS-3 (#13): serve refuses an alerts.command that is not one
+// executable program: a command line with arguments, or a file that
+// cannot be run, says what to do instead.
+func TestServeRefusesAnAlertCommandItCannotRun(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(t)
+	dir := t.TempDir()
+	hook := filepath.Join(dir, "hook.sh")
+	plain := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plain, []byte("#!/bin/sh\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{hook + " --topic backups", plain} {
+		code, _, errOut := n.run("", "", "serve", "--alerts-command", bad)
+		if code == 0 || !strings.Contains(errOut, "alerts.command must be the path to one program, with no arguments; put arguments in a small script") {
+			t.Errorf("serve with alerts.command %q: exit %d\n%s", bad, code, errOut)
+		}
+	}
+}
+
 // OPS-1 (#13): with nothing wrong, status says so.
 func TestStatusShowsNoAlerts(t *testing.T) {
 	n := newNode(t)

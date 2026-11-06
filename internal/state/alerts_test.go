@@ -79,7 +79,10 @@ func TestAlertsDeduplicatedWhileHeldAndClearedWhenEnded(t *testing.T) {
 
 	// A delivery of an earlier raise does not mark a later one.
 	old := raised[0]
-	old.RaisedAt = t0
+	if old.Raise != 2 {
+		t.Fatalf("re-raise numbered %d, want 2", old.Raise)
+	}
+	old.Raise = 1
 	if err := db.MarkAlertDelivered(ctx, old, ChannelWebhook, t3); err != nil {
 		t.Fatal(err)
 	}
@@ -108,6 +111,41 @@ func mustActive(t *testing.T, db *DB) []Alert {
 		t.Fatal(err)
 	}
 	return as
+}
+
+// OPS-3 (#13): an alert cleared and raised again within one second is
+// a new raise: delivering the old one does not mark it.
+func TestSameSecondReRaiseIsDeliveredOnItsOwn(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	t0 := time.Unix(1_800_000_000, 0)
+	kinds := []string{"store_unreadable"}
+	s := Alert{Key: "store_unreadable", Kind: "store_unreadable", Message: "disk"}
+	raised, _, err := db.SyncAlerts(ctx, kinds, []Alert{s}, t0)
+	if err != nil || len(raised) != 1 {
+		t.Fatalf("raise %v %v", raised, err)
+	}
+	first := raised[0]
+	if _, cleared, err := db.SyncAlerts(ctx, kinds, nil, t0.Add(200*time.Millisecond)); err != nil || len(cleared) != 1 {
+		t.Fatalf("clear %v %v", cleared, err)
+	}
+	again, _, err := db.SyncAlerts(ctx, kinds, []Alert{s}, t0.Add(400*time.Millisecond))
+	if err != nil || len(again) != 1 {
+		t.Fatalf("re-raise %v %v", again, err)
+	}
+	// The first raise's send finishes now.
+	if err := db.MarkAlertDelivered(ctx, first, ChannelHook, t0.Add(500*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if a := mustActive(t, db); len(a) != 1 || !a[0].HookAt.IsZero() {
+		t.Fatalf("the re-raise was marked by the first raise's delivery: %+v", a)
+	}
+	if err := db.MarkAlertDelivered(ctx, again[0], ChannelHook, t0.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if a := mustActive(t, db); a[0].HookAt.IsZero() {
+		t.Fatal("the re-raise's own delivery not recorded")
+	}
 }
 
 // OPS-2 (#13): the alert evaluator counts each place's own refusals.

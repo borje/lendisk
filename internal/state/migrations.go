@@ -198,13 +198,16 @@ var migrations = []Migration{
 		-- Pending alerts (OPS-2, OPS-3, #13): one row per condition, keyed
 		-- kind:subject, so an alert is raised once while its condition
 		-- holds. cleared_at is set when it ends; a later raise of the same
-		-- key replaces the row. hook_at and webhook_at record delivery of
-		-- the current raise to each channel; NULL until delivered.
+		-- key replaces the row and counts up raise_no, which a delivery
+		-- names, so the send of an earlier raise never marks a later one.
+		-- hook_at and webhook_at record delivery of the current raise to
+		-- each channel; NULL until delivered.
 		CREATE TABLE alert (
 			key        TEXT PRIMARY KEY, -- kind, or kind:subject
 			kind       TEXT NOT NULL,    -- friend_unreachable, store_unreadable, …
 			subject    TEXT NOT NULL,    -- the friend's node ID, the bucket, or ''
 			message    TEXT NOT NULL,
+			raise_no   INTEGER NOT NULL, -- 1, 2, … per key
 			raised_at  INTEGER NOT NULL, -- unix seconds
 			cleared_at INTEGER,          -- unix seconds; NULL while it holds
 			hook_at    INTEGER,          -- unix seconds

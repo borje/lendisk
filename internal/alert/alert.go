@@ -30,10 +30,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/borje/lendisk/internal/state"
@@ -236,11 +239,21 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 	after := orDefault(s.UnreachableAfter, 24*time.Hour)
 	for _, f := range fs {
 		c := conds[f.Peer]
-		if c.Condition != state.ConditionRetrying || now.Sub(c.Since) < after {
+		if c.Condition != state.ConditionRetrying {
+			continue
+		}
+		// Counted from its last answer: a friend that went off long
+		// before the next backup tried it has been gone since then. One
+		// that never answered is counted from its first failure.
+		from := c.LastOK
+		if from.IsZero() {
+			from = c.Since
+		}
+		if now.Sub(from) < after {
 			continue
 		}
 		msg := fmt.Sprintf("friend %s has not answered since %s (longer than %v); replication to it waits: %s",
-			f.Peer, c.Since.UTC().Format(time.RFC3339), after, c.Detail)
+			f.Peer, from.UTC().Format(time.RFC3339), after, c.Detail)
 		out = append(out, alertOf(KindFriendUnreachable, f.Peer, msg))
 	}
 	var store []string
@@ -379,11 +392,39 @@ func (s *Service) runHook(ctx context.Context, body []byte) error {
 	return RunCommand(ctx, s.Command, body)
 }
 
-// RunCommand runs command without a shell, stdin on its standard input;
-// a failure carries the start of what it printed.
+// CheckCommand checks alerts.command: the absolute path of one
+// executable regular file. It is run with no arguments and no shell, so
+// a command line such as "ntfy.sh --topic x" is refused rather than
+// failing at the first alert.
+func CheckCommand(command string) error {
+	const rule = "alerts.command must be the path to one program, with no arguments; put arguments in a small script"
+	if strings.ContainsAny(command, " \t\n") {
+		return fmt.Errorf("%s (alerts.command = %q holds spaces)", rule, command)
+	}
+	if !filepath.IsAbs(command) {
+		return fmt.Errorf("%s (alerts.command = %q is not an absolute path)", rule, command)
+	}
+	fi, err := os.Stat(command)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%s: %w", rule, err)
+	case !fi.Mode().IsRegular():
+		return fmt.Errorf("%s (%s is not a regular file)", rule, command)
+	case fi.Mode().Perm()&0o111 == 0:
+		return fmt.Errorf("%s (%s is not executable: chmod +x it)", rule, command)
+	}
+	return nil
+}
+
+// RunCommand runs command without a shell, stdin on its standard input,
+// in a process group of its own: when ctx ends, the whole group is
+// killed, so nothing the hook started outlives it. A failure carries the
+// start of what it printed.
 func RunCommand(ctx context.Context, command string, stdin []byte) error {
 	cmd := exec.CommandContext(ctx, command)
 	cmd.Stdin = bytes.NewReader(stdin)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = 5 * time.Second // a child that keeps the pipes open
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -405,7 +446,10 @@ func (s *Service) postWebhook(ctx context.Context, body []byte) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "lendisk/"+version.Version)
-	client := cmp.Or(s.HTTP, http.DefaultClient)
+	// No redirects: a 3xx is a failure, and a followed redirect would put
+	// the Location, maybe a secret too, in the client's errors.
+	client := *cmp.Or(s.HTTP, http.DefaultClient)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
 		// url.Error repeats the whole URL, secret and all.
@@ -413,7 +457,7 @@ func (s *Service) postWebhook(ctx context.Context, body []byte) error {
 		if errors.As(err, &ue) {
 			return fmt.Errorf("POST %s: %w", Redact(s.Webhook), ue.Err)
 		}
-		return err
+		return fmt.Errorf("POST %s failed", Redact(s.Webhook))
 	}
 	defer resp.Body.Close()
 	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))

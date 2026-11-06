@@ -2183,14 +2183,17 @@ capture decorator, so nothing stands between that and posix (#62).
   blocks). Table `alert` (migration 11) keeps one row per condition,
   keyed `kind` or `kind:subject`: `state.SyncAlerts` raises a row
   when its condition starts, keeps it (updating its message) while
-  the condition holds, so an alert is raised and delivered once, and
-  sets `cleared_at` when it ends. A later raise of the same key
-  replaces the row and is delivered again. The kinds so far:
-  - `friend_unreachable`, subject the friend: its place has been
-    `retrying` (a network error) for longer than
-    `alerts.unreachable_after` (24h), counted from the place's `since`.
+  the condition holds, so an alert is raised once, and sets
+  `cleared_at` when it ends. A later raise of the same key replaces the
+  row, counts up its `raise_no` and is delivered again. The kinds so far:
+  - `friend_unreachable`, subject the friend: its place is `retrying`
+    (a network error) and has not answered for longer than
+    `alerts.unreachable_after` (24h), counted from its `last_ok`, or
+    from `since` when it never answered. A friend that went off at t0,
+    tried next by a backup at t0+20h, is alerted at t0+24h.
     Reachability is learned only from replication attempts, so a friend
-    with nothing queued is not judged until a probe exists;
+    with nothing queued is not judged until the periodic reachability
+    probe (#65);
   - `store_unreadable`, no subject: a place waits with condition
     `store` (§3.4 *Local errors*);
   - `objects_not_replicated`, subject the bucket: objects refused
@@ -2200,26 +2203,36 @@ capture decorator, so nothing stands between that and posix (#62).
     (EP-11, a `BadDigest` for bytes that match, #57), until written
     again.
   Later tickets add a kind to `alert.kinds` and its condition to the
-  evaluator. Each raise is delivered once to each configured channel,
-  recorded in `hook_at` and `webhook_at`, so a restarted daemon
-  delivers what was not delivered and nothing twice. A cleared alert
+  evaluator. Each raise is delivered at least once to each configured
+  channel: success is recorded in `hook_at` or `webhook_at` against
+  that raise's `raise_no` (so the send of an earlier raise never marks
+  a later one, even within the same second), and a restarted daemon
+  delivers what is not recorded. A crash between a send and its
+  record, or a record that fails, delivers that raise again. A cleared alert
   is not delivered (decided for #13: the minimal option; the
   `event` field leaves room for `cleared`). The body is
   `alert.Message`, JSON:
   `{"schema":1,"event":"raised","kind":…,"subject":…,"message":…,"raised_at":RFC 3339 UTC,"node":node ID}`
   (`subject` omitted when empty; fields are added, never renamed).
-  `alerts.command` is a program run without a shell, the body on
-  stdin, delivered on exit status 0; `alerts.webhook` receives the
-  same body as a `POST` with `Content-Type: application/json`,
-  delivered on a 2xx. Each attempt has 30 s; a failure is logged at
+  `alerts.command` is the absolute path of one executable program, run
+  with no arguments and no shell, the body on stdin, delivered on exit
+  status 0; `serve` refuses at startup anything else (a command line
+  with arguments, a file that is missing or not executable), saying to
+  put arguments in a small script. The hook runs in a process group of
+  its own, killed whole when its attempt times out, so nothing it
+  started outlives it. Its output (the first 512 bytes) is logged
+  when it fails, so a hook should not print secrets. `alerts.webhook`
+  receives the same body as a `POST` with `Content-Type:
+  application/json`, delivered on a 2xx; redirects are not followed,
+  so a 3xx is a failure. Each attempt has 30 s; a failure is logged at
   warn level and every undelivered channel is retried after a backoff
   of 1 s doubling to 5 minutes, for as long as the alert holds.
   Delivery runs on its own goroutine and the evaluator on another,
   both only reading and writing state, so neither replication nor the
   gateway ever waits for a hook or a webhook. The webhook URL may hold
   a secret (a healthchecks.io UUID, an ntfy topic): it is logged as
-  scheme and host only (`alert.Redact`), also inside errors, and a
-  config refusal never echoes it. `status` and `status --json`
+  scheme and host only (`alert.Redact`), also inside connection and
+  redirect errors, and a config refusal never echoes it. `status` and `status --json`
   (`alerts`: kind, subject, message, raised_at) show the pending
   alerts, also while the daemon is stopped.
 - **OPS-4** `prometheus/client_golang` on a loopback port, not started
