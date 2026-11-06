@@ -47,10 +47,11 @@ type Worker struct {
 	// PauseRetry is how long a place paused for quota or removed waits
 	// before trying again (default an hour, LEND-2).
 	PauseRetry time.Duration
-	// StoreStall is how long one read of the store may take while an
-	// object is sent or re-hashed before it fails as the store's failure
-	// (default 1 minute: half a friend's stall timeout, so a hung disk is
-	// not blamed on the friend, #61).
+	// StoreStall is how long one call into the store (opening and
+	// stating an object, stating its bucket's directory, one read while
+	// it is sent or re-hashed) may take before it fails as the store's
+	// failure (default 1 minute: half a friend's stall timeout, so a hung
+	// disk is not blamed on the friend, #61, #63).
 	StoreStall time.Duration
 	// OnRead, if set, is called after each read of a body sent to a
 	// place, with the bytes read so far. Tests only.
@@ -62,6 +63,9 @@ type Worker struct {
 	// open opens a file in the store; nil means os.Open. Tests set it to
 	// inject open, stat and read failures.
 	open func(name string) (fs.File, error)
+	// stat stats a bucket's directory in the store; nil means os.Stat.
+	// Tests set it to hang.
+	stat func(name string) (fs.FileInfo, error)
 }
 
 func (w *Worker) openFile(name string) (fs.File, error) {
@@ -70,6 +74,15 @@ func (w *Worker) openFile(name string) (fs.File, error) {
 	}
 	return os.Open(name)
 }
+
+func (w *Worker) statFile(name string) (fs.FileInfo, error) {
+	if w.stat != nil {
+		return w.stat(name)
+	}
+	return os.Stat(name)
+}
+
+func (w *Worker) storeStall() time.Duration { return orDefault(w.StoreStall, time.Minute) }
 
 func (w *Worker) now() time.Time {
 	if w.Now != nil {
@@ -380,7 +393,7 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	} else if sup {
 		return errSuperseded
 	}
-	body, done, err := w.openCaptured(p)
+	body, done, err := w.openCaptured(ctx, p)
 	if err != nil {
 		return err
 	}
@@ -388,7 +401,7 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	// A store read that does not return ends the body with an error, so
 	// the put fails as the store's failure before the client's stall
 	// timeout blames the place (#61).
-	sr := w.storeReader(body)
+	sr := w.storeReader(body, p.Size)
 	defer sr.Close()
 	body = sr
 	if w.OnRead != nil {
@@ -400,7 +413,7 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	}
 	if rerr := sr.failed(); rerr != nil {
 		// The place did not fail: reading the store did.
-		return w.unreadable(p, "reading", rerr)
+		return w.unreadable(ctx, p, "reading", rerr)
 	}
 	if errors.Is(err, ErrRejected) {
 		// The place says the bytes do not match the hash. Only the
@@ -418,8 +431,9 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 // the capture: a body of p.Size bytes and the function that closes it.
 // The error is errLocal only for what is definitely permanent (gone, a
 // directory or special file, another size, an escaping key, too large to
-// send), errStore for anything that may pass (#57).
-func (w *Worker) openCaptured(p state.Placement) (io.Reader, func(), error) {
+// send), errStore for anything that may pass (#57), including an open or
+// stat that does not return within Worker.StoreStall (#63).
+func (w *Worker) openCaptured(ctx context.Context, p state.Placement) (io.Reader, func(), error) {
 	name := filepath.FromSlash(p.Key)
 	if !filepath.IsLocal(name) {
 		return nil, nil, fmt.Errorf("%w: key %q does not name a file in the store", errLocal, p.Key)
@@ -431,23 +445,42 @@ func (w *Worker) openCaptured(p state.Placement) (io.Reader, func(), error) {
 	// local blames the object, unless the bucket's directory is
 	// unreadable too, which is the store's fault, not the object's.
 	local := func(format string, a ...any) error {
-		if err := w.storeReadable(p.Bucket); err != nil {
+		if err := w.storeReadable(ctx, p.Bucket); err != nil {
 			return err
 		}
 		return fmt.Errorf("%w: "+format, append([]any{errLocal}, a...)...)
 	}
-	f, err := w.openFile(filepath.Join(w.StoreDir, p.Bucket, name))
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+	// Opening and stating run on their own goroutine (storeCall); a stat
+	// that fails closes the file there, not here, where the close could
+	// hang on the same disk.
+	type opened struct {
+		f     fs.File
+		fi    fs.FileInfo
+		doing string // what failed: "opening" or "stating"
+	}
+	o, err := storeCall(ctx, w.storeStall(), "opening and stating "+p.Bucket+"/"+p.Key, func() (opened, error) {
+		f, err := w.openFile(filepath.Join(w.StoreDir, p.Bucket, name))
+		if err != nil {
+			return opened{doing: "opening"}, err
+		}
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return opened{doing: "stating"}, err
+		}
+		return opened{f: f, fi: fi}, nil
+	}, func(o opened) { o.f.Close() })
+	switch {
+	case ctx.Err() != nil:
+		return nil, nil, ctx.Err()
+	case err != nil && o.doing == "":
+		return nil, nil, fmt.Errorf("%w: %w", errStore, err) // it stalled
+	case o.doing == "opening" && (errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)):
 		return nil, nil, local("it is gone")
+	case err != nil:
+		return nil, nil, w.unreadable(ctx, p, o.doing, err)
 	}
-	if err != nil {
-		return nil, nil, w.unreadable(p, "opening", err)
-	}
-	fi, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, nil, w.unreadable(p, "stating", err)
-	}
+	f, fi := o.f, o.fi
 	var body io.Reader = f
 	switch {
 	case fi.IsDir() && strings.HasSuffix(p.Key, "/") && p.Size == 0:
@@ -471,19 +504,19 @@ func (w *Worker) openCaptured(p state.Placement) (io.Reader, func(), error) {
 // write outside lendisk changed it: VER-5), errStore when it cannot be
 // read now.
 func (w *Worker) verify(ctx context.Context, p state.Placement) error {
-	body, done, err := w.openCaptured(p)
+	body, done, err := w.openCaptured(ctx, p)
 	if err != nil {
 		return err
 	}
 	defer done()
-	sr := w.storeReader(body) // a hung re-hash is the store's failure too
+	sr := w.storeReader(body, p.Size) // a hung or short re-hash is the store's failure too
 	defer sr.Close()
 	h := sha256.New()
 	if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: sr}); err != nil {
 		if ctx.Err() != nil {
 			return err
 		}
-		return w.unreadable(p, "re-hashing", err)
+		return w.unreadable(ctx, p, "re-hashing", err)
 	}
 	if got := hex.EncodeToString(h.Sum(nil)); got != p.SHA256 {
 		return fmt.Errorf("%w: the store's copy no longer matches its capture hash (it hashes to %s; bit rot, or changed outside lendisk)",
@@ -494,8 +527,8 @@ func (w *Worker) verify(ctx context.Context, p state.Placement) error {
 
 // unreadable is errStore for a failure that may pass: opening, stating
 // or reading the object failed for another reason than its absence.
-func (w *Worker) unreadable(p state.Placement, doing string, err error) error {
-	if serr := w.storeReadable(p.Bucket); serr != nil {
+func (w *Worker) unreadable(ctx context.Context, p state.Placement, doing string, err error) error {
+	if serr := w.storeReadable(ctx, p.Bucket); serr != nil {
 		return serr
 	}
 	return fmt.Errorf("%w: %s %s/%s: %w", errStore, doing, p.Bucket, p.Key, err)
@@ -516,9 +549,15 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 
 // storeReadable checks that bucket's directory is in the store, so a
 // missing or unreadable object is the object's fault and not, say, a
-// store disk that is not mounted.
-func (w *Worker) storeReadable(bucket string) error {
-	fi, err := os.Stat(filepath.Join(w.StoreDir, bucket))
+// store disk that is not mounted. A stat that does not return within
+// Worker.StoreStall is the store's failure too (#63).
+func (w *Worker) storeReadable(ctx context.Context, bucket string) error {
+	fi, err := storeCall(ctx, w.storeStall(), "stating it", func() (fs.FileInfo, error) {
+		return w.statFile(filepath.Join(w.StoreDir, bucket))
+	}, nil)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if err == nil && !fi.IsDir() {
 		err = errors.New("not a directory")
 	}
@@ -535,18 +574,58 @@ func fileKind(fi os.FileInfo) string {
 	return "special file (" + fi.Mode().Type().String() + ")"
 }
 
-// storeReader reads body from the store on its own goroutine and hands
-// the bytes on through a pipe, so a store read that does not return
-// within Worker.StoreStall ends the body with an error at once (#61).
+// storeCall runs call, which touches the store, on its own goroutine, so
+// a call that does not return within stall fails at once, with an error
+// saying what did not return, and one still blocked when ctx ends does
+// not hold up the sender's stop (#63). The goroutine stuck in such a
+// call is left behind until the disk answers; drop, if set, then
+// releases what it returned.
+func storeCall[T any](ctx context.Context, stall time.Duration, what string, call func() (T, error), drop func(T)) (T, error) {
+	type result struct {
+		v   T
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		v, err := call()
+		ch <- result{v, err}
+	}()
+	t := time.NewTimer(stall)
+	defer t.Stop()
+	var err error
+	select {
+	case r := <-ch:
+		return r.v, r.err
+	case <-t.C:
+		err = fmt.Errorf("%s did not return for %v", what, stall)
+	case <-ctx.Done():
+		err = ctx.Err()
+	}
+	go func() {
+		if r := <-ch; r.err == nil && drop != nil {
+			drop(r.v)
+		}
+	}()
+	var zero T
+	return zero, err
+}
+
+// storeReader reads body, size bytes, from the store on its own
+// goroutine and hands the bytes on through a pipe, so a store read that
+// does not return within Worker.StoreStall ends the body with an error
+// at once (#61). A body that ends before size bytes (the file was
+// truncated under the sender) ends with the store's error too, not with
+// the friend's (#63).
 // Cancelling a put's context is not enough: net/http does not return
 // while the request body's Read is blocked. The goroutine stuck in such
 // a read is left behind until the disk answers; its bytes are dropped.
-func (w *Worker) storeReader(body io.Reader) *localReader {
-	stall := orDefault(w.StoreStall, time.Minute)
+func (w *Worker) storeReader(body io.Reader, size int64) *localReader {
+	stall := w.storeStall()
 	pr, pw := io.Pipe()
 	l := &localReader{pr: pr}
 	go func() {
 		buf := make([]byte, 32<<10)
+		var read int64
 		for {
 			t := time.AfterFunc(stall, func() {
 				err := fmt.Errorf("a read did not return for %v", stall)
@@ -556,6 +635,10 @@ func (w *Worker) storeReader(body io.Reader) *localReader {
 			n, err := body.Read(buf)
 			if !t.Stop() {
 				return // the stall ended the body
+			}
+			read += int64(n)
+			if err == io.EOF && read < size {
+				err = fmt.Errorf("the object ended after %d of %d bytes: %w", read, size, io.ErrUnexpectedEOF)
 			}
 			if n > 0 {
 				if _, werr := pw.Write(buf[:n]); werr != nil {

@@ -1003,3 +1003,179 @@ func TestHungStoreReadDoesNotHangTheRealClient(t *testing.T) {
 	waitFor(t, "ok", func() bool { return fx.condition(place).Condition == state.ConditionOK })
 	unhang()
 }
+
+// statHungFile is a store file whose Stat blocks until release is closed.
+type statHungFile struct {
+	fs.File
+	entered func()
+	release chan struct{}
+}
+
+func (f *statHungFile) Stat() (fs.FileInfo, error) {
+	f.entered()
+	<-f.release
+	return nil, errors.New("released")
+}
+
+// storeHang makes one of the store calls made before an object is read
+// block, while hung is set, until release is closed: opening the object,
+// stating it, or stating its bucket's directory (reached when opening
+// fails). entered is called when a call blocks.
+type storeHang struct {
+	name string
+	set  func(w *Worker, hung *atomic.Bool, entered func(), release chan struct{})
+}
+
+var storeHangs = []storeHang{
+	{"opening the object", func(w *Worker, hung *atomic.Bool, entered func(), release chan struct{}) {
+		w.open = func(name string) (fs.File, error) {
+			if hung.Load() {
+				entered()
+				<-release
+				return nil, errors.New("released")
+			}
+			return os.Open(name)
+		}
+	}},
+	{"stating the object", func(w *Worker, hung *atomic.Bool, entered func(), release chan struct{}) {
+		w.open = func(name string) (fs.File, error) {
+			f, err := os.Open(name)
+			if err != nil || !hung.Load() {
+				return f, err
+			}
+			return &statHungFile{File: f, entered: entered, release: release}, nil
+		}
+	}},
+	{"stating the bucket", func(w *Worker, hung *atomic.Bool, entered func(), release chan struct{}) {
+		w.open = func(name string) (fs.File, error) {
+			if hung.Load() {
+				return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EIO}
+			}
+			return os.Open(name)
+		}
+		w.stat = func(name string) (fs.FileInfo, error) {
+			if hung.Load() {
+				entered()
+				<-release
+				return nil, errors.New("released")
+			}
+			return os.Stat(name)
+		}
+	}},
+}
+
+// REPL-3, OPS-1 (#63): opening or stating an object, or stating its
+// bucket's directory, that never returns is bounded like a read: the
+// place shows store, the failure is alerted, and the sender is not stuck
+// behind the disk.
+func TestHungStoreOpenOrStatIsTheStoresFault(t *testing.T) {
+	for _, h := range storeHangs {
+		t.Run(h.name, func(t *testing.T) {
+			fx := newFixture(t, "B")
+			fx.w.StoreStall = 30 * time.Millisecond
+			logs := fx.logTo()
+			fx.write("laptop", "data/1", "one")
+			release := make(chan struct{})
+			var hung atomic.Bool
+			hung.Store(true)
+			h.set(fx.w, &hung, func() {}, release)
+			fx.run()
+			t.Cleanup(func() { close(release) }) // runs before the worker stops
+			waitFor(t, "store", func() bool { return fx.condition("B").Condition == state.ConditionStore })
+			if c := fx.condition("B"); !strings.Contains(c.Detail, "did not return") {
+				t.Fatalf("condition %+v", c)
+			}
+			if len(logs.alerts("store")) == 0 {
+				t.Fatal("not alerted")
+			}
+			hung.Store(false)
+			fx.drained("B")
+			waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
+		})
+	}
+}
+
+// REPL-3, OPS-1 (#63): stopping the worker while a store open or stat
+// blocks returns at once, long before the stall rule would end it.
+func TestHungStoreOpenOrStatDoesNotBlockShutdown(t *testing.T) {
+	for _, h := range storeHangs {
+		t.Run(h.name, func(t *testing.T) {
+			fx := newFixture(t, "B")
+			fx.w.StoreStall = time.Hour
+			fx.write("laptop", "data/1", "one")
+			release := make(chan struct{})
+			t.Cleanup(func() { close(release) })
+			var hung atomic.Bool
+			hung.Store(true)
+			entered := make(chan struct{}, 1)
+			h.set(fx.w, &hung, func() {
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+			}, release)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan struct{})
+			go func() { defer close(done); fx.w.Run(ctx) }()
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the store call was not made")
+			}
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the worker did not stop while a store call blocked")
+			}
+		})
+	}
+}
+
+// truncatedFile is a store file that ends after its first byte, though
+// it stated its full size.
+type truncatedFile struct {
+	fs.File
+	read bool
+}
+
+func (f *truncatedFile) Read(p []byte) (int, error) {
+	if f.read {
+		return 0, io.EOF
+	}
+	f.read = true
+	return f.File.Read(p[:1])
+}
+
+// REPL-3, OPS-1 (#63): through the real friend client, an object that
+// ends early while it is sent (truncated under the sender) is the
+// store's failure, not the friend's: the place shows store, not
+// retrying.
+func TestTruncatedStoreReadIsTheStoresFault(t *testing.T) {
+	fx := newFixture(t)
+	self := newID(t)
+	friend, peer := tunnelLender(t, self, &recorder{})
+	place := peer.String()
+	if err := fx.db.AddFriendship(t.Context(), state.Friendship{Peer: place, Address: "tc", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	fx.w.Connect = func(state.Friendship) (Replica, error) { return friend, nil }
+	fx.write("laptop", "data/1", "one")
+	var truncated atomic.Bool
+	truncated.Store(true)
+	fx.w.open = func(name string) (fs.File, error) {
+		f, err := os.Open(name)
+		if err != nil || !truncated.Load() {
+			return f, err
+		}
+		return &truncatedFile{File: f}, nil
+	}
+	fx.run()
+	waitFor(t, "store", func() bool { return fx.condition(place).Condition == state.ConditionStore })
+	if c := fx.condition(place); !strings.Contains(c.Detail, "1 of 3 bytes") {
+		t.Fatalf("condition %+v", c)
+	}
+	truncated.Store(false)
+	fx.drained(place)
+	waitFor(t, "ok", func() bool { return fx.condition(place).Condition == state.ConditionOK })
+}
