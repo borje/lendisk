@@ -47,6 +47,11 @@ type Worker struct {
 	// PauseRetry is how long a place paused for quota or removed waits
 	// before trying again (default an hour, LEND-2).
 	PauseRetry time.Duration
+	// StoreStall is how long one read of the store may take while an
+	// object is sent before the send is cancelled as the store's failure
+	// (default 1 minute: half a friend's stall timeout, so a hung disk is
+	// not blamed on the friend, #61).
+	StoreStall time.Duration
 	// OnRead, if set, is called after each read of a body sent to a
 	// place, with the bytes read so far. Tests only.
 	OnRead func(place string, seq, read int64)
@@ -91,6 +96,11 @@ var errSuperseded = errors.New("superseded by a later write of the key")
 // it, retrying cannot help, so the row is refused for every place,
 // against its bucket (#50, #57).
 var errLocal = errors.New("the store cannot supply the captured object")
+
+// errOversize: the object is larger than one PUT carries. A local error
+// refused with cause oversize, which multipart replication (#23)
+// re-queues (state.RequeueOversize).
+var errOversize = fmt.Errorf("%w: larger than one PUT carries", errLocal)
 
 // errStore: the store cannot be read now: the bucket's directory is
 // missing (a disk not mounted), or opening, stating or reading the
@@ -194,16 +204,22 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	minB, maxB := orDefault(w.MinBackoff, time.Second), orDefault(w.MaxBackoff, 5*time.Minute)
 	pause := orDefault(w.PauseRetry, time.Hour)
 	backoff := minB
+	// failing is the kind of failure the last outcome was ("store",
+	// "network"), or "" for any other outcome: the first failure of a
+	// kind after anything else is alerted and backs off from minB, so a
+	// store failure is alerted whatever the network did before (#61).
+	failing := ""
 	log := w.Log.With("place", place)
-	// stale: the place's recorded condition may not be ok, so an empty
-	// FIFO resets it (#57). True at start for a condition left by an
-	// earlier run.
+	// stale: the place may be recorded as waiting on the store, so an
+	// empty FIFO resets it (#57). True at start for a condition left by
+	// an earlier run. Only the store condition is reset: the others are
+	// the place's own answer (#61).
 	stale := true
 	condition := func(c, detail string) {
 		if err := w.DB.SetPlaceCondition(context.Background(), place, c, detail, w.now()); err != nil {
 			log.Error("replication: recording the place's condition failed", "err", err)
 		}
-		stale = c != state.ConditionOK
+		stale = c == state.ConditionStore
 	}
 	for ctx.Err() == nil {
 		p, ok, err := w.DB.NextPlacement(ctx, place)
@@ -216,7 +232,8 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		}
 		if !ok {
 			// Its rows went for another reason than its answer (refused
-			// for the store by another sender): nothing waits for it.
+			// for the store by another sender): the store no longer holds
+			// it up.
 			if stale {
 				if err := w.DB.ResetPlaceCondition(context.Background(), place, w.now()); err != nil {
 					log.Error("replication: resetting the place's condition failed", "err", err)
@@ -224,7 +241,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 					stale = false
 				}
 			}
-			backoff = minB
+			failing = ""
 			sleep(ctx, poll)
 			continue
 		}
@@ -232,6 +249,8 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		if ctx.Err() != nil {
 			return // stopping; the row stays queued
 		}
+		prev := failing
+		failing = ""
 		row := []any{"bucket", p.Bucket, "key", p.Key, "seq", p.Seq, "op", p.Op}
 		bg := context.Background()
 		switch {
@@ -246,7 +265,6 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				continue
 			}
 			condition(state.ConditionOK, "")
-			backoff = minB
 			log.Debug("replicated", row...)
 		case errors.Is(err, errSuperseded):
 			if err := w.DB.CancelPlacement(bg, place, p.Seq); err != nil {
@@ -268,20 +286,23 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			// Nothing will make the store supply the captured bytes, so
 			// waiting would stall every place's FIFO for good (#48, #50).
 			w.refuseObject(log, p, row, err)
-			backoff = minB
 		case errors.Is(err, ErrRejected):
 			// send re-hashed the store's copy and it matches the capture:
 			// the place is at fault, and only its copy is refused (#57).
 			w.refuse(log, place, p, row, err, "replication alert: the place rejects bytes that match their capture hash; not replicated there")
 			condition(state.ConditionOK, "") // the place answered
-			backoff = minB
 		case errors.Is(err, errStore):
 			// Retried for as long as it lasts, never refused: what may pass
 			// (EMFILE, EACCES, a disk dropping out) must not lose an
-			// object for good. Alerted on the first failure in a row and
-			// shown as the place's condition (#57).
+			// object for good. Alerted on the first store failure after
+			// any other outcome, whatever the network backoff was, and
+			// shown as the place's condition (#57, #61).
+			failing = "store"
+			if prev != failing {
+				backoff = minB
+			}
 			attrs := append(row, "err", err, "retry_in", backoff)
-			if backoff == minB {
+			if prev != failing {
 				log.Error("replication alert: this node's store cannot be read; waiting", append(attrs, "alert", true)...)
 			} else {
 				log.Debug("replication: this node's store cannot be read; waiting", attrs...)
@@ -298,8 +319,10 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			condition(state.ConditionRemoved, err.Error())
 			sleep(ctx, pause)
 		default:
+			failing = "network"
 			level := slog.LevelDebug
-			if backoff == minB {
+			if prev != failing {
+				backoff = minB
 				level = slog.LevelWarn // the first failure in a row
 			}
 			log.Log(ctx, level, "replication: sending failed; retrying", append(row, "err", err, "retry_in", backoff)...)
@@ -324,7 +347,11 @@ func (w *Worker) refuse(log *slog.Logger, place string, p state.Placement, row [
 // log (alert delivery is #13), once: when another place's sender
 // refused it first, this one only logs at debug level.
 func (w *Worker) refuseObject(log *slog.Logger, p state.Placement, row []any, err error) {
-	refused, rerr := w.DB.RefuseObject(context.Background(), p.Seq, err.Error())
+	cause := state.CauseStore
+	if errors.Is(err, errOversize) {
+		cause = state.CauseOversize // multipart replication re-queues it (#23)
+	}
+	refused, rerr := w.DB.RefuseObject(context.Background(), p.Seq, cause, err.Error())
 	if rerr != nil {
 		log.Error("replication: recording a refusal failed", append(row, "err", rerr)...)
 	}
@@ -358,12 +385,16 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		return err
 	}
 	defer done()
-	lr := &localReader{r: body}
+	// A store read that does not return cancels the put as the store's
+	// failure, before the client's stall timeout blames the place (#61).
+	pctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	lr := &localReader{r: body, stall: orDefault(w.StoreStall, time.Minute), cancel: cancel}
 	body = lr
 	if w.OnRead != nil {
 		body = &observed{r: body, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
 	}
-	err = r.Put(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Body: body})
+	err = r.Put(pctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Body: body})
 	if ctx.Err() != nil || err == nil {
 		return err
 	}
@@ -394,8 +425,8 @@ func (w *Worker) openCaptured(p state.Placement) (io.Reader, func(), error) {
 		return nil, nil, fmt.Errorf("%w: key %q does not name a file in the store", errLocal, p.Key)
 	}
 	if p.Size > MaxPutSize {
-		return nil, nil, fmt.Errorf("%w: %d bytes is more than one PUT carries (%d) and multipart replication is not built yet (#23)",
-			errLocal, p.Size, int64(MaxPutSize))
+		return nil, nil, fmt.Errorf("%w: %d bytes is more than %d and multipart replication is not built yet (#23)",
+			errOversize, p.Size, int64(MaxPutSize))
 	}
 	// local blames the object, unless the bucket's directory is
 	// unreadable too, which is the store's fault, not the object's.
@@ -503,22 +534,39 @@ func fileKind(fi os.FileInfo) string {
 }
 
 // localReader remembers a read error from the store, which the client
-// would otherwise report as its own failure. The HTTP transport may
-// still be reading when Put returns, hence the lock.
+// would otherwise report as its own failure. A read that does not return
+// within stall is such an error too: it calls cancel, which ends the put
+// (#61). The HTTP transport may still be reading when Put returns, hence
+// the lock.
 type localReader struct {
-	r   io.Reader
-	mu  sync.Mutex
-	err error
+	r      io.Reader
+	stall  time.Duration
+	cancel func()
+	mu     sync.Mutex
+	err    error
 }
 
 func (l *localReader) Read(p []byte) (int, error) {
+	t := time.AfterFunc(l.stall, func() {
+		l.fail(fmt.Errorf("a read did not return for %v", l.stall))
+		l.cancel()
+	})
 	n, err := l.r.Read(p)
+	t.Stop()
 	if err != nil && err != io.EOF {
-		l.mu.Lock()
-		l.err = err
-		l.mu.Unlock()
+		l.fail(err)
 	}
 	return n, err
+}
+
+// fail keeps the first error: a hung read that fails once the file is
+// closed is still the hang.
+func (l *localReader) fail(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err == nil {
+		l.err = err
+	}
 }
 
 func (l *localReader) failed() error {
