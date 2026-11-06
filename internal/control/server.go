@@ -82,9 +82,13 @@ func (s *Server) method(w http.ResponseWriter, r *http.Request, m string) bool {
 // the redeeming node's own key is the one its address names, proven by
 // RedeemProof. The invite is marked used by that key in the transaction
 // that stores the friendship, and the invite key's connection is closed
-// after the answer (SEC-13). Until the invite expires the same proven
-// key may redeem it again and gets the same terms, since it may have
-// lost the answer (#51); any other key is refused (state.RedeemInvite).
+// after the answer (SEC-13).
+//
+// The proven key may have lost the answer (#51, #56): if it is a friend
+// already, any unexpired invite answers it with that friendship's terms
+// (state.RedeemInvite). The proof binds the invite key of this
+// connection, so one seen elsewhere does not carry over. Every other
+// key is refused.
 func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 	w.Header().Set("Connection", "close")
 	if c.Role != state.RoleInvite {
@@ -134,7 +138,7 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 	if s.Changed != nil {
 		s.Changed()
 	}
-	s.Log.Info("invite redeemed; new friend", "peer", f.Peer, "quota", f.Quota())
+	s.Log.Info("invite redeemed", "peer", f.Peer, "quota", f.Quota())
 	writeJSON(w, http.StatusOK, RedeemResponse{Number: f.OwnNumber, RetentionSeconds: int64(f.OwnRetention / time.Second)})
 }
 

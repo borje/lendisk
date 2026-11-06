@@ -3,8 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -373,4 +375,239 @@ func filesHolding(n *node, needle string) []string {
 		return nil
 	})
 	return found
+}
+
+// openDB opens n's lendisk.db alongside whatever else has it open.
+func openDB(t *testing.T, n *node) *state.DB {
+	t.Helper()
+	db, err := state.Open(t.Context(), n.data, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db
+}
+
+func countRows(t *testing.T, n *node, table string) int {
+	t.Helper()
+	var c int
+	if err := openDB(t, n).QueryRow(`SELECT count(*) FROM ` + table).Scan(&c); err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// loseAnswer runs B's peer add with s while the answer is dropped and
+// checks that A alone holds the friendship.
+func loseAnswer(t *testing.T, a, b *node, s, number string) {
+	t.Helper()
+	had := len(a.peers())
+	b.redeemTransport = func(rt http.RoundTripper) http.RoundTripper { return lostAnswer{rt} }
+	defer func() { b.redeemTransport = nil }()
+	code, _, errOut := b.run(number+"\n", "", "peer", "add", s)
+	if code == 0 || !strings.Contains(errOut, "run the same `lendisk peer add` again") {
+		t.Fatalf("lost answer: %d %s", code, errOut)
+	}
+	if len(a.peers()) != had+1 || len(b.peers()) != 0 {
+		t.Fatal("the dropped answer did not leave a one-sided friendship")
+	}
+}
+
+// PEER-2, #56: the answer is lost and the invite expires (and is
+// purged) before B runs peer add again. The invite key is no longer
+// admitted, so the re-run cannot reach A: it says A may count B as a
+// friend already and to ask for a new invite, keeping its record. A
+// new invite then heals both sides and clears every record.
+func TestExpiredInviteRerunAsksForNewInviteWhichHeals(t *testing.T) {
+	a, b := friendNode(t), friendNode(t)
+	stop := a.serveLogged()
+	defer stop()
+	s := a.invite("--quota", "80G")
+	loseAnswer(t, a, b, s, "100G")
+
+	// Eight days on, `invite` purges the expired one first (SEC-6).
+	a.clock = func() time.Time { return time.Now().Add(8 * 24 * time.Hour) }
+	a.invite("--quota", "1G")
+	a.clock = nil
+	inv, _ := invite.Parse(s)
+	key, _ := inv.Key()
+	if role, err := openDB(t, a).PeerRole(t.Context(), key.NodeID().String(), time.Now()); err != nil || role != state.RoleNone {
+		t.Fatalf("the expired invite's key still has role %q (%v)", role, err)
+	}
+
+	b.dialTimeout = 5 * time.Second
+	code, out, errOut := b.run("", "", "peer", "add", s)
+	if code == 0 || !strings.Contains(out, "Resuming") {
+		t.Fatalf("re-run after expiry: %d\n%s%s", code, out, errOut)
+	}
+	for _, want := range []string{"invite has expired", "may already count you as a friend", "Ask them for a new invite"} {
+		if !strings.Contains(errOut, want) {
+			t.Fatalf("re-run after expiry does not say %q:\n%s", want, errOut)
+		}
+	}
+	if n := countRows(t, b, "pending_redeem"); n != 1 || len(b.peers()) != 0 {
+		t.Fatalf("after the re-run: %d pending redeems, %d friends", n, len(b.peers()))
+	}
+
+	s2 := a.invite("--quota", "60G")
+	code, out, errOut = b.run("100G\n", "", "peer", "add", s2)
+	if code != 0 {
+		t.Fatalf("peer add with the new invite: %d %s", code, errOut)
+	}
+	if !strings.Contains(out, key.NodeID().String()) {
+		t.Fatalf("peer add did not name the expired invite's redeem:\n%s", out)
+	}
+	assertHealed(t, a, b, 100<<30)
+	if n := countRows(t, b, "pending_redeem"); n != 0 {
+		t.Fatalf("%d pending redeems left", n)
+	}
+}
+
+// PEER-2, #56: the answer is lost and B's user asks A for a new invite.
+// B names the earlier invite's unfinished redeem, A answers with the
+// friendship it holds (not the new invite's terms) and consumes the new
+// invite, and B writes the friendship and drops every pending redeem.
+func TestLostAnswerHealsWithNewInvite(t *testing.T) {
+	a, b, c := friendNode(t), friendNode(t), friendNode(t)
+	stop := a.serveLogged()
+	defer stop()
+	s1 := a.invite("--quota", "80G")
+	loseAnswer(t, a, b, s1, "100G")
+	inv1, _ := invite.Parse(s1)
+	key1, _ := inv1.Key()
+
+	s2 := a.invite("--quota", "60G")
+	code, out, errOut := b.run("100G\n", "", "peer", "add", s2)
+	if code != 0 {
+		t.Fatalf("peer add with a new invite: %d %s", code, errOut)
+	}
+	if !strings.Contains(out, "unfinished redeem") || !strings.Contains(out, key1.NodeID().String()) {
+		t.Fatalf("peer add did not name the earlier invite's redeem:\n%s", out)
+	}
+	assertHealed(t, a, b, 100<<30) // A's 80G, from the first invite
+	if n := countRows(t, b, "pending_redeem"); n != 0 {
+		t.Fatalf("%d pending redeems left", n)
+	}
+
+	// The new invite is spent: another node is refused it.
+	c.dialTimeout = 10 * time.Second
+	if code, _, errOut := c.run("\n", "", "peer", "add", s2); code == 0 || !strings.Contains(errOut, "already used or has expired") {
+		t.Fatalf("another node redeemed the healing invite: %d %s", code, errOut)
+	}
+	if len(a.peers()) != 1 || len(c.peers()) != 0 {
+		t.Fatal("the healing invite made a second friendship")
+	}
+}
+
+// PEER-2, SEC-13, #56: only the proven friend learns its friendship.
+// A third key holding a new invite cannot pass as B, not with B's
+// proof from another exchange either, and a friend's own key cannot
+// redeem at all. The refused attempts leave the new invite unused, and
+// B then heals with it.
+func TestThirdKeyWithNewInviteRefused(t *testing.T) {
+	a, b, c, d := friendNode(t), friendNode(t), friendNode(t), friendNode(t)
+	stop := a.serveLogged()
+	defer stop()
+	befriend(t, a, d)
+	s1 := a.invite("--quota", "80G")
+	loseAnswer(t, a, b, s1, "100G")
+	if len(a.peers()) != 2 {
+		t.Fatalf("A has %d friends", len(a.peers()))
+	}
+	inv1, _ := invite.Parse(s1)
+	key1, _ := inv1.Key()
+
+	s2 := a.invite("--quota", "80G")
+	inv2, _ := invite.Parse(s2)
+	key2, _ := inv2.Key()
+	aKey, _ := transport.KeyOf(inv2.Address)
+	bAddr, cAddr, dAddr := b.status().Node.Address, c.status().Node.Address, d.status().Node.Address
+	bID, cID, dID := b.identity(), c.identity(), d.identity()
+	proof := func(self *identity.Identity, invKey identity.NodeID) []byte {
+		p, err := control.RedeemProof(self, aKey, invKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	redeem := func(cl *control.Client, addr string, proof []byte) error {
+		_, err := cl.Redeem(t.Context(), control.RedeemRequest{Address: addr, Number: 1 << 30,
+			RetentionSeconds: 86400, Proof: proof})
+		return err
+	}
+	refused := func(what string, err error) {
+		t.Helper()
+		var ce *control.CallError
+		if !errors.As(err, &ce) || ce.Status != http.StatusForbidden {
+			t.Fatalf("%s: %v, want 403", what, err)
+		}
+	}
+	viaInvite := tunnelClient(t, key2, inv2.Address)
+	refused("C as B, its own proof", redeem(viaInvite, bAddr, proof(cID, key2.NodeID())))
+	refused("C as B, B's proof of the first invite", redeem(viaInvite, bAddr, proof(bID, key1.NodeID())))
+	refused("C as B, no proof", redeem(viaInvite, bAddr, nil))
+
+	viaD := tunnelClient(t, dID, inv2.Address)
+	refused("D's own key as B", redeem(viaD, bAddr, proof(dID, dID.NodeID())))
+	refused("D's own key as C", redeem(viaD, cAddr, proof(dID, dID.NodeID())))
+	refused("D's own key, no proof", redeem(viaD, dAddr, nil))
+	refused("D's own key for itself", redeem(viaD, dAddr, proof(dID, dID.NodeID())))
+
+	if len(a.peers()) != 2 {
+		t.Fatalf("A has %d friends", len(a.peers()))
+	}
+	var used sql.NullInt64
+	openDB(t, a).QueryRow(`SELECT used_at FROM invite WHERE invite_key = ?`, key2.NodeID().String()).Scan(&used)
+	if used.Valid {
+		t.Fatal("a refused redeem used the new invite")
+	}
+	if code, _, errOut := b.run("100G\n", "", "peer", "add", s2); code != 0 {
+		t.Fatalf("B with the new invite: %d %s", code, errOut)
+	}
+	if bp := b.peers(); len(a.peers()) != 2 || len(bp) != 1 || bp[0].PeerNumber != 80<<30 {
+		t.Fatalf("B's peers %+v", bp)
+	}
+}
+
+// inProgress reads as the user's Enter, after another peer add has
+// started the redeem of the same invite.
+type inProgress struct {
+	t    *testing.T
+	b    *node
+	key  string
+	peer string
+	done bool
+}
+
+func (r *inProgress) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	if err := openDB(r.t, r.b).StartRedeem(r.t.Context(), state.PendingRedeem{InviteKey: r.key, Peer: r.peer,
+		Number: 1 << 30, Retention: time.Hour, StartedAt: time.Now()}); err != nil {
+		r.t.Fatal(err)
+	}
+	return copy(p, "\n"), nil
+}
+
+// #56: two peer adds of one invite at once; the one that finds the
+// redeem started under it while it asked says so.
+func TestConcurrentPeerAddSaysInProgress(t *testing.T) {
+	a, b := friendNode(t), friendNode(t)
+	stop := a.serveLogged()
+	defer stop()
+	s := a.invite("--quota", "80G")
+	inv, _ := invite.Parse(s)
+	key, _ := inv.Key()
+	them, _ := transport.KeyOf(inv.Address)
+	b.stdin = &inProgress{t: t, b: b, key: key.NodeID().String(), peer: them.String()}
+	code, _, errOut := b.run("", "", "peer", "add", s)
+	b.stdin = nil
+	if code == 0 || !strings.Contains(errOut, "a redeem of this invite is already in progress") {
+		t.Fatalf("concurrent peer add: %d %s", code, errOut)
+	}
+	if len(a.peers()) != 0 {
+		t.Fatal("the losing peer add redeemed")
+	}
 }
