@@ -310,3 +310,64 @@ func TestUsageErrorExitCode(t *testing.T) {
 		t.Fatalf("bad setting exit %d, want 1", code)
 	}
 }
+
+// AGENTS.md: cobra's own usage errors (a missing or extra argument, an
+// unknown subcommand) exit 2, like a bad flag.
+func TestCobraUsageErrorsExitTwo(t *testing.T) {
+	n := newNode(t)
+	for _, args := range [][]string{
+		{"bucket", "add"},          // missing argument
+		{"status", "extra"},        // argument where none is taken
+		{"no-such-command"},        // unknown command
+		{"bucket", "no-such-verb"}, // unknown subcommand
+		{"bucket", "help", "nope"}, // help for an unknown subcommand
+	} {
+		if code, _, e := n.run("", "", args...); code != 2 {
+			t.Errorf("%v: exit %d, want 2 (%s)", args, code, e)
+		}
+	}
+	// A command group on its own still prints its help.
+	for _, args := range [][]string{{}, {"bucket"}, {"bucket", "help"}, {"peer", "help"}, {"help", "bucket"}} {
+		if code, out, e := n.run("", "", args...); code != 0 || !strings.Contains(out, "Available Commands") {
+			t.Errorf("%v: exit %d, want 0 and help (%s%s)", args, code, out, e)
+		}
+	}
+	if code, out, e := n.run("", "", "bucket", "help", "add"); code != 0 || !strings.Contains(out, "bucket add") {
+		t.Errorf("bucket help add: exit %d (%s%s)", code, out, e)
+	}
+}
+
+// EP-12: status reports the linked versitygw and tailcat versions, as
+// go.sum pins them.
+func TestStatusReportsVersitygwAndTailcatVersions(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(t)
+	st := n.status()
+	if !strings.HasPrefix(st.Versions.Versitygw, "v1.") {
+		t.Errorf("versitygw version %q", st.Versions.Versitygw)
+	}
+	if !strings.HasPrefix(st.Versions.Tailcat, "v0.") {
+		t.Errorf("tailcat version %q", st.Versions.Tailcat)
+	}
+	_, out, _ := n.run("", "", "status")
+	if !strings.Contains(out, "tailcat "+st.Versions.Tailcat) {
+		t.Errorf("status does not name the tailcat version:\n%s", out)
+	}
+}
+
+// SEC-16's search (filesHolding) finds a needle in a file's contents,
+// in a file's name and in a directory's name.
+func TestFileSearchFindsNamesAndContents(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(t)
+	if err := os.MkdirAll(filepath.Join(n.data, "store", "lent-NEEDLEDIR"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(n.data, "x-NEEDLEFILE"), nil, 0o600)
+	os.WriteFile(filepath.Join(n.data, "plain"), []byte("..NEEDLEBODY.."), 0o600)
+	for _, needle := range []string{"NEEDLEDIR", "NEEDLEFILE", "NEEDLEBODY"} {
+		if got := filesHolding(n, needle); len(got) != 1 {
+			t.Errorf("search for %s found %v, want one path", needle, got)
+		}
+	}
+}

@@ -108,7 +108,7 @@ func TestBadProfileFileRefused(t *testing.T) {
 	}
 }
 
-func TestGlob(t *testing.T) {
+func TestGlobStarMatchesAcrossSlashesQuestionMatchesOne(t *testing.T) {
 	cases := []struct {
 		pattern, key string
 		match        bool

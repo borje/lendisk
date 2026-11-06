@@ -3,9 +3,10 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
-
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -110,6 +111,24 @@ type LAN struct {
 	Log       *slog.Logger
 	Lookup    Lookup        // nil means InterfaceAddrs
 	Poll      time.Duration // zero means 10s
+	// Clock dates and Random makes the generated certificate; nil means
+	// time.Now and crypto/rand.
+	Clock  func() time.Time
+	Random io.Reader
+}
+
+func (l *LAN) now() time.Time {
+	if l.Clock == nil {
+		return time.Now()
+	}
+	return l.Clock()
+}
+
+func (l *LAN) random() io.Reader {
+	if l.Random == nil {
+		return rand.Reader
+	}
+	return l.Random
 }
 
 type lanListener struct {
@@ -174,7 +193,7 @@ func (l *LAN) Run(ctx context.Context, ready chan<- struct{}) error {
 		}
 		sortIPs(ips)
 		if len(ips) > 0 && !slices.EqualFunc(ips, genIPs, net.IP.Equal) {
-			pair, changed, err := ensureCert(l.ConfigDir, ips, names)
+			pair, changed, err := ensureCert(l.ConfigDir, ips, names, l.now(), l.random())
 			if err != nil {
 				return fmt.Errorf("endpoint certificate: %w", err)
 			}

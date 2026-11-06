@@ -195,7 +195,7 @@ func TestDowngradeOneMinor(t *testing.T) {
 	db.Close()
 }
 
-func TestCheckMigrations(t *testing.T) {
+func TestMigrationGapsAndBadCompatRefused(t *testing.T) {
 	bad := [][]Migration{
 		{{Version: 2, Compat: 1}},
 		{{Version: 1, Compat: 2}},

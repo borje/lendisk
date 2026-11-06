@@ -320,7 +320,7 @@ func TestCrashDuringResticBackup(t *testing.T) {
 			t.Errorf("%s is in the store but not queued", key)
 		case len(puts) != 1 || es[len(es)-1].Op != state.OpPut:
 			t.Errorf("%s has %d entries (%d puts), want exactly one put: %+v", key, len(es), len(puts), es)
-		case puts[0].Upload == "" && puts[0].SHA256 != sum:
+		case puts[0].SHA256 != sum: // multipart too: the whole object is hashed (§3.3)
 			t.Errorf("%s queued with hash %s, store has %s", key, puts[0].SHA256, sum)
 		}
 	}

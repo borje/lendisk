@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -40,6 +41,16 @@ type Migration struct {
 type DB struct {
 	*sql.DB
 	Path string
+	// Clock stamps the rows the queue writes (created_at, acked_at); nil
+	// means time.Now. Tests set it.
+	Clock func() time.Time
+}
+
+func (db *DB) now() time.Time {
+	if db.Clock == nil {
+		return time.Now()
+	}
+	return db.Clock()
 }
 
 // ErrTooNew means the database was migrated by a release this binary

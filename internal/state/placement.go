@@ -71,7 +71,7 @@ type Placement struct {
 // refusing. An older acknowledgement of the hash is not enough: a row of
 // other bytes sent since may have landed with its answer lost and then
 // been cancelled as superseded, which leaves no row behind.
-func placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) error {
+func placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool, now time.Time) error {
 	_, err := tx.ExecContext(ctx, `WITH c AS (
 		SELECT q.seq, f.peer_key AS place, q.bucket, q.key, q.op, q.sha256,
 			?2 AND q.op = 'put'
@@ -89,7 +89,7 @@ func placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) error {
 			CASE WHEN held THEN 'acked' ELSE 'queued' END,
 			CASE WHEN held THEN sha256 END,
 			CASE WHEN held THEN ?3 END
-		FROM c`, seq, heal, time.Now().Unix())
+		FROM c`, seq, heal, now.Unix())
 	return err
 }
 

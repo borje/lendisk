@@ -49,6 +49,7 @@ func (a *app) serveCmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
+			db.Clock = a.clock
 			if prev, ok, err := db.GetNode(ctx, "id"); err != nil {
 				return err
 			} else if ok && prev != nodeID {
@@ -79,7 +80,7 @@ func (a *app) serveCmd() *cobra.Command {
 			defer cancel()
 			errc := make(chan error, 4)
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
-				Profiles: profiles, AfterStore: a.afterStore}
+				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
 			select {
@@ -96,7 +97,8 @@ func (a *app) serveCmd() *cobra.Command {
 			tun.S3.Set(br.TunnelS3Handler()) // S3 for friends (NET-7, SEC-12)
 			// LAN listeners (EP-17); config load refuses them for a lender.
 			if len(cfg.Endpoint.Listen) > 0 {
-				lan := &bridge.LAN{Entries: cfg.Endpoint.Listen, ConfigDir: cfg.ConfigDir(), Handler: br.LANHandler(), Log: log}
+				lan := &bridge.LAN{Entries: cfg.Endpoint.Listen, ConfigDir: cfg.ConfigDir(), Handler: br.LANHandler(), Log: log,
+					Clock: a.clock, Random: a.random}
 				lanReady := make(chan struct{})
 				running++
 				go func() { errc <- lan.Run(ctx, lanReady) }()

@@ -75,7 +75,7 @@ func TestEverySettingHasFlagAndEnv(t *testing.T) {
 	}
 }
 
-func TestNames(t *testing.T) {
+func TestSettingFlagAndEnvNamesFollowTheKey(t *testing.T) {
 	for _, s := range settings() {
 		if s.key == "log.level" {
 			if s.Flag() != "log-level" || s.Env() != "LENDISK_LOG_LEVEL" {
@@ -97,7 +97,7 @@ func TestDefaultsWhenFileMissing(t *testing.T) {
 	}
 }
 
-func TestPrecedence(t *testing.T) {
+func TestFlagOverEnvOverFileOverDefault(t *testing.T) {
 	p := writeFile(t, "role = \"lender\"\n[log]\nlevel = \"warn\"\nformat = \"json\"\n")
 	e := map[string]string{EnvConfig: p, "LENDISK_LOG_LEVEL": "error", "LENDISK_LOG_FORMAT": "text"}
 	l, err := load(t, []string{"--log-format", "json"}, e)
@@ -121,7 +121,7 @@ func TestPrecedence(t *testing.T) {
 	}
 }
 
-func TestValidation(t *testing.T) {
+func TestInvalidSettingsAndSyntaxRefused(t *testing.T) {
 	cases := []string{
 		`role = "borrower"`,
 		"[log]\nlevel = \"loud\"",
@@ -187,7 +187,7 @@ func TestStoreAndEndpointSettings(t *testing.T) {
 	}
 }
 
-func TestParseFloor(t *testing.T) {
+func TestFloorParsesPercentOrSizeAndRefusesNonsense(t *testing.T) {
 	cases := map[string]Floor{"5%": {Percent: 5}, "0.5%": {Percent: 0.5}, "20G": {Bytes: 20 << 30}, "512MiB": {Bytes: 512 << 20}, "1000": {Bytes: 1000}}
 	for in, want := range cases {
 		got, err := ParseFloor(in)

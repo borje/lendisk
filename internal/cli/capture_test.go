@@ -42,7 +42,7 @@ metadata = ["config"]
 		t.Fatalf("status queues %+v", q)
 	}
 	_, text, _ := n.run("", "", "status")
-	if !strings.Contains(text, "queue 2 objects") {
+	if !strings.Contains(text, "captured 2 objects") {
 		t.Fatalf("status text:\n%s", text)
 	}
 }

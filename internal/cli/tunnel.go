@@ -54,7 +54,7 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		return nil, err
 	}
 	adm := transport.NewAdmission(func(ctx context.Context, peer identity.NodeID) (bool, error) {
-		r, err := db.PeerRole(ctx, peer.String(), time.Now())
+		r, err := db.PeerRole(ctx, peer.String(), a.now())
 		return r != state.RoleNone, err
 	}, log)
 	admit := adm.Admit
@@ -73,23 +73,23 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		ln.Close()
 	}()
 	roles := func(ctx context.Context, peer identity.NodeID) (state.Role, error) {
-		return db.PeerRole(ctx, peer.String(), time.Now())
+		return db.PeerRole(ctx, peer.String(), a.now())
 	}
 	ctl := &control.Server{DB: db, Self: id, Changed: adm.Clear, Log: log}
 	s3 := &bridge.Late{}
 	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(roles, ctl, s3, log), log)
-	go purgeInvites(ctx, db, adm, log)
+	go purgeInvites(ctx, db, adm, a.now, log)
 	log.Info("tunnel listening", "address", tc.Address(), "port", transport.Port, "region", region.RegionCode)
 	return &tunnel{Transport: tc, Admission: adm, S3: s3}, nil
 }
 
 // purgeInvites deletes expired invites at start and every minute after
 // (SEC-3, SEC-6), and clears admission when it deleted any (SEC-15).
-func purgeInvites(ctx context.Context, db *state.DB, adm *transport.Admission, log *slog.Logger) {
+func purgeInvites(ctx context.Context, db *state.DB, adm *transport.Admission, now func() time.Time, log *slog.Logger) {
 	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()
 	for {
-		n, err := db.PurgeInvites(ctx, time.Now())
+		n, err := db.PurgeInvites(ctx, now())
 		if err != nil && ctx.Err() == nil {
 			log.Warn("purging expired invites failed", "err", err)
 		}

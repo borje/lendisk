@@ -28,6 +28,16 @@ type IAM struct {
 	// resolves no node ID.
 	Self *identity.Identity
 	Log  *slog.Logger
+	// Clock decides whether a friendship is still valid; nil means
+	// time.Now.
+	Clock func() time.Time
+}
+
+func (i *IAM) now() time.Time {
+	if i.Clock == nil {
+		return time.Now()
+	}
+	return i.Clock()
 }
 
 var errAdmin = s3err.GetAPIError(s3err.ErrAdminMethodNotSupported)
@@ -56,7 +66,7 @@ func (i *IAM) friend(peer identity.NodeID) (auth.Account, error) {
 	if i.Self == nil {
 		return auth.Account{}, auth.ErrNoSuchUser
 	}
-	role, err := i.DB.PeerRole(context.Background(), peer.String(), time.Now())
+	role, err := i.DB.PeerRole(context.Background(), peer.String(), i.now())
 	if err != nil {
 		i.Log.Error("IAM lookup failed", "err", err)
 		return auth.Account{}, auth.ErrNoSuchUser

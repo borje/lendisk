@@ -15,6 +15,7 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/transport"
 	"github.com/borje/lendisk/internal/version"
 )
 
@@ -145,6 +146,7 @@ func lanListeners(cfg *config.Loaded) []StatusListener {
 // StatusVersions are the linked components' versions (EP-12).
 type StatusVersions struct {
 	Versitygw string `json:"versitygw"`
+	Tailcat   string `json:"tailcat"`
 }
 
 // StatusBucket is one of the node's own buckets.
@@ -152,7 +154,12 @@ type StatusBucket struct {
 	Name    string `json:"name"`
 	Profile string `json:"profile"`
 	Copies  int    `json:"copies"`
-	// Queue is the bucket's replication queue (REPL-3).
+	// Queue counts what the bucket captured (REPL-3): Objects and Bytes
+	// are every done queue row, puts and deletes, ever captured, and the
+	// bytes of its puts; queue rows are never removed once done (§3.4),
+	// so this is not the backlog, which is places[].queue. Pending is
+	// writes still in flight to the store. The name stays: status
+	// --json never renames.
 	Queue StatusQueue `json:"queue"`
 	// Refused counts objects not replicated because the store could not
 	// supply them as captured: gone, changed or rotted since capture, a
@@ -160,8 +167,9 @@ type StatusBucket struct {
 	Refused int64 `json:"refused"`
 }
 
-// StatusQueue is a bucket's replication queue: captured writes and
-// deletes (EP-2), and writes still in flight to the store.
+// StatusQueue is a count of queue rows and their bytes. For a bucket it
+// is every captured write and delete (EP-2) and the writes still in
+// flight to the store; for a place, what waits to be sent there.
 type StatusQueue struct {
 	Objects int64 `json:"objects"`
 	Bytes   int64 `json:"bytes"`
@@ -221,7 +229,7 @@ func (a *app) statusCmd() *cobra.Command {
 				Version:  version.Version,
 				Node:     StatusNode{ID: id.NodeID().String(), Role: cfg.Role, Address: nodeAddress(cmd.Context(), cfg, id, log)},
 				Paths:    StatusPaths{Config: cfg.ConfigDir(), Data: cfg.DataDir},
-				Versions: StatusVersions{Versitygw: gateway.Version()},
+				Versions: StatusVersions{Versitygw: gateway.Version(), Tailcat: transport.Version()},
 				Buckets:  []StatusBucket{},
 				Places:   []StatusPlace{},
 			}
@@ -251,7 +259,7 @@ func (a *app) statusCmd() *cobra.Command {
 				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name]})
 			}
-			if st.Places, err = places(cmd.Context(), db, time.Now()); err != nil {
+			if st.Places, err = places(cmd.Context(), db, a.now()); err != nil {
 				return err
 			}
 			if asJSON {
@@ -272,7 +280,7 @@ func (a *app) statusCmd() *cobra.Command {
 			}
 			fmt.Fprintf(a.out, "Buckets: %d\n", len(st.Buckets))
 			for _, b := range st.Buckets {
-				fmt.Fprintf(a.out, "  %s (%s, copies %d), queue %d objects, %d bytes", b.Name, b.Profile, b.Copies,
+				fmt.Fprintf(a.out, "  %s (%s, copies %d), captured %d objects, %d bytes", b.Name, b.Profile, b.Copies,
 					b.Queue.Objects, b.Queue.Bytes)
 				if b.Queue.Pending > 0 {
 					fmt.Fprintf(a.out, ", %d writes in flight", b.Queue.Pending)
@@ -296,7 +304,7 @@ func (a *app) statusCmd() *cobra.Command {
 				}
 				fmt.Fprintln(a.out)
 			}
-			fmt.Fprintf(a.out, "versitygw %s\n", st.Versions.Versitygw)
+			fmt.Fprintf(a.out, "versitygw %s, tailcat %s\n", st.Versions.Versitygw, st.Versions.Tailcat)
 			return nil
 		},
 	}

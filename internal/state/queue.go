@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
-	"time"
 )
 
 // Queue operations (REPL-1, REPL-2).
@@ -56,7 +55,7 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 		return nil, err
 	}
 	defer tx.Rollback()
-	now := time.Now().Unix()
+	now := db.now().Unix()
 	seqs := make([]int64, 0, len(cs))
 	for _, c := range cs {
 		r, err := tx.ExecContext(ctx, `INSERT INTO queue
@@ -114,7 +113,7 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 		_, err = tx.ExecContext(ctx, `UPDATE queue SET state = 'done', size = ?, sha256 = ?, token = NULL WHERE seq = ?`,
 			size, sha256, seq)
 		if err == nil {
-			err = placeTx(ctx, tx, seq, heal)
+			err = placeTx(ctx, tx, seq, heal, db.now())
 		}
 	}
 	if err != nil {
@@ -142,7 +141,7 @@ func (db *DB) FinishDelete(ctx context.Context, seqs ...int64) error {
 		if n, err := r.RowsAffected(); err != nil {
 			return err
 		} else if n == 1 {
-			if err := placeTx(ctx, tx, s, false); err != nil {
+			if err := placeTx(ctx, tx, s, false, db.now()); err != nil {
 				return err
 			}
 		}

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"path"
 	"strings"
 
 	"github.com/gofiber/fiber/v3"
@@ -40,6 +41,16 @@ func Gate() s3api.Option {
 // ControlPrefix is the control API's path on the tunnel (§3.7).
 const ControlPrefix = "/_lendisk/"
 
+// IsControlPath reports whether p names the control API once cleaned:
+// /_lendisk itself, or anything under it however spelled (//_lendisk/x,
+// /b/../_lendisk/x). The request is not rewritten; this only decides
+// whether to refuse it (#53).
+func IsControlPath(p string) bool {
+	c := path.Clean("/" + p)
+	prefix := strings.TrimSuffix(ControlPrefix, "/")
+	return c == prefix || strings.HasPrefix(c, prefix+"/")
+}
+
 // request is what the gate looks at.
 type request struct {
 	method, path string
@@ -52,7 +63,7 @@ func refuse(r request) string {
 	switch {
 	case r.method == http.MethodPatch:
 		return "lendisk: the admin API is not served"
-	case strings.HasPrefix(r.path, ControlPrefix):
+	case IsControlPath(r.path):
 		return "lendisk: control API not served here"
 	case r.method == http.MethodPut && strings.EqualFold(strings.TrimSpace(r.objectLock), "true"):
 		return "lendisk: object lock is not offered"

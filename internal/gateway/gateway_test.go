@@ -27,6 +27,11 @@ func TestGateRefuses(t *testing.T) {
 		{"PUT", "/newbucket", "true", true, false},
 		{"PUT", "/newbucket", " TRUE ", true, false},
 		{"GET", "/_lendisk/version", "", true, false},
+		// The control path however spelled, once cleaned (#53, #54).
+		{"GET", "//_lendisk/x", "", true, false},
+		{"GET", "/b/../_lendisk/x", "", true, false},
+		{"GET", "/./_lendisk/x", "", true, false},
+		{"GET", "/_lendisk", "", true, false},
 		{"PUT", "/newbucket", "", false, false},
 		{"PUT", "/newbucket", "false", false, false},
 		{"PUT", "/laptop/data/ab", "", false, false},

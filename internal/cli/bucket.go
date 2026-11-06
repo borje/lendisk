@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/base32"
 	"encoding/base64"
 	"errors"
@@ -11,7 +10,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -138,9 +136,17 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 	if cfg.Role == "lender" {
 		return errors.New("a lender-only node has no buckets of its own; set role = \"full\" first")
 	}
+	access, err := newAccessKey(a.rng())
+	if err != nil {
+		return err
+	}
+	secret, err := newSecretKey(a.rng())
+	if err != nil {
+		return err
+	}
 	b := state.Bucket{
 		Name: name, Profile: profile, Copies: copies,
-		AccessKey: newAccessKey(), SecretKey: newSecretKey(), CreatedAt: time.Now(),
+		AccessKey: access, SecretKey: secret, CreatedAt: a.now(),
 	}
 	if err := db.AddBucket(ctx, b); errors.Is(err, state.ErrExists) {
 		return fmt.Errorf("bucket %q already exists; `lendisk bucket show %s` prints its lines", name, name)
@@ -229,17 +235,21 @@ func toolLines(w io.Writer, b state.Bucket, where, url, cacert string) {
 }
 
 // newAccessKey returns an AWS-shaped access key ID: LDK and 17 characters.
-func newAccessKey() string {
+func newAccessKey(r io.Reader) (string, error) {
 	b := make([]byte, 11)
-	rand.Read(b)
-	return "LDK" + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)[:17]
+	if _, err := io.ReadFull(r, b); err != nil {
+		return "", fmt.Errorf("make access key: %w", err)
+	}
+	return "LDK" + base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b)[:17], nil
 }
 
 // newSecretKey returns 240 random bits as 40 URL-safe characters.
-func newSecretKey() string {
+func newSecretKey(r io.Reader) (string, error) {
 	b := make([]byte, 30)
-	rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return "", fmt.Errorf("make secret key: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func contains(xs []string, x string) bool {
