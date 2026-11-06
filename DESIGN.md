@@ -955,7 +955,13 @@ upstream bucket is Q-V.
 - **EP-1** lendisk's bridge (§3.7) listens on `127.0.0.1:9000` and
   proxies to embedded versitygw (D15) over the decorated backend on
   the internal socket. No unix socket is offered to tools: no backup
-  tool can use one. Path-style addressing is versitygw's default.
+  tool can use one. Path-style addressing is versitygw's default. The
+  address is the `endpoint.loopback` setting, refused at config load
+  unless its host is a loopback IP or `localhost`; it exists for a
+  second node on one machine and for tests. CI runs restic (`init`,
+  `backup`, `check --read-data`, `restore`), the AWS CLI and rclone
+  against it. A bucket credential cannot create buckets, so rclone
+  needs `no_check_bucket = true`, which the generic profile's lines say.
 - **EP-5** versitygw is given the internal `gw.sock` (§3.7) and
   nothing else, whatever the configuration says; every TCP listener,
   loopback included, is lendisk's bridge, so no versitygw option or
@@ -1008,9 +1014,18 @@ upstream bucket is Q-V.
   (REPL-10). EP-11 needs the hash at write time in any case, to notice
   a changed acknowledged key.
 - **EP-6** Bucket credentials are one access/secret pair per bucket,
-  generated and stored by lendisk in `lendisk.db` and resolved by
-  lendisk's `IAMService` (`Config.IAMService`, which takes precedence
-  over versitygw's own IAM options). versitygw's `IAMDir` is not used.
+  generated and stored by lendisk in `lendisk.db` (table `buckets`)
+  and resolved by lendisk's `IAMService` (`Config.IAMService`, which
+  takes precedence over versitygw's own IAM options). versitygw's
+  `IAMDir` is not used. The access key is `LDK` and 17 base32
+  characters, and the secret is 240 random bits as 40 URL-safe base64
+  characters. The account has versitygw's plain `user` role, and
+  `bucket add` creates the bucket with that access key as its ACL
+  owner, so versitygw's own access check confines each key to its
+  bucket: another bucket is `AccessDenied`, `ListBuckets` shows only
+  its own, and it cannot create buckets. `bucket add` writes the row
+  and then creates the bucket directly through the posix backend, so it
+  needs no running daemon; `bucket show` prints the lines again.
 - **EP-7** Profiles are TOML files compiled into the binary and
   overridable in `<config>/profiles/`; each lists the four key classes
   as glob patterns and the encryption flag. The decorator classifies a
@@ -1031,8 +1046,11 @@ upstream bucket is Q-V.
   interval; re-placement would then stream from a holder through the
   replica client, and the evicted part would be verified by VER-2's
   sampling.
-- **EP-12** `init` checks xattr support and the free-space floor on
-  the store directory and refuses otherwise. Post-v1, on `s3`, it
+- **EP-12** `init` checks xattr support (versitygw's own
+  `XattrMeta.Test`) and the free-space floor (`statfs`, as a percentage
+  of the filesystem or a size) on the store directory, before showing
+  the phrase, and refuses otherwise, naming the filesystem from its
+  `statfs` magic number. `serve` repeats the check at start. Post-v1, on `s3`, it
   would run the copy probe (D15) and warn when the endpoint is not on
   the local network. `status` reports the pinned versitygw and tailcat
   versions.
@@ -1275,7 +1293,10 @@ upstream bucket is Q-V.
 - **The bridge.** `embedgw` takes listener addresses, not a
   `net.Listener` (D15), so versitygw is given one internal unix
   socket, `<data>/run/gw.sock`, and lendisk's bridge owns every
-  listener in front of it: `127.0.0.1:9000` (EP-1), each
+  listener in front of it. A unix socket path is limited to 108 bytes,
+  so when `<data>` is too long for one, `gw.sock` goes in a private
+  0700 directory from `os.MkdirTemp` instead, removed on stop. The
+  listeners are `127.0.0.1:9000` (EP-1), each
   `[[endpoint.listen]]` address with its TLS setting (EP-17), and the
   one tunnel port, 9000, inside the tailcat `Server`. One code path
   accepts a connection, learns what it is allowed (a per-bucket

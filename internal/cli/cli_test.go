@@ -39,7 +39,7 @@ func (n *node) run(stdin string, phrase string, args ...string) (int, string, st
 		pick:      func(int, int) []int { return []int{0, 11, 23} },
 		newPhrase: func() (string, error) { return phrase, nil },
 	}
-	args = append(args, "--config", n.config, "--data-dir", n.data)
+	args = append(args, "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0")
 	code := a.run(args)
 	return code, out.String(), errOut.String()
 }
@@ -194,7 +194,7 @@ func TestServeLogsStructuredAndStops(t *testing.T) {
 	a := &app{in: bufio.NewReader(strings.NewReader("")), out: &out, errOut: &errOut, ctx: ctx}
 	done := make(chan int)
 	go func() {
-		done <- a.run([]string{"serve", "--config", n.config, "--data-dir", n.data, "--log-format", "json", "--log-level", "debug"})
+		done <- a.run([]string{"serve", "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0", "--log-format", "json", "--log-level", "debug"})
 	}()
 	time.Sleep(200 * time.Millisecond)
 	cancel()

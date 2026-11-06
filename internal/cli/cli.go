@@ -17,6 +17,7 @@ import (
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
+	"github.com/borje/lendisk/internal/store"
 	"github.com/borje/lendisk/internal/version"
 )
 
@@ -32,6 +33,18 @@ type app struct {
 	newPhrase func() (string, error)
 	// ctx ends `serve` when done; nil means on SIGINT or SIGTERM.
 	ctx context.Context
+	// storeCheck runs EP-12's filesystem checks; zero means the real ones.
+	storeCheck store.Checker
+	// serving, if set, is called once `serve` accepts S3 requests, with
+	// the loopback endpoint's address.
+	serving func(addr string)
+}
+
+func (a *app) checker() store.Checker {
+	if a.storeCheck.Xattr == nil {
+		return store.DefaultChecker
+	}
+	return a.storeCheck
 }
 
 // Main runs the command line and returns the process exit code.
@@ -69,7 +82,7 @@ func (a *app) rootCmd() *cobra.Command {
 	root.SetErr(a.errOut)
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	a.flags = config.RegisterFlags(root.PersistentFlags())
-	root.AddCommand(a.initCmd(), a.statusCmd(), a.serveCmd())
+	root.AddCommand(a.initCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
 	return root
 }
 

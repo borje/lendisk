@@ -3,12 +3,16 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/bridge"
+	"github.com/borje/lendisk/internal/config"
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/version"
@@ -51,12 +55,52 @@ func (a *app) serveCmd() *cobra.Command {
 					return err
 				}
 			}
+			floor, _ := config.ParseFloor(cfg.Store.FreeSpaceFloor)
+			if err := a.checker().Check(cfg.StorePath(), floor); err != nil {
+				return err
+			}
 			schema, _, _ := db.Versions(ctx)
 			log.Info("lendisk started", "version", version.Version, "node_id", nodeID,
 				"role", cfg.Role, "config", cfg.Path, "data_dir", cfg.DataDir, "schema", schema)
-			<-ctx.Done()
-			log.Info("lendisk stopping")
-			return nil
+
+			ctx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			errc := make(chan error, 2)
+			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Log: log}
+			ready := make(chan struct{})
+			go func() { errc <- gw.Run(ctx, ready) }()
+			select {
+			case <-ready:
+			case err := <-errc:
+				return err
+			}
+
+			running := 1
+			// The lender-only profile has nothing on loopback (PEER-9).
+			if cfg.Role == "full" {
+				ln, err := net.Listen("tcp", cfg.Endpoint.Loopback)
+				if err != nil {
+					return fmt.Errorf("S3 endpoint: %w", err)
+				}
+				br := bridge.New(gw.Socket, log)
+				log.Info("S3 endpoint listening", "address", ln.Addr().String())
+				if a.serving != nil {
+					a.serving(ln.Addr().String())
+				}
+				running++
+				go func() { errc <- bridge.Serve(ctx, ln, br.LoopbackHandler(), log) }()
+			}
+
+			var first error
+			for i := 0; i < running; i++ {
+				err := <-errc
+				if first == nil && err != nil && ctx.Err() == nil {
+					first = err
+				}
+				cancel() // one part stopping stops the daemon
+			}
+			log.Info("lendisk stopped")
+			return first
 		},
 	}
 }

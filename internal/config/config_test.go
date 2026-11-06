@@ -125,25 +125,65 @@ func TestValidation(t *testing.T) {
 }
 
 func TestUnknownKeysReported(t *testing.T) {
-	p := writeFile(t, "role = \"full\"\n[store]\npath = \"/x\"\n")
+	p := writeFile(t, "role = \"full\"\n[store]\nengine = \"x\"\n")
 	l, err := load(t, []string{"--config", p}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(l.Unknown) != 1 || l.Unknown[0] != "store.path" {
+	if len(l.Unknown) != 1 || l.Unknown[0] != "store.engine" {
 		t.Fatalf("unknown = %v", l.Unknown)
 	}
 }
 
-// The shipped examples must parse; keys later tickets add are only reported.
+// The v1 examples must parse; keys later tickets add are only reported.
+// garage-on-lan and provider-store-vps are post-v1 (EP-16, store.backend s3).
 func TestExamplesParse(t *testing.T) {
-	files, _ := filepath.Glob("../../examples/*/config/lendisk.toml")
-	if len(files) == 0 {
-		t.Skip("no examples found")
+	var files []string
+	for _, ex := range []string{"default-nas", "lender-only-pi"} {
+		files = append(files, "../../examples/"+ex+"/config/lendisk.toml")
 	}
 	for _, p := range files {
 		if _, err := load(t, []string{"--config", p}, nil); err != nil {
 			t.Errorf("%s: %v", p, err)
+		}
+	}
+}
+
+func TestStoreAndEndpointSettings(t *testing.T) {
+	l, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "none.toml"), "--data-dir", "/srv/l"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.StorePath() != "/srv/l/store" || l.Endpoint.Loopback != "127.0.0.1:9000" || l.Store.FreeSpaceFloor != "5%" {
+		t.Fatalf("defaults: %s %s %s", l.StorePath(), l.Endpoint.Loopback, l.Store.FreeSpaceFloor)
+	}
+	// EP-5: the loopback setting can never name a network address.
+	for _, bad := range []string{"0.0.0.0:9000", "192.168.1.10:9000", ":9000", "[::]:9000", "127.0.0.1"} {
+		if _, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "x.toml"), "--endpoint-loopback", bad}, nil); err == nil {
+			t.Errorf("accepted endpoint.loopback %q", bad)
+		}
+	}
+	for _, good := range []string{"127.0.0.1:0", "[::1]:9000", "localhost:9001"} {
+		if _, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "x.toml"), "--endpoint-loopback", good}, nil); err != nil {
+			t.Errorf("refused endpoint.loopback %q: %v", good, err)
+		}
+	}
+	if _, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "x.toml"), "--store-backend", "s3"}, nil); err == nil {
+		t.Error("accepted store.backend s3 in v1")
+	}
+}
+
+func TestParseFloor(t *testing.T) {
+	cases := map[string]Floor{"5%": {Percent: 5}, "0.5%": {Percent: 0.5}, "20G": {Bytes: 20 << 30}, "512MiB": {Bytes: 512 << 20}, "1000": {Bytes: 1000}}
+	for in, want := range cases {
+		got, err := ParseFloor(in)
+		if err != nil || got != want {
+			t.Errorf("ParseFloor(%q) = %+v, %v", in, got, err)
+		}
+	}
+	for _, bad := range []string{"", "x", "101%", "-1%", "5Q"} {
+		if _, err := ParseFloor(bad); err == nil {
+			t.Errorf("ParseFloor(%q) accepted", bad)
 		}
 	}
 }

@@ -61,6 +61,12 @@ func (a *app) runInit(ctx context.Context, restore bool) error {
 	if err := ensureDir(cfg.DataDir); err != nil {
 		return fmt.Errorf("data directory: %w", err)
 	}
+	// EP-12: refuse a store the filesystem cannot hold, before the user
+	// writes a phrase down for a node that cannot run.
+	floor, _ := config.ParseFloor(cfg.Store.FreeSpaceFloor)
+	if err := a.checker().Prepare(cfg.StorePath(), floor); err != nil {
+		return err
+	}
 
 	var phrase string
 	if restore {

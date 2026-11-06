@@ -14,10 +14,12 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -36,9 +38,32 @@ const (
 // Config is the user's settings. Add new settings here, with toml, help and
 // (when not empty) default tags.
 type Config struct {
-	Role    string `toml:"role" default:"full" help:"node role: full, or lender for a node that only lends (PEER-9)"`
-	DataDir string `toml:"data_dir" default:"/var/lib/lendisk" help:"data directory: lendisk.db, store/, run/"`
-	Log     Log    `toml:"log"`
+	Role     string   `toml:"role" default:"full" help:"node role: full, or lender for a node that only lends (PEER-9)"`
+	DataDir  string   `toml:"data_dir" default:"/var/lib/lendisk" help:"data directory: lendisk.db, store/, run/"`
+	Store    Store    `toml:"store"`
+	Endpoint Endpoint `toml:"endpoint"`
+	Log      Log      `toml:"log"`
+}
+
+// Store is the [store] section: one store for the node's own buckets and
+// what it lends (D15).
+type Store struct {
+	Backend        string `toml:"backend" default:"posix" help:"store backend; posix is the only one in v1"`
+	Path           string `toml:"path" help:"store directory (default <data_dir>/store)"`
+	FreeSpaceFloor string `toml:"free_space_floor" default:"5%" help:"refuse writes below this much free space: a percentage or a size such as 20G (LEND-2, EP-12)"`
+}
+
+// Endpoint is the [endpoint] section (EP-1, EP-5).
+type Endpoint struct {
+	Loopback string `toml:"loopback" default:"127.0.0.1:9000" help:"loopback address of the S3 endpoint for backup tools on this host"`
+}
+
+// StorePath is the store directory, defaulting to <data_dir>/store.
+func (c *Config) StorePath() string {
+	if c.Store.Path != "" {
+		return c.Store.Path
+	}
+	return filepath.Join(c.DataDir, "store")
 }
 
 // Log is the [log] section (OPS-5).
@@ -66,7 +91,90 @@ func (c *Config) Validate() error {
 	} else if !filepath.IsAbs(c.DataDir) {
 		errs = append(errs, fmt.Errorf("data_dir = %q: must be an absolute path", c.DataDir))
 	}
+	if c.Store.Backend != "posix" {
+		errs = append(errs, fmt.Errorf("store.backend = %q: only \"posix\" is supported", c.Store.Backend))
+	}
+	if c.Store.Path != "" && !filepath.IsAbs(c.Store.Path) {
+		errs = append(errs, fmt.Errorf("store.path = %q: must be an absolute path", c.Store.Path))
+	}
+	if _, err := ParseFloor(c.Store.FreeSpaceFloor); err != nil {
+		errs = append(errs, fmt.Errorf("store.free_space_floor: %w", err))
+	}
+	if err := checkLoopback(c.Endpoint.Loopback); err != nil {
+		errs = append(errs, fmt.Errorf("endpoint.loopback = %q: %w", c.Endpoint.Loopback, err))
+	}
 	return errors.Join(errs...)
+}
+
+// checkLoopback accepts host:port where host is a loopback IP literal or
+// "localhost" (EP-5: never a network address).
+func checkLoopback(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("bad port %q", port)
+	}
+	if host == "localhost" {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("must be a loopback address such as 127.0.0.1:9000; LAN addresses are [[endpoint.listen]] entries")
+	}
+	return nil
+}
+
+// Floor is a free-space floor: a fraction of the filesystem or a byte count.
+type Floor struct {
+	Percent float64 // 0 when Bytes is used
+	Bytes   uint64
+}
+
+// ParseFloor reads "5%", "0.5%", "20G", "512M" or a plain byte count.
+func ParseFloor(s string) (Floor, error) {
+	s = strings.TrimSpace(s)
+	if p, ok := strings.CutSuffix(s, "%"); ok {
+		v, err := strconv.ParseFloat(p, 64)
+		if err != nil || v < 0 || v > 100 {
+			return Floor{}, fmt.Errorf("%q: want a percentage between 0%% and 100%%", s)
+		}
+		return Floor{Percent: v}, nil
+	}
+	b, err := ParseSize(s)
+	if err != nil {
+		return Floor{}, err
+	}
+	return Floor{Bytes: b}, nil
+}
+
+// ParseSize reads a byte count with an optional K, M, G or T suffix
+// (powers of 1024, an optional trailing "B" or "iB" ignored).
+func ParseSize(s string) (uint64, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	t = strings.TrimSuffix(strings.TrimSuffix(t, "B"), "I")
+	mult := uint64(1)
+	if n := len(t); n > 0 {
+		switch t[n-1] {
+		case 'K':
+			mult = 1 << 10
+		case 'M':
+			mult = 1 << 20
+		case 'G':
+			mult = 1 << 30
+		case 'T':
+			mult = 1 << 40
+		}
+		if mult != 1 {
+			t = t[:n-1]
+		}
+	}
+	v, err := strconv.ParseFloat(t, 64)
+	if err != nil || v < 0 {
+		return 0, fmt.Errorf("%q: want a size such as 20G or 512M", s)
+	}
+	return uint64(v * float64(mult)), nil
 }
 
 // Loaded is a resolved configuration and where it came from.
