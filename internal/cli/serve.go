@@ -70,7 +70,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 2)
+			errc := make(chan error, 3)
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Log: log}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
@@ -84,13 +84,27 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 
 			running := 1
+			br := bridge.New(gw.Socket, log)
+			// LAN listeners (EP-17); config load refuses them for a lender.
+			if len(cfg.Endpoint.Listen) > 0 {
+				lan := &bridge.LAN{Entries: cfg.Endpoint.Listen, ConfigDir: cfg.ConfigDir(), Handler: br.LANHandler(), Log: log}
+				lanReady := make(chan struct{})
+				running++
+				go func() { errc <- lan.Run(ctx, lanReady) }()
+				select {
+				case <-lanReady:
+				case err := <-errc:
+					cancel()
+					<-errc // the gateway
+					return err
+				}
+			}
 			// The lender-only profile has nothing on loopback (PEER-9).
 			if cfg.Role == "full" {
 				ln, err := net.Listen("tcp", cfg.Endpoint.Loopback)
 				if err != nil {
 					return fmt.Errorf("S3 endpoint: %w", err)
 				}
-				br := bridge.New(gw.Socket, log)
 				log.Info("S3 endpoint listening", "address", ln.Addr().String())
 				if a.serving != nil {
 					a.serving(ln.Addr().String())

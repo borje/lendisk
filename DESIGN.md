@@ -981,26 +981,57 @@ upstream bucket is Q-V.
   for. The bridge listens on each
   `[[endpoint.listen]]` entry (`address = "192.168.1.10:9000"`
   or `interface = "eth0"` with a port; `tls = "generate"`, the
-  default, `"files"` with `cert` and `key` paths, or `"off"`). An
-  interface name is resolved to its addresses at start and on change;
-  `0.0.0.0`, `::` and an empty host are refused at config load. Each
+  default, `"files"` with `cert` and `key` paths, or `"off"`). The
+  flag and variable (OPS-6) are the repeatable `--endpoint-listen` and
+  `LENDISK_ENDPOINT_LISTEN`, an entry written as comma-separated
+  `key=value` pairs with the table's keys and entries separated by
+  `;` (`address=192.168.1.10:9000,tls=off;interface=eth0,port=9000`);
+  either replaces the file's whole list. An `address` is an IP
+  literal with its port (a host name is refused: use `interface`);
+  `0.0.0.0`, `::`, an empty host, port 0, and `port` beside `address`
+  are refused at config load. An interface name is resolved to its
+  addresses (link-local ones left out, since a URL cannot carry the
+  zone) with `net.InterfaceByName`, pure Go, at start and every 10 s
+  after: listeners open and close as addresses come and go, and an
+  interface with no address is logged and waited for. A fixed address
+  that cannot be bound stops `serve`; an interface address that cannot
+  is retried. Each
   accepted connection is served as HTTP (after a `crypto/tls`
-  handshake where TLS is on; a plaintext request on a TLS port gets
-  the TLS alert, nothing is proxied) and every request is proxied,
+  handshake where TLS is on, TLS 1.2 or later; a plaintext request on
+  a TLS port gets Go's `400 Client sent an HTTP request to an HTTPS
+  server`, nothing is proxied) and every request is proxied,
   unbuffered, to `gw.sock` with the `Host` header and every signed
   header unchanged, as on every other listener (§3.7, Q-G). versitygw verifies the signature against the per-bucket
   credential exactly as on loopback; lendisk adds no check of its own
   and needs none, since the writer is trusted (§2). A request under
   `/_lendisk/` is refused on a loopback or LAN listener. With `tls = "generate"`,
-  lendisk creates a self-signed ECDSA P-256 certificate whose SANs are
-  the configured addresses and the host name, valid ten years, at
-  `<config>/endpoint.crt` with its key at `<config>/endpoint.key`
-  (0600); it is regenerated when the address set changes, and
-  `lendisk endpoint cert` prints its path and SHA-256 fingerprint.
-  `bucket add` prints, for each network address, `restic -r
-  s3:https://<address>/<bucket>` with `--cacert <path to a copy of
-  endpoint.crt>` for a generated certificate, or `s3:http://…` with the
-  plaintext warning for `tls = "off"`. With TLS off the request is
+  lendisk creates one self-signed ECDSA P-256 certificate whose SANs are
+  the addresses of every `generate` entry (interfaces resolved) and the
+  host name, valid ten years, at
+  `<config>/endpoint.crt` (0644) with its key at `<config>/endpoint.key`
+  (0600, written first, each through a rename); it is its own CA
+  (`CA:TRUE`), so it is what a client trusts. It is regenerated when
+  that SAN set changes, at start or when an interface's addresses
+  change, and swapped into the running listeners; otherwise the
+  existing pair is reused. `lendisk endpoint cert` prints its path,
+  SHA-256 fingerprint (colon-separated hex, as `openssl x509
+  -fingerprint -sha256`), names and expiry, and says to run `serve`
+  when there is none yet. With `tls = "files"` the key must be owned
+  by the service user with no group or other permission bits, or
+  `serve` refuses to start (SEC-3).
+  `bucket add` and `bucket show` print, after the loopback lines, for
+  each network address: for restic `RESTIC_REPOSITORY=s3:https://<address>/<bucket>`
+  and `restic --cacert endpoint.crt init`, after a line saying to copy
+  `<config>/endpoint.crt` to the other machine and check it with
+  `lendisk endpoint cert`, for a generated certificate (Kopia gets
+  `--root-ca-pem-path=endpoint.crt`, the generic profile a `CA cert`
+  line); `s3:http://…` after the
+  plaintext warning for `tls = "off"`. Loading a configuration with a
+  `tls = "off"` entry logs that warning, on every command. `status`
+  lists every non-loopback listener under `endpoint.listen` in
+  `--json` (`url`, `interface`, `tls`, `plaintext`; an interface with
+  no address has an empty `url`), and a `LAN:` line each in text,
+  ending "(plaintext)" when TLS is off. With TLS off the request is
   still SigV4-signed, and restic and Kopia send the `aws-chunked`
   streaming form, which signs every chunk, so a machine on the LAN can
   read object bytes and replay a captured request for up to SigV4's

@@ -55,8 +55,22 @@ func TestEverySettingHasFlagAndEnv(t *testing.T) {
 		}
 		seenEnv[s.Env()] = s.key
 		f := reflect.TypeOf(Config{}).FieldByIndex(s.field)
-		if f.Type.Kind() != reflect.String {
-			t.Errorf("%s is %s; the loader handles string settings only, extend it", s.key, f.Type)
+		switch {
+		case f.Type.Kind() == reflect.String:
+		case f.Type.Kind() == reflect.Slice && f.Type.Elem().Kind() == reflect.Struct:
+			// An array of tables: one repeatable flag and one variable,
+			// entries in the compact form parseList reads.
+			if !s.list {
+				t.Errorf("%s is a list but not registered as one", s.key)
+			}
+			for i := 0; i < f.Type.Elem().NumField(); i++ {
+				ef := f.Type.Elem().Field(i)
+				if k := ef.Type.Kind(); k != reflect.String && k != reflect.Int {
+					t.Errorf("%s.%s is %s; the compact form handles strings and ints only, extend it", s.key, ef.Tag.Get("toml"), ef.Type)
+				}
+			}
+		default:
+			t.Errorf("%s is %s; the loader handles strings and arrays of tables only, extend it", s.key, f.Type)
 		}
 	}
 }
@@ -184,6 +198,104 @@ func TestParseFloor(t *testing.T) {
 	for _, bad := range []string{"", "x", "101%", "-1%", "5Q"} {
 		if _, err := ParseFloor(bad); err == nil {
 			t.Errorf("ParseFloor(%q) accepted", bad)
+		}
+	}
+}
+
+// EP-17 and OPS-6: [[endpoint.listen]] from the file, the environment
+// and a repeatable flag, each replacing the whole list.
+func TestEndpointListenSources(t *testing.T) {
+	p := writeFile(t, `
+[[endpoint.listen]]
+address = "192.168.1.10:9000"
+
+[[endpoint.listen]]
+interface = "eth0"
+port = 9001
+tls = "off"
+
+[[endpoint.listen]]
+address = "[fd00::5]:9002"
+tls = "files"
+cert = "/etc/ssl/nas.crt"
+key = "/etc/ssl/nas.key"
+`)
+	l, err := load(t, []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Listen{
+		{Address: "192.168.1.10:9000", TLS: "generate"},
+		{Interface: "eth0", Port: 9001, TLS: "off"},
+		{Address: "[fd00::5]:9002", TLS: "files", Cert: "/etc/ssl/nas.crt", Key: "/etc/ssl/nas.key"},
+	}
+	if !reflect.DeepEqual(l.Endpoint.Listen, want) || len(l.Unknown) != 0 {
+		t.Fatalf("file: %+v (unknown %v)", l.Endpoint.Listen, l.Unknown)
+	}
+
+	e := map[string]string{"LENDISK_ENDPOINT_LISTEN": "address=192.168.1.11:9000,tls=off; interface=eth1,port=9000"}
+	l, err = load(t, []string{"--config", p}, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []Listen{{Address: "192.168.1.11:9000", TLS: "off"}, {Interface: "eth1", Port: 9000, TLS: "generate"}}
+	if !reflect.DeepEqual(l.Endpoint.Listen, want) {
+		t.Fatalf("env: %+v", l.Endpoint.Listen)
+	}
+
+	l, err = load(t, []string{"--config", p, "--endpoint-listen", "address=10.0.0.2:9000",
+		"--endpoint-listen", "interface=wlan0,port=9443,tls=generate"}, e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []Listen{{Address: "10.0.0.2:9000", TLS: "generate"}, {Interface: "wlan0", Port: 9443, TLS: "generate"}}
+	if !reflect.DeepEqual(l.Endpoint.Listen, want) {
+		t.Fatalf("flag: %+v", l.Endpoint.Listen)
+	}
+
+	// An empty variable clears the file's list.
+	l, err = load(t, []string{"--config", p}, map[string]string{"LENDISK_ENDPOINT_LISTEN": ""})
+	if err != nil || len(l.Endpoint.Listen) != 0 {
+		t.Fatalf("empty env: %+v %v", l.Endpoint.Listen, err)
+	}
+}
+
+// EP-17: wildcards, empty hosts, names and malformed entries are refused
+// at load, and so is any entry in the lender-only profile (PEER-9).
+func TestEndpointListenRefused(t *testing.T) {
+	bad := []string{
+		"address=0.0.0.0:9000",
+		"address=[::]:9000",
+		"address=:9000",
+		"address=192.168.1.10",
+		"address=nas.local:9000",
+		"address=192.168.1.10:0",
+		"address=192.168.1.10:9000,port=9000",
+		"interface=eth0",
+		"interface=eth0,port=70000",
+		"interface=eth0,address=192.168.1.10:9000,port=9000",
+		"port=9000",
+		"address=192.168.1.10:9000,tls=maybe",
+		"address=192.168.1.10:9000,tls=files",
+		"address=192.168.1.10:9000,tls=files,cert=rel.crt,key=/k",
+		"address=192.168.1.10:9000,cert=/c,key=/k",
+		"address=192.168.1.10:9000,colour=blue",
+		"interface=eth0,port=nine",
+		"address",
+	}
+	for _, b := range bad {
+		if _, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "x.toml"), "--endpoint-listen", b}, nil); err == nil {
+			t.Errorf("accepted %q", b)
+		}
+	}
+	_, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "x.toml"), "--role", "lender",
+		"--endpoint-listen", "address=192.168.1.10:9000"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "lender") {
+		t.Errorf("lender-only profile accepted endpoint.listen: %v", err)
+	}
+	for _, good := range []string{"address=192.168.1.10:9000", "address=[fd00::1]:9000,tls=off", "interface=lo,port=9000"} {
+		if _, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "x.toml"), "--endpoint-listen", good}, nil); err != nil {
+			t.Errorf("refused %q: %v", good, err)
 		}
 	}
 }

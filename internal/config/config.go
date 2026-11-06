@@ -8,6 +8,13 @@
 // field of Config with a `toml` tag and a `help` tag; RegisterFlags walks
 // the struct, so a new field gets its flag and variable without further
 // code.
+//
+// An array of tables (`[[endpoint.listen]]`) is one setting: a repeatable
+// flag and one variable, each entry written compactly as comma-separated
+// key=value pairs using the table's keys, entries separated by ';'
+// (`address=192.168.1.10:9000,tls=off;interface=eth0,port=9000`). Values
+// cannot contain ',' or ';'. A flag or variable replaces the file's whole
+// list; an empty variable clears it.
 package config
 
 import (
@@ -54,9 +61,76 @@ type Store struct {
 	FreeSpaceFloor string `toml:"free_space_floor" default:"5%" help:"refuse writes below this much free space: a percentage or a size such as 20G (LEND-2, EP-12)"`
 }
 
-// Endpoint is the [endpoint] section (EP-1, EP-5).
+// Endpoint is the [endpoint] section (EP-1, EP-5, EP-17).
 type Endpoint struct {
-	Loopback string `toml:"loopback" default:"127.0.0.1:9000" help:"loopback address of the S3 endpoint for backup tools on this host"`
+	Loopback string   `toml:"loopback" default:"127.0.0.1:9000" help:"loopback address of the S3 endpoint for backup tools on this host"`
+	Listen   []Listen `toml:"listen" help:"network addresses of the S3 endpoint for other machines (EP-17), repeatable; entries separated by ';', fields by ',', e.g. 'address=192.168.1.10:9000,tls=off;interface=eth0,port=9000'"`
+}
+
+// Listen is one [[endpoint.listen]] entry (EP-17): an IP address with a
+// port, or an interface whose addresses are used with Port.
+type Listen struct {
+	Address   string `toml:"address"`
+	Interface string `toml:"interface"`
+	Port      int    `toml:"port"`
+	// TLS is "generate" (the default), "files" with Cert and Key, or "off".
+	TLS  string `toml:"tls"`
+	Cert string `toml:"cert"`
+	Key  string `toml:"key"`
+}
+
+// String names the entry for messages: its address, or interface:port.
+func (l Listen) String() string {
+	if l.Interface != "" {
+		return net.JoinHostPort(l.Interface, strconv.Itoa(l.Port))
+	}
+	return l.Address
+}
+
+func (l Listen) check() error {
+	switch {
+	case l.Address != "" && l.Interface != "":
+		return errors.New("give address or interface, not both")
+	case l.Address != "":
+		if l.Port != 0 {
+			return errors.New("the port goes in address (host:port)")
+		}
+		host, port, err := net.SplitHostPort(l.Address)
+		if err != nil {
+			return err
+		}
+		if p, err := strconv.ParseUint(port, 10, 16); err != nil || p == 0 {
+			return fmt.Errorf("bad port %q", port)
+		}
+		ip := net.ParseIP(host)
+		switch {
+		case host == "":
+			return errors.New("empty host: name one address, such as 192.168.1.10:9000")
+		case ip == nil:
+			return errors.New("host must be an IP address; for a name that changes, use interface and port")
+		case ip.IsUnspecified():
+			return errors.New("wildcard address refused: name one address, or an interface")
+		}
+	case l.Interface != "":
+		if l.Port < 1 || l.Port > 65535 {
+			return errors.New("an interface entry needs port = 1 to 65535")
+		}
+	default:
+		return errors.New("needs address, or interface and port")
+	}
+	switch l.TLS {
+	case "generate", "off":
+		if l.Cert != "" || l.Key != "" {
+			return fmt.Errorf("cert and key are used only with tls = \"files\"")
+		}
+	case "files":
+		if !filepath.IsAbs(l.Cert) || !filepath.IsAbs(l.Key) {
+			return errors.New("tls = \"files\" needs cert and key as absolute paths")
+		}
+	default:
+		return fmt.Errorf("tls = %q: want generate, files or off", l.TLS)
+	}
+	return nil
 }
 
 // StorePath is the store directory, defaulting to <data_dir>/store.
@@ -108,6 +182,14 @@ func (c *Config) Validate() error {
 	}
 	if err := checkLoopback(c.Endpoint.Loopback); err != nil {
 		errs = append(errs, fmt.Errorf("endpoint.loopback = %q: %w", c.Endpoint.Loopback, err))
+	}
+	if c.Role == "lender" && len(c.Endpoint.Listen) > 0 {
+		errs = append(errs, errors.New("endpoint.listen: a lender-only node has no S3 endpoint (PEER-9); remove the entries or set role = \"full\""))
+	}
+	for i, l := range c.Endpoint.Listen {
+		if err := l.check(); err != nil {
+			errs = append(errs, fmt.Errorf("endpoint.listen entry %d (%s): %w", i+1, l, err))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -201,6 +283,7 @@ type setting struct {
 	help  string
 	def   string
 	field []int // reflect index path into Config
+	list  bool  // an array of tables, in the compact form
 }
 
 func (s setting) Flag() string {
@@ -226,7 +309,8 @@ func settings() []setting {
 				walk(f.Type, key+".", path)
 				continue
 			}
-			out = append(out, setting{key: key, help: f.Tag.Get("help"), def: f.Tag.Get("default"), field: path})
+			list := f.Type.Kind() == reflect.Slice && f.Type.Elem().Kind() == reflect.Struct
+			out = append(out, setting{key: key, help: f.Tag.Get("help"), def: f.Tag.Get("default"), field: path, list: list})
 		}
 	}
 	walk(reflect.TypeOf(Config{}), "", nil)
@@ -237,17 +321,63 @@ func settings() []setting {
 type Flags struct {
 	fs     *pflag.FlagSet
 	config *string
-	vals   map[string]*string // key -> flag value
+	vals   map[string]*string   // key -> flag value
+	lists  map[string]*[]string // key -> repeated flag values
 }
 
 // RegisterFlags adds --config and one flag per setting to fs.
 func RegisterFlags(fs *pflag.FlagSet) *Flags {
-	f := &Flags{fs: fs, vals: map[string]*string{}}
+	f := &Flags{fs: fs, vals: map[string]*string{}, lists: map[string]*[]string{}}
 	f.config = fs.String("config", "", "config file (env "+EnvConfig+", default "+DefaultPath+")")
 	for _, s := range settings() {
+		if s.list {
+			f.lists[s.key] = fs.StringArray(s.Flag(), nil, fmt.Sprintf("%s (env %s)", s.help, s.Env()))
+			continue
+		}
 		f.vals[s.key] = fs.String(s.Flag(), "", fmt.Sprintf("%s (env %s, default %q)", s.help, s.Env(), s.def))
 	}
 	return f
+}
+
+// parseList reads the compact form of an array of tables into a slice of
+// type t: entries separated by ';', key=value fields by ',', keys being
+// the element's toml tags.
+func parseList(t reflect.Type, s string) (reflect.Value, error) {
+	out := reflect.MakeSlice(t, 0, 0)
+	et := t.Elem()
+	for _, entry := range strings.Split(s, ";") {
+		if strings.TrimSpace(entry) == "" {
+			continue
+		}
+		v := reflect.New(et).Elem()
+		for _, kv := range strings.Split(entry, ",") {
+			k, val, ok := strings.Cut(strings.TrimSpace(kv), "=")
+			if !ok {
+				return out, fmt.Errorf("%q: want key=value", kv)
+			}
+			i := -1
+			for j := 0; j < et.NumField(); j++ {
+				if et.Field(j).Tag.Get("toml") == k {
+					i = j
+				}
+			}
+			if i < 0 {
+				return out, fmt.Errorf("unknown key %q", k)
+			}
+			switch fv := v.Field(i); fv.Kind() {
+			case reflect.Int:
+				n, err := strconv.Atoi(val)
+				if err != nil {
+					return out, fmt.Errorf("%s = %q: want a number", k, val)
+				}
+				fv.SetInt(int64(n))
+			default:
+				fv.SetString(val)
+			}
+		}
+		out = reflect.Append(out, v)
+	}
+	return out, nil
 }
 
 // Load resolves the configuration. A missing config file is not an error:
@@ -271,7 +401,9 @@ func (f *Flags) load(getenv func(string) (string, bool)) (*Loaded, error) {
 	ss := settings()
 	rv := reflect.ValueOf(&l.Config).Elem()
 	for _, s := range ss {
-		rv.FieldByIndex(s.field).SetString(s.def)
+		if !s.list {
+			rv.FieldByIndex(s.field).SetString(s.def)
+		}
 	}
 
 	md, err := toml.DecodeFile(l.Path, &l.Config)
@@ -291,11 +423,32 @@ func (f *Flags) load(getenv func(string) (string, bool)) (*Loaded, error) {
 	}
 
 	for _, s := range ss {
+		if s.list {
+			fv := rv.FieldByIndex(s.field)
+			from := s.Env()
+			v, ok := getenv(from)
+			if f.fs.Changed(s.Flag()) {
+				from, v, ok = "--"+s.Flag(), strings.Join(*f.lists[s.key], ";"), true
+			}
+			if ok {
+				list, err := parseList(fv.Type(), v)
+				if err != nil {
+					return nil, fmt.Errorf("configuration: %s: %w", from, err)
+				}
+				fv.Set(list)
+			}
+			continue
+		}
 		if v, ok := getenv(s.Env()); ok {
 			rv.FieldByIndex(s.field).SetString(v)
 		}
 		if f.fs.Changed(s.Flag()) {
 			rv.FieldByIndex(s.field).SetString(*f.vals[s.key])
+		}
+	}
+	for i := range l.Endpoint.Listen {
+		if l.Endpoint.Listen[i].TLS == "" {
+			l.Endpoint.Listen[i].TLS = "generate"
 		}
 	}
 	if err := l.Validate(); err != nil {

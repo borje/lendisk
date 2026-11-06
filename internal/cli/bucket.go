@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
@@ -158,29 +160,72 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 	return nil
 }
 
+// printToolLines prints the lines for loopback and, for each
+// [[endpoint.listen]] address, for another machine (EP-17).
 func printToolLines(w io.Writer, cfg *config.Loaded, b state.Bucket) {
-	ep := cfg.Endpoint.Loopback
+	toolLines(w, b, "on this machine", "http://"+cfg.Endpoint.Loopback, "")
+	for _, e := range cfg.Endpoint.Listen {
+		addrs := bridge.Resolve([]config.Listen{e}, nil)
+		if len(addrs) == 0 {
+			fmt.Fprintf(w, "\n%s has no address now; `lendisk bucket show %s` prints its lines once it has one.\n", e, b.Name)
+		}
+		for _, a := range addrs {
+			fmt.Fprintln(w)
+			cacert := ""
+			switch {
+			case a.Plaintext():
+				fmt.Fprintf(w, "Warning: %s is plain HTTP. Request metadata and object contents cross the network\n"+
+					"unencrypted; only restic and Kopia buckets are protected by the tool's own encryption.\n\n", a.URL())
+			case e.TLS == "generate":
+				cacert = "endpoint.crt"
+				fmt.Fprintf(w, "Copy %s to the other machine as endpoint.crt;\n"+
+					"`lendisk endpoint cert` prints its SHA-256 fingerprint to check the copy.\n\n",
+					filepath.Join(cfg.ConfigDir(), bridge.CertFile))
+			}
+			toolLines(w, b, "on another machine, at "+a.URL(), a.URL(), cacert)
+		}
+	}
+	fmt.Fprintf(w, "\nKeep the secret key private. `lendisk bucket show %s` prints these lines again.\n", b.Name)
+}
+
+// toolLines prints one endpoint's lines; cacert, if set, is the file the
+// tool must trust as the certificate authority.
+func toolLines(w io.Writer, b state.Bucket, where, url, cacert string) {
+	hostPort := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
 	switch b.Profile {
 	case "restic":
-		fmt.Fprintf(w, "For restic on this machine:\n\n")
+		fmt.Fprintf(w, "For restic %s:\n\n", where)
 		fmt.Fprintf(w, "  export AWS_ACCESS_KEY_ID=%s\n", b.AccessKey)
 		fmt.Fprintf(w, "  export AWS_SECRET_ACCESS_KEY=%s\n", b.SecretKey)
-		fmt.Fprintf(w, "  export RESTIC_REPOSITORY=s3:http://%s/%s\n", ep, b.Name)
-		fmt.Fprintf(w, "  restic init\n")
+		fmt.Fprintf(w, "  export RESTIC_REPOSITORY=s3:%s/%s\n", url, b.Name)
+		if cacert != "" {
+			fmt.Fprintf(w, "  restic --cacert %s init\n", cacert)
+		} else {
+			fmt.Fprintf(w, "  restic init\n")
+		}
 	case "kopia":
-		fmt.Fprintf(w, "For Kopia on this machine:\n\n")
-		fmt.Fprintf(w, "  kopia repository create s3 --endpoint=%s --disable-tls --bucket=%s \\\n", ep, b.Name)
+		tlsFlag := " --disable-tls"
+		if strings.HasPrefix(url, "https://") {
+			tlsFlag = ""
+			if cacert != "" {
+				tlsFlag = " --root-ca-pem-path=" + cacert
+			}
+		}
+		fmt.Fprintf(w, "For Kopia %s:\n\n", where)
+		fmt.Fprintf(w, "  kopia repository create s3 --endpoint=%s%s --bucket=%s \\\n", hostPort, tlsFlag, b.Name)
 		fmt.Fprintf(w, "    --access-key=%s --secret-access-key=%s\n", b.AccessKey, b.SecretKey)
 	default:
-		fmt.Fprintf(w, "For any S3 client on this machine (path-style addressing):\n\n")
-		fmt.Fprintf(w, "  endpoint:   http://%s\n", ep)
+		fmt.Fprintf(w, "For any S3 client %s (path-style addressing):\n\n", where)
+		fmt.Fprintf(w, "  endpoint:   %s\n", url)
+		if cacert != "" {
+			fmt.Fprintf(w, "  CA cert:    %s\n", cacert)
+		}
 		fmt.Fprintf(w, "  region:     us-east-1\n")
 		fmt.Fprintf(w, "  bucket:     %s\n", b.Name)
 		fmt.Fprintf(w, "  access key: %s\n", b.AccessKey)
 		fmt.Fprintf(w, "  secret key: %s\n", b.SecretKey)
 		fmt.Fprintf(w, "\nThe key cannot create buckets; for rclone set no_check_bucket = true.\n")
 	}
-	fmt.Fprintf(w, "\nKeep the secret key private. `lendisk bucket show %s` prints these lines again.\n", b.Name)
 }
 
 // newAccessKey returns an AWS-shaped access key ID: LDK and 17 characters.
