@@ -1078,16 +1078,22 @@ upstream bucket is Q-V.
   on a successful `PutObject` or `CompleteMultipartUpload`, and a
   delete on a successful `DeleteObject` or each entry `DeleteObjects`
   reports deleted. Only the node's own buckets (rows in `buckets`) are
-  captured; `lent-*` buckets pass through. `UploadPart` is hashed (see
-  EP-3) but not queued, and `AbortMultipartUpload` drops the upload's
-  part hashes. The other ways to put content into an object (Q-H at
+  captured; `lent-*` buckets pass through. Parts and aborted uploads
+  are neither hashed nor queued (EP-3). The other ways to put content into an object (Q-H at
   v1.10.0) are refused rather than captured, since their bytes never
   pass the decorator as a stream: `CopyObject` (including the same-key
   metadata replace) and `UploadPartCopy` answer `501 NotImplemented` on
   an own bucket, from the decorator, which knows the bucket map; a
   browser-form `POST` upload (a `POST` to a bucket that is not
   `?delete`) is refused by the gate. restic, Kopia and the AWS CLI's
-  and rclone's uploads use none of them.
+  and rclone's uploads use none of them. Decided 2026-11-06 to keep
+  copies refused for every profile, generic included: a copy is a new
+  key that friends store and receive in full anyway, so capturing it
+  would save only local I/O. rclone's server-side copy and move
+  (`--backup-dir`, `move`, `--track-renames`) and its in-place modtime
+  update fail against a lendisk bucket, so the generic profile's
+  `bucket add` lines tell rclone users to pass `--disable Copy,Move`
+  (download and re-upload instead) and `--no-update-modtime` (#7).
   *Measured (EP-2 AC):* `TestCaptureOverhead` in `internal/gateway`
   (opt-in, `LENDISK_OVERHEAD_MB`) times `restic backup` of random data
   through the gateway with capture on and off, alternating, after a
