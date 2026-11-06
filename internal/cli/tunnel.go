@@ -32,12 +32,15 @@ type tunnel struct {
 	// Admission is the admission function; call Clear after changing a
 	// friendship or an invite (SEC-15).
 	Admission *transport.Admission
+	// S3 is the tunnel's S3 handler, set once the gateway serves; until
+	// then S3 on the tunnel answers 503.
+	S3 *bridge.Late
 }
 
 // startTunnel chooses the region if none is saved yet, starts the
 // transport with admission over db and serves the tunnel port until ctx
 // ends: the bridge's tunnel middleware in front of the control API
-// (§3.7). S3 on the tunnel comes with #14.
+// (§3.7) and, once tun.S3 is set, S3 for friends.
 func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.Identity, db *state.DB, log *slog.Logger) (*tunnel, error) {
 	region, chosen, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays())
 	if err != nil {
@@ -73,10 +76,11 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		return db.PeerRole(ctx, peer.String(), time.Now())
 	}
 	ctl := &control.Server{DB: db, Self: id, Changed: adm.Clear, Log: log}
-	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(roles, ctl, nil, log), log)
+	s3 := &bridge.Late{}
+	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(roles, ctl, s3, log), log)
 	go purgeInvites(ctx, db, adm, log)
 	log.Info("tunnel listening", "address", tc.Address(), "port", transport.Port, "region", region.RegionCode)
-	return &tunnel{Transport: tc, Admission: adm}, nil
+	return &tunnel{Transport: tc, Admission: adm, S3: s3}, nil
 }
 
 // purgeInvites deletes expired invites at start and every minute after

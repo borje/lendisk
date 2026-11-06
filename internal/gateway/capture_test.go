@@ -25,6 +25,7 @@ import (
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3response"
 
+	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
 )
@@ -39,6 +40,7 @@ type harness struct {
 	db     *state.DB
 	socket string
 	keys   map[string][2]string
+	self   *identity.Identity // the lender, for friends' accounts; nil serves none
 }
 
 func newHarness(t *testing.T, buckets map[string]string) *harness {
@@ -77,7 +79,7 @@ func newHarnessIn(t *testing.T, dir string, buckets map[string]string) *harness 
 // serve runs the gateway until stop is called or the test ends.
 func (h *harness) serve(noCapture bool) (stop func()) {
 	h.t.Helper()
-	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Log: quiet, noCapture: noCapture}
+	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: quiet, noCapture: noCapture}
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan struct{})
 	errc := make(chan error, 1)
