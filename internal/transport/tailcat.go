@@ -5,8 +5,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
+	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +41,16 @@ type Tailcat struct {
 	quietFor     time.Duration
 	check        func(context.Context, *tailcatClient) error
 
+	// elapsed is the transport's clock: the time since it was made,
+	// read on the monotonic clock, so a step of the wall clock (an NTP
+	// correction on a board without a real-time clock) moves no
+	// activity stamp. dial opens a connection through a client, and
+	// closeTailcat closes a tailcat client or server. Tests wrap all
+	// three.
+	elapsed      func() time.Duration
+	dial         func(context.Context, *tailcatClient) (net.Conn, error)
+	closeTailcat func(io.Closer) error
+
 	mu       sync.Mutex
 	admit    func(identity.NodeID) bool
 	server   *tailcat.Server // set by Listen
@@ -54,9 +67,9 @@ type tailcatClient struct {
 	*tailcat.Client
 	t      *Tailcat
 	peer   identity.NodeID
-	relay  string        // relayOf the address it was built for
+	relay  relay         // relayOf the address it was built for
 	down   chan struct{} // closed once Client.Close has returned
-	active atomic.Int64  // unix nanoseconds a connection last moved bytes
+	active atomic.Int64  // Tailcat.elapsed when a connection last moved bytes
 
 	refs    int  // open connections, dials in flight and a running check
 	conns   int  // open connections
@@ -84,7 +97,8 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 	if region == nil || region.RegionID == 0 {
 		return nil, errors.New("transport: no saved tunnel region")
 	}
-	return &Tailcat{
+	epoch := time.Now()
+	t := &Tailcat{
 		key:    nodePrivate(id),
 		region: region,
 		logf: func(format string, args ...any) {
@@ -92,12 +106,18 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 		},
 		probeTimeout: probeTimeout,
 		quietFor:     quietFor,
-		check:        dialCheck,
+		elapsed:      func() time.Duration { return time.Since(epoch) },
+		dial: func(ctx context.Context, c *tailcatClient) (net.Conn, error) {
+			return c.DialTCPPort(ctx, Port)
+		},
+		closeTailcat: io.Closer.Close,
 		clients:      map[identity.NodeID]*tailcatClient{},
 		retired:      map[*tailcatClient]bool{},
 		shutting:     map[*tailcatClient]bool{},
 		done:         make(chan struct{}),
-	}, nil
+	}
+	t.check = t.dialCheck
+	return t, nil
 }
 
 // NewDialer returns a transport that only dials, with a key that need
@@ -225,7 +245,8 @@ func (t *Tailcat) Listen(ctx context.Context) (net.Listener, error) {
 // own, bounded by probeTimeout, at most one at a time. A failed check
 // closes the client only once its open connections have moved no bytes
 // for quietFor; until then it checks again, so a transfer that pauses
-// through a short outage is not cut.
+// through a short outage is not cut. A dial that succeeds through a
+// client closed meanwhile closes its connection and fails.
 func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (net.Conn, error) {
 	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
 	if err != nil {
@@ -240,12 +261,18 @@ func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (
 		return nil, err
 	}
 
-	conn, err := c.DialTCPPort(ctx, Port)
+	conn, err := t.dial(ctx, c)
 	if err == nil {
 		t.mu.Lock()
+		if c.closed {
+			t.releaseLocked(c) // a closed client is already shut or shutting
+			t.mu.Unlock()
+			conn.Close()
+			return nil, fmt.Errorf("tunnel to %s: the client closed during the dial; dial again: %w", peer, net.ErrClosed)
+		}
 		c.conns++ // the connection keeps the dial's reference
-		t.mu.Unlock()
 		c.touch()
+		t.mu.Unlock()
 		return &tunnelConn{Conn: conn, c: c}, nil
 	}
 	t.mu.Lock()
@@ -263,7 +290,7 @@ func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (
 
 // clientFor returns peer's client for relay, with a reference taken
 // for the caller, building it from addr if there is none.
-func (t *Tailcat) clientFor(ctx context.Context, peer identity.NodeID, relay, addr string) (*tailcatClient, error) {
+func (t *Tailcat) clientFor(ctx context.Context, peer identity.NodeID, relay relay, addr string) (*tailcatClient, error) {
 	t.mu.Lock()
 	for {
 		if t.closed {
@@ -272,7 +299,7 @@ func (t *Tailcat) clientFor(ctx context.Context, peer identity.NodeID, relay, ad
 		}
 		var stale *tailcatClient
 		c := t.clients[peer]
-		if c != nil && c.relay != relay {
+		if c != nil && !c.relay.overlaps(relay) {
 			stale = t.retireLocked(c) // the friend moved to another relay
 			c = nil
 		}
@@ -322,7 +349,7 @@ func (t *Tailcat) probe(stop context.Context, c *tailcatClient) {
 		if err == nil || stop.Err() != nil || c.retired || c.closed || t.closed {
 			break
 		}
-		if quiet := time.Since(c.lastActive()); c.conns > 0 && quiet < t.quietFor {
+		if quiet := c.quiet(); c.conns > 0 && quiet < t.quietFor {
 			t.mu.Unlock()
 			t.logf("tunnel to %s: a check of the client failed, but a connection moved bytes %v ago; checking again: %v", c.peer, quiet.Round(time.Second), err)
 			wait := time.NewTimer(t.quietFor - quiet)
@@ -351,31 +378,73 @@ func (t *Tailcat) probe(stop context.Context, c *tailcatClient) {
 }
 
 // dialCheck is the default check: a dial through c.
-func dialCheck(ctx context.Context, c *tailcatClient) error {
-	conn, err := c.DialTCPPort(ctx, Port)
+func (t *Tailcat) dialCheck(ctx context.Context, c *tailcatClient) error {
+	conn, err := t.dial(ctx, c)
 	if err == nil {
 		conn.Close()
 	}
 	return err
 }
 
-// relayOf names the relay an address reaches its server through: a
-// public region by its ID, or the DERP servers (host and port) of the
-// region it carries. The rest of the address (node IPs, STUN ports,
-// region names) can change without moving the friend to another
-// relay. The server key is the peer's and checked by Dial. An address
-// carries no region or node names (tailcat strips them), so a local
-// relay is told apart from another by its host and port.
-func relayOf(ci tailcat.ConnInfo) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "%d", ci.RegionID)
-	for _, r := range ci.Region {
-		b.WriteString("/")
-		for _, n := range r.Nodes {
-			fmt.Fprintf(&b, ",%s", net.JoinHostPort(n.HostName, strconv.Itoa(n.DERPPort)))
+// relay names the DERP servers a client of an address may connect to:
+// "host:port" for each server, or "region:N" for a public region named
+// by ID only. tailcat's client connects to the first node of the
+// address's region that answers (derphttp's dialRegion), so which one
+// it uses is known only once it has, and tailcat does not report it.
+type relay []string
+
+// relayOf is the relay of an address: every node of its regions that
+// is not STUN-only, by host name and by each IP it gives, with the
+// DERP port (0 is 443). An address carries no region or node names
+// (tailcat strips them), and the rest of it (STUN ports, region IDs,
+// node order) can change without moving the friend to another relay.
+// The server key is the peer's and checked by Dial.
+func relayOf(ci tailcat.ConnInfo) relay {
+	var r relay
+	for _, reg := range ci.Region {
+		for _, n := range reg.Nodes {
+			if n.STUNOnly {
+				continue
+			}
+			port := n.DERPPort
+			if port == 0 {
+				port = 443
+			}
+			hosts := []string{strings.TrimSuffix(strings.ToLower(n.HostName), ".")}
+			for _, ip := range []string{n.IPv4, n.IPv6} {
+				if a, err := netip.ParseAddr(ip); err == nil {
+					hosts = append(hosts, a.String())
+				}
+			}
+			for _, h := range hosts {
+				if a, err := netip.ParseAddr(h); err == nil {
+					h = a.String()
+				}
+				if h != "" {
+					r = append(r, net.JoinHostPort(h, strconv.Itoa(port)))
+				}
+			}
 		}
 	}
-	return b.String()
+	if len(r) == 0 {
+		r = relay{fmt.Sprintf("region:%d", ci.RegionID)}
+	}
+	slices.Sort(r)
+	return slices.Compact(r)
+}
+
+// overlaps reports whether a client of one address and a client of the
+// other may connect to the same DERP server, and so count as one relay.
+// It errs towards yes: a client taken for another relay fails its
+// check and is replaced, while two clients with one key at one relay
+// stall each other (#52).
+func (r relay) overlaps(o relay) bool {
+	for _, e := range r {
+		if _, ok := slices.BinarySearch(o, e); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // retireLocked takes c out of service: no new dial uses it, and it is
@@ -399,9 +468,9 @@ func (t *Tailcat) retireLocked(c *tailcatClient) *tailcatClient {
 // reviveLocked puts back in service a retired client of peer at relay
 // whose connections are still open, and returns it, or nil if there is
 // none.
-func (t *Tailcat) reviveLocked(peer identity.NodeID, relay string) *tailcatClient {
+func (t *Tailcat) reviveLocked(peer identity.NodeID, relay relay) *tailcatClient {
 	for c := range t.retired {
-		if c.peer == peer && c.relay == relay && !c.closed {
+		if c.peer == peer && c.relay.overlaps(relay) && !c.closed {
 			delete(t.retired, c)
 			c.retired = false
 			t.clients[peer] = c
@@ -413,9 +482,9 @@ func (t *Tailcat) reviveLocked(peer identity.NodeID, relay string) *tailcatClien
 
 // shuttingLocked returns the down channel of a client of peer at relay
 // that is still closing, or nil if there is none.
-func (t *Tailcat) shuttingLocked(peer identity.NodeID, relay string) chan struct{} {
+func (t *Tailcat) shuttingLocked(peer identity.NodeID, relay relay) chan struct{} {
 	for c := range t.shutting {
-		if c.peer == peer && c.relay == relay {
+		if c.peer == peer && c.relay.overlaps(relay) {
 			return c.down
 		}
 	}
@@ -455,7 +524,7 @@ func (c *tailcatClient) shut() {
 	if c == nil {
 		return
 	}
-	c.Client.Close()
+	c.t.closeTailcat(c.Client)
 	c.t.mu.Lock()
 	delete(c.t.shutting, c)
 	c.t.mu.Unlock()
@@ -463,9 +532,14 @@ func (c *tailcatClient) shut() {
 }
 
 // touch records that a connection through c moved bytes.
-func (c *tailcatClient) touch() { c.active.Store(time.Now().UnixNano()) }
+func (c *tailcatClient) touch() { c.active.Store(int64(c.t.elapsed())) }
 
-func (c *tailcatClient) lastActive() time.Time { return time.Unix(0, c.active.Load()) }
+// quiet is how long since a connection through c last moved bytes, on
+// the transport's clock. It is never negative, so a wait for the rest
+// of quietFor never exceeds quietFor.
+func (c *tailcatClient) quiet() time.Duration {
+	return max(c.t.elapsed()-time.Duration(c.active.Load()), 0)
+}
 
 // tunnelConn is a dialled connection; closing it releases its client.
 // Its reads and writes record when it last moved bytes.
@@ -550,34 +624,44 @@ func (t *Tailcat) PathInfo(ctx context.Context, peer identity.NodeID) (Path, err
 	}, nil
 }
 
-// Close stops the server and every client.
+// Close stops the server and every client. It marks them closed under
+// Tailcat.mu and closes them after releasing it, since tailcat's
+// shutdown may wait on a goroutine in the admission hook, which takes
+// that lock. A client already shutting is left to its own shut.
 func (t *Tailcat) Close() error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.closed {
+		t.mu.Unlock()
 		return nil
 	}
 	t.closed = true
 	close(t.done)
-	var errs []error
-	closeNow := func(c *tailcatClient) {
+	var shut []*tailcatClient
+	mark := func(c *tailcatClient) {
 		c.closed = true
 		if c.stopCheck != nil {
 			c.stopCheck()
 		}
-		errs = append(errs, c.Client.Close())
-		close(c.down)
+		shut = append(shut, c)
 	}
 	for _, c := range t.clients {
-		closeNow(c)
+		mark(c)
 	}
 	clear(t.clients)
 	for c := range t.retired {
-		closeNow(c)
+		mark(c)
 	}
 	clear(t.retired)
-	if t.server != nil {
-		errs = append(errs, t.server.Close())
+	s := t.server
+	t.mu.Unlock()
+
+	var errs []error
+	for _, c := range shut {
+		errs = append(errs, t.closeTailcat(c.Client))
+		close(c.down)
+	}
+	if s != nil {
+		errs = append(errs, t.closeTailcat(s))
 	}
 	return errors.Join(errs...)
 }
