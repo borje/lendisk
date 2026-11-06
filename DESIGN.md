@@ -1,6 +1,6 @@
 # lendisk — design
 
-Status: draft v0.13, 2026-11-06. Companion to REQUIREMENTS.md v0.11.
+Status: draft v0.14, 2026-11-06. Companion to REQUIREMENTS.md v0.11.
 REQUIREMENTS.md v0.9 made the two requirement changes this design
 needed (Q-T, resolved); its later versions moved third-party
 credentials to the environment,
@@ -79,7 +79,11 @@ allow-list moves from the decorator to a gate in front of versitygw's
 routing; versitygw's admin API, which cannot be left out, is made
 unreachable; object lock is refused rather than "left off"; the
 tunnel region is saved whole in `lendisk.db`; and v1 does without
-port mapping. The trust model is unchanged throughout.
+port mapping. v0.14 takes in the minio-go spike (Q-Y items 1, 2 and
+4): minio-go v7.4.1 is pinned, every target is sent unsigned payloads,
+and the SHA-256 request checksum is the queue row's hash on a single
+PUT and a per-part SHA-256 in an unsigned trailer on multipart (§3.4,
+S3-3). The trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -584,7 +588,8 @@ Why an in-process client, and why minio-go:
 - minio-go is written for S3-compatible stores first: path-style, no
   AWS-only request defaults, and multipart, ranged reads, versioned
   listings, delete-marker removal and object-lock calls all present.
-  Its low-level multipart calls are what the resume loop needs.
+  Its low-level multipart calls are what the resume loop needs. By
+  default it sends no request checksum at all (spike #4, Q-Y.2).
 
 What lendisk writes because the client does not: the resume loop,
 which keeps the multipart upload ID and the ETag of each completed part
@@ -645,9 +650,11 @@ Costs accepted:
   replica interface; if it is withdrawn a new decision is taken, with
   the AWS SDK for Go v2 as the obvious replacement (D11).
 - REPL-10's SHA-256 travels as user metadata
-  (`x-amz-meta-lendisk-sha256`) and, where the target verifies one, as
-  the request checksum. The lender's decorator hashes the stream anyway
-  and compares with the metadata (LEND-4).
+  (`x-amz-meta-lendisk-sha256`) and, on a single PUT, as the request
+  checksum. S3 has no whole-object SHA-256 for multipart, so a part
+  carries its own SHA-256, taken as it streams (§3.4, Q-Y.2). The
+  lender's decorator hashes the stream anyway and compares with the
+  metadata (LEND-4).
 - Stored-checksum verification is per target (an MD5 ETag on
   single-part objects, nothing usable on multipart at many providers);
   sample downloads carry the real check (VER-2, S3-6).
@@ -714,8 +721,10 @@ backend instance, no mux, and Q-W closed. A lender who wants lent
 buckets on a second disk mounts it at the bucket directory (Q-Z).
 
 **Store features lendisk does not use.** versitygw's versioning,
-object lock, conditional puts and upload checksum verification are all
-left off. The decorator keeps retention (§3.6), immutability (§3.5)
+object lock and conditional puts are left off. Its verification of a
+request checksum cannot be turned off and is not relied on: it refuses
+a part whose SHA-256 is wrong (Q-Y.2), which only catches damage in
+transit earlier. The decorator keeps retention (§3.6), immutability (§3.5)
 and the hash check (LEND-4) itself, in one way on every store, so
 nothing the lender promises depends on what a store provides and
 nothing needs a probe. Object lock in particular would only guard
@@ -1132,14 +1141,27 @@ upstream bucket is Q-V.
   bucket's sealed name in place of its own (SEC-16), and an HTTP
   transport whose dial function is the tailcat `Client` for
   that peer (§3.7). An overflow target is the endpoint, bucket, prefix
-  and credential the user registered (S3-1). The clients are built in
-  one package, which is the only code that imports minio-go (D12).
+  and credential the user registered (S3-1). Every client is built
+  with `DisableContentSha256` (an `UNSIGNED-PAYLOAD` body: over the
+  tunnel's plain HTTP minio-go would otherwise SigV4-sign every 64 KiB
+  chunk, and over HTTPS it sends unsigned anyway) and `MaxRetries: 1`
+  (minio-go retries only seekable bodies, and the limited reader is
+  not one; the worker owns retries). `TrailingHeaders` stays off. The
+  clients are built in one package, which is the only code that
+  imports minio-go (D12). Pinned at **minio-go v7.4.1** (Q-Y).
 - **Operations.** `Put` streams the object from the store through the
   decorator into `PutObject`, or for objects above the part size into
   the low-level multipart calls (`NewMultipartUpload`, `PutObjectPart`,
   `CompleteMultipartUpload`), with `x-amz-meta-lendisk-sha256` from the
-  queue row and the SHA-256 as the request checksum where the target
-  verifies one. `Get` with a range is `GetObject` with a range option.
+  queue row. The request checksum is SHA-256 (S3-3, Q-Y.2): a single
+  PUT carries the queue row's hash as `x-amz-checksum-sha256`, at no
+  extra read; a multipart upload is created with
+  `x-amz-checksum-algorithm: SHA256` and each part carries its own
+  SHA-256 as an unsigned trailer (`PutObjectPartOptions.Trailer`, a
+  placeholder of the final length filled by a hashing reader at EOF),
+  so each byte is still read once. minio-go's *signed* trailer is never
+  used: its framing is refused by versitygw and Garage. A target that
+  refuses checksums gets none, per target. `Get` with a range is `GetObject` with a range option.
   `Head`, `List` and `Delete` map to `StatObject`, `ListObjects` (with
   versions at an overflow target) and `RemoveObject`. For a friend,
   `List` is the control API call of §3.7 and `Undelete` is §3.6.
@@ -1148,10 +1170,15 @@ upstream bucket is Q-V.
   "paused for quota" (LEND-2); a `403` after a removal becomes
   "removed" (PEER-5, SEC-15); a `412` becomes an immutability alert
   (EP-11); anything else is a retry with backoff.
-- **REPL-6** The upload ID and the ETag of each completed part are
-  written to the queue row as parts complete. After a restart or an
-  interruption the worker lists the parts of the open upload, checks
-  them against the row, and continues at the next part. Objects below
+- **REPL-6** The upload ID and the number, ETag and checksum of each
+  completed part are written to the queue row as parts complete. After
+  a restart or an interruption the worker lists the parts of the open
+  upload (`ListObjectParts`), keeps the stored parts whose ETag
+  matches, and continues at the next part, reading the store from that
+  part's offset. A part the target acknowledged but the row missed is
+  sent again; a `NoSuchUpload` (aborted or expired at the target)
+  starts the object over. Shown with `SIGKILL` mid-part against
+  versitygw and Garage (Q-Y.1). Objects below
   the part size (16 MiB, configurable) restart whole. The same for
   friends and overflow targets.
 - **REPL-7** Per-peer and global limits are token buckets
@@ -1159,8 +1186,11 @@ upstream bucket is Q-V.
   part and of every download (read-through, VER-2 samples, `verify
   --full`);
   the time-of-day schedule is checked before each part, so a closing
-  window stops a transfer within one part. Both change at runtime from
-  the configuration.
+  window stops a transfer within one part, which is part size over rate
+  in time (16 s for 16 MiB at 1 MiB/s). Each read is cut to the
+  smallest bucket's burst (64 KiB) before `WaitN`. Both change at
+  runtime from the configuration: `SetLimit` applies from the next
+  read (Q-Y.4).
 - **REPL-8** `export --for <peer>` pages through the bucket through the
   decorator and writes one file per key at its key path (or Kopia's
   sharded layout), for each key with a `placement` row at that peer;
@@ -1617,10 +1647,12 @@ of the `copies`, and the estimated cost (S3-7).
   start. Each of the node's buckets is a sub-prefix
   `<prefix>/<sealed name>/` (SEC-16), with keys below it as the tool
   wrote them (S3-2).
-- **S3-3** Uploads carry the SHA-256 as the request checksum where the
-  provider verifies one and Content-MD5 otherwise, plus lendisk's
-  SHA-256 as metadata. Large objects use multipart with the resume of
-  §3.4.
+- **S3-3** Uploads carry a SHA-256 request checksum, the object's on a
+  single PUT and each part's on multipart (§3.4), plus lendisk's
+  SHA-256 as metadata. Garage verifies both (Q-Y.2); a provider that
+  refuses them is set per target to send none, and the sample
+  downloads of VER-2 carry the check there. Large objects use
+  multipart with the resume of §3.4.
 - **S3-4** Buckets without versioning get lendisk-side tombstones: the
   delete is recorded locally and issued after the window; `status`
   labels the target "retention: client-side". Drain-back deletes go
@@ -1792,7 +1824,8 @@ design and disappear with it.
      every bump.
   3. *No longer needed:* whether versitygw verifies
      `x-amz-checksum-sha256` on upload. REPL-10's hash travels as
-     metadata and the decorator compares it itself (LEND-4).
+     metadata and the decorator compares it itself (LEND-4). Spike #4
+     found that it does (Q-Y.2).
   4. *No longer needed:* whether `posix` versioning gives RET-1 to
      RET-3 their semantics. Versioning is off; the decorator's
      tombstones are the only path (§3.6).
@@ -1924,18 +1957,54 @@ design and disappear with it.
 - **Q-X (gate, open, measured with G-3)** Listing time at 500k objects
   in one bucket on `posix`. Testable in a day. Object lock semantics
   were part of this gate until v0.12; object lock is no longer used.
-- **Q-Y (gate, open)** The replica client (D12, §3.4), against the
-  pinned minio-go, before the worker is built on it:
-  1. A multipart upload killed with `SIGKILL` mid-part resumes at the
-     next part after restart, against a friend (versitygw), RustFS, B2
-     and Garage.
-  2. Each tier-1 and tier-2 target accepts the request checksum lendisk
-     sends, or the client is configured per target to send none.
+- **Q-Y (gate, open: items 3 and 5, and 1 and 2 at RustFS and B2)**
+  The replica client (D12, §3.4), against the pinned minio-go, before
+  the worker is built on it. Pinned at **minio-go v7.4.1** (2026-10-12)
+  with `golang.org/x/time` v0.16.0. Items 1, 2 and 4 were answered on
+  2026-11-06 by the spike in `spikes/minio-go/` (issue #4), against a
+  versitygw v1.10.0 friend over TCP and a `dxflrs/garage:v2.5.0`
+  container; no item needed the AWS SDK.
+  1. *Resolved for versitygw and Garage:* a multipart upload killed
+     with `SIGKILL` mid-part resumes at the next part after restart,
+     using only the upload ID and the part ETags. A subprocess sending
+     six 5 MiB parts was killed 300 ms into part 4; the target listed
+     parts 1 to 3 and not the partial one, the restarted process
+     checked the stored parts with `ListObjectParts`, sent parts 4 to 6
+     only (13.6 of 29.4 MB read again) and the object's SHA-256
+     matched. Same with and without the SHA-256 trailer. The loop uses
+     `minio.Core`'s `NewMultipartUpload`, `PutObjectPart`,
+     `ListObjectParts` and `CompleteMultipartUpload` only (§3.4,
+     REPL-6). RustFS and B2 are left to the tier-1 CI.
+  2. *Resolved for versitygw and Garage:* both accept **and verify** a
+     SHA-256 request checksum (a wrong one gets `400 BadDigest` and
+     `400 InvalidDigest`; versitygw thereby answers Q-I.3 too), and both
+     accept none. minio-go sends none by default, unlike the AWS SDK:
+     over plain HTTP it signs every 64 KiB chunk
+     (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`), over HTTPS it sends
+     `UNSIGNED-PAYLOAD`. Its `TrailingHeaders` option turns on CRC32C,
+     and on multipart over plain HTTP that goes in a *signed* trailer
+     which both targets refuse, as they do a SHA-256 in one: minio-go
+     ends the trailer line with `\n` before the `\r\n` the format
+     expects. What works with one read of each byte is an unsigned
+     payload with the part's SHA-256 in an unsigned trailer
+     (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`), and on a single PUT the
+     queue row's hash as a header. S3 has no whole-object SHA-256 for
+     multipart. §3.4 and S3-3 are written to match. Tier-1 providers
+     are left to their CI.
   3. A friend's `507`, `403` and `412` reach the worker as
-     distinguishable errors through the tailcat transport.
-  4. The limiter and the timetable hold to within one part.
+     distinguishable errors through the tailcat transport (ticket 18).
+  4. *Resolved:* the limiter and the timetable hold to within one part.
+     At 4 MiB/s each 5 MiB part took 1.236 to 1.255 s at both targets
+     and a 20 MiB download 4.99 to 5.00 s; `SetLimit` from 2 to 8 MiB/s
+     mid-part gave 8.14 MiB/s within 250 ms; two places at 4 MiB/s
+     under a 6 MiB/s global bucket ran at 6.006 MiB/s combined. A window
+     closing 10, 50 and 90 % into a part stopped the transfer at the end
+     of that part (0.95, 0.50 and 0.10 parts after the close at most)
+     and the reopened transfer sent only the remaining parts.
   5. RSS per transfer in flight (with Q-M) and throughput to a friend
-     on a Pi 4 (with Q-L).
+     on a Pi 4 (with Q-L). The client's per-chunk signing is gone with
+     the unsigned payload, so the SHA-256 work per byte sent is the
+     part checksum's alone.
   If minio-go fails these in a way configuration cannot fix, the AWS
   SDK for Go v2 behind the same interface (D12).
 - **Q-Z (open)** Lent buckets on a second disk under one `posix` root.
