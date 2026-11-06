@@ -2186,14 +2186,18 @@ capture decorator, so nothing stands between that and posix (#62).
   the condition holds, so an alert is raised once, and sets
   `cleared_at` when it ends. A later raise of the same key replaces the
   row, counts up its `raise_no` and is delivered again. The kinds so far:
-  - `friend_unreachable`, subject the friend: its place is `retrying`
-    (a network error) and has not answered for longer than
-    `alerts.unreachable_after` (24h), counted from its `last_ok`, or
-    from `since` when it never answered. A friend that went off at t0,
-    tried next by a backup at t0+20h, is alerted at t0+24h.
-    Reachability is learned only from replication attempts, so a friend
+  - `friend_unreachable`, subject the friend: raised at `now` when
+    both hold: its place's condition is `retrying` (a network error)
+    and `now − since ≥ alert.Service.MinRetrying` (1 hour), and
+    `now − last_ok ≥ alerts.unreachable_after` (24h), using `since`
+    when `last_ok` is unset (it never answered). A friend that went off
+    at t0, tried next by a backup at t0+20h, is alerted at t0+24h (at
+    t0+21h at the earliest, when the hour of retrying is what is
+    missing). The hour keeps a nightly backup that meets a one-minute
+    blip 24h after the last answer from alerting at once, since
+    reachability is learned only from replication attempts. So a friend
     with nothing queued is not judged until the periodic reachability
-    probe (#65);
+    probe (#65), which may let the hour be revisited;
   - `store_unreadable`, no subject: a place waits with condition
     `store` (§3.4 *Local errors*);
   - `objects_not_replicated`, subject the bucket: objects refused
@@ -2216,11 +2220,17 @@ capture decorator, so nothing stands between that and posix (#62).
   (`subject` omitted when empty; fields are added, never renamed).
   `alerts.command` is the absolute path of one executable program, run
   with no arguments and no shell, the body on stdin, delivered on exit
-  status 0; `serve` refuses at startup anything else (a command line
-  with arguments, a file that is missing or not executable), saying to
-  put arguments in a small script. The hook runs in a process group of
-  its own, killed whole when its attempt times out, so nothing it
-  started outlives it. Its output (the first 512 bytes) is logged
+  status 0; `serve` refuses at startup anything else
+  (`alert.CheckCommand`). The path may hold spaces when the whole
+  string names such a file; when only its first word does, the rest
+  are arguments and the refusal says to put them in a small script;
+  a missing file is refused with "create it, or clear
+  alerts.command". The hook runs in a process group of its own,
+  killed whole when its attempt times out and again once it returns,
+  so nothing it started outlives it, except a child that left the
+  group with `setsid`. A hook that exits 0 but leaves a child holding
+  its output is delivered once the 5 s wait for the output ends, with
+  a warning, rather than sent again. Its output (the first 512 bytes) is logged
   when it fails, so a hook should not print secrets. `alerts.webhook`
   receives the same body as a `POST` with `Content-Type:
   application/json`, delivered on a 2xx; redirects are not followed,

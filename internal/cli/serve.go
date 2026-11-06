@@ -85,7 +85,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 4)
+			errc := make(chan error, 5) // gateway, LAN, loopback, replication, alerts
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs}
 			ready := make(chan struct{})

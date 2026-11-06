@@ -6,9 +6,10 @@
 // the store could not supply (VER-5), objects a place refused (EP-11).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
-// holds and cleared when it ends. Each raise is delivered once to the
-// command hook (Message as JSON on stdin) and once to the webhook (the
-// same JSON POSTed), retried with backoff until delivered or cleared.
+// holds and cleared when it ends. Each raise is delivered at least once
+// to the command hook (Message as JSON on stdin) and to the webhook (the
+// same JSON POSTed), retried with backoff until delivered or cleared; a
+// crash between a send and its record sends it again.
 //
 // Rules a caller must keep:
 //   - A new alert is a condition the evaluator reads from state, with a
@@ -16,7 +17,7 @@
 //     condition in lendisk.db and calls Check.
 //   - Check never blocks, and nothing the Service does waits on the
 //     caller: replication and the gateway only write state.
-//   - The webhook URL may hold a secret: log it only through redact.
+//   - The webhook URL may hold a secret: log it only through Redact.
 package alert
 
 import (
@@ -27,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -98,6 +100,12 @@ type Service struct {
 	// UnreachableAfter is how long a friend may go unanswered before
 	// it is alerted (default 24h).
 	UnreachableAfter time.Duration
+	// MinRetrying is how long a place must have been retrying before it
+	// counts as unreachable (default 1 hour): reachability is learned
+	// only from replication, so without it a nightly backup meeting a
+	// one-minute blip 24h after the last answer would alert at once.
+	// The reachability probe (#65) may let this be revisited.
+	MinRetrying time.Duration
 
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
@@ -237,14 +245,16 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 	}
 	var out []state.Alert
 	after := orDefault(s.UnreachableAfter, 24*time.Hour)
+	minRetrying := orDefault(s.MinRetrying, time.Hour)
 	for _, f := range fs {
 		c := conds[f.Peer]
-		if c.Condition != state.ConditionRetrying {
+		// Retrying for at least MinRetrying, and silent for at least the
+		// threshold counted from its last answer: a friend that went off
+		// long before the next backup tried it has been gone since then.
+		// One that never answered is counted from its first failure.
+		if c.Condition != state.ConditionRetrying || now.Sub(c.Since) < minRetrying {
 			continue
 		}
-		// Counted from its last answer: a friend that went off long
-		// before the next backup tried it has been gone since then. One
-		// that never answered is counted from its first failure.
 		from := c.LastOK
 		if from.IsZero() {
 			from = c.Since
@@ -386,28 +396,43 @@ func (s *Service) target(channel string) string {
 }
 
 func (s *Service) runHook(ctx context.Context, body []byte) error {
-	if s.RunCommand != nil {
-		return s.RunCommand(ctx, s.Command, body)
+	run := s.RunCommand
+	if run == nil {
+		run = RunCommand
 	}
-	return RunCommand(ctx, s.Command, body)
+	err := run(ctx, s.Command, body)
+	if errors.Is(err, ErrLeftChildren) {
+		s.Log.Warn("alert hook left processes running after it exited 0; delivered, and they were killed",
+			"command", s.Command)
+		return nil
+	}
+	return err
 }
 
 // CheckCommand checks alerts.command: the absolute path of one
 // executable regular file. It is run with no arguments and no shell, so
 // a command line such as "ntfy.sh --topic x" is refused rather than
 // failing at the first alert.
+//
+// A path holding spaces is accepted when the whole string names such a
+// file. Otherwise, when its first word does, the rest are arguments,
+// which a small script must carry.
 func CheckCommand(command string) error {
 	const rule = "alerts.command must be the path to one program, with no arguments; put arguments in a small script"
-	if strings.ContainsAny(command, " \t\n") {
-		return fmt.Errorf("%s (alerts.command = %q holds spaces)", rule, command)
-	}
 	if !filepath.IsAbs(command) {
 		return fmt.Errorf("%s (alerts.command = %q is not an absolute path)", rule, command)
 	}
 	fi, err := os.Stat(command)
-	switch {
-	case err != nil:
+	if err != nil {
+		if first := strings.Fields(command)[0]; first != command && executable(first) {
+			return fmt.Errorf("%s (alerts.command = %q holds arguments)", rule, command)
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("alerts.command: %s does not exist: create it, or clear alerts.command", command)
+		}
 		return fmt.Errorf("%s: %w", rule, err)
+	}
+	switch {
 	case !fi.Mode().IsRegular():
 		return fmt.Errorf("%s (%s is not a regular file)", rule, command)
 	case fi.Mode().Perm()&0o111 == 0:
@@ -416,17 +441,40 @@ func CheckCommand(command string) error {
 	return nil
 }
 
+func executable(path string) bool {
+	fi, err := os.Stat(path)
+	return err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0
+}
+
+// waitDelay is how long RunCommand waits for the hook's output pipes
+// to close once it exited; tests shorten it.
+var waitDelay = 5 * time.Second
+
+// ErrLeftChildren: the hook exited 0 but left a process holding its
+// output past waitDelay. The alert was delivered; the process group was
+// killed.
+var ErrLeftChildren = errors.New("the hook exited 0 but left processes holding its output; they were killed")
+
 // RunCommand runs command without a shell, stdin on its standard input,
-// in a process group of its own: when ctx ends, the whole group is
-// killed, so nothing the hook started outlives it. A failure carries the
-// start of what it printed.
+// in a process group of its own. When ctx ends, and again once it
+// returns, the whole group is killed, so nothing the hook started
+// outlives it (except a child that left the group with setsid). A
+// failure carries the start of what it printed; ErrLeftChildren is a
+// success.
 func RunCommand(ctx context.Context, command string, stdin []byte) error {
 	cmd := exec.CommandContext(ctx, command)
 	cmd.Stdin = bytes.NewReader(stdin)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = 5 * time.Second // a child that keeps the pipes open
+	cmd.WaitDelay = waitDelay // a child that keeps the pipes open
 	out, err := cmd.CombinedOutput()
+	if cmd.Process != nil {
+		syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) // ESRCH when nothing is left
+	}
+	if errors.Is(err, exec.ErrWaitDelay) {
+		// Wait reports it only after an exit status of 0.
+		return ErrLeftChildren
+	}
 	if err != nil {
 		if o := strings.TrimSpace(string(out)); o != "" {
 			if len(o) > 512 {

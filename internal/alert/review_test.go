@@ -3,6 +3,7 @@ package alert
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -62,13 +63,29 @@ func TestCommandMustBeOneExecutableProgram(t *testing.T) {
 	if err := os.WriteFile(plain, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := CheckCommand(exe); err != nil {
-		t.Fatalf("refused %s: %v", exe, err)
+	spaced := filepath.Join(dir, "my hooks", "ntfy hook.sh")
+	if err := os.MkdirAll(filepath.Dir(spaced), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	for _, bad := range []string{exe + " --topic backups", "hook.sh", plain, dir, filepath.Join(dir, "missing")} {
+	if err := os.WriteFile(spaced, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, good := range []string{exe, spaced} {
+		if err := CheckCommand(good); err != nil {
+			t.Errorf("refused %q: %v", good, err)
+		}
+	}
+	for bad, want := range map[string]string{
+		exe + " --topic backups":              "put arguments in a small script",
+		"hook.sh":                             "absolute path",
+		plain:                                 "not executable",
+		dir:                                   "not a regular file",
+		filepath.Join(dir, "missing"):         "create it, or clear alerts.command",
+		filepath.Join(dir, "missing") + " -v": "create it, or clear alerts.command",
+	} {
 		err := CheckCommand(bad)
-		if err == nil || !strings.Contains(err.Error(), "put arguments in a small script") {
-			t.Errorf("CheckCommand(%q) = %v", bad, err)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("CheckCommand(%q) = %v, want %q", bad, err, want)
 		}
 	}
 }
@@ -100,6 +117,108 @@ func TestUnreachableCountedFromLastAnswer(t *testing.T) {
 	}
 	if _, ok := active(t, db)["friend_unreachable:B"]; !ok {
 		t.Fatal("not alerted 24h after B's last answer")
+	}
+}
+
+// OPS-2 (#13): reachability is learned only from replication, so a
+// nightly backup that meets a one-minute blip, 24h after the last
+// answer, is not alerted: the place must also have been retrying for
+// an hour (MinRetrying) before it counts as unreachable.
+func TestNightlyBlipNotAlerted(t *testing.T) {
+	db := openDB(t)
+	addFriend(t, db, "B")
+	t0 := time.Unix(1_800_000_000, 0)
+	if err := db.SetPlaceCondition(t.Context(), "B", state.ConditionOK, "", t0); err != nil {
+		t.Fatal(err)
+	}
+	// The next night's backup fails at t0+24h.
+	if err := db.SetPlaceCondition(t.Context(), "B", state.ConditionRetrying, "dial: timeout", t0.Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c := &clock{t: t0.Add(24*time.Hour + time.Minute)}
+	s := &Service{DB: db, Log: quiet, Now: c.now, UnreachableAfter: 24 * time.Hour}
+	if err := s.evaluate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if as := active(t, db); len(as) != 0 {
+		t.Fatalf("a one-minute blip was alerted: %v", as)
+	}
+	// Still failing an hour later: now it is.
+	c.set(t0.Add(25 * time.Hour))
+	if err := s.evaluate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := active(t, db)["friend_unreachable:B"]; !ok {
+		t.Fatal("not alerted after an hour of retrying, 25h after the last answer")
+	}
+
+	// The minimum is injectable: B gone at t0, next backup at t0+20h,
+	// with a 2h minimum, is alerted at t0+24h, not before t0+22h.
+	db2 := openDB(t)
+	addFriend(t, db2, "B")
+	db2.SetPlaceCondition(t.Context(), "B", state.ConditionOK, "", t0)
+	db2.SetPlaceCondition(t.Context(), "B", state.ConditionRetrying, "dial: timeout", t0.Add(20*time.Hour))
+	s2 := &Service{DB: db2, Log: quiet, Now: c.now, UnreachableAfter: 24 * time.Hour, MinRetrying: 2 * time.Hour}
+	c.set(t0.Add(24*time.Hour - time.Second))
+	s2.evaluate(t.Context())
+	if as := active(t, db2); len(as) != 0 {
+		t.Fatalf("alerted before 24h: %v", as)
+	}
+	c.set(t0.Add(24 * time.Hour))
+	s2.evaluate(t.Context())
+	if _, ok := active(t, db2)["friend_unreachable:B"]; !ok {
+		t.Fatal("not alerted at t0+24h")
+	}
+}
+
+// OPS-3 (#13): a hook that exits 0 but leaves a child holding its
+// output is delivered (with a warning), not re-sent for ever, and the
+// child is killed.
+func TestHookExitingWithChildIsDelivered(t *testing.T) {
+	defer func(d time.Duration) { waitDelay = d }(waitDelay)
+	waitDelay = 200 * time.Millisecond
+	dir := t.TempDir()
+	pidFile := filepath.Join(dir, "child.pid")
+	hook := filepath.Join(dir, "hook.sh")
+	script := "#!/bin/sh\ncat > /dev/null\nsleep 300 &\necho $! > '" + pidFile + "'\nexit 0\n"
+	if err := os.WriteFile(hook, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := RunCommand(context.Background(), hook, []byte("{}"))
+	if !errors.Is(err, ErrLeftChildren) {
+		t.Fatalf("RunCommand = %v, want ErrLeftChildren", err)
+	}
+	b, rerr := os.ReadFile(pidFile)
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+	waitFor(t, "the hook's child to be gone", func() bool {
+		return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH)
+	})
+
+	// The service counts it as delivered and warns.
+	db := openDB(t)
+	addFriend(t, db, "B")
+	if err := db.SetPlaceCondition(t.Context(), "B", state.ConditionStore, "disk gone", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	s := &Service{DB: db, Log: slog.New(slog.NewTextHandler(logs, nil)), Command: hook}
+	if err := s.evaluate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !s.deliverPending(t.Context(), time.Second) {
+		t.Fatalf("not delivered:\n%s", logs)
+	}
+	if active(t, db)["store_unreadable"].HookAt.IsZero() || !strings.Contains(logs.String(), "left") {
+		t.Fatalf("delivery not recorded or not warned:\n%s", logs)
+	}
+	if b, err := os.ReadFile(pidFile); err == nil {
+		if p, _ := strconv.Atoi(strings.TrimSpace(string(b))); p > 0 {
+			t.Cleanup(func() { syscall.Kill(p, syscall.SIGKILL) })
+		}
 	}
 }
 

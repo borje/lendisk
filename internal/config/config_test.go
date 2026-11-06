@@ -158,8 +158,15 @@ func TestExamplesParse(t *testing.T) {
 		files = append(files, "../../examples/"+ex+"/config/lendisk.toml")
 	}
 	for _, p := range files {
-		if _, err := load(t, []string{"--config", p}, nil); err != nil {
+		l, err := load(t, []string{"--config", p}, nil)
+		if err != nil {
 			t.Errorf("%s: %v", p, err)
+			continue
+		}
+		// serve refuses a hook file that does not exist (#13), so an
+		// example names one only in a comment.
+		if l.Alerts.Command != "" {
+			t.Errorf("%s sets alerts.command = %q; serve would refuse to start until it exists", p, l.Alerts.Command)
 		}
 	}
 }

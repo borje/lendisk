@@ -62,7 +62,14 @@ bjorn = "8M"                 # REPL-7: Björn is relayed through DERP; be gentle
 # pool (S3-7): alert at 90%, stop at 100%.
 
 [alerts]
-command = "/etc/lendisk/hooks/ntfy.sh"    # OPS-3: receives JSON on stdin
+# OPS-3: the hook receives each alert as JSON on stdin. Uncomment once
+# the file exists: serve refuses to start otherwise. It must be an
+# absolute path to one executable file (chmod +x), with no arguments;
+# put arguments in the script. A shell script needs /bin/sh in the
+# image. For example /etc/lendisk/hooks/ntfy.sh:
+#   #!/bin/sh
+#   exec curl -fsS -H 'Title: lendisk alert' --data-binary @- https://ntfy.sh/your-topic
+# command = "/etc/lendisk/hooks/ntfy.sh"
 webhook = "https://hc-ping.com/your-uuid" # OPS-3: healthchecks.io style
 unreachable_after = "24h"                 # OPS-2: the default
 
