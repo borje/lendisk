@@ -659,3 +659,219 @@ func TestCompletionAfterStopLeavesItsRowPending(t *testing.T) {
 	}
 	assertOneDoneRow(t, h, be, "big", body)
 }
+
+func (f *failingFirstCompletion) Unwrap() backend.Backend { return f.Backend }
+
+// failingGets fails GetObject while fail is set and counts the calls.
+type failingGets struct {
+	backend.Backend
+	fail atomic.Bool
+	gets atomic.Int32
+}
+
+func (f *failingGets) GetObject(ctx context.Context, in *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+	f.gets.Add(1)
+	if f.fail.Load() {
+		return nil, s3err.GetAPIError(s3err.ErrInternalError)
+	}
+	return f.Backend.GetObject(ctx, in)
+}
+
+func (f *failingGets) Unwrap() backend.Backend { return f.Backend }
+
+// EP-3, REPL-10 (#59): a completion whose background hash failed leaves
+// its row stranded. A retry checks only that the object landed, answers
+// from the store without reading the object, and leaves the row pending
+// for ResolveStranded, which hashes it.
+func TestRetryOfAStrandedButLandedUploadDoesNotHash(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	ctx := context.Background()
+	posix, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := &failingGets{Backend: posix}
+	be.fail.Store(true)
+	set, _ := profile.Load("")
+	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	_, in, body := twoPartUpload(t, posix, "big")
+	if _, _, err := d.CompleteMultipartUpload(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	d.hashes.wg.Wait()
+	if p, _ := h.db.PendingCaptures(ctx); len(p) != 1 {
+		t.Fatalf("%d rows pending after the failed hash, want 1", len(p))
+	}
+	gets := be.gets.Load()
+	if _, _, err := d.CompleteMultipartUpload(ctx, in); err != nil {
+		t.Fatalf("retried completion: %v", err)
+	}
+	if n := be.gets.Load() - gets; n != 0 {
+		t.Fatalf("the retry read the object %d times", n)
+	}
+	if p, _ := h.db.PendingCaptures(ctx); len(p) != 1 {
+		t.Fatalf("%d rows pending after the retry, want the stranded one", len(p))
+	}
+	if len(d.completing) != 0 {
+		t.Fatalf("completions left registered: %v", d.completing)
+	}
+	be.fail.Store(false)
+	d.ResolveStranded(ctx)
+	assertOneDoneRow(t, h, posix, "big", body)
+}
+
+// EP-3 (#59): two retries that both found no row (the first completion
+// failed) do not both wait for the key's lock: one captures, and the
+// other waits for its store call, not for its hash.
+func TestConcurrentRetriesAfterAFailedCompletionDoNotWaitForTheHash(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	ctx := context.Background()
+	posix, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := &failingFirstCompletion{Backend: posix, entered: make(chan struct{}), release: make(chan struct{})}
+	close(be.release)
+	set, _ := profile.Load("")
+	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	inFirst, inRetry, body := twoPartUpload(t, posix, "big")
+	if _, _, err := d.CompleteMultipartUpload(ctx, inFirst); err == nil {
+		t.Fatal("the first completion succeeded")
+	}
+	// The second retry reads "no row", then stalls until the first retry
+	// is hashing.
+	var noRow atomic.Int32
+	stalled, gate := make(chan struct{}), make(chan struct{})
+	d.seenUpload = func(st string) {
+		if st == "" && noRow.Add(1) == 1 {
+			close(stalled)
+			<-gate
+		}
+	}
+	hashing, finish := make(chan struct{}), make(chan struct{})
+	d.beforeHash = func() { close(hashing); <-finish }
+	waited := make(chan string, 4)
+	d.keys.waiting = func(name string) { waited <- name }
+	complete := func() chan error {
+		c := make(chan error, 1)
+		go func() { _, _, err := d.CompleteMultipartUpload(ctx, inRetry); c <- err }()
+		return c
+	}
+	second := complete()
+	within(t, "second retry reading no row", stalled)
+	if err := within(t, "first retry", complete()); err != nil {
+		t.Fatalf("first retry: %v", err)
+	}
+	within(t, "first retry's hash", hashing)
+	close(gate)
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatalf("second retry: %v", err)
+		}
+	case name := <-waited:
+		t.Fatalf("the second retry waited for the key's lock %q", name)
+	}
+	close(finish)
+	d.hashes.stop()
+	assertOneDoneRow(t, h, posix, "big", body)
+}
+
+// EP-3 (#55, #59): a retry waiting for the first completion's store call
+// gives up when its context ends, without the key's lock.
+func TestWaitingForARunningCompletionRespectsTheRequestContext(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	posix, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be := &failingFirstCompletion{Backend: posix, entered: make(chan struct{}), release: make(chan struct{})}
+	set, _ := profile.Load("")
+	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	in, _, _ := twoPartUpload(t, posix, "big")
+	first := make(chan error, 1)
+	go func() { _, _, err := d.CompleteMultipartUpload(context.Background(), in); first <- err }()
+	within(t, "first completion reaching the store", be.entered)
+	d.keys.waiting = func(name string) { t.Errorf("a retry waited for the key's lock %q", name) }
+	ctx, cancel := context.WithCancel(context.Background())
+	d.seenUpload = func(string) { cancel() }
+	if _, _, err := d.CompleteMultipartUpload(ctx, in); err == nil {
+		t.Fatal("the retry succeeded after its client gave up")
+	}
+	close(be.release)
+	within(t, "first completion", first)
+}
+
+// panickingCompletion panics in CompleteMultipartUpload.
+type panickingCompletion struct{ backend.Backend }
+
+func (panickingCompletion) CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+	panic("injected")
+}
+
+// EP-3 (#59): a completion that panics in the store releases its
+// per-upload signal and the key's lock, and strands its row.
+func TestPanickingCompletionReleasesTheKey(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	posix, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, _ := profile.Load("")
+	d := &Decorator{Backend: panickingCompletion{posix}, DB: h.db, Profiles: set, Log: quiet}
+	in, _, _ := twoPartUpload(t, posix, "big")
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("no panic")
+			}
+		}()
+		d.CompleteMultipartUpload(context.Background(), in)
+	}()
+	if len(d.completing) != 0 {
+		t.Fatalf("completion left registered: %v", d.completing)
+	}
+	unlock, free := d.keys.tryLock("files", "big")
+	if !free {
+		t.Fatal("the key's lock is still held")
+	}
+	unlock()
+	if len(d.stranded) != 1 {
+		t.Fatalf("stranded: %v, want the row", d.stranded)
+	}
+}
+
+// EP-3 (#59): a pending completion's row is matched to its own upload,
+// not to its ETag: another upload with the same parts, already on disk,
+// does not make it look landed.
+func TestPendingCompletionMatchedByUploadNotETag(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	ctx := context.Background()
+	be, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, _ := profile.Load("")
+	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	_, a, body := twoPartUpload(t, be, "big")
+	_, b, _ := twoPartUpload(t, be, "big")
+	if _, _, err := d.CompleteMultipartUpload(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	d.hashes.stop()
+	if id, err := storeUpload(be, "files", "big"); err != nil || id != *a.UploadId {
+		t.Fatalf("store records upload %q (%v), want %q", id, err, *a.UploadId)
+	}
+	etag, err := backend.ComputeMultipartETagFromPartETags(*b.UploadId, b.MultipartUpload.Parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.BeginCaptures(ctx, []state.Capture{{Bucket: "files", Key: "big", Op: state.OpPut,
+		Class: "data", ETag: etag, UploadID: *b.UploadId}}); err != nil {
+		t.Fatal(err)
+	}
+	if done, dropped, err := d.ResolvePending(ctx); err != nil || done != 0 || dropped != 1 {
+		t.Fatalf("startup settled %d done, %d dropped (%v); want B's row dropped", done, dropped, err)
+	}
+	assertOneDoneRow(t, h, be, "big", body)
+}
