@@ -127,8 +127,15 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	errc := make(chan error, 1)
 	go func() { errc <- embedgw.RunVersityGW(ctx, &Decorator{Backend: be}, cfg) }()
 	if err := waitForSocket(ctx, g.Socket, errc); err != nil {
+		var stopped *stoppedError
+		if ctx.Err() != nil && !errors.As(err, &stopped) {
+			// Stopped while starting: wait for versitygw to stop too, so it
+			// never outlives Run (only one may run per process).
+			<-errc
+			return nil
+		}
 		if ctx.Err() != nil {
-			return nil // stopped while starting
+			return nil
 		}
 		return err
 	}
@@ -156,7 +163,7 @@ func waitForSocket(ctx context.Context, sock string, errc <-chan error) error {
 			if err == nil {
 				err = errors.New("gateway stopped before serving")
 			}
-			return fmt.Errorf("gateway: %w", err)
+			return &stoppedError{fmt.Errorf("gateway: %w", err)}
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(20 * time.Millisecond):
@@ -166,6 +173,11 @@ func waitForSocket(ctx context.Context, sock string, errc <-chan error) error {
 		}
 	}
 }
+
+// stoppedError means versitygw already returned, so errc is drained.
+type stoppedError struct{ error }
+
+func (e *stoppedError) Unwrap() error { return e.error }
 
 func randomHex(n int) string {
 	b := make([]byte, n)

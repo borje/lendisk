@@ -110,3 +110,27 @@ func TestLongSocketPathFallsBack(t *testing.T) {
 		t.Fatal("temporary socket directory left behind")
 	}
 }
+
+// Stopping during startup must not leave versitygw running: only one may
+// run per process, so a leak makes the next start fail.
+func TestStopDuringStartDoesNotLeak(t *testing.T) {
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for i := 0; i < 5; i++ {
+		dir := t.TempDir()
+		os.MkdirAll(filepath.Join(dir, "store"), 0o700)
+		db, err := state.Open(context.Background(), dir, quiet)
+		if err != nil {
+			t.Fatal(err)
+		}
+		g := &Gateway{StoreDir: filepath.Join(dir, "store"), Socket: SocketPath(dir), DB: db, Log: quiet}
+		ctx, cancel := context.WithCancel(context.Background())
+		errc := make(chan error, 1)
+		go func() { errc <- g.Run(ctx, nil) }()
+		time.Sleep(time.Duration(i) * 2 * time.Millisecond)
+		cancel()
+		if err := <-errc; err != nil {
+			t.Fatalf("round %d: %v", i, err)
+		}
+		db.Close()
+	}
+}
