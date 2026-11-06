@@ -1358,8 +1358,12 @@ upstream bucket is Q-V.
   so the index outlives it, `state` (`queued`, `acked`, `refused`),
   and on acknowledgement `sha256` and `acked_at`: acked put rows are
   the index of acknowledged hashes (REPL-10, `state.AckedHash`).
-  `refused` (with `detail`) is a refusal the place would repeat; the row
-  leaves the FIFO. Table `place` keeps each place's last answer:
+  `refused` (with `detail`) is a refusal that would repeat; the row
+  leaves the FIFO. Its `cause` (schema 9) is NULL when the place
+  refused (a `412`) and `store` when the node's own store could not
+  supply the object as captured (`state.RefuseObject`, #50): such a
+  refusal takes the row out of every place's FIFO at once and counts
+  against the bucket (`state.RefusedObjects`), not any place. Table `place` keeps each place's last answer:
   `condition` (`ok`, `retrying`, `quota`, `removed`), `detail`, `since`
   and `last_ok`, D6's last-reachable time. A friend added after a row
   was placed gets no copy of it until re-placement (#26).
@@ -1460,13 +1464,34 @@ upstream bucket is Q-V.
   "removed" (PEER-5, SEC-15); a `412` becomes an immutability alert
   (EP-11); anything else is a retry with backoff. A `BadDigest` (also
   `InvalidDigest`, `XAmzContentSHA256Mismatch`) means the bytes read
-  from the store no longer match the capture hash (REPL-10): unless a
-  later capture of the key exists, which explains it, the row is
-  `refused` like a `412`, so a rotted object does not stop its place's
-  FIFO. A refused row is logged at error level with `alert=true` until
-  alert delivery (#13). A paused (`quota`) or `removed` place tries its
-  head row again after an hour (LEND-2); other errors back off from 1 s,
-  doubling to 5 minutes.
+  from the store no longer match the capture hash (REPL-10), a local
+  error like those below. A refused row is logged at error level with
+  `alert=true` until alert delivery (#13). A paused (`quota`) or
+  `removed` place tries its head row again after an hour (LEND-2);
+  other errors back off from 1 s, doubling to 5 minutes, with the place
+  `retrying`.
+- **Local errors (#50).** The worker tells the store's failures apart
+  from the network's and the place's. A row whose object the store
+  cannot supply as captured is a *local error*: the file is gone, its
+  size differs from the capture, it is a directory or special file, it
+  cannot be opened or read, its key names no file under the bucket, or
+  it is larger than one PUT carries (5 GiB, `replica.MaxPutSize`, until
+  multipart replication, #23), or the place answered `BadDigest`. A
+  local error is explained by a later write of the key only while a
+  later capture exists (`state.LaterCapture`); since a done later
+  capture supersedes the row first, that means while one is in flight
+  (pending), which lasts until its write ends or, after a crash, until
+  the next start settles it (§3.3). Only then does the row wait,
+  polling every second, with the place's condition untouched; it is
+  then cancelled as superseded (or sent, if that write was dropped and
+  the store holds the captured bytes again). With no later capture the
+  row is refused at once with cause `store`, for every place, with an
+  alert, so a rotted or vanished object never stops a FIFO. A directory
+  marker (a key ending in `/` captured with no bytes, which the posix
+  store keeps as a directory) is not an error: it is sent as an empty
+  object. When the bucket's directory itself is missing (a store disk
+  not mounted), no object is blamed: the row waits with backoff, logged
+  at error level, the place's condition untouched.
 - **The worker** (`replica.Worker`, started by `serve` in the full
   profile only). It re-reads the friendships every 5 s and runs one
   sender per friend with an address, restarted when the address
@@ -1476,20 +1501,16 @@ upstream bucket is Q-V.
   capture replaced or deleted (`state.Superseded`) is cancelled, since
   the store no longer holds its bytes; deletes are always sent, and a
   key or bucket the friend lacks counts as deleted. A put reads
-  `<store>/<bucket>/<key>` from the `posix` store as it sends it. A size
-  other than the row's, or a missing file, while a later capture of the
-  key exists (`state.LaterCapture`) means that write is in flight: the
-  row waits, and is cancelled as superseded once that capture is done
-  (or sent, if it was dropped). With no later capture, the object
-  changed outside lendisk, and the row is `refused` like a `BadDigest`,
-  so it cannot stall the FIFO (#48). On
+  `<store>/<bucket>/<key>` from the `posix` store as it sends it; what
+  it cannot read as captured is a local error, above (#48, #50). On
   acknowledgement the row becomes `acked` with its hash and the place
   `ok`. Nothing is acknowledged before the place answers, so a restart
   of either side sends the head row again whole; the friend stores the
   same bytes under the same key, and nothing is sent twice that was
   acknowledged. `status` (and `places` in `status --json`) shows per
   place its condition, queued objects and bytes, lag (age of the oldest
-  queued row) and refused rows.
+  queued row) and the rows it refused; per bucket (`buckets[].refused`)
+  the objects refused for a local error.
 - **REPL-6** The upload ID and the number, ETag and checksum of each
   completed part are written to the queue row as parts complete. After
   a restart or an interruption the worker lists the parts of the open
@@ -1720,9 +1741,22 @@ upstream bucket is Q-V.
 - **A restarted friend.** tailcat admits a client as a WireGuard peer
   at its first ping only (the "meow" handshake, `Client.up`), and a
   restarted server has forgotten it while the client's session looks
-  valid, so its dials time out. `Tailcat.Dial` therefore drops and
-  closes a cached client when a dial through it fails; the next dial
-  builds a new one, which pings first.
+  valid, so its dials time out. `Tailcat.Dial` keeps one client per
+  friend, shared by every caller (replication now, the control API
+  calls of #24 and #28 later), and counts its open connections. A
+  failed dial does not drop the client, since the caller's own context
+  may have ended or the friend hiccupped: the transport checks the
+  client with a dial of its own, bounded by 10 s, at most one at a
+  time. Only if that check fails too is the client closed and dropped;
+  the next dial builds a new one, which pings first (#52). Closing it
+  then cuts no working connection: the check proves the server no
+  longer takes this client's dials, and tailcat's server keeps one
+  WireGuard session per client key, so a live old client would fight
+  its successor for that session (measured: a second client of the
+  same key to the same server stalls the first one's connections).
+  When the friend's address changes, the old client takes no new dials
+  but stays up until its last connection closes; clients on different
+  relays coexist.
 - **Dialling a friend.** The replica client's HTTP transport uses the
   tailcat `Client.Dial` for that peer as its dial function, so
   replication traffic enters the tunnel from inside the process. No

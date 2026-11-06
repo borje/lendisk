@@ -148,6 +148,48 @@ func TestRefusedPlacementLeavesTheFIFO(t *testing.T) {
 	}
 }
 
+// REPL-3 (#50): an object the store cannot supply as captured leaves
+// every place's FIFO at once and is counted against its bucket, not
+// against any place.
+func TestRefusedObjectCountsAgainstTheBucket(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	friend(t, db, "B")
+	friend(t, db, "C")
+	s1 := capture(t, db, "laptop", "data/1", OpPut)
+	s2 := capture(t, db, "laptop", "data/2", OpPut)
+	capture(t, db, "phone", "data/1", OpPut)
+	if err := db.AckPlacement(ctx, "C", s1, "h-data/1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RefuseObject(ctx, s1, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	for _, place := range []string{"B", "C"} {
+		if p, _, _ := db.NextPlacement(ctx, place); p.Seq != s2 {
+			t.Fatalf("%s head %+v", place, p)
+		}
+	}
+	st, err := db.PlaceStats(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st["B"].Refused != 0 || st["C"].Refused != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+	r, err := db.RefusedObjects(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r["laptop"] != 1 || r["phone"] != 0 {
+		t.Fatalf("refused objects %v", r)
+	}
+	// C's acknowledgement stands: it holds the object.
+	if h, ok, _ := db.AckedHash(ctx, "C", "laptop", "data/1"); !ok || h != "h-data/1" {
+		t.Fatalf("C's hash %q %v", h, ok)
+	}
+}
+
 // `status` (#18): per place, the queued objects and bytes and the lag,
 // the age of the oldest queued row; and the place's condition.
 func TestPlaceStatsAndCondition(t *testing.T) {

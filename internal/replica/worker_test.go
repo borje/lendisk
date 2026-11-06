@@ -125,12 +125,19 @@ func (fx *fixture) write(bucket, key, content string) int64 {
 	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
 		fx.t.Fatal(err)
 	}
+	return fx.capture(bucket, key, int64(len(content)), content)
+}
+
+// capture records a completed put of key, size bytes hashed from
+// content, without touching the store.
+func (fx *fixture) capture(bucket, key string, size int64, content string) int64 {
+	fx.t.Helper()
 	seqs, err := fx.db.BeginCaptures(fx.t.Context(), []state.Capture{{Bucket: bucket, Key: key, Op: state.OpPut, Class: "data"}})
 	if err != nil {
 		fx.t.Fatal(err)
 	}
 	sum := sha256.Sum256([]byte(content))
-	if _, err := fx.db.FinishPut(fx.t.Context(), seqs[0], int64(len(content)), hex.EncodeToString(sum[:])); err != nil {
+	if _, err := fx.db.FinishPut(fx.t.Context(), seqs[0], size, hex.EncodeToString(sum[:])); err != nil {
 		fx.t.Fatal(err)
 	}
 	return seqs[0]
@@ -175,6 +182,17 @@ func (fx *fixture) condition(place string) state.PlaceCondition {
 		fx.t.Fatal(err)
 	}
 	return cs[place]
+}
+
+// refused returns how many of bucket's objects were refused because the
+// store could not supply them as captured.
+func (fx *fixture) refused(bucket string) int64 {
+	fx.t.Helper()
+	r, err := fx.db.RefusedObjects(fx.t.Context())
+	if err != nil {
+		fx.t.Fatal(err)
+	}
+	return r[bucket]
 }
 
 func waitFor(t *testing.T, what string, ok func() bool) {
@@ -314,9 +332,11 @@ func TestImmutabilityAndRejectedHashAreRefused(t *testing.T) {
 	if len(log) != 1 || log[0] != "put laptop/data/fine" {
 		t.Fatalf("sent %v", log)
 	}
+	// The friend refused the immutable key; the rotted copy is the
+	// bucket's fault, not the friend's (#50).
 	st, _ := fx.db.PlaceStats(t.Context(), time.Now())
-	if st["B"].Refused != 2 {
-		t.Fatalf("stats %+v", st["B"])
+	if st["B"].Refused != 1 || fx.refused("laptop") != 1 {
+		t.Fatalf("stats %+v, bucket refused %d", st["B"], fx.refused("laptop"))
 	}
 }
 
@@ -344,8 +364,13 @@ func TestChangedObjectDoesNotStallTheFIFO(t *testing.T) {
 		log, _, _, _ := fx.places["B"].snapshot()
 		return len(log) == 1
 	})
-	if st, _ := fx.db.PlaceStats(ctx, time.Now()); st["B"].Refused != 2 || st["B"].Queued != 1 {
-		t.Fatalf("stats %+v, want two refused and the rewritten row waiting", st["B"])
+	if st, _ := fx.db.PlaceStats(ctx, time.Now()); fx.refused("laptop") != 2 || st["B"].Refused != 0 || st["B"].Queued != 1 {
+		t.Fatalf("stats %+v, bucket refused %d: want two refused against the bucket and the rewritten row waiting",
+			st["B"], fx.refused("laptop"))
+	}
+	// Waiting for the rewrite is not the friend's failure (#50).
+	if c := fx.condition("B"); c.Condition != state.ConditionOK {
+		t.Fatalf("condition %+v while the rewrite is in flight", c)
 	}
 	sum := sha256.Sum256([]byte("newer"))
 	if _, err := fx.db.FinishPut(ctx, later[0], 5, hex.EncodeToString(sum[:])); err != nil {
@@ -356,9 +381,80 @@ func TestChangedObjectDoesNotStallTheFIFO(t *testing.T) {
 	if len(log) != 2 || log[0] != "put laptop/data/fine" || log[1] != "put laptop/data/rewritten" {
 		t.Fatalf("sent %v", log)
 	}
-	if st, _ := fx.db.PlaceStats(ctx, time.Now()); st["B"].Refused != 2 {
+	if st, _ := fx.db.PlaceStats(ctx, time.Now()); st["B"].Refused != 0 || fx.refused("laptop") != 2 {
 		t.Fatalf("stats %+v", st["B"])
 	}
+}
+
+// REPL-1, REPL-3, VER-5 (#50): a row the store can never supply as
+// captured is refused against its bucket, once for every place, with an
+// alert, and each place's FIFO moves on: a directory where an object
+// should be, a truncated object, a missing file, an object larger than
+// one PUT carries (until #23), a key that names no file in the store. A
+// directory marker (photos/ in a generic bucket, which the posix store
+// keeps as a directory) is an empty object and is sent as one.
+func TestPermanentLocalErrorsDoNotStallTheFIFO(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	bucket := filepath.Join(fx.store, "laptop")
+	os.MkdirAll(filepath.Join(bucket, "photos"), 0o700)
+	os.WriteFile(filepath.Join(bucket, "photos", "cat.jpg"), []byte("meow"), 0o600)
+	fx.capture("laptop", "photos/", 0, "")
+	os.MkdirAll(filepath.Join(bucket, "album"), 0o700)
+	fx.capture("laptop", "album", 5, "album")
+	fx.write("laptop", "data/truncated", "whole object")
+	os.Truncate(filepath.Join(bucket, "data", "truncated"), 3)
+	fx.write("laptop", "data/missing", "m")
+	os.Remove(filepath.Join(bucket, "data", "missing"))
+	f, err := os.Create(filepath.Join(bucket, "data", "huge"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Truncate(MaxPutSize + 1) // sparse
+	f.Close()
+	fx.capture("laptop", "data/huge", MaxPutSize+1, "huge")
+	fx.capture("laptop", "a/../../escape", 1, "e")
+	fx.write("laptop", "data/fine", "fine")
+	fx.run()
+	fx.drained("B")
+	fx.drained("C")
+	for _, p := range []string{"B", "C"} {
+		log, _, _, _ := fx.places[p].snapshot()
+		if len(log) != 2 || log[0] != "put laptop/photos/" || log[1] != "put laptop/data/fine" {
+			t.Fatalf("%s got %v", p, log)
+		}
+		if c := fx.condition(p); c.Condition != state.ConditionOK {
+			t.Fatalf("%s condition %+v", p, c)
+		}
+	}
+	st, _ := fx.db.PlaceStats(t.Context(), time.Now())
+	if st["B"].Refused != 0 || st["C"].Refused != 0 || fx.refused("laptop") != 5 {
+		t.Fatalf("places %+v, bucket refused %d; want 5 against the bucket", st, fx.refused("laptop"))
+	}
+}
+
+// REPL-3 (#50): when the bucket's directory in the store cannot be read
+// at all (a store disk not mounted), nothing is refused and the friend
+// is not blamed: the rows wait until the store is back.
+func TestUnreadableStoreWaitsWithoutRefusing(t *testing.T) {
+	fx := newFixture(t, "B")
+	fx.write("laptop", "data/1", "one")
+	bucket := filepath.Join(fx.store, "laptop")
+	aside := filepath.Join(fx.store, "aside")
+	if err := os.Rename(bucket, aside); err != nil {
+		t.Fatal(err)
+	}
+	fx.run()
+	time.Sleep(200 * time.Millisecond)
+	if st, _ := fx.db.PlaceStats(t.Context(), time.Now()); st["B"].Queued != 1 || fx.refused("laptop") != 0 {
+		t.Fatalf("stats %+v, refused %d", st["B"], fx.refused("laptop"))
+	}
+	if c := fx.condition("B"); c.Condition == state.ConditionRetrying {
+		t.Fatalf("the friend is blamed: %+v", c)
+	}
+	if err := os.Rename(aside, bucket); err != nil {
+		t.Fatal(err)
+	}
+	fx.drained("B")
 }
 
 // REPL-3: the FIFO is in lendisk.db, so a worker stopped mid-way and

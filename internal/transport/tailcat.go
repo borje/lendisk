@@ -32,13 +32,25 @@ type Tailcat struct {
 	admit   func(identity.NodeID) bool
 	server  *tailcat.Server // set by Listen
 	clients map[identity.NodeID]*tailcatClient
+	retired map[*tailcatClient]bool // replaced, closed when their last connection is
 	closed  bool
 }
 
+// tailcatClient is the client shared by every dial to one friend. Its
+// fields after Client are guarded by Tailcat.mu.
 type tailcatClient struct {
 	addr string
 	*tailcat.Client
+	t       *Tailcat
+	refs    int  // open connections and dials in flight through it
+	retired bool // replaced: no new dials; closed once refs is 0
+	probing bool // a check of the client is running (see Dial)
+	closed  bool
 }
+
+// probeTimeout bounds the transport's own check of a client after a
+// dial through it ran out of its caller's time.
+const probeTimeout = 10 * time.Second
 
 // NewTailcat returns a transport for id with the saved region. It
 // neither listens nor dials until asked.
@@ -56,6 +68,7 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 			log.Debug(strings.TrimSpace(fmt.Sprintf(format, args...)), "component", "tailcat")
 		},
 		clients: map[identity.NodeID]*tailcatClient{},
+		retired: map[*tailcatClient]bool{},
 	}, nil
 }
 
@@ -164,8 +177,20 @@ func (t *Tailcat) Listen(ctx context.Context) (net.Listener, error) {
 	return ln, nil
 }
 
-// Dial connects to peer's tunnel port at addr, through a client kept per
-// peer until a dial through it fails.
+// Dial connects to peer's tunnel port at addr, through one client per
+// peer shared by every caller (NET-1, NET-8).
+//
+// tailcat admits a client as a WireGuard peer at its first ping only,
+// so a client whose dials fail may be talking to a server that
+// restarted and forgot it, and must be replaced. But a failed dial says
+// little about the client: its caller's context may have ended, or the
+// friend hiccupped. So the transport checks the client with a dial of
+// its own, bounded by probeTimeout, and replaces it only if that fails
+// too. Such a client is closed at once: none of its connections can be
+// working, and tailcat's server keeps one WireGuard session per key, so
+// a live predecessor would fight its successor for it. A client
+// replaced because the friend's address changed takes no new dials but
+// stays up until its last connection closes.
 func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (net.Conn, error) {
 	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
 	if err != nil {
@@ -179,29 +204,121 @@ func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (
 		t.mu.Unlock()
 		return nil, net.ErrClosed
 	}
+	var stale *tailcatClient
 	c := t.clients[peer]
 	if c != nil && c.addr != addr {
-		c.Close() // the friend's address changed
+		stale = t.retireLocked(peer, c) // the friend's address changed
 		c = nil
 	}
 	if c == nil {
-		c = &tailcatClient{addr: addr, Client: &tailcat.Client{Server: tailcat.Addr(addr), Key: t.key, Logf: t.logf}}
+		c = &tailcatClient{addr: addr, t: t, Client: &tailcat.Client{Server: tailcat.Addr(addr), Key: t.key, Logf: t.logf}}
 		t.clients[peer] = c
 	}
+	c.refs++
 	t.mu.Unlock()
+	stale.shut()
+
 	conn, err := c.DialTCPPort(ctx, Port)
-	if err != nil {
-		// tailcat admits a client as a WireGuard peer at its first ping
-		// only, so a client that fails may be talking to a server that
-		// restarted and forgot it. Drop it; the next dial starts afresh.
-		t.mu.Lock()
+	if err == nil {
+		return &tunnelConn{Conn: conn, c: c}, nil // the connection keeps the dial's reference
+	}
+	t.mu.Lock()
+	if !c.probing && !c.retired && !c.closed {
+		c.probing = true
+		c.refs++
+		go t.probe(peer, c)
+	}
+	last := t.releaseLocked(c)
+	t.mu.Unlock()
+	last.shut()
+	return nil, err
+}
+
+// probe checks c, a dial through which failed, with a dial of the
+// transport's own, and closes and replaces c if that fails too. It holds
+// a reference to c, which it releases.
+func (t *Tailcat) probe(peer identity.NodeID, c *tailcatClient) {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	conn, err := c.DialTCPPort(ctx, Port)
+	cancel()
+	if err == nil {
+		conn.Close()
+	} else {
+		t.logf("tunnel to %s: a check of the client failed, replacing it: %v", peer, err)
+	}
+	t.mu.Lock()
+	c.probing = false
+	var dead *tailcatClient
+	if err != nil && !c.closed {
 		if t.clients[peer] == c {
 			delete(t.clients, peer)
 		}
-		t.mu.Unlock()
-		c.Close()
+		delete(t.retired, c)
+		c.retired, c.closed = true, true
+		dead = c
 	}
-	return conn, err
+	last := t.releaseLocked(c)
+	t.mu.Unlock()
+	dead.shut()
+	last.shut()
+}
+
+// retireLocked takes c out of service: no new dial uses it, and it is
+// closed when its last connection is. It returns c if nothing uses it
+// and it should be shut now.
+func (t *Tailcat) retireLocked(peer identity.NodeID, c *tailcatClient) *tailcatClient {
+	if t.clients[peer] == c {
+		delete(t.clients, peer)
+	}
+	if c.retired || c.closed {
+		return nil
+	}
+	c.retired = true
+	t.retired[c] = true
+	return t.idleLocked(c)
+}
+
+// releaseLocked drops a reference to c, returning c if it should now be
+// shut.
+func (t *Tailcat) releaseLocked(c *tailcatClient) *tailcatClient {
+	c.refs--
+	return t.idleLocked(c)
+}
+
+func (t *Tailcat) idleLocked(c *tailcatClient) *tailcatClient {
+	if !c.retired || c.refs > 0 || c.closed {
+		return nil
+	}
+	c.closed = true
+	delete(t.retired, c)
+	return c
+}
+
+// shut closes a client marked closed; nil is a no-op. It runs outside
+// Tailcat.mu, since closing tailcat's engine can take a while.
+func (c *tailcatClient) shut() {
+	if c != nil {
+		c.Client.Close()
+	}
+}
+
+// tunnelConn is a dialled connection; closing it releases its client.
+type tunnelConn struct {
+	net.Conn
+	c    *tailcatClient
+	once sync.Once
+}
+
+func (tc *tunnelConn) Close() error {
+	err := tc.Conn.Close()
+	tc.once.Do(func() {
+		t := tc.c.t
+		t.mu.Lock()
+		last := t.releaseLocked(tc.c)
+		t.mu.Unlock()
+		last.shut()
+	})
+	return err
 }
 
 // PeerOf returns the key of the client that opened an accepted connection.
@@ -260,9 +377,15 @@ func (t *Tailcat) Close() error {
 	t.closed = true
 	var errs []error
 	for _, c := range t.clients {
-		errs = append(errs, c.Close())
+		c.closed = true
+		errs = append(errs, c.Client.Close())
 	}
 	clear(t.clients)
+	for c := range t.retired {
+		c.closed = true
+		errs = append(errs, c.Client.Close())
+	}
+	clear(t.retired)
 	if t.server != nil {
 		errs = append(errs, t.server.Close())
 	}

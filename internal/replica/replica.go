@@ -26,6 +26,10 @@ import (
 // SHA-256 in hex (REPL-10), sent as x-amz-meta-lendisk-sha256.
 const MetaSHA256 = "lendisk-sha256"
 
+// MaxPutSize is the largest object one S3 PUT carries (5 GiB). The
+// worker refuses a larger one until multipart replication (#23).
+const MaxPutSize = 5 << 30
+
 // Object is one object to send: the queue row's facts and the store's
 // bytes, read once as they are sent.
 type Object struct {

@@ -299,3 +299,52 @@ func TestReplicateResticBackupToFriend(t *testing.T) {
 	// SEC-16: B's store and database never hold the bucket's name.
 	assertNotIn(t, bn, "laptop")
 }
+
+// REPL-3, VER-5 (#50): an object the store could not supply as captured
+// shows against its bucket in `status`, not against the friend, whose
+// own refusals and condition stay its own.
+func TestStatusShowsStoreRefusalsAgainstTheBucket(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(t)
+	n.addBucket(t, "laptop", "generic")
+	ctx := context.Background()
+	db, err := state.Open(ctx, n.data, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	var seqs []int64
+	for _, k := range []string{"data/rotted", "data/immutable"} {
+		s, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: k, Op: state.OpPut, Class: "data"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FinishPut(ctx, s[0], 1, "h"); err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, s[0])
+	}
+	if err := db.RefuseObject(ctx, seqs[0], "the store holds 0 bytes, the capture 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.RefusePlacement(ctx, "B", seqs[1], "PreconditionFailed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPlaceCondition(ctx, "B", state.ConditionOK, "", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	st := n.status()
+	if len(st.Buckets) != 1 || st.Buckets[0].Refused != 1 {
+		t.Fatalf("buckets %+v", st.Buckets)
+	}
+	if p := n.place("B"); p.Refused != 1 || p.State != state.ConditionOK {
+		t.Fatalf("place %+v", p)
+	}
+	_, text, _ := n.run("", "", "status")
+	if !strings.Contains(text, "1 not replicated") {
+		t.Fatalf("status text:\n%s", text)
+	}
+}

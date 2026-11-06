@@ -9,8 +9,9 @@ import (
 
 // Placement row states (D6). A queued row is an entry in its place's
 // FIFO; acked keeps the hash the place verified (REPL-10); refused is a
-// refusal the place would repeat (EP-11, LEND-4), out of the FIFO and
-// shown in status.
+// refusal that would repeat, out of the FIFO and shown in status: by
+// the place (EP-11, LEND-4), or, with cause 'store', because the node's
+// own store cannot supply the object as captured (RefuseObject, #50).
 const (
 	PlacementQueued  = "queued"
 	PlacementAcked   = "acked"
@@ -89,6 +90,37 @@ func (db *DB) RefusePlacement(ctx context.Context, place string, seq int64, deta
 	return err
 }
 
+// RefuseObject takes the queue row seq out of every place's FIFO as
+// refused because the node's own store cannot supply the object as
+// captured (#50); RefusedObjects counts it against its bucket, and no
+// place's refusals include it. Rows already acknowledged stay so.
+func (db *DB) RefuseObject(ctx context.Context, seq int64, detail string) error {
+	_, err := db.ExecContext(ctx, `UPDATE placement SET state = 'refused', detail = ?, cause = 'store'
+		WHERE seq = ? AND state = 'queued'`, detail, seq)
+	return err
+}
+
+// RefusedObjects returns, per bucket, how many objects were refused
+// because the store could not supply them; buckets with none are absent.
+func (db *DB) RefusedObjects(ctx context.Context) (map[string]int64, error) {
+	rows, err := db.QueryContext(ctx, `SELECT bucket, count(DISTINCT seq) FROM placement
+		WHERE state = 'refused' AND cause = 'store' GROUP BY bucket`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int64{}
+	for rows.Next() {
+		var b string
+		var n int64
+		if err := rows.Scan(&b, &n); err != nil {
+			return nil, err
+		}
+		out[b] = n
+	}
+	return out, rows.Err()
+}
+
 // Superseded reports whether a later completed write or delete of the
 // same key follows the queue row seq: the store no longer holds that
 // row's bytes, so a put of it is cancelled, not sent.
@@ -128,7 +160,7 @@ type PlaceStat struct {
 	QueuedBytes int64         // bytes of queued puts
 	Lag         time.Duration // age of the oldest queued row; zero when none
 	Oldest      time.Time     // capture time of the oldest queued row
-	Refused     int64         // rows the place refused for good
+	Refused     int64         // rows the place itself refused for good (not RefuseObject's)
 }
 
 // PlaceStats returns each place's FIFO size and lag at now; places with
@@ -138,7 +170,7 @@ func (db *DB) PlaceStats(ctx context.Context, now time.Time) (map[string]PlaceSt
 		count(*) FILTER (WHERE p.state = 'queued'),
 		coalesce(sum(q.size) FILTER (WHERE p.state = 'queued' AND p.op = 'put'), 0),
 		min(q.created_at) FILTER (WHERE p.state = 'queued'),
-		count(*) FILTER (WHERE p.state = 'refused')
+		count(*) FILTER (WHERE p.state = 'refused' AND p.cause IS NULL)
 		FROM placement p JOIN queue q ON q.seq = p.seq GROUP BY p.place`)
 	if err != nil {
 		return nil, err
