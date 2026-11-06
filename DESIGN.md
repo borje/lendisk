@@ -1668,27 +1668,81 @@ design and disappear with it.
   `CopyObject`, `UploadPartCopy`, `PutObjectTagging`, `RestoreObject`
   if present) is either captured or disabled. A method that mutates
   objects without being captured is a replication hole. Re-run on every
-  versitygw upgrade, together with SEC-9's table.
-- **Q-I (gate, open)** The embedded design depends on five properties of
-  versitygw at the pinned version:
-  1. *Resolved:* `embedgw` takes listener address strings, not a
-     `net.Listener`. Every listener is lendisk's bridge in front of
-     one internal unix socket (§3.7).
-  2. *Half resolved:* `Config.IAMService` takes an external
-     `auth.IAMService` and overrides every built-in IAM option
-     (confirmed). Open is whether the authenticated account reaches the
-     backend call, so the decorator can map bucket names per borrower
-     and count quota. Fallback: a vendored patch that puts the account
-     in the request context, carried as a Go module `replace`.
+  versitygw upgrade, together with SEC-9's table. Seen at v1.10.0
+  while answering Q-I: the methods that create, replace or remove
+  object content are `PutObject` (also reached by a browser-form
+  `POST`), `CompleteMultipartUpload`, `CopyObject` (including a
+  same-key metadata replace), `DeleteObject` and `DeleteObjects`;
+  `UploadPartCopy` writes a part only. `PutObjectTagging`,
+  `DeleteObjectTagging`, `PutObjectAcl`, `PutObjectRetention` and
+  `PutObjectLegalHold` change an object's metadata. `RestoreObject` and
+  `SelectObjectContent` are not implemented on `posix`. The full review
+  is still to do.
+- **Q-I (gate, resolved 2026-11-05)** The embedded design depends on
+  five properties of versitygw at the pinned version. Pinned at
+  **v1.10.0** (tag commit `72f75bd`, 2026-10-22), vendored; it needs Go
+  1.26. Answered by the spike in `spikes/versitygw/` (issue #2): the
+  `posix` backend behind a pass-through decorator and an external
+  `IAMService`, tested with the AWS SDK for Go v2 and with restic.
+  1. *Resolved:* `embedgw.RunVersityGW(ctx, backend.Backend, *Config)`
+     takes listener address strings (`Config.Ports`), not a
+     `net.Listener`. Given one unix socket path and nothing else, the
+     process holds that socket, at the mode `SocketPerm` sets, and no
+     TCP or UDP socket (`ss -lntupx`, and a test over `/proc/self/net`).
+     Every listener is lendisk's bridge in front of it (§3.7).
+  2. *Resolved, no patch:* `Config.IAMService` overrides every built-in
+     IAM option, and the authenticated account reaches every backend
+     call. versitygw passes the request's `*fasthttp.RequestCtx` as the
+     `context.Context`; the auth middleware stores the `auth.Account`
+     with fiber's `Locals`, which are fasthttp user values, so
+     `ctx.Value(string(utils.ContextKeyAccount)).(auth.Account)` returns
+     it inside the decorator. An unsigned request reaches
+     `GetBucketPolicy` and `GetBucketAcl` (the public-bucket check) with
+     a zero `Account`, so an empty `Access` means no account. The key
+     is a string constant from an internal package and is re-checked on
+     every bump.
   3. *No longer needed:* whether versitygw verifies
      `x-amz-checksum-sha256` on upload. REPL-10's hash travels as
      metadata and the decorator compares it itself (LEND-4).
   4. *No longer needed:* whether `posix` versioning gives RET-1 to
      RET-3 their semantics. Versioning is off; the decorator's
      tombstones are the only path (§3.6).
-  5. A backend can return a custom error (`QuotaExceeded`, HTTP 507)
-     and a conditional-put refusal (`PreconditionFailed`). Fallback:
-     `AccessDenied` with a distinguishing message the borrower parses.
+  5. *Resolved:* a backend error of type `s3err.APIError` reaches the
+     client with its code, message and status: `QuotaExceeded` with
+     507 and `PreconditionFailed` with 412 arrive intact, and a `HEAD`
+     carries the status only. The error must be returned unwrapped: the
+     controller uses a type assertion, not `errors.As`, so a wrapped one
+     becomes 500 `InternalError`, which clients retry. versitygw's own
+     `ErrQuotaExceeded` is a 403, so lendisk defines its own. The
+     `AccessDenied` fallback is not needed.
+
+  Found by the spike, and changing what SEC-8, NET-7 and D15 say:
+  - The admin API cannot be left unconfigured. With `AdminPorts` empty,
+    `embedgw` mounts it on the S3 socket (`PATCH /create-user`,
+    `/list-users` and the rest), open to any account with the admin
+    role. The root account `RunVersityGW` requires has that role, and
+    `list-users` returns every secret the `IAMService` lists. lendisk
+    sets a random root secret held only in memory, its `IAMService`
+    never returns the admin role and refuses the user-management calls,
+    and the gate below refuses every `PATCH`, which S3 does not use.
+  - The decorator cannot refuse operations by `backend.Backend` method
+    alone: versitygw calls `GetBucketAcl` and `GetBucketPolicy` on the
+    backend for its own access check on every request. NET-7's refusal
+    by S3 action goes in a gate, a fiber middleware passed through
+    `Config.S3Options` (`s3api.WithMiddleware`), which runs before
+    routing and authentication; the decorator keeps capture, quota and
+    the bucket map.
+  - Versioning is off by construction: without `VersioningDir`,
+    `PutBucketVersioning` answers 501 `VersioningNotConfigured`. Object
+    lock is not: `CreateBucket` with `x-amz-bucket-object-lock-enabled`
+    succeeds on `posix` and the bucket then reports lock enabled. The
+    gate refuses that header.
+  - `posix.New` changes the process's working directory to the store
+    root unless `PosixOpts.AbsolutePaths` is set; lendisk sets it.
+  - restic 0.19.1 `init`, `backup`, `check --read-data` and `restore`
+    work through a TCP-to-unix byte forward, and `restic -r
+    <store>/<bucket>` opens the same repository with nothing running
+    (P-5).
 - **Q-J, Q-K, Q-N, Q-O, Q-P (superseded)** Questions about Garage as the
   storage engine (upload checksum verification, block-error reporting,
   listener set, `CopyObject` cost, byte-total freshness). They went with
@@ -1770,7 +1824,13 @@ design and disappear with it.
   way. Check in the pinned source and with
   a bind mount in CI. Fallback: a second `posix` backend instance for
   `lent-*` buckets with a mux by bucket name, for that configuration
-  only.
+  only. The pinned source (v1.10.0, read 2026-11-05) puts the temp file
+  in `<bucket>/.sgwtmp` (`O_TMPFILE` where supported, then linked into
+  place) and multipart parts in `<bucket>/.sgwtmp/multipart/`, so a
+  disk mounted at the bucket directory keeps both on the bucket's
+  filesystem and the fallback should not be needed; the bind-mount
+  check in CI remains. A symlinked bucket directory is served only with
+  `PosixOpts.BucketLinks` set.
 - **Q-AA (open, tuned with G-1)** Placement and re-placement
   parameters (D6, §3.4): `reroute_after` (1 hour), `replace_after` (7
   days), the hourly re-placement pass, and free fraction as the
