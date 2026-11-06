@@ -87,20 +87,25 @@ func TestDroppedCopiesAreAlerted(t *testing.T) {
 	}
 	addFriend(t, db, "B")
 	addFriend(t, db, "C")
-	seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "data/1", Op: state.OpPut, Class: "data"}})
+	// data/1, then the index that waits for it.
+	seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "data/1", Op: state.OpPut, Class: "data"},
+		{Bucket: "laptop", Key: "index/1", Op: state.OpPut, Class: "metadata"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.FinishPut(ctx, seqs[0], 100, "h"); err != nil {
-		t.Fatal(err)
+	for _, s := range seqs {
+		if _, err := db.FinishPut(ctx, s, 100, "h"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := db.AckPlacement(ctx, "B", seqs[0], "h", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetPlaceCondition(ctx, "C", state.ConditionQuota, "507", time.Now()); err != nil {
+	// C has answered 507 for two hours (reroute_after is 1 hour).
+	if err := db.SetPlaceCondition(ctx, "C", state.ConditionQuota, "507", time.Now().Add(-2*time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	if _, dropped, err := db.Reroute(ctx, nil); err != nil || dropped != 1 {
+	if _, dropped, err := db.Reroute(ctx, nil, nil); err != nil || dropped != 1 {
 		t.Fatalf("dropped %d %v", dropped, err)
 	}
 	s := &Service{DB: db, Log: quiet}

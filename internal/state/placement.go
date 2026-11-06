@@ -15,11 +15,16 @@ import (
 // CauseStore or CauseOversize). An identical re-upload of the key heals
 // a refusal: FinishPut queues it again except where the place
 // acknowledged the very row it heals, and a refusal a later done write
-// replaced no longer counts (#57, #61).
+// replaced no longer counts (#57, #61). dropped is a copy never sent:
+// unsent at a friend gone past replace_after, or full for
+// reroute_after while it held a metadata barrier, with no other friend
+// with room (Reroute, #19); out of the FIFO, not counted in the place's
+// use, and the object is below copies until re-placement (#26).
 const (
 	PlacementQueued  = "queued"
 	PlacementAcked   = "acked"
 	PlacementRefused = "refused"
+	PlacementDropped = "dropped"
 )
 
 // Place conditions: how a place answered last (#18).

@@ -302,7 +302,7 @@ func (a *app) statusCmd() *cobra.Command {
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
 					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1})
 			}
-			db.Clock, db.ReplaceAfter = a.clock, cfg.ReplaceAfter()
+			db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
 			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
 				return err
 			}

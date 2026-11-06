@@ -171,10 +171,12 @@ func TestFreeCapacityCountsStoredAndUnsentMetadata(t *testing.T) {
 	// What is stored at B counts: C now has the larger free fraction.
 	d2 := p.put("laptop", "data/2", "data", 1)
 	p.wantPlaces("data/2", d2, "C")
-	// B 7/10, C 9/10. Metadata goes everywhere and counts: B 5, C 7.
-	p.put("laptop", "index/1", "metadata", 2)
-	// D joins with 6: it has none of the bucket's 2 units of metadata
-	// yet (re-placement sends them, #26), so 4/6 free, not 6/6, which
+	// B 7/10, C 9/10 (less the metadata reserve). Metadata goes
+	// everywhere and counts, and data leaves three times the live
+	// metadata (1.5) free for more: B 5, C 7.
+	p.put("laptop", "index/1", "metadata", 0.5)
+	// D joins with 6: it has none of the bucket's 0.5 units of metadata
+	// yet (re-placement sends them, #26), so 4/6 free, not 4.5/6, which
 	// is less than C's 7/10.
 	p.friend("D", 6)
 	d3 := p.put("laptop", "data/3", "data", 1)
@@ -196,7 +198,7 @@ func TestFreeCapacityCountsStoredAndUnsentMetadata(t *testing.T) {
 	}
 	// B: data/1, index/1 and data/4, less data/1; C: data/2, index/1,
 	// data/3; D: nothing yet (its metadata is not placed).
-	if use["B"] != 3*unit || use["C"] != 4*unit || use["D"] != 0 {
+	if use["B"] != 3*unit/2 || use["C"] != 5*unit/2 || use["D"] != 0 {
 		t.Fatalf("use after the delete %v (units of %d)", use, unit)
 	}
 }
@@ -248,20 +250,22 @@ func TestRerouteMovesUnsentDataFromAnUnreachableFriend(t *testing.T) {
 	p := newPool(t)
 	p.friend("B", 10)
 	p.friend("C", 10)
-	p.friend("D", 2)
+	p.friend("D", 5)
 	p.bucket("laptop", 2)
-	p.put("laptop", "index/0", "metadata", 0.5) // everywhere: D is 75% free
+	// Everywhere: D is 60% free once data leaves three times the live
+	// metadata for more (1.5 units).
+	p.put("laptop", "index/0", "metadata", 0.5)
 	d1 := p.put("laptop", "data/1", "data", 1)
 	p.wantPlaces("data/1", d1, "B", "C")
 	d2 := p.put("laptop", "data/2", "data", 1)
-	p.wantPlaces("data/2", d2, "B", "C")             // B and C 85%
-	m := p.put("laptop", "index/1", "metadata", 0.5) // D: 1 unit free
+	p.wantPlaces("data/2", d2, "B", "C")             // B and C 70%
+	m := p.put("laptop", "index/1", "metadata", 0.5) // D: 1 unit free, less a 3-unit reserve
 	p.ack("B", d1)
 	p.ack("B", d2)
 	p.ack("C", d1) // C acknowledged data/1 before it went away
 	reroute := func() (int64, int64) {
 		t.Helper()
-		moved, dropped, err := p.db.Reroute(ctx, nil)
+		moved, dropped, err := p.db.Reroute(ctx, nil, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -560,11 +564,11 @@ func TestAFullFriendWithNowhereElseDoesNotHoldTheBarrier(t *testing.T) {
 	m := p.put("laptop", "index/1", "metadata", 0.5)
 	x := p.del("laptop", "data/0", "data")
 	p.ack("C", d1)
-	p.condition("B", ConditionQuota, p.now, p.now.Add(-time.Minute))
+	p.condition("B", ConditionQuota, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour)) // 507 for reroute_after
 	if !p.held(m) {
 		t.Fatal("index/1 not held while data/1 waits at B")
 	}
-	moved, dropped, err := p.db.Reroute(ctx, nil)
+	moved, dropped, err := p.db.Reroute(ctx, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -597,7 +601,7 @@ func TestAFullFriendWithNowhereElseDoesNotHoldTheBarrier(t *testing.T) {
 	}
 	// Fifty days on, nothing is left to hold anything.
 	p.now = p.now.Add(50 * 24 * time.Hour)
-	if moved, dropped, err := p.db.Reroute(ctx, nil); err != nil || moved != 0 || dropped != 0 {
+	if moved, dropped, err := p.db.Reroute(ctx, nil, nil); err != nil || moved != 0 || dropped != 0 {
 		t.Fatalf("moved %d dropped %d %v", moved, dropped, err)
 	}
 	if p.held(m) {
@@ -632,9 +636,170 @@ func TestRerouteMovesOnlyToAReachableFriend(t *testing.T) {
 	p.wantPlaces("data/1", d, "B")
 	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
 	p.condition("C", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
-	moved, dropped, err := p.db.Reroute(context.Background(), nil)
+	moved, dropped, err := p.db.Reroute(context.Background(), nil, nil)
 	if err != nil || moved != 0 || dropped != 0 {
 		t.Fatalf("moved %d dropped %d %v: C is unreachable too", moved, dropped, err)
 	}
 	p.wantPlaces("data/1", d, "B")
+}
+
+// §3.4 (#19 final review): a re-routing pass over 3000 waiting rows in
+// a bucket of 1200 metadata objects takes well under a second, so it
+// never keeps captures waiting on the write lock past busy_timeout.
+// Only a few rows find room; the rest wait.
+func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 1<<20)
+	p.friend("C", 1<<20)
+	p.friend("D", 40) // room for about 20 after the bucket's metadata and its reserve
+	p.bucket("laptop", 2)
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
+			SELECT 'laptop', 'index/' || i, 'put', 'metadata', 'done', 100, 'h', ?1 FROM n`,
+		`INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
+			SELECT q.seq, f.peer_key, q.bucket, q.key, 'put', 'acked', 'h', ?1, 100 + 4096
+			FROM queue q, friendship f WHERE q.class = 'metadata'`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
+			SELECT 'laptop', 'data/' || i, 'put', 'data', 'done', 1048576 - 4096, 'h', ?1 FROM n`,
+		`INSERT INTO placement (seq, place, bucket, key, op, state, size)
+			SELECT seq, 'B', bucket, key, 'put', 'queued', 1048576 FROM queue WHERE class = 'data'`,
+		`INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
+			SELECT seq, 'C', bucket, key, 'put', 'acked', 'h', ?1, 1048576 FROM queue WHERE class = 'data'`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, p.now.Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	start := time.Now()
+	moved, dropped, err := p.db.Reroute(ctx, nil, nil)
+	took := time.Since(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("a pass over 3000 rows took %v, moved %d", took, moved)
+	if moved == 0 || moved > 40 || dropped != 0 {
+		t.Fatalf("moved %d dropped %d: D has room for a few", moved, dropped)
+	}
+	if took > 2*time.Second {
+		t.Fatalf("a pass took %v", took)
+	}
+	use, err := p.db.PlaceUse(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if use["D"] > 40*unit {
+		t.Fatalf("D counts %d bytes, more than its quota", use["D"])
+	}
+}
+
+// LEND-2, §3.4 (#19 final review): a 507 can be transient (the lender
+// counts writes in flight and its floor), so copies at a full friend
+// are dropped only once it has answered 507 for reroute_after, and only
+// the rows that hold a metadata barrier: a row with no metadata after
+// it waits for the friend to accept it.
+func TestATransient507DoesNotDropCopies(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 2)
+	d1 := p.put("laptop", "data/1", "data", 1)
+	m := p.put("laptop", "index/1", "metadata", 0.5)
+	d2 := p.put("laptop", "data/2", "data", 1)
+	p.ack("C", d1)
+	p.ack("C", d2)
+	reroute := func() int64 {
+		t.Helper()
+		moved, dropped, err := p.db.Reroute(ctx, nil, nil)
+		if err != nil || moved != 0 {
+			t.Fatalf("moved %d %v", moved, err)
+		}
+		return dropped
+	}
+	p.condition("B", ConditionQuota, p.now.Add(-30*time.Minute), p.now.Add(-time.Hour))
+	if dropped := reroute(); dropped != 0 {
+		t.Fatalf("dropped %d after 30 minutes of 507", dropped)
+	}
+	p.wantPlaces("data/1", d1, "B", "C")
+	p.condition("B", ConditionQuota, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	if dropped := reroute(); dropped != 1 {
+		t.Fatalf("dropped %d after two hours of 507, want data/1 only", dropped)
+	}
+	p.wantPlaces("data/1", d1, "C")
+	p.wantPlaces("data/2", d2, "B", "C") // holds no barrier: it waits
+	if p.held(m) {
+		t.Fatal("index/1 still held")
+	}
+}
+
+// D6, REPL-1 (#19, decided 2026-11-06): data leaves headroom for
+// metadata at every friend. restic prune writes its new index before it
+// deletes packs, so a pool filled with data must still take the index,
+// or the index is refused and the deletes behind it in the friend's
+// FIFO never free room.
+func TestDataLeavesRoomForAPrunesIndex(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("repo", 2)
+	ack := func(seq int64) {
+		t.Helper()
+		for _, place := range p.places(seq) {
+			p.ack(place, seq)
+		}
+	}
+	ack(p.put("repo", "index/0", "metadata", 0.5))
+	var packs []string
+	for i := range 20 { // fill with data as far as placement allows
+		k := fmt.Sprintf("data/%d", i)
+		s := p.put("repo", k, "data", 1)
+		if len(p.places(s)) == 0 {
+			break
+		}
+		ack(s)
+		packs = append(packs, k)
+	}
+	if len(packs) < 7 {
+		t.Fatalf("only %d packs placed", len(packs))
+	}
+	// The prune: a new index, then the deletes of the old index and of
+	// the packs it no longer lists.
+	m := p.put("repo", "index/1", "metadata", 1)
+	p.wantPlaces("index/1", m, "B", "C")
+	use, err := p.db.PlaceUse(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"B", "C"} {
+		if use[f] > 10*unit {
+			t.Fatalf("%s counts %d bytes with the new index, over its quota %d: the index would be refused",
+				f, use[f], 10*unit)
+		}
+	}
+	p.del("repo", "index/0", "metadata")
+	for _, k := range packs[:3] {
+		p.del("repo", k, "data")
+	}
+	if p.held(m) {
+		t.Fatal("the new index is held")
+	}
+	ack(m)
+	for _, f := range []string{"B", "C"} {
+		nx, ok, err := p.db.NextPlacement(ctx, f)
+		if err != nil || !ok || nx.Op != OpDelete {
+			t.Fatalf("%s's head after the index: %+v %v %v, want the deletes", f, nx, ok, err)
+		}
+	}
 }

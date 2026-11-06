@@ -243,12 +243,12 @@ func (w *Worker) Run(ctx context.Context) {
 // reroute_after, or full by their last answer, to friends with room
 // (§3.4), so the metadata barrier does not wait on them.
 func (w *Worker) reroute(ctx context.Context) {
-	w.flight.Lock()
-	moved, dropped, err := w.DB.Reroute(ctx, func(place string, seq int64) bool {
+	// Called with w.flight held, as Reroute applies its moves.
+	sending := func(place string, seq int64) bool {
 		s, ok := w.sending[place]
 		return ok && s == seq
-	})
-	w.flight.Unlock()
+	}
+	moved, dropped, err := w.DB.Reroute(ctx, sending, &w.flight)
 	if dropped > 0 {
 		w.alerted() // alert.KindCopiesDropped
 	}

@@ -55,7 +55,8 @@ func TestBucketAddCopiesAndTheCopiesOneWarning(t *testing.T) {
 	lines := strings.Split(text, "\n")
 	var under []string
 	for i, l := range lines {
-		if strings.Contains(l, singleCopyLine) {
+		// EP-6: the line recommends 2.
+		if strings.TrimSpace(l) == "! one copy: losing that friend's disk loses the offsite copy; 2 is recommended" {
 			under = append(under, strings.Fields(lines[i-1])[0])
 		}
 	}
@@ -116,6 +117,12 @@ func TestStatusWarnsOfAOneFriendPool(t *testing.T) {
 	}
 	db.Close()
 	check(1, true) // C is gone past replace_after
+	// With reroute_after 10 days C is not even unreachable yet: status
+	// counts the pool as the daemon would.
+	_, out, errOut := n.run("", "", "status", "--json", "--replication-reroute-after", "240h")
+	if !strings.Contains(out, `"friends": 2`) {
+		t.Fatalf("status with reroute_after 240h (%s):\n%s", errOut, out)
+	}
 }
 
 // REPL-4, OPS-1 (#19): status shows the bytes held at fewer than copies

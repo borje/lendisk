@@ -1419,7 +1419,7 @@ upstream bucket is Q-V.
   this bucket has no offsite copy left. Add a second friend, or
   recreate the bucket with --copies 2." (`bucket set` comes with
   REPL-13), and `status` prints "! one copy: losing that friend's disk
-  loses the offsite copy" under the bucket (`buckets[].single_copy` in
+  loses the offsite copy; 2 is recommended" under the bucket (`buckets[].single_copy` in
   `status --json`). `bucket add` also says when the pool has fewer
   places than `copies` (OPS-2), as does the `pool_too_small` alert
   (§3.8).
@@ -1486,10 +1486,12 @@ upstream bucket is Q-V.
     `state.DefaultCopies`, 2, for a bucket with none) by D6's choice
     (`state.DB.choose`): candidates are friends with an address and
     free capacity for the object; reachable ones first, then by largest
-    free fraction (free ÷ quota), ties by node ID. Free capacity is the
+    free fraction (free ÷ quota), ties by node ID (fractions within one
+    part in a million tie). Free capacity is the
     friendship's quota less the borrower's count of the place's use
     (below) less the bucket's live metadata with no row at that place
-    (a friend added later, which re-placement, #26, fills). A friend
+    (a friend added later, which re-placement, #26, fills) less the
+    metadata reserve (below). A friend
     that is `removed`, whose last answer was `507` (condition `quota`,
     below), or that is gone past `replace_after` is not a candidate;
   - a delete goes to every friend whose latest row of the key is a put,
@@ -1497,6 +1499,22 @@ upstream bucket is Q-V.
     one that refused it, which may hold older bytes;
   - a healing re-upload of a data key (*Healing*, below) goes where the
     row it heals was placed, topped up to `copies` by the choice.
+
+  *Decision (#19, the user, 2026-11-06): data leaves headroom for
+  metadata.* The metadata reserve at a friend is the larger of
+  `state.MetadataReserveFactor` (3) times the live metadata of all the
+  node's buckets (the key's latest done write a put, each counted as
+  the place counts it) and `state.MetadataReservePercent` (1%) of the
+  friend's quota. Data placement and re-routing leave it free; metadata
+  placement ignores it and may use it. It exists because restic's prune
+  writes the new index before it deletes the packs it no longer lists:
+  were a friend filled with data, it would refuse that index with
+  `507`, the deletes behind the index in its FIFO would never be sent,
+  and it would never free room. Residual risk: metadata that grows
+  faster than the reserve between backups (a large first index, many
+  snapshots at once) can still fill a friend; the reconcile from the
+  lender's own count (follow-up, #68) corrects the borrower's count, not
+  the room.
 
   With fewer candidates than `copies`, what fits is placed: the deficit
   is not stored, it is the object's count of `queued` and `acked` rows
@@ -1506,7 +1524,7 @@ upstream bucket is Q-V.
   `queued` is an entry in that place's FIFO.
   *Thin pools (EP-6, #19).* Two `status` lines, neither an alert: a
   bucket at `copies` 1 gets "! one copy: losing that friend's disk
-  loses the offsite copy" under it (`buckets[].single_copy`; `bucket
+  loses the offsite copy; 2 is recommended" under it (`buckets[].single_copy`; `bucket
   add` warns too, see EP-6 below), and a pool of exactly one friend,
   counted as `state.DB.PoolSize` counts (not removed, not gone past
   `replace_after`), whatever the buckets' `copies`, gets "Friends (1:
@@ -1538,7 +1556,7 @@ upstream bucket is Q-V.
   (below), until it acknowledges a row again. Each backup run queues
   metadata at every friend, so a full friend learns of freed room within
   a `PauseRetry` (an hour) of the next run.
-  *Follow-up (to file): reconcile the count from the lender.* Nothing
+  *Follow-up (#68): reconcile the count from the lender.* Nothing
   corrects `place_use` but the rows, so it drifts from what the lender
   holds. Known sources: a send that landed but whose answer was lost
   (a network error), whose row is then re-routed, cancelled as
@@ -1666,20 +1684,34 @@ upstream bucket is Q-V.
   that set (`Worker.sending`) under a lock that the sender takes its row
   under and a re-routing pass reads it under, so neither misses the
   other; a send that failed releases its row before the sender waits
-  to retry. With no reachable friend with room the row waits at an
-  unreachable friend, the lag shows in `status`. *Decision (#19,
-  review):* the row is dropped (state `dropped`, out of the FIFO, not
-  counted in `place_use`) instead of waiting when its friend is gone
-  past `replace_after`, or full (its last answer `507`): a full friend
-  would refuse it, and while queued it would hold every place's
-  metadata and the full friend's later deletes for as long as the
-  friend stays full. The object is then below `copies`, which
+  to retry. A pass reads without a transaction: the waiting rows of
+  each friend to re-route, with their holders, in one query; each
+  bucket's free room at each reachable friend, computed once and
+  lowered in memory as rows move (a friend with no room for one more
+  object leaves the candidates, so the remaining rows cost nothing).
+  It then applies the moves in write transactions of at most 64 rows,
+  each under the worker's lock, re-checking that each row is still
+  queued and not being sent, so captures never wait behind a long pass
+  (3000 waiting rows in a bucket of 1200 metadata objects take tens of
+  milliseconds). With no reachable friend with room the row waits at
+  its friend, and the lag shows in `status`. *Decision (#19,
+  review):* the row is dropped instead of waiting (state `dropped`:
+  out of the FIFO, not counted in `place_use`) when its friend is gone
+  past `replace_after`, or has answered `507` for
+  `replication.reroute_after` and the row holds a metadata barrier
+  (`Held`'s rule): a full friend would refuse it, and while queued it
+  would hold every place's metadata and the full friend's later
+  deletes for as long as the friend stays full. A shorter `507` is
+  not enough, since the lender's count includes writes in flight and
+  its floor (LEND-2) and may pass, and a dropped copy stays dropped
+  until re-placement; a row that holds no barrier waits for the friend
+  to accept it. The object is then below `copies`, which
   `status` shows and the `copies_dropped` alert raises (§3.8);
   re-placement (#26) places the copy when there is room. A dropped row
   still counts as the place's latest row of the key, so a later delete
-  is sent there too; it is not a target for a healing re-upload. A
-  full friend's queued metadata is not dropped (metadata goes to every
-  friend): it still waits there until the friend accepts it.
+  is sent there too; it is not a target for a healing re-upload.
+  `dropped` is a copy never sent; it is not REPL-13's `dropping`, a
+  copy the place holds that re-placement is deleting.
   Restic and Kopia write packs, then indexes, then the snapshot or
   manifest, so the barrier costs one round of acknowledgements per
   backup run, not per object.
@@ -1687,7 +1719,7 @@ upstream bucket is Q-V.
   the pool (friend added or removed, quota changed, a verification
   failed, an overflow target added) and hourly. It computes for each
   object the places that hold or will hold it (`acked`, `queued`, not
-  `dropping`) and:
+  `dropping`; a `dropped` row is a copy that was never sent, §3.4) and:
   - for each object with fewer than `copies` such places, places the
     missing copies by D6's choice, excluding the current holders; the
     put reads from the local store;
@@ -2356,7 +2388,10 @@ capture decorator, so nothing stands between that and posix (#62).
   - `copies_dropped`, subject the bucket: live objects below `copies`
     with a copy dropped at a full or gone friend (§3.4,
     `state.DB.DroppedBelowCopies`, #19), until written again or
-    re-placed (#26). The worker calls `Alerted` when it drops one.
+    re-placed (#26). It raises at once: the worker calls `Alerted` when
+    it drops one. A deficit from placement (the pool had no room for
+    `copies` when the object was captured) shows in `status` as bytes
+    below `copies` but raises no alert until #26's threshold alert.
   Later tickets add a kind to `alert.kinds` and its condition to the
   evaluator. Each raise is delivered at least once to each configured
   channel: success is recorded in `hook_at` or `webhook_at` against

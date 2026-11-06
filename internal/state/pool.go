@@ -6,6 +6,9 @@ import (
 	"database/sql"
 	"errors"
 	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,7 +24,47 @@ const (
 	// bytes (gateway's itemOverhead, LEND-1), so the borrower's count of a
 	// place's use matches the lender's.
 	ObjectOverhead = 4096
+
+	// MetadataReserveFactor and MetadataReservePercent size the headroom
+	// data leaves for metadata at each friend (D6, §3.4): the larger of
+	// MetadataReserveFactor times the live metadata of all the node's
+	// buckets, and MetadataReservePercent of the friend's quota. Restic's
+	// prune writes its new index before it deletes packs, so metadata
+	// must always fit, or the deletes behind it never free room.
+	MetadataReserveFactor  = 3
+	MetadataReservePercent = 1
 )
+
+// liveMetadata is the bytes of every bucket's live metadata (the key's
+// latest done write is a put), as a place counts them.
+func liveMetadata(ctx context.Context, q querier) (int64, error) {
+	var n int64
+	err := q.QueryRowContext(ctx, `SELECT coalesce(sum(q.size + ?), 0) FROM queue q
+		WHERE q.class IN ('metadata', 'snapshot') AND q.op = 'put' AND q.state = 'done'
+		AND NOT EXISTS (SELECT 1 FROM queue l
+			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')`,
+		ObjectOverhead).Scan(&n)
+	return n, err
+}
+
+// byFraction orders candidates by largest free fraction (free ÷ quota),
+// ties by node ID. Fractions within one part in a million tie: the
+// reserve's rounding to whole bytes must not break a tie.
+func byFraction(aPeer string, aFrac float64, bPeer string, bFrac float64) int {
+	if d := aFrac - bFrac; d > 1e-6 {
+		return -1
+	} else if d < -1e-6 {
+		return 1
+	}
+	return cmp.Compare(aPeer, bPeer)
+}
+
+// metadataReserve is the room data leaves for metadata at a friend of
+// quota bytes, with meta bytes of live metadata (liveMetadata).
+// Metadata placement ignores it: metadata may use it.
+func metadataReserve(quota, meta int64) int64 {
+	return max(MetadataReserveFactor*meta, quota*MetadataReservePercent/100)
+}
 
 func (db *DB) rerouteAfter() time.Duration { return cmp.Or(db.RerouteAfter, time.Hour) }
 func (db *DB) replaceAfter() time.Duration { return cmp.Or(db.ReplaceAfter, 7*24*time.Hour) }
@@ -67,16 +110,16 @@ func (p poolPlace) reroutable(db *DB, now time.Time) bool {
 	return p.unreachable(db, now) || p.full()
 }
 
-// droppable: its unsent data, with nowhere else to go, is dropped as a
-// deficit rather than wait: it is full (it would refuse the copies, and
-// they would hold the barrier and its later deletes for as long as it
-// stays full), or gone past replace_after.
-func (p poolPlace) droppable(db *DB, now time.Time) bool {
-	return p.full() || p.gone(db, now)
+// fullForLong: it has answered 507 for reroute_after. A 507 can pass (the
+// lender counts writes in flight and its floor, LEND-2), so only a long
+// one lets Reroute drop copies there.
+func (p poolPlace) fullForLong(db *DB, now time.Time) bool {
+	return p.full() && now.Sub(p.since) >= db.rerouteAfter()
 }
 
 type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
 func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
@@ -109,7 +152,7 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 // unsentMetadata is the bytes of bucket's live metadata not placed at
 // place: a friend added later receives them (REPL-13, #26), so they are
 // not room for data (D6 step 1).
-func unsentMetadata(ctx context.Context, tx *sql.Tx, bucket, place string) (int64, error) {
+func unsentMetadata(ctx context.Context, tx querier, bucket, place string) (int64, error) {
 	var n int64
 	err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(q.size + ?3), 0) FROM queue q
 		WHERE q.bucket = ?1 AND q.class IN ('metadata', 'snapshot') AND q.op = 'put' AND q.state = 'done'
@@ -122,7 +165,8 @@ func unsentMetadata(ctx context.Context, tx *sql.Tx, bucket, place string) (int6
 
 // choose is D6's choice of up to n places for an object of bucket that
 // counts need bytes at a place, never one in exclude: friends with free
-// capacity for it, reachable ones first, each by largest free fraction
+// capacity for it (quota less use, the bucket's unsent metadata and the
+// metadata reserve), reachable ones first, each by largest free fraction
 // (free ÷ quota), ties by node ID. A friend gone past replace_after,
 // removed, or full by its last answer is not room; with reachableOnly,
 // neither is an unreachable one (re-routing, so rows do not move between
@@ -138,6 +182,10 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 		return nil, err
 	}
 	now := db.now()
+	live, err := liveMetadata(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	type cand struct {
 		peer      string
 		reachable bool
@@ -153,7 +201,7 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 		if err != nil {
 			return nil, err
 		}
-		free := p.quota - p.use - meta
+		free := p.quota - p.use - meta - metadataReserve(p.quota, live)
 		if free < need {
 			continue
 		}
@@ -166,10 +214,7 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 			}
 			return 1
 		}
-		if c := cmp.Compare(b.frac, a.frac); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.peer, b.peer)
+		return byFraction(a.peer, a.frac, b.peer, b.frac)
 	})
 	var out []string
 	for _, c := range cs[:min(n, len(cs))] {
@@ -286,7 +331,7 @@ func (db *DB) insertPlacement(ctx context.Context, tx *sql.Tx, seq int64, place 
 	return err
 }
 
-func column(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]string, error) {
+func column(ctx context.Context, tx querier, q string, args ...any) ([]string, error) {
 	rows, err := tx.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -331,86 +376,212 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 // for longer than reroute_after, or whose last answer was 507, to
 // another reachable friend with room by D6's choice, never to one that
 // has or had a row of the object (§3.4). The row keeps its sequence, so
-// it takes its place in the new FIFO before later rows. A row for which
-// sending(place, seq) is true is skipped: its send may land, and the
-// place's row must be there to record it, or no delete would reach the
-// copy. With no friend with room the row waits, unless its place is full
-// or gone past replace_after: then it is dropped (state dropped), a
-// deficit status shows as bytes below copies and alert.KindCopiesDropped
-// raises, so it cannot hold the metadata barrier, or a full friend's
-// later deletes, for good. Re-placement (#26) restores the copies once
-// there is room.
-func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64) bool) (moved, dropped int64, err error) {
+// it takes its place in the new FIFO before later rows. With no friend
+// with room the row waits, unless its place is gone past replace_after,
+// or has answered 507 for reroute_after and the row holds a metadata
+// barrier: then it is dropped (PlacementDropped), a deficit status shows
+// as bytes below copies and alert.KindCopiesDropped raises, so it cannot
+// hold the barrier, or a full friend's later deletes, for good.
+// Re-placement (#26) restores the copies once there is room.
+//
+// The pass reads without a transaction, keeping each bucket's free room
+// per place in memory as rows move, and applies the moves in short write
+// transactions, each under lock when lock is set. A row is applied only
+// if it is still queued there and sending(place, seq) is false under the
+// lock: its send may land, and the place's row must be there to record
+// it, or no delete would reach the copy.
+func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64) bool, lock sync.Locker) (moved, dropped int64, err error) {
+	ps, err := poolPlaces(ctx, db)
+	if err != nil {
+		return 0, 0, err
+	}
+	now := db.now()
+	quota := map[string]int64{}
+	for _, p := range ps {
+		quota[p.peer] = p.quota
+	}
+	// room[bucket][place] is the free room at each reachable friend that
+	// could take a copy, less the metadata reserve, computed once per
+	// bucket; a place without room for one more object leaves the map.
+	live, err := liveMetadata(ctx, db)
+	if err != nil {
+		return 0, 0, err
+	}
+	room := map[string]map[string]int64{}
+	roomFor := func(bucket string) (map[string]int64, error) {
+		if r, ok := room[bucket]; ok {
+			return r, nil
+		}
+		r := map[string]int64{}
+		for _, p := range ps {
+			if p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) || p.unreachable(db, now) {
+				continue
+			}
+			meta, err := unsentMetadata(ctx, db, bucket, p.peer)
+			if err != nil {
+				return nil, err
+			}
+			if free := p.quota - p.use - meta - metadataReserve(p.quota, live); free > ObjectOverhead {
+				r[p.peer] = free
+			}
+		}
+		room[bucket] = r
+		return r, nil
+	}
+	var ops []rerouteOp
+	for _, p := range ps {
+		if !p.reroutable(db, now) {
+			continue
+		}
+		gone, full := p.gone(db, now), p.fullForLong(db, now)
+		rs, err := db.waiting(ctx, p.peer, gone || full)
+		if err != nil {
+			return 0, 0, err
+		}
+		for _, r := range rs {
+			free, err := roomFor(r.bucket)
+			if err != nil {
+				return 0, 0, err
+			}
+			to := ""
+			frac := func(place string) float64 { return float64(free[place]) / float64(quota[place]) }
+			for place, f := range free {
+				if f < r.need || slices.Contains(r.holders, place) {
+					continue
+				}
+				if to == "" || byFraction(place, frac(place), to, frac(to)) < 0 {
+					to = place
+				}
+			}
+			switch {
+			case to != "":
+				if free[to] -= r.need; free[to] <= ObjectOverhead {
+					delete(free, to)
+				}
+				ops = append(ops, rerouteOp{from: p.peer, seq: r.seq, to: to})
+			case gone || full && r.barrier:
+				ops = append(ops, rerouteOp{from: p.peer, seq: r.seq})
+			}
+		}
+	}
+	for len(ops) > 0 {
+		n := min(len(ops), 64)
+		m, d, err := db.applyReroute(ctx, ops[:n], sending, lock)
+		moved, dropped = moved+m, dropped+d
+		if err != nil {
+			return moved, dropped, err
+		}
+		ops = ops[n:]
+	}
+	return moved, dropped, nil
+}
+
+// rerouteOp moves row seq from one place to another, or drops it there
+// when to is empty.
+type rerouteOp struct {
+	from, to string
+	seq      int64
+}
+
+// waitingRow is a queued data put at a place Reroute looks at.
+type waitingRow struct {
+	seq     int64
+	bucket  string
+	need    int64    // what it counts at a place: its size and ObjectOverhead
+	holders []string // the places with a row of it
+	barrier bool     // it holds a metadata barrier (Held); only when asked
+}
+
+// waiting returns place's queued data puts, in sequence order, with
+// whether each holds a metadata barrier when barrier is set: a queued
+// metadata row of its bucket comes after it, before any later done
+// write of its key (Held's rule).
+func (db *DB) waiting(ctx context.Context, place string, barrier bool) ([]waitingRow, error) {
+	rows, err := db.QueryContext(ctx, `SELECT p.seq, p.bucket, coalesce(q.size, 0) + ?2,
+		(SELECT group_concat(h.place, char(31)) FROM placement h WHERE h.seq = p.seq),
+		(SELECT min(l.seq) FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
+		FROM placement p JOIN queue q ON q.seq = p.seq
+		WHERE p.place = ?1 AND p.state = 'queued' AND p.op = 'put' AND q.class = 'data' ORDER BY p.seq`,
+		place, ObjectOverhead)
+	if err != nil {
+		return nil, err
+	}
+	var out []waitingRow
+	var next []sql.NullInt64
+	for rows.Next() {
+		var r waitingRow
+		var holders string
+		var n sql.NullInt64
+		if err := rows.Scan(&r.seq, &r.bucket, &r.need, &holders, &n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		r.holders = strings.Split(holders, "\x1f")
+		out = append(out, r)
+		next = append(next, n)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || !barrier {
+		return out, err
+	}
+	meta := map[string][]int64{} // bucket -> its queued metadata rows, in order
+	for i, r := range out {
+		ms, ok := meta[r.bucket]
+		if !ok {
+			ss, err := column(ctx, db, `SELECT DISTINCT p.seq FROM placement p JOIN queue q ON q.seq = p.seq
+				WHERE p.bucket = ? AND p.state = 'queued' AND q.class IN ('metadata', 'snapshot') ORDER BY p.seq`, r.bucket)
+			if err != nil {
+				return nil, err
+			}
+			for _, s := range ss {
+				n, _ := strconv.ParseInt(s, 10, 64)
+				ms = append(ms, n)
+			}
+			meta[r.bucket] = ms
+		}
+		j, _ := slices.BinarySearch(ms, r.seq+1)
+		out[i].barrier = j < len(ms) && (!next[i].Valid || ms[j] < next[i].Int64)
+	}
+	return out, nil
+}
+
+// applyReroute applies ops in one short write transaction, under lock
+// when set, skipping rows no longer queued at their place or being sent.
+func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(string, int64) bool, lock sync.Locker) (moved, dropped int64, err error) {
+	if lock != nil {
+		lock.Lock()
+		defer lock.Unlock()
+	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer tx.Rollback()
-	ps, err := poolPlaces(ctx, tx)
-	if err != nil {
-		return 0, 0, err
-	}
-	now := db.now()
-	for _, p := range ps {
-		if !p.reroutable(db, now) {
+	for _, op := range ops {
+		if sending != nil && sending(op.from, op.seq) {
 			continue
 		}
-		type row struct {
-			seq    int64
-			bucket string
-			size   int64
+		q := `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`
+		if op.to == "" {
+			q = `UPDATE placement SET state = 'dropped' WHERE place = ? AND seq = ? AND state = 'queued'`
 		}
-		var rs []row
-		rows, err := tx.QueryContext(ctx, `SELECT p.seq, p.bucket, coalesce(q.size, 0)
-			FROM placement p JOIN queue q ON q.seq = p.seq
-			WHERE p.place = ? AND p.state = 'queued' AND p.op = 'put' AND q.class = 'data' ORDER BY p.seq`, p.peer)
+		r, err := tx.ExecContext(ctx, q, op.from, op.seq)
 		if err != nil {
 			return 0, 0, err
 		}
-		for rows.Next() {
-			var r row
-			if err := rows.Scan(&r.seq, &r.bucket, &r.size); err != nil {
-				rows.Close()
-				return 0, 0, err
-			}
-			rs = append(rs, r)
+		if n, err := r.RowsAffected(); err != nil {
+			return 0, 0, err
+		} else if n == 0 {
+			continue // sent, refused or cancelled since the scan
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
+		if op.to == "" {
+			dropped++
+			continue
+		}
+		if err := db.insertPlacement(ctx, tx, op.seq, op.to, false); err != nil {
 			return 0, 0, err
 		}
-		for _, r := range rs {
-			if sending != nil && sending(p.peer, r.seq) {
-				continue
-			}
-			holders, err := column(ctx, tx, `SELECT place FROM placement WHERE seq = ?`, r.seq)
-			if err != nil {
-				return 0, 0, err
-			}
-			to, err := db.choose(ctx, tx, r.bucket, r.size+ObjectOverhead, 1, holders, true)
-			if err != nil {
-				return 0, 0, err
-			}
-			if len(to) == 0 {
-				if !p.droppable(db, now) {
-					continue
-				}
-				if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = 'dropped'
-					WHERE place = ? AND seq = ? AND state = 'queued'`, p.peer, r.seq); err != nil {
-					return 0, 0, err
-				}
-				dropped++
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`,
-				p.peer, r.seq); err != nil {
-				return 0, 0, err
-			}
-			if err := db.insertPlacement(ctx, tx, r.seq, to[0], false); err != nil {
-				return 0, 0, err
-			}
-			moved++
-		}
+		moved++
 	}
 	return moved, dropped, tx.Commit()
 }

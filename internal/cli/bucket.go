@@ -168,7 +168,7 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 	if copies == 1 {
 		fmt.Fprintln(a.out, singleCopyWarning)
 	}
-	db.ReplaceAfter = cfg.ReplaceAfter()
+	db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
 	if places, err := db.PoolSize(ctx); err != nil {
 		return err
 	} else if places < copies {
@@ -185,7 +185,7 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 // an alert.
 const (
 	singleCopyWarning = "Warning: copies = 1. Each object is held by one friend only, so if that friend's disk is lost, this bucket has no offsite copy left. Add a second friend, or recreate the bucket with --copies 2."
-	singleCopyLine    = "! one copy: losing that friend's disk loses the offsite copy"
+	singleCopyLine    = "! one copy: losing that friend's disk loses the offsite copy; 2 is recommended"
 	singleFriendLine  = "Friends (1: one lost disk loses every offsite copy)"
 )
 
