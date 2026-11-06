@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -157,6 +158,56 @@ func TestUnknownIdentityRefusedByMiddleware(t *testing.T) {
 	if resp, err := l.tun.client(nil).Do(t.Context(), "GET", control.VersionPath, nil); err == nil {
 		resp.Body.Close()
 		t.Fatalf("a keyless connection was answered: %d", resp.StatusCode)
+	}
+}
+
+// NET-6, #53: the middleware's refusals carry the protocol header, on
+// the control path and on S3, so a peer can tell an old lendisk from
+// something else answering.
+func TestMiddlewareRefusalsCarryProtocol(t *testing.T) {
+	l := startLender(t)
+	ik := newID(t)
+	l.addInvite(t, ik)
+	for _, key := range []*identity.Identity{newID(t), ik} {
+		c := l.tun.client(key)
+		for _, r := range everyRequest {
+			if key == ik && r.path == control.RedeemPath {
+				continue
+			}
+			resp, err := c.Do(t.Context(), r.method, r.path, strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusForbidden || resp.Header.Get(control.ProtocolHeader) != control.Protocol {
+				t.Errorf("%s %s: %d with %s %q", r.method, r.path, resp.StatusCode, control.ProtocolHeader, resp.Header.Get(control.ProtocolHeader))
+			}
+		}
+	}
+}
+
+// NET-6, #53: the control client treats an answer without the protocol
+// header as an error, refusal or not: whatever answered is not a
+// lendisk control API it can trust.
+func TestClientRefusesAnswerWithoutProtocol(t *testing.T) {
+	for _, code := range []int{http.StatusOK, http.StatusForbidden} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(code)
+			io.WriteString(w, `{"protocol":"0.1","version":"x","error":"no"}`)
+		}))
+		addr := srv.Listener.Addr().String()
+		c := &control.Client{HTTP: &http.Client{Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "tcp", addr)
+			}}}}
+		_, err := c.Version(t.Context())
+		var ce *control.CallError
+		if err == nil || errors.As(err, &ce) || !strings.Contains(err.Error(), control.ProtocolHeader) {
+			t.Errorf("answer %d without the header: %v", code, err)
+		}
+		srv.Close()
 	}
 }
 

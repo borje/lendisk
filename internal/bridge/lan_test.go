@@ -157,6 +157,23 @@ func TestGeneratedCertificate(t *testing.T) {
 	}
 }
 
+// SEC-3, #53: a generated key that is reused is checked like a
+// tls = files key: one others can read is refused, not served.
+func TestReusedGeneratedKeyIsChecked(t *testing.T) {
+	dir := t.TempDir()
+	ips := []net.IP{net.ParseIP("127.0.0.1")}
+	if _, made, err := ensureCert(dir, ips, nil); err != nil || !made {
+		t.Fatalf("first: made %v, %v", made, err)
+	}
+	if _, made, err := ensureCert(dir, ips, nil); err != nil || made {
+		t.Fatalf("reuse: made %v, %v", made, err)
+	}
+	os.Chmod(filepath.Join(dir, KeyFile), 0o644)
+	if _, _, err := ensureCert(dir, ips, nil); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+		t.Fatalf("readable key reused: %v", err)
+	}
+}
+
 // EP-17: tls = off serves plain HTTP.
 func TestPlaintextListener(t *testing.T) {
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(freePort(t, "127.0.0.1")))

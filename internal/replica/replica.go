@@ -54,7 +54,9 @@ var (
 	// ErrQuota: the friend refused for quota or its free-space floor
 	// (507 QuotaExceeded, LEND-2). The place is paused for quota.
 	ErrQuota = errors.New("paused for quota")
-	// ErrRemoved: the friend refuses this node (403, PEER-5, SEC-15).
+	// ErrRemoved: the friend refuses this node as not a friend (a 403
+	// AccessDenied saying state.NoRelationship, or InvalidAccessKeyId;
+	// PEER-5, SEC-15).
 	ErrRemoved = errors.New("removed by the friend")
 	// ErrImmutable: the friend holds the key with another hash (412,
 	// LEND-4); an immutability alert (EP-11).

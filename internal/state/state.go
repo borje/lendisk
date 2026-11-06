@@ -129,12 +129,20 @@ func (db *DB) migrate(ctx context.Context, ms []Migration, log *slog.Logger) err
 		return nil
 	}
 	if cur > 0 {
+		// The backup holds bucket secrets: create it empty at 0600, which
+		// VACUUM INTO accepts, so it is never readable by others (#53).
 		backup := fmt.Sprintf("%s.schema-%d.bak", db.Path, cur)
-		os.Remove(backup)
+		if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("backing up state before migration: removing the old backup: %w", err)
+		}
+		f, err := os.OpenFile(backup, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("backing up state before migration: %w", err)
+		}
+		f.Close()
 		if _, err := db.ExecContext(ctx, `VACUUM INTO ?`, backup); err != nil {
 			return fmt.Errorf("backing up state before migration: %w", err)
 		}
-		os.Chmod(backup, 0o600)
 		log.Info("backed up state database before migration", "path", backup)
 	}
 	for _, m := range ms[cur:] {

@@ -23,6 +23,33 @@ func TestPrepareRealDirectory(t *testing.T) {
 	}
 }
 
+// #53: generic buckets hold plaintext, so an existing store others can
+// read is refused, unless it is still empty, when it is tightened.
+func TestPrepareRefusesStoreOthersCanRead(t *testing.T) {
+	ok := Checker{
+		Xattr:  func(string) error { return nil },
+		Statfs: func(string) (Space, error) { return Space{Total: 1 << 40, Free: 1 << 40, FSType: "ext4"}, nil },
+	}
+	dir := t.TempDir() + "/store"
+	os.Mkdir(dir, 0o755)
+	os.Chmod(dir, 0o755)
+	if err := ok.Prepare(dir, config.Floor{}); err != nil {
+		t.Fatalf("empty store: %v", err)
+	}
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("empty store left at %04o", fi.Mode().Perm())
+	}
+	os.Mkdir(dir+"/laptop", 0o755)
+	os.Chmod(dir, 0o750)
+	err := ok.Prepare(dir, config.Floor{})
+	if err == nil || !strings.Contains(err.Error(), "chmod 700 "+dir) || !strings.Contains(err.Error(), "0750") {
+		t.Fatalf("readable store: %v", err)
+	}
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o750 {
+		t.Fatalf("mode changed to %04o", fi.Mode().Perm())
+	}
+}
+
 // EP-12 AC: refuse below the free-space floor, naming the filesystem.
 func TestFloorRefused(t *testing.T) {
 	c := Checker{

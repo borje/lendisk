@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
@@ -115,8 +116,46 @@ func TestUpgradeAppliesForwardAndBacksUp(t *testing.T) {
 	if err := db.QueryRow(`SELECT count(*) FROM a`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("data from migration 2 missing: %d %v", n, err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, FileName+".schema-1.bak")); err != nil {
+	// #53: the backup holds bucket secrets; it is 0600, and a valid copy.
+	backup := filepath.Join(dir, FileName+".schema-1.bak")
+	fi, err := os.Stat(backup)
+	if err != nil {
 		t.Fatalf("no pre-migration backup: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("backup mode %04o", fi.Mode().Perm())
+	}
+	bk, err := sql.Open("sqlite", "file:"+backup+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bk.Close()
+	var v1 int
+	if err := bk.QueryRow(`SELECT version FROM schema_meta`).Scan(&v1); err != nil || v1 != 1 {
+		t.Fatalf("backup schema %d: %v", v1, err)
+	}
+}
+
+// #53: a stale, world-readable backup from an earlier attempt is
+// replaced by a new one at 0600.
+func TestStaleMigrationBackupReplacedPrivately(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db, err := open(ctx, dir, r1, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	// A stale, world-readable backup from an earlier attempt is replaced.
+	backup := filepath.Join(dir, FileName+".schema-1.bak")
+	os.WriteFile(backup, []byte("stale"), 0o644)
+	db, err = open(ctx, dir, r3, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if fi, err := os.Stat(backup); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("backup: %v %v", fi, err)
 	}
 }
 

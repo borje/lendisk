@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/state"
 )
 
 // DialFunc opens a connection to a friend's tunnel port
@@ -168,7 +170,11 @@ func (f *Friend) Delete(ctx context.Context, bucket, key string) error {
 }
 
 // classify marks a place's refusals with the kind the worker acts on
-// (§3.4 Errors); anything else is left to retry.
+// (§3.4 Errors); anything else is left to retry. Only a 403 saying this
+// node is not a friend is ErrRemoved: the tunnel's "no relationship"
+// refusal, or versitygw not knowing the access key. Other 403s (a skewed
+// clock, a bad signature) are retried and reported as what they are
+// (#53).
 func classify(err error) error {
 	var er minio.ErrorResponse
 	if !errors.As(err, &er) {
@@ -177,8 +183,14 @@ func classify(err error) error {
 	switch {
 	case er.StatusCode == 507 || er.Code == "QuotaExceeded":
 		return fmt.Errorf("%w: %w", ErrQuota, err)
-	case er.StatusCode == http.StatusForbidden:
+	case er.StatusCode == http.StatusForbidden && (er.Code == "InvalidAccessKeyId" ||
+		er.Code == "AccessDenied" && strings.Contains(er.Message, state.NoRelationship)):
 		return fmt.Errorf("%w: %w", ErrRemoved, err)
+	case er.Code == "RequestTimeTooSkewed":
+		return fmt.Errorf("the friend refuses the request because this node's clock and the friend's differ by more than 15 minutes; "+
+			"set the wrong one right (enable NTP) (%s): %w", er.Code, err)
+	case er.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("the friend refused the request (%d %s): %w", er.StatusCode, er.Code, err)
 	case er.StatusCode == http.StatusPreconditionFailed:
 		return fmt.Errorf("%w: %w", ErrImmutable, err)
 	case er.Code == "BadDigest" || er.Code == "InvalidDigest" || er.Code == "XAmzContentSHA256Mismatch":

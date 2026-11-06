@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -307,6 +308,34 @@ func TestQuotaAndRemovalPauseThePlace(t *testing.T) {
 				t.Fatalf("condition %+v", c)
 			}
 		})
+	}
+}
+
+// #53: a transient error reading the friendships keeps the senders
+// running; it is not read as "no friends".
+func TestFriendshipReadErrorKeepsSenders(t *testing.T) {
+	fx := newFixture(t, "B")
+	var failing atomic.Bool
+	var connects atomic.Int32
+	fx.w.friendships = func(ctx context.Context) ([]state.Friendship, error) {
+		if failing.Load() {
+			return nil, errors.New("database is locked")
+		}
+		return fx.db.Friendships(ctx)
+	}
+	connect := fx.w.Connect
+	fx.w.Connect = func(f state.Friendship) (Replica, error) { connects.Add(1); return connect(f) }
+	fx.write("laptop", "data/1", "x")
+	fx.run()
+	fx.drained("B")
+	failing.Store(true)
+	time.Sleep(20 * fx.w.Poll) // several friendship reads fail
+	fx.write("laptop", "data/2", "y")
+	fx.drained("B")
+	failing.Store(false)
+	time.Sleep(10 * fx.w.Poll)
+	if n := connects.Load(); n != 1 {
+		t.Fatalf("the sender was rebuilt: %d connects", n)
 	}
 }
 

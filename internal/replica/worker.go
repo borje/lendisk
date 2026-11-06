@@ -46,6 +46,10 @@ type Worker struct {
 	// OnRead, if set, is called after each read of a body sent to a
 	// place, with the bytes read so far. Tests only.
 	OnRead func(place string, seq, read int64)
+
+	// friendships reads the friendships; nil means DB.Friendships. Tests
+	// set it to fail.
+	friendships func(context.Context) ([]state.Friendship, error)
 }
 
 func (w *Worker) now() time.Time {
@@ -91,10 +95,22 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 	}()
 	poll := orDefault(w.Poll, time.Second)
+	friendships := w.friendships
+	if friendships == nil {
+		friendships = w.DB.Friendships
+	}
 	for {
-		fs, err := w.DB.Friendships(ctx)
-		if err != nil && ctx.Err() == nil {
-			w.Log.Error("replication: reading friendships failed", "err", err)
+		fs, err := friendships(ctx)
+		if err != nil {
+			// Keep the senders as they are: a failed read says nothing
+			// about who the friends are (#53).
+			if ctx.Err() == nil {
+				w.Log.Error("replication: reading friendships failed; keeping the current senders", "err", err)
+			}
+			if !sleep(ctx, 5*poll) {
+				return
+			}
+			continue
 		}
 		seen := map[string]bool{}
 		for _, f := range fs {

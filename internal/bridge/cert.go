@@ -58,11 +58,16 @@ func Fingerprint(der []byte) string {
 // its key loads, and otherwise generating a self-signed ECDSA P-256
 // certificate valid ten years. The key is written at 0600 from the first
 // byte, before the certificate, so a crash between leaves a pair that
-// does not load and is regenerated.
+// does not load and is regenerated. A reused key is checked as a
+// tls = "files" key is: one others can read, or another user owns, is
+// refused (SEC-3, #53).
 func ensureCert(dir string, ips []net.IP, names []string) (*tls.Certificate, bool, error) {
 	certFile, keyFile := filepath.Join(dir, CertFile), filepath.Join(dir, KeyFile)
 	if old, err := ReadCert(dir); err == nil && sameSANs(old, ips, names) {
 		if pair, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
+			if err := checkKeyFile(keyFile); err != nil {
+				return nil, false, err
+			}
 			return &pair, false, nil
 		}
 	}
@@ -154,18 +159,27 @@ func writeAtomic(path string, b []byte, mode os.FileMode) error {
 	return os.Rename(f.Name(), path)
 }
 
+// checkKeyFile refuses a TLS key that anyone but the service user can
+// read, or that another user owns (SEC-3).
+func checkKeyFile(keyFile string) error {
+	fi, err := os.Stat(keyFile)
+	if err != nil {
+		return fmt.Errorf("endpoint TLS key: %w", err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("endpoint TLS key %s has mode %04o: make it readable by the service user only (chmod 600)", keyFile, fi.Mode().Perm())
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("endpoint TLS key %s belongs to uid %d: chown it to the service user (uid %d)", keyFile, st.Uid, os.Geteuid())
+	}
+	return nil
+}
+
 // loadUserPair loads a tls = "files" pair, refusing a key that anyone but
 // the service user can read (SEC-3).
 func loadUserPair(certFile, keyFile string) (*tls.Certificate, error) {
-	fi, err := os.Stat(keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("endpoint TLS key: %w", err)
-	}
-	if fi.Mode().Perm()&0o077 != 0 {
-		return nil, fmt.Errorf("endpoint TLS key %s has mode %04o: make it readable by the service user only (chmod 600)", keyFile, fi.Mode().Perm())
-	}
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != os.Geteuid() {
-		return nil, fmt.Errorf("endpoint TLS key %s belongs to uid %d: chown it to the service user (uid %d)", keyFile, st.Uid, os.Geteuid())
+	if err := checkKeyFile(keyFile); err != nil {
+		return nil, err
 	}
 	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {

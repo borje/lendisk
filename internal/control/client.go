@@ -80,10 +80,16 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 	if err != nil {
 		return err
 	}
-	if v := resp.Header.Get(ProtocolHeader); v != "" {
-		if err := Compatible(c.protocol(), v); err != nil {
-			return err
-		}
+	// Every answer from a lendisk control API, refusals included,
+	// carries the protocol header (NET-6); one without it is from
+	// something else on that port and is not trusted.
+	v := resp.Header.Get(ProtocolHeader)
+	if v == "" {
+		return fmt.Errorf("the peer's answer to %s (%d) has no %s header: whatever answered is not a lendisk control API",
+			path, resp.StatusCode, ProtocolHeader)
+	}
+	if err := Compatible(c.protocol(), v); err != nil {
+		return err
 	}
 	if resp.StatusCode != http.StatusOK {
 		var e errorBody

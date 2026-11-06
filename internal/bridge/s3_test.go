@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -119,5 +120,33 @@ func TestTunnelS3BindsAccessKeyToPeer(t *testing.T) {
 	}
 	if gw.count() != before {
 		t.Fatalf("%d refused requests reached the gateway", gw.count()-before)
+	}
+}
+
+// #53: the loopback and LAN listeners refuse the control API path in
+// every spelling that cleans to it, and pass everything else.
+func TestLoopbackRefusesControlPathAfterCleaning(t *testing.T) {
+	sock, g := startFakeGateway(t)
+	h := New(sock, quiet).LoopbackHandler()
+	serve := func(p string) int {
+		r := httptest.NewRequest("GET", "/", nil)
+		r.URL.Path = p
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	for _, p := range []string{"/_lendisk", "/_lendisk/", "/_lendisk/version", "//_lendisk/x",
+		"/./_lendisk/redeem", "/b/../_lendisk/version", "_lendisk/x"} {
+		if code := serve(p); code != http.StatusForbidden {
+			t.Errorf("%q: %d", p, code)
+		}
+	}
+	if n := g.count(); n != 0 {
+		t.Fatalf("%d control requests reached the gateway", n)
+	}
+	for _, p := range []string{"/bucket/_lendisk/x", "/_lendiskish/x", "/bucket"} {
+		if code := serve(p); code != http.StatusOK {
+			t.Errorf("%q: %d", p, code)
+		}
 	}
 }
