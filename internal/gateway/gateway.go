@@ -36,9 +36,6 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/versity/versitygw/backend"
-	"github.com/versity/versitygw/backend/meta"
-	"github.com/versity/versitygw/backend/posix"
 	"github.com/versity/versitygw/embedgw"
 	"github.com/versity/versitygw/s3api"
 
@@ -92,16 +89,6 @@ type Gateway struct {
 	ResolveEvery time.Duration
 
 	noCapture bool // tests: the decorator passes everything through
-}
-
-// OpenBackend opens the posix backend on dir. AbsolutePaths is required:
-// without it posix.New changes the process's working directory (D15).
-func OpenBackend(dir string) (backend.Backend, error) {
-	be, err := posix.New(dir, meta.XattrMeta{}, posix.PosixOpts{AbsolutePaths: true})
-	if err != nil {
-		return nil, fmt.Errorf("opening store %s: %w", dir, err)
-	}
-	return be, nil
 }
 
 // Run serves S3 on the socket until ctx is cancelled. ready, if not nil,
@@ -194,8 +181,8 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 
 // decorator wraps be and settles what a crash left pending before
 // anything is served (EP-3).
-func (g *Gateway) decorator(ctx context.Context, be backend.Backend) (*Decorator, error) {
-	d := &Decorator{Backend: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore, ctx: ctx}
+func (g *Gateway) decorator(ctx context.Context, be *Store) (*Decorator, error) {
+	d := &Decorator{Backend: be, Uploads: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore, ctx: ctx}
 	if d.Profiles == nil {
 		set, err := profile.Load("")
 		if err != nil {

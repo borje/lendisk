@@ -1191,15 +1191,31 @@ upstream bucket is Q-V.
     posix records the upload ID on the object it assembles, in the
     `mp-metadata` attribute (`user.mp-metadata` xattr; versitygw v1.10.0
     `posix.go`, which checks it to answer a retried completion), and the
-    decorator reads the same attribute (`storeUpload`), so a row matches
-    its own upload exactly; an ETag would also match an earlier upload
-    of the same parts (#59). A `PutObject` drops the attribute.
+    decorator reads the same attribute (`Store.UploadID`), so a row
+    matches its own upload exactly; an ETag would also match an earlier
+    upload of the same parts (#59). A `PutObject` drops the attribute.
+    `OpenBackend` returns the `Store`: the posix backend with the
+    metadata storer it was opened with, so the attribute is read through
+    the same storer and bucket paths posix writes it with. The gateway
+    hands the `Store` to the decorator as `Decorator.Uploads`, apart from
+    the backend it wraps, so a wrapper between the decorator and posix
+    (quota #16, tombstones #17) cannot hide it (#62). An object with no
+    attribute but the row's ETag (the attribute was lost, as when a store
+    is copied without extended attributes) holds the bytes the row's
+    parts give: it counts as landed and is logged. An attribute that
+    cannot be read (an I/O error, or a value that does not parse) leaves
+    the row undecided: it is logged and stays pending and stranded, and
+    is never dropped for it.
   - *Startup.* Before the gateway serves anything, `ResolvePending`
     settles every pending row with `HeadObject`: a put is done if the
     object carries the row's token (or upload ID), and is otherwise removed;
     a delete is done if the key is gone. A `PutObject` that reached the
-    store but not its row is hashed by reading the object once: the
-    only read capture makes of a stored object, and only after a crash.
+    store but not its done row is hashed by reading the object once; a
+    `PutObject`'s object is read only then (after a crash, or for a
+    stranded row), while a completed upload's is always read once
+    (*Multipart*). A completion's row whose upload ID cannot be read does
+    not stop the start: it is logged and left pending and stranded for
+    `ResolveStranded` (#62).
   - *While running.* A row whose request ended without completing or
     removing it (the state database refused the write, or a multipart
     hash failed) is remembered by the decorator as stranded, and
@@ -1234,13 +1250,14 @@ upstream bucket is Q-V.
     free (else it lets go and waits for the busy one), so two batches
     cannot deadlock and a batch never holds a key while it waits for
     another. restic and Kopia never write one key concurrently, so the
-    lock costs them one uncontended channel send per request. `ResolveStranded` settles a row only
-    if its key's lock is free, and otherwise leaves it for the next
-    round.
+    lock costs them one uncontended channel send per request.
+    `ResolveStranded` settles a row only if its key's lock is free (and,
+    for a completion's row, the upload is unclaimed, *Retried
+    completions*), and otherwise leaves it for the next round.
   - *Multipart.* There is no single stream to hash, and clients upload
     parts in parallel, so parts are not hashed. The completion writes a
-    pending row with the ETag the completion will give the object, the
-    store assembles it, and the decorator then reads the finished object
+    pending row with its upload ID (and the ETag the completion will give
+    the object), the store assembles it, and the decorator then reads the finished object
     once and records its whole-object SHA-256 and size (decided
     2026-11-06: one canonical hash for every object is worth the second
     read, and replication may then use any part size). If the key holds
@@ -1290,9 +1307,18 @@ upstream bucket is Q-V.
       the row stays pending and stranded for `ResolveStranded` (or
       startup) to hash; not landed, the row is removed. The request
       never hashes the object inline, so a client's timeout cannot
-      waste a multi-GB read and every retry is cheap (#59). Anything
-      else is captured as a first completion, with its own row, upload
-      ID and ETag.
+      waste a multi-GB read (#59). Anything else is captured as a first
+      completion, with its own row, upload ID and ETag.
+    `ResolveStranded` settles a completion's stranded row holding the
+    upload's claim as well as the key's lock, and settles the claim as
+    stored as soon as the `HEAD` and the attribute show the object
+    landed, before it hashes. A retry arriving meanwhile finds the claim
+    and is answered from the store; one that claimed the upload first
+    keeps the resolver off the row until the next round (#62). So a
+    retried completion waits at most for another request's store call or
+    a `HEAD` and an attribute read, never for a hash. (A retried
+    `PutObject` writes the key, so it does wait for the key's lock, as
+    any later write of the key does.)
     So no completion stores an object without a row. The claim, the
     key's lock and an unsettled row are released (the row stranded) by
     a deferred step, so a panic in the store leaks neither (#59). Every
