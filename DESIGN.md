@@ -1,6 +1,6 @@
 # lendisk — design
 
-Status: draft v0.14, 2026-11-06. Companion to REQUIREMENTS.md v0.11.
+Status: draft v0.15, 2026-11-06. Companion to REQUIREMENTS.md v0.11.
 REQUIREMENTS.md v0.9 made the two requirement changes this design
 needed (Q-T, resolved); its later versions moved third-party
 credentials to the environment,
@@ -83,7 +83,12 @@ port mapping. v0.14 takes in the minio-go spike (Q-Y items 1, 2 and
 4): minio-go v7.4.1 is pinned, every target is sent unsigned payloads,
 and the SHA-256 request checksum is the queue row's hash on a single
 PUT and a per-part SHA-256 in an unsigned trailer on multipart (§3.4,
-S3-3). The trust model is unchanged throughout.
+S3-3). v0.15 follows the first capture code (#6): a multipart object's
+hash is the SHA-256 of the whole object, read once at completion,
+rather than a composite of its parts, so every object has one hash and
+replication picks part sizes freely (EP-3, REPL-10); and dependencies
+are pinned by `go.sum` rather than vendored (OPS-8). The trust model is
+unchanged throughout.
 
 ## 1. Name
 
@@ -480,7 +485,7 @@ bundled program, not reimplemented. The daemon is glue around these:
 | Concern | Component | Licence | Notes |
 |---|---|---|---|
 | Backup format, client, encryption | **restic**, **Kopia**, unmodified | BSD-2 / Apache | Never imported; only their S3 usage and key naming conventions are relied on, via tool profiles. |
-| S3 front end and store | **versitygw** via `embedgw`, pinned and vendored | Apache-2.0 | D15. SigV4 incl. `aws-chunked`, routing, multipart, listings; `backend/posix` (`backend/s3` post-v1). Versioning off; object lock refused at the gate; admin API mounted but unreachable (SEC-8). |
+| S3 front end and store | **versitygw** via `embedgw`, pinned by `go.sum` | Apache-2.0 | D15. SigV4 incl. `aws-chunked`, routing, multipart, listings; `backend/posix` (`backend/s3` post-v1). Versioning off; object lock refused at the gate; admin API mounted but unreachable (SEC-8). |
 | Replication transfers, every place in the pool | **minio-go** | Apache-2.0 | D12. In-process S3 client, confined to one package behind the replica interface; the AWS SDK for Go v2 is the replacement if it is withdrawn. |
 | Rate limiting | `golang.org/x/time/rate` | BSD-3 | REPL-7's token bucket around each uploaded part. |
 | Overlay network and NAT traversal | **`github.com/tailscale/tailcat`** | BSD-3 | D5. |
@@ -755,7 +760,7 @@ Known costs and their handling:
   extracted in versitygw v1.5.0 (June 2026), external IAM arrived in
   v1.8.0 (September) and v1.10.0 shipped on 22 October: five minor
   releases in four months, with no stability statement. The version is
-  pinned and vendored, the decorator is the only file that touches the
+  pinned by `go.sum`, the decorator is the only file that touches the
   interface, the SEC-9 table and the replication-hole review (Q-H) are
   re-run on every bump, and CI runs restic and Kopia end to end. This is
   the risk that made the v0.8 sidecar attractive; the price of avoiding
@@ -1120,18 +1125,18 @@ upstream bucket is Q-V.
     store but not its row is hashed by reading the object once: the
     only read capture makes of a stored object, and only after a crash.
   - *Multipart.* There is no single stream to hash, and clients upload
-    parts in parallel. Each `UploadPart` stream is hashed as it passes
-    and its SHA-256 and size are saved (`upload_part`) before the part's
-    answer, so every part a client can name in a completion has one.
-    The completion copies the named parts, in order, to the row
-    (`queue_part`) with the pending row, and the object's hash is the
-    composite: SHA-256 over the parts' binary SHA-256 digests, hex, then
-    `-<parts>` (as S3's composite checksums). No byte is read twice.
-    The replica worker sends such an object with the same part
-    boundaries, each part with its SHA-256 trailer (§3.4), so the lender
-    can verify every part and recompute the composite (LEND-4). A
-    retried completion of an upload already queued is passed to the
-    store but not queued again.
+    parts in parallel, so parts are not hashed. The completion writes a
+    pending row with the ETag the completion will give the object, the
+    store assembles it, and the decorator then reads the finished object
+    once and records its whole-object SHA-256 and size. If the key
+    already holds another object by then (a later write won the race),
+    the row is dropped, since that write has its own. The read is
+    usually served from the page cache, but completing a large upload
+    takes as long as hashing it (decided 2026-11-06: one canonical hash
+    for every object is worth the second read, and replication may then
+    use any part size). A failed read leaves the row pending; a retried
+    completion or the next start finishes it. A retried completion of an
+    upload already done is passed to the store but not queued again.
   - *Exactly once.* A put whose hash equals the key's latest done row,
     a put, is not queued again (`FinishPut` drops it): this is the
     client's retry after a crash it saw as a failure, and an identical
@@ -1235,9 +1240,8 @@ upstream bucket is Q-V.
   index gets the index after them), `bucket`, `key`, `op` (`put`,
   `delete`), `class` (`snapshot`, `metadata`, `data`), `state`
   (`pending`, `done`), and for a put `size` and `sha256`; `token`,
-  `etag` and `upload_id` serve EP-3. `queue_part` holds a multipart
-  object's parts (number, size, SHA-256) and `upload_part` those of
-  uploads still open. Rows are never removed by capture; `placement`
+  `etag` and `upload_id` serve EP-3. `sha256` is always the
+  whole-object SHA-256. Rows are never removed by capture; `placement`
   (#19) and the worker (#18) consume them. `status` shows each
   bucket's queue (`queue.objects`, `queue.bytes`, `queue.pending` in
   `status --json`).
@@ -1311,12 +1315,10 @@ upstream bucket is Q-V.
   `x-amz-checksum-algorithm: SHA256` and each part carries its own
   SHA-256 as an unsigned trailer (`PutObjectPartOptions.Trailer`, a
   placeholder of the final length filled by a hashing reader at EOF),
-  so each byte is still read once. An object captured from a multipart
-  upload (its hash is a composite, `<hex>-<n>`, EP-3) is always sent as
-  a multipart upload with the parts it was written with, from
-  `queue_part`: each part's trailer is then the SHA-256 taken at
-  capture, and the lender recomputes the composite from the parts it
-  received. minio-go's *signed* trailer is never
+  so each byte is still read once. Every object's capture hash is a
+  whole-object SHA-256 (EP-3), so the worker chooses part sizes freely;
+  the lender hashes the whole stream it receives and compares with
+  `x-amz-meta-lendisk-sha256` (LEND-4). minio-go's *signed* trailer is never
   used: its framing is refused by versitygw and Garage. A target that
   refuses checksums gets none, per target. `Get` with a range is `GetObject` with a range option.
   `Head`, `List` and `Delete` map to `StatObject`, `ListObjects` (with
@@ -1364,14 +1366,10 @@ upstream bucket is Q-V.
   and send is rejected and alerted rather than replicated.
   REQUIREMENTS.md v0.9 reworded REPL-10 to allow the hash to be taken
   when the tool writes the object, for exactly this. For an object the
-  tool wrote as a multipart upload the hash is the composite of its
-  parts' SHA-256 digests (EP-3), since the parts arrive in parallel and
-  a whole-object SHA-256 would need a second read; it is still computed
-  from the object's bytes, the same way for friends and overflow
-  targets. Two uploads of the same bytes with different part
-  boundaries therefore have different hashes: EP-11 (#22) must compare
-  like with like (a composite only with a composite of the same part
-  sizes) before calling a key changed.
+  tool wrote as a multipart upload the hash is taken by reading the
+  assembled object once at completion (EP-3), so every object has one
+  whole-object SHA-256 whatever its part sizes, and EP-11 compares
+  hashes directly.
 - **REPL-11** The bucket's watermark is the highest sequence `w` such
   that every object up to `w` has `copies` `acked` placement rows; it
   advances as acknowledgements arrive and is the offsite-complete point
@@ -1616,8 +1614,11 @@ upstream bucket is Q-V.
 - **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the
   replica client included); active RSS adds one part buffer (16 MiB by
   default) per transfer in flight. Q-M measures both.
-- **OPS-8** One binary; versitygw, tailcat and minio-go are vendored,
-  so their upgrades are lendisk releases. State migrations are
+- **OPS-8** One binary; versitygw, tailcat and minio-go are pinned to
+  exact versions by `go.mod` and `go.sum`, so their upgrades are lendisk
+  releases. They are not vendored (decided 2026-11-06): the Go module
+  proxy keeps every published version, and a vendor tree would add
+  about 80 MB to the repository. State migrations are
   `lendisk.db`'s, forward and one minor version back. Each migration
   is one integer schema step that records a *compat* level: the oldest
   schema whose binary still runs safely on the result. A binary that
@@ -2007,7 +2008,7 @@ design and disappear with it.
   refused yet; the rest of the review is still to do.
 - **Q-I (gate, resolved 2026-11-05)** The embedded design depends on
   five properties of versitygw at the pinned version. Pinned at
-  **v1.10.0** (tag commit `72f75bd`, 2026-10-22), vendored; it needs Go
+  **v1.10.0** (tag commit `72f75bd`, 2026-10-22), pinned by `go.sum`; it needs Go
   1.26. Answered by the spike in `spikes/versitygw/` (issue #2): the
   `posix` backend behind a pass-through decorator and an external
   `IAMService`, tested with the AWS SDK for Go v2 and with restic.

@@ -5,11 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"hash"
 	"io"
 	"log/slog"
 	"maps"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/versity/versitygw/backend"
@@ -116,36 +116,12 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 	return out, nil
 }
 
-// UploadPart records the hash of each part of an own bucket's upload as
-// it is written; a part is not itself queued (EP-2).
-func (d *Decorator) UploadPart(ctx context.Context, in *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
-	class, err := d.classify(in.Bucket, in.Key)
-	if err != nil {
-		return nil, err
-	}
-	if !captured(class) || in.UploadId == nil || in.PartNumber == nil {
-		return d.Backend.UploadPart(ctx, in)
-	}
-	cp := *in
-	var h *hashReader
-	cp.Body, h = hashing(in.Body)
-	out, err := d.Backend.UploadPart(ctx, &cp)
-	if err != nil {
-		return out, err
-	}
-	d.stored()
-	if err := d.DB.SaveUploadPart(context.Background(), *in.UploadId,
-		state.Part{Number: *in.PartNumber, Size: h.n, SHA256: h.hex()}); err != nil {
-		d.Log.Error("capture: saving a part hash failed", "bucket", *in.Bucket, "key", *in.Key, "err", err)
-		return nil, errInternal
-	}
-	return out, nil
-}
-
-// CompleteMultipartUpload captures a completed upload (EP-2). Its hash is
-// the composite of the part hashes taken as the parts were written
-// (§3.3): SHA-256 over the parts' SHA-256 digests in order, with the part
-// count, as "<hex>-<n>".
+// CompleteMultipartUpload captures a completed upload (EP-2). Its parts
+// arrive separately, possibly in parallel, so there is no single stream
+// to hash on the way in; the hash is the SHA-256 of the whole object,
+// read once from the store after it is assembled (§3.3, REPL-10). The
+// read is usually from the page cache, but it makes completing a large
+// upload take as long as hashing it.
 func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
 	class, err := d.classify(in.Bucket, in.Key)
 	if err != nil {
@@ -155,65 +131,67 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 		return d.Backend.CompleteMultipartUpload(ctx, in)
 	}
 	bg := context.Background()
-	uploadID := *in.UploadId
-	// A retry of a completion that was already captured completes again
-	// in the store (posix answers it from the finished object) but is not
-	// queued twice.
-	if done, err := d.DB.UploadCaptured(bg, *in.Bucket, *in.Key, uploadID); err != nil {
+	bucket, key, uploadID := *in.Bucket, *in.Key, *in.UploadId
+	// A retried completion is not queued twice: posix answers it from the
+	// finished object. A row left pending by a failed hash is finished now.
+	seq, st, found, err := d.DB.UploadEntry(bg, bucket, key, uploadID)
+	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", errInternal
-	} else if done {
+	}
+	if found && st == state.StateDone {
 		return d.Backend.CompleteMultipartUpload(ctx, in)
 	}
-	etag, err := backend.ComputeMultipartETagFromPartETags(uploadID, in.MultipartUpload.Parts)
-	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", err
-	}
-	have, err := d.DB.UploadParts(bg, uploadID)
-	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", errInternal
-	}
-	parts := make([]state.Part, 0, len(in.MultipartUpload.Parts))
-	var size int64
-	for _, p := range in.MultipartUpload.Parts {
-		hp, ok := have[*p.PartNumber]
-		if !ok {
-			// No part the client has an ETag for lacks a hash: the hash
-			// is saved before UploadPart answers. Let the store judge.
-			return s3response.CompleteMultipartUploadResult{}, "", s3err.GetInvalidPartErr(uploadID, *p.PartNumber, deref(p.ETag))
+	if !found {
+		etag, err := backend.ComputeMultipartETagFromPartETags(uploadID, in.MultipartUpload.Parts)
+		if err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", err
 		}
-		parts = append(parts, hp)
-		size += hp.Size
-	}
-	seq, err := d.begin(state.Capture{Bucket: *in.Bucket, Key: *in.Key, Op: state.OpPut, Class: string(class),
-		ETag: etag, UploadID: uploadID, Parts: parts})
-	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", err
+		if seq, err = d.begin(state.Capture{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(class),
+			ETag: etag, UploadID: uploadID}); err != nil {
+			return s3response.CompleteMultipartUploadResult{}, "", err
+		}
 	}
 	res, ver, err := d.Backend.CompleteMultipartUpload(ctx, in)
 	if err != nil {
-		d.drop(seq)
+		if !found {
+			d.drop(seq)
+		}
 		return res, ver, err
 	}
 	d.stored()
-	if _, err := d.DB.FinishPut(bg, seq, size, compositeHash(parts)); err != nil {
-		d.Log.Error("capture: completing a queue row failed", "bucket", *in.Bucket, "key", *in.Key, "seq", seq, "err", err)
+	if err := d.finishUpload(bg, seq, bucket, key, deref(res.ETag)); err != nil {
+		// The row stays pending; a retried completion or the next start
+		// finishes it.
+		d.Log.Error("capture: hashing a completed upload failed", "bucket", bucket, "key", key, "seq", seq, "err", err)
 		return s3response.CompleteMultipartUploadResult{}, "", errInternal
 	}
 	return res, ver, nil
 }
 
-// AbortMultipartUpload forgets the upload's part hashes; nothing is
-// queued (EP-2).
-func (d *Decorator) AbortMultipartUpload(ctx context.Context, in *s3.AbortMultipartUploadInput) error {
-	if err := d.Backend.AbortMultipartUpload(ctx, in); err != nil {
+// finishUpload hashes a completed upload's object and marks its row done.
+// If the key already holds another object (a later write won the race),
+// the row is dropped: the later write has its own row.
+func (d *Decorator) finishUpload(ctx context.Context, seq int64, bucket, key, etag string) error {
+	out, err := d.Backend.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+	if notFound(err) {
+		d.drop(seq)
+		return nil
+	}
+	if err != nil {
 		return err
 	}
-	if d.DB != nil && in.UploadId != nil {
-		if err := d.DB.DropUpload(context.Background(), *in.UploadId); err != nil {
-			d.Log.Warn("capture: forgetting an aborted upload's parts failed", "upload", *in.UploadId, "err", err)
-		}
+	defer out.Body.Close()
+	if etag != "" && strings.Trim(deref(out.ETag), `"`) != strings.Trim(etag, `"`) {
+		d.drop(seq)
+		return nil
 	}
-	return nil
+	h := sha256.New()
+	n, err := io.Copy(h, out.Body)
+	if err != nil {
+		return err
+	}
+	_, err = d.DB.FinishPut(ctx, seq, n, hex.EncodeToString(h.Sum(nil)))
+	return err
 }
 
 // DeleteObject captures a successful delete (EP-2).
@@ -340,17 +318,6 @@ func (d *Decorator) drop(seqs ...int64) {
 		// Left pending, the rows are resolved at the next start.
 		d.Log.Warn("capture: removing the rows of a failed request failed", "seqs", seqs, "err", err)
 	}
-}
-
-// compositeHash is a multipart object's hash: SHA-256 over the binary
-// SHA-256 of each part in order, hex, then "-" and the part count.
-func compositeHash(parts []state.Part) string {
-	h := sha256.New()
-	for _, p := range parts {
-		b, _ := hex.DecodeString(p.SHA256)
-		h.Write(b)
-	}
-	return fmt.Sprintf("%s-%d", hex.EncodeToString(h.Sum(nil)), len(parts))
 }
 
 // hashReader hashes what is read through it, so the hash is taken as the

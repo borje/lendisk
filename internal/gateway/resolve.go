@@ -20,9 +20,8 @@ import (
 //
 //   - a put is done if the object on disk carries the row's capture token
 //     (PutObject) or the ETag its completion was to give it (multipart);
-//     else it never took effect and the row is removed. A PutObject that
-//     took effect is hashed by reading the object once, the only read of
-//     a stored object capture ever makes, and only after a crash;
+//     else it never took effect and the row is removed. A put that took
+//     effect is hashed by reading the object once;
 //   - a delete is done if the key is gone, else removed.
 //
 // It returns how many rows it marked done and removed.
@@ -49,15 +48,6 @@ func (d *Decorator) ResolvePending(ctx context.Context) (done, dropped int, err 
 		switch {
 		case e.Op == state.OpDelete:
 			err = d.DB.FinishDelete(ctx, e.Seq)
-		case e.Upload != "":
-			var parts []state.Part
-			if parts, err = d.DB.EntryParts(ctx, e.Seq); err == nil {
-				var size int64
-				for _, p := range parts {
-					size += p.Size
-				}
-				_, err = d.DB.FinishPut(ctx, e.Seq, size, compositeHash(parts))
-			}
 		default:
 			var size int64
 			var sum string

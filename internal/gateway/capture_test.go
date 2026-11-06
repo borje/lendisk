@@ -203,9 +203,6 @@ func TestCaptureWritesAndDeletes(t *testing.T) {
 		UploadId: ab.UploadId}); err != nil {
 		t.Fatal(err)
 	}
-	if ps, _ := h.db.UploadParts(ctx, *ab.UploadId); len(ps) != 0 {
-		t.Fatal("aborted upload's part hashes kept")
-	}
 
 	// Deletes: one, then a multi-delete with a local-only key in it.
 	put("data/dd/gone", []byte("g"))
@@ -226,12 +223,12 @@ func TestCaptureWritesAndDeletes(t *testing.T) {
 		}
 		rows = append(rows, row{e.Key, e.Op, e.Class, e.SHA256})
 	}
-	h1, h2 := sha256.Sum256(part1), sha256.Sum256(part2)
-	composite := sum(append(h1[:], h2[:]...)) + "-2"
+	// A multipart object's hash is the SHA-256 of the whole object (§3.3).
+	whole := sum(append(append([]byte{}, part1...), part2...))
 	want := []row{
 		{"data/aa/pack1", "put", "data", sum(pack)},
 		{"config", "put", "metadata", sum([]byte("cfg"))},
-		{"data/bb/big", "put", "data", composite},
+		{"data/bb/big", "put", "data", whole},
 		{"data/dd/gone", "put", "data", sum([]byte("g"))},
 		{"data/dd/gone", "delete", "data", ""},
 		{"index/ee", "put", "metadata", sum([]byte("i"))},
@@ -245,9 +242,8 @@ func TestCaptureWritesAndDeletes(t *testing.T) {
 			t.Errorf("row %d = %v, want %v", i, rows[i], want[i])
 		}
 	}
-	es := h.entries("laptop")
-	if ps, _ := h.db.EntryParts(ctx, es[2].Seq); len(ps) != 2 || ps[0].Size != 5<<20 || ps[1].Size != 4 {
-		t.Errorf("multipart entry parts %+v", ps)
+	if es := h.entries("laptop"); es[2].Size != 5<<20+4 {
+		t.Errorf("multipart entry size %d", es[2].Size)
 	}
 }
 
@@ -345,12 +341,11 @@ func TestPendingResolvedAtStartup(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		parts, _ := h.db.UploadParts(ctx, up.UploadId)
 		cps := []types.CompletedPart{{PartNumber: &one, ETag: out.ETag}}
 		in := &s3.CompleteMultipartUploadInput{Bucket: b, Key: aws.String(key), UploadId: &up.UploadId,
 			MultipartUpload: &types.CompletedMultipartUpload{Parts: cps}}
 		etag, _ := computeETag(up.UploadId, cps)
-		seq := begin(state.Capture{Key: key, Op: state.OpPut, UploadID: up.UploadId, ETag: etag, Parts: []state.Part{parts[1]}})
+		seq := begin(state.Capture{Key: key, Op: state.OpPut, UploadID: up.UploadId, ETag: etag})
 		if complete {
 			if _, _, err := be.CompleteMultipartUpload(ctx, in); err != nil {
 				t.Fatal(err)
@@ -386,8 +381,7 @@ func TestPendingResolvedAtStartup(t *testing.T) {
 	if _, ok := bySeq[delDone]; !ok {
 		t.Error("done delete dropped")
 	}
-	ph := sha256.Sum256([]byte("part of data/mp-done"))
-	if e := bySeq[mpDone]; e.SHA256 != sum(ph[:])+"-1" {
+	if e := bySeq[mpDone]; e.SHA256 != sum([]byte("part of data/mp-done")) {
 		t.Errorf("multipart: %+v", e)
 	}
 }

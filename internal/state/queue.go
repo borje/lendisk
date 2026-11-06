@@ -28,10 +28,8 @@ type Capture struct {
 	// Token is the lendisk-capture metadata a PutObject carries, which
 	// tells startup whether the object on disk is this write's.
 	Token string
-	// ETag and UploadID identify a CompleteMultipartUpload, and Parts
-	// are the parts it names, in order.
+	// ETag and UploadID identify a CompleteMultipartUpload.
 	ETag, UploadID string
-	Parts          []Part
 }
 
 // Entry is a queue row.
@@ -41,13 +39,6 @@ type Entry struct {
 	State                       string
 	Size                        int64
 	SHA256, Token, ETag, Upload string
-}
-
-// Part is one part of a multipart object, hashed as it was written.
-type Part struct {
-	Number int32
-	Size   int64
-	SHA256 string
 }
 
 // QueueStat is a bucket's queue size for status.
@@ -79,19 +70,12 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 		if err != nil {
 			return nil, err
 		}
-		for _, p := range c.Parts {
-			if _, err := tx.ExecContext(ctx, `INSERT INTO queue_part (seq, number, size, sha256) VALUES (?, ?, ?, ?)`,
-				seq, p.Number, p.Size, p.SHA256); err != nil {
-				return nil, err
-			}
-		}
 		seqs = append(seqs, seq)
 	}
 	return seqs, tx.Commit()
 }
 
-// FinishPut marks a pending put done with its size and hash, and for a
-// multipart object forgets the upload's part hashes. If the
+// FinishPut marks a pending put done with its size and hash. If the
 // key's latest done row is a put with the same hash, the row is dropped
 // instead and dup is true: an identical re-upload, such as a client's
 // retry after a crash, is not queued twice (EP-3, EP-11).
@@ -102,9 +86,8 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 	}
 	defer tx.Rollback()
 	var bucket, key string
-	var upload sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT bucket, key, upload_id FROM queue WHERE seq = ? AND state = 'pending'`, seq).
-		Scan(&bucket, &key, &upload); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT bucket, key FROM queue WHERE seq = ? AND state = 'pending'`, seq).
+		Scan(&bucket, &key); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, ErrNotFound
 		}
@@ -125,11 +108,6 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 	}
 	if err != nil {
 		return false, err
-	}
-	if upload.Valid {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM upload_part WHERE upload_id = ?`, upload.String); err != nil {
-			return false, err
-		}
 	}
 	return dup, tx.Commit()
 }
@@ -194,64 +172,16 @@ func (db *DB) QueueEntries(ctx context.Context, bucket string) ([]Entry, error) 
 	return db.entries(ctx, `bucket = ?`, bucket)
 }
 
-// EntryParts lists a multipart entry's parts in order.
-func (db *DB) EntryParts(ctx context.Context, seq int64) ([]Part, error) {
-	return db.parts(ctx, `SELECT number, size, sha256 FROM queue_part WHERE seq = ? ORDER BY number`, seq)
-}
-
-func (db *DB) parts(ctx context.Context, q string, arg any) ([]Part, error) {
-	rows, err := db.QueryContext(ctx, q, arg)
-	if err != nil {
-		return nil, err
+// UploadEntry finds the queue row of a completed upload of key, so a
+// client's retried CompleteMultipartUpload is not queued twice. ok is
+// false if there is none.
+func (db *DB) UploadEntry(ctx context.Context, bucket, key, uploadID string) (seq int64, state string, ok bool, err error) {
+	err = db.QueryRowContext(ctx, `SELECT seq, state FROM queue
+		WHERE bucket = ? AND key = ? AND upload_id = ? ORDER BY seq DESC LIMIT 1`, bucket, key, uploadID).Scan(&seq, &state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", false, nil
 	}
-	defer rows.Close()
-	var out []Part
-	for rows.Next() {
-		var p Part
-		if err := rows.Scan(&p.Number, &p.Size, &p.SHA256); err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	return out, rows.Err()
-}
-
-// SaveUploadPart records a part's hash once the backend has stored it; a
-// part uploaded again replaces the earlier one, as in the store.
-func (db *DB) SaveUploadPart(ctx context.Context, uploadID string, p Part) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO upload_part (upload_id, number, size, sha256) VALUES (?, ?, ?, ?)
-		ON CONFLICT (upload_id, number) DO UPDATE SET size = excluded.size, sha256 = excluded.sha256`,
-		uploadID, p.Number, p.Size, p.SHA256)
-	return err
-}
-
-// UploadParts returns an open upload's part hashes by part number.
-func (db *DB) UploadParts(ctx context.Context, uploadID string) (map[int32]Part, error) {
-	ps, err := db.parts(ctx, `SELECT number, size, sha256 FROM upload_part WHERE upload_id = ?`, uploadID)
-	if err != nil {
-		return nil, err
-	}
-	m := make(map[int32]Part, len(ps))
-	for _, p := range ps {
-		m[p.Number] = p
-	}
-	return m, nil
-}
-
-// DropUpload forgets an aborted upload's part hashes.
-func (db *DB) DropUpload(ctx context.Context, uploadID string) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM upload_part WHERE upload_id = ?`, uploadID)
-	return err
-}
-
-// UploadCaptured reports whether a completed upload of key is already
-// queued, so a client's retried CompleteMultipartUpload is not queued
-// twice.
-func (db *DB) UploadCaptured(ctx context.Context, bucket, key, uploadID string) (bool, error) {
-	var ok bool
-	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM queue
-		WHERE bucket = ? AND key = ? AND upload_id = ? AND state = 'done')`, bucket, key, uploadID).Scan(&ok)
-	return ok, err
+	return seq, state, err == nil, err
 }
 
 // QueueStats returns each bucket's queue size; buckets with no rows are

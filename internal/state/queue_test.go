@@ -87,52 +87,26 @@ func TestIdenticalReuploadNotQueuedTwice(t *testing.T) {
 	}
 }
 
-// EP-3, multipart: part hashes are kept per upload as parts succeed and
-// move to the entry when the upload completes, in one transaction.
-func TestUploadPartsMoveToEntry(t *testing.T) {
+// EP-3, multipart: a completed upload's row is found by its upload ID,
+// pending or done, so a retried completion is not queued twice.
+func TestUploadEntryFindsCompletion(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t)
-	db.SaveUploadPart(ctx, "up1", Part{Number: 1, Size: 10, SHA256: "p1"})
-	db.SaveUploadPart(ctx, "up1", Part{Number: 2, Size: 3, SHA256: "old"})
-	db.SaveUploadPart(ctx, "up1", Part{Number: 2, Size: 4, SHA256: "p2"}) // re-uploaded part
-	db.SaveUploadPart(ctx, "up2", Part{Number: 1, Size: 1, SHA256: "q"})
-	parts, err := db.UploadParts(ctx, "up1")
-	if err != nil || len(parts) != 2 || parts[2].SHA256 != "p2" || parts[2].Size != 4 {
-		t.Fatalf("parts %+v %v", parts, err)
+	if _, _, ok, err := db.UploadEntry(ctx, "b", "k", "up1"); ok || err != nil {
+		t.Fatalf("found before capture: %v", err)
 	}
-	if done, _ := db.UploadCaptured(ctx, "b", "k", "up1"); done {
-		t.Fatal("captured before completion")
+	s, _ := db.BeginCaptures(ctx, []Capture{{Bucket: "b", Key: "k", Op: OpPut, Class: "data", UploadID: "up1", ETag: `"e-2"`}})
+	seq, st, ok, err := db.UploadEntry(ctx, "b", "k", "up1")
+	if !ok || err != nil || seq != s[0] || st != StatePending {
+		t.Fatalf("pending: %d %s %v %v", seq, st, ok, err)
 	}
-	s, _ := db.BeginCaptures(ctx, []Capture{{Bucket: "b", Key: "k", Op: OpPut, Class: "data", UploadID: "up1", ETag: `"e-2"`,
-		Parts: []Part{parts[1], parts[2]}}})
-	if got, _ := db.EntryParts(ctx, s[0]); len(got) != 2 {
-		t.Fatal("pending entry has no parts")
-	}
-	if _, err := db.FinishPut(ctx, s[0], 14, "c-2"); err != nil {
+	if _, err := db.FinishPut(ctx, s[0], 14, "whole"); err != nil {
 		t.Fatal(err)
 	}
-	if p, _ := db.UploadParts(ctx, "up1"); len(p) != 0 {
-		t.Fatal("upload parts left after completion")
+	if _, st, ok, _ := db.UploadEntry(ctx, "b", "k", "up1"); !ok || st != StateDone {
+		t.Fatalf("done: %s %v", st, ok)
 	}
-	if p, _ := db.UploadParts(ctx, "up2"); len(p) != 1 {
-		t.Fatal("another upload's parts removed")
-	}
-	if done, _ := db.UploadCaptured(ctx, "b", "k", "up1"); !done {
-		t.Fatal("completed upload not found")
-	}
-	got, err := db.EntryParts(ctx, s[0])
-	if err != nil || len(got) != 2 || got[0].SHA256 != "p1" || got[1].Number != 2 {
-		t.Fatalf("entry parts %+v %v", got, err)
-	}
-	// A dropped capture takes its parts with it.
-	s2, _ := db.BeginCaptures(ctx, []Capture{{Bucket: "b", Key: "k2", Op: OpPut, Class: "data", UploadID: "up2",
-		Parts: []Part{{Number: 1, Size: 1, SHA256: "q"}}}})
-	db.DropCaptures(ctx, s2[0])
-	if got, _ := db.EntryParts(ctx, s2[0]); len(got) != 0 {
-		t.Fatal("dropped entry's parts kept")
-	}
-	db.DropUpload(ctx, "up2")
-	if p, _ := db.UploadParts(ctx, "up2"); len(p) != 0 {
-		t.Fatal("aborted upload's parts kept")
+	if _, _, ok, _ := db.UploadEntry(ctx, "b", "k", "up2"); ok {
+		t.Fatal("another upload matched")
 	}
 }

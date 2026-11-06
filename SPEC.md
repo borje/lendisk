@@ -22,5 +22,5 @@ design. Design references requirements by ID; requirements never
 reference design.
 
 REQUIREMENTS.md is at draft v0.11 (2026-11-04) and DESIGN.md at draft
-v0.14 (2026-11-06); they were split from SPEC v0.6 on 2026-10-28.
+v0.15 (2026-11-06); they were split from SPEC v0.6 on 2026-10-28.
 `architecture.html` is an overview rendered from the design.
