@@ -919,9 +919,8 @@ func TestHungStoreReadIsTheStoresFault(t *testing.T) {
 	hung.Store(false)
 	fx.drained("B")
 	close(release)
-	if c := fx.condition("B"); c.Condition != state.ConditionOK {
-		t.Fatalf("condition %+v", c)
-	}
+	// The condition is reset after the FIFO drains, not with it.
+	waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
 }
 
 // REPL-3, OPS-1 (#61): when a place rejects the bytes, the store's copy
@@ -959,9 +958,8 @@ func TestHungReHashIsTheStoresFault(t *testing.T) {
 	reject.Store(false)
 	fx.drained("B")
 	close(release)
-	if c := fx.condition("B"); c.Condition != state.ConditionOK {
-		t.Fatalf("condition %+v", c)
-	}
+	// The condition is reset after the FIFO drains, not with it.
+	waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
 }
 
 // REPL-3, OPS-1 (#61): through the real friend client, whose HTTP
@@ -1001,8 +999,7 @@ func TestHungStoreReadDoesNotHangTheRealClient(t *testing.T) {
 	// disk answers new reads, the object is sent.
 	hung.Store(false)
 	fx.drained(place)
-	if c := fx.condition(place); c.Condition != state.ConditionOK {
-		t.Fatalf("condition %+v", c)
-	}
+	// The condition is reset after the FIFO drains, not with it.
+	waitFor(t, "ok", func() bool { return fx.condition(place).Condition == state.ConditionOK })
 	unhang()
 }
