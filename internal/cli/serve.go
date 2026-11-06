@@ -77,7 +77,7 @@ func (a *app) serveCmd() *cobra.Command {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			errc := make(chan error, 3)
-			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Log: log,
+			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
@@ -92,6 +92,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			running := 1
 			br := bridge.New(gw.Socket, log)
+			tun.S3.Set(br.TunnelS3Handler()) // S3 for friends (NET-7, SEC-12)
 			// LAN listeners (EP-17); config load refuses them for a lender.
 			if len(cfg.Endpoint.Listen) > 0 {
 				lan := &bridge.LAN{Entries: cfg.Endpoint.Listen, ConfigDir: cfg.ConfigDir(), Handler: br.LANHandler(), Log: log}

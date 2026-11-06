@@ -83,4 +83,18 @@ var migrations = []Migration{
 		ALTER TABLE invite ADD COLUMN number    INTEGER;
 		ALTER TABLE invite ADD COLUMN retention INTEGER;`,
 	},
+	{
+		Version: 6, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The lender's mapping table (PEER-8, SEC-16): each bucket a
+		-- borrower created here, by the borrower's node ID and the
+		-- bucket's sealed name, never its real one. The store holds it as
+		-- lent-<id16>-<sealed>. A borrower's bucket listing is these rows.
+		CREATE TABLE lent_bucket (
+			peer_key   TEXT NOT NULL,    -- the borrower's node ID in display form
+			sealed     TEXT NOT NULL,    -- s<26>, the name on the wire
+			created_at INTEGER NOT NULL, -- unix seconds
+			PRIMARY KEY (peer_key, sealed)
+		);`,
+	},
 }

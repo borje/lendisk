@@ -841,7 +841,20 @@ reserved name `lendisk-manifests`. The borrower's `lendisk.db` and its
 encrypted manifest (ID-4) hold the name-to-sealed-name map; the
 lender's mapping table holds only sealed names and is authoritative on
 its side; the stored name is a stable label for reading the store with
-no lendisk running (P-5). Post-v1, behind `backend/s3`, the same names
+no lendisk running (P-5). On the wire the borrower names its bucket
+by the sealed name alone, in path-style S3 requests
+(`/s<26>/<key>`), signed with the pair's derived credential (§3.7
+NET-7a); it never sends `lent-` or its `id16`. The lender maps the
+name in the decorator's outer layer, `gateway.Lending`, from the
+account versitygw authenticated (Q-I.2): for an access key that is a
+node ID, a name not of the form `s<26>` is `NoSuchBucket` (and
+`InvalidBucketName` on `CreateBucket`), a sealed name with no row for
+that borrower is `NoSuchBucket`, and otherwise the backend is called
+with `lent-<id16>-<sealed>`; names in answers (`ListObjectsV2`'s
+`Name`, the multipart results' `Bucket`) are mapped back. The mapping
+table is `lent_bucket` (migration 6: borrower node ID, sealed name,
+created at). Code: `identity.SealedName`, `identity.IsSealedName`,
+`gateway.LentName`, `state.DB.LentBuckets`. Post-v1, behind `backend/s3`, the same names
 would be upstream bucket names; placing them as prefixes inside one
 upstream bucket is Q-V.
 
@@ -977,7 +990,25 @@ upstream bucket is Q-V.
   buckets; and versitygw's bucket-ownership check refuses an account
   any bucket it does not own, so a mapping bug cannot cross into another
   borrower's data or the lender's own. `ListBuckets` is answered from
-  the mapping table.
+  the mapping table. `gateway.Lending` writes out every
+  `backend.Backend` method rather than embedding the next layer, so a
+  method a versitygw upgrade adds fails to compile instead of passing a
+  sealed name through unmapped. For a borrower's account it maps every
+  bucket-named call, and refuses (`AccessDenied`) the ones that could
+  weaken the ownership wall or name a bucket outside the mapping:
+  `PutBucketAcl`, `PutBucketPolicy`, `DeleteBucketPolicy`, the
+  ownership-control writes, `PutObjectAcl`, `ChangeBucketOwner`,
+  `ListBucketsAndOwners`, `CopyObject` and `UploadPartCopy` (their
+  source is a bucket inside a string), and `DeleteBucket` (its row and
+  quota count would go stale). The rest of NET-7's narrowing is the
+  gate's (#15). `CreateBucket` creates the bucket with lendisk's own
+  private ACL owned by the borrower's account and `BucketOwnerEnforced`,
+  whatever ACL headers came with it, then inserts the row; a retry that
+  finds `BucketAlreadyOwnedByYou` inserts it too, so a crash between
+  the two heals on the client's retry. The borrower's account has
+  versitygw's `userplus` role, whose one addition to `user` is
+  `CreateBucket`; own bucket keys keep `user`. Own bucket keys cannot
+  reach a `lent-*` bucket, since the borrower owns it.
 - **PEER-9** The lender-only profile skips the loopback S3 listener,
   the metrics listener and the replication worker, so nothing listens
   on loopback (its AC); an `endpoint.listen` or `metrics` entry is
@@ -1546,12 +1577,16 @@ upstream bucket is Q-V.
   derived credential.
 - **NET-7a** The S3 credential for a borrower–lender pair is derived:
   access key is the borrower's node ID; secret key is
-  `HKDF-SHA256(X25519(borrower key, lender key), info="lendisk-s3-v1")`.
-  The lender's `IAMService` resolves a node-ID access key only when a
-  relationship exists for it (SEC-11), since any node can derive a valid
-  secret for its own key, and computes the secret on demand. The bridge
-  refuses a request whose access key is not the tunnel peer key
-  (SEC-12). The derived secret is never stored.
+  `HKDF-SHA256(X25519(borrower key, lender key), info="lendisk-s3-v1")`,
+  32 bytes in lowercase hex (`identity.S3Secret`). The access key is
+  the node ID exactly in its display form; another spelling is not a
+  node-ID key. The lender's `IAMService` resolves a node-ID access key
+  only when a relationship exists for it in the `peer` role (SEC-11;
+  an invite key gets nothing), since any node can derive a valid
+  secret for its own key, and computes the secret on demand, reading
+  `lendisk.db` on every lookup so a removed friend's next request is
+  refused. The bridge refuses a request whose access key is not the
+  tunnel peer key (SEC-12). The derived secret is never stored.
 - **Dialling a friend.** The replica client's HTTP transport uses the
   tailcat `Client.Dial` for that peer as its dial function, so
   replication traffic enters the tunnel from inside the process. No
@@ -1587,8 +1622,9 @@ upstream bucket is Q-V.
   `transport.NewDialer` is a dial-only transport with any key and no
   region, which never listens: `peer add` dials with the invite key
   through it. `serve` hands the tunnel listener to
-  `bridge.ServeTunnel`; until #14 the tunnel answers S3 requests that
-  pass the middleware with 501.
+  `bridge.ServeTunnel`. The tunnel listens before the gateway is
+  ready, so its S3 handler is a `bridge.Late` that answers 503 until
+  `serve` sets it to `Bridge.TunnelS3Handler` once `gw.sock` serves.
 
 ### 3.8 Operations and observability
 
@@ -1736,7 +1772,10 @@ upstream bucket is Q-V.
   URL's `X-Amz-Credential`, without verifying anything, and refuses the
   request unless it equals the peer key; versitygw then verifies the
   signature for that access key. A request with neither form is
-  refused. The control API takes the borrower from the context, never
+  refused, and so is an `Authorization` header in any scheme but
+  `AWS4-HMAC-SHA256` (SigV2's `AWS key:sig` included) and a request
+  whose header and query name two different keys
+  (`bridge.AccessKeyOf`, `Bridge.TunnelS3Handler`). The control API takes the borrower from the context, never
   from a parameter. `redeem` is the one call whose connection is not
   the friend's own key; the friend's key comes from its address and is
   accepted only with the key-agreement proof of §3.2 (PEER-2).

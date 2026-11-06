@@ -1,13 +1,16 @@
 // Package bridge owns every TCP listener in front of the gateway's internal
 // socket (§3.7): the loopback S3 endpoint (EP-1), the LAN listeners and
-// their TLS certificate (EP-17, SEC-3), and the tunnel port later. It proxies each request, unbuffered,
-// to gw.sock with the Host header and every signed header unchanged, so
-// the client's SigV4 signature still verifies there (Q-G). lendisk never
-// computes a signature.
+// their TLS certificate (EP-17, SEC-3), and the tunnel port, where the
+// control API and S3 for friends are served (§3.7). It proxies each S3
+// request, unbuffered, to gw.sock with the Host header and every signed
+// header unchanged, so the client's SigV4 signature still verifies there
+// (Q-G). lendisk never computes a signature.
 //
 // Rules: never use a ServeMux or anything else that cleans or rewrites the
 // path, since the signature covers it; never set X-Forwarded-* headers;
-// refuse the control API path on loopback and LAN listeners.
+// refuse the control API path on loopback and LAN listeners; on the
+// tunnel, proxy an S3 request only when its access key is the
+// connection's peer key (SEC-12).
 package bridge
 
 import (

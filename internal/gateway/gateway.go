@@ -1,9 +1,12 @@
 // Package gateway runs versitygw embedded in the daemon (D4, D15): the S3
 // protocol on one internal unix socket, <data>/run/gw.sock, over the posix
 // store, with lendisk's gate in front of its routing, lendisk's IAM service
-// for credentials and lendisk's decorator around the backend, which
+// for credentials and lendisk's decorator around the backend. The
+// decorator's outer layer (Lending) maps a borrower's sealed bucket names
+// to its lent-<id16>-<sealed> buckets (PEER-8, SEC-16); its inner layer
 // captures every write and delete of an own bucket into the replication
-// queue (EP-2, EP-3, EP-7, REPL-3, REPL-10).
+// queue (EP-2, EP-3, EP-7, REPL-3, REPL-10). A friend's node ID is an
+// account whose secret is derived per pair (NET-7a).
 //
 // Rules a caller must keep:
 //   - versitygw opens no TCP port (EP-5, SEC-8); every TCP listener is the
@@ -37,6 +40,7 @@ import (
 	"github.com/versity/versitygw/embedgw"
 	"github.com/versity/versitygw/s3api"
 
+	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
 )
@@ -71,6 +75,9 @@ type Gateway struct {
 	StoreDir string
 	Socket   string
 	DB       *state.DB
+	// Self is the node's identity: friends' node IDs are accounts whose
+	// secret is derived from it (NET-7a). Nil serves no friend.
+	Self *identity.Identity
 	// Profiles classify own buckets' keys (EP-7); nil means the
 	// compiled-in ones.
 	Profiles profile.Set
@@ -136,7 +143,7 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		MaxConnections:    250000,
 		MaxRequests:       100000,
 		MultipartMaxParts: 10000,
-		IAMService:        &IAM{DB: g.DB, Log: g.Log},
+		IAMService:        &IAM{DB: g.DB, Self: g.Self, Log: g.Log},
 		Quiet:             true,
 		S3Options:         []s3api.Option{Gate()},
 		// Deliberately empty: AdminPorts, WebuiPorts, WebsitePorts, metrics
@@ -145,7 +152,8 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	}
 
 	errc := make(chan error, 1)
-	go func() { errc <- embedgw.RunVersityGW(ctx, dec, cfg) }()
+	lend := &Lending{Next: dec, DB: g.DB}
+	go func() { errc <- embedgw.RunVersityGW(ctx, lend, cfg) }()
 	// waitForSocket drains errc whenever it returns early, so versitygw
 	// never outlives Run (only one may run per process).
 	if err := waitForSocket(ctx, g.Socket, errc); err != nil {

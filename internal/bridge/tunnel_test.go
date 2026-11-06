@@ -70,7 +70,10 @@ type lender struct {
 
 // startLender serves the tunnel handler for a node with a fresh
 // database, admitting every connection: the handler alone decides.
-func startLender(t *testing.T) *lender {
+func startLender(t *testing.T) *lender { return startLenderS3(t, nil) }
+
+// startLenderS3 is startLender with s3 as the tunnel's S3 handler.
+func startLenderS3(t *testing.T, s3 http.Handler) *lender {
 	t.Helper()
 	db, err := state.Open(t.Context(), t.TempDir(), quiet)
 	if err != nil {
@@ -88,7 +91,7 @@ func startLender(t *testing.T) *lender {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
-	go func() { done <- ServeTunnel(ctx, ln, l.tun.peerOf, TunnelHandler(roles, ctl, nil, quiet), quiet) }()
+	go func() { done <- ServeTunnel(ctx, ln, l.tun.peerOf, TunnelHandler(roles, ctl, s3, quiet), quiet) }()
 	t.Cleanup(func() { cancel(); <-done })
 	return l
 }

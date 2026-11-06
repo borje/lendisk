@@ -29,8 +29,8 @@ type PeerOf func(net.Conn) (identity.NodeID, error)
 // takes the connection's key, loads that key's role from lendisk.db and
 // refuses before routing if there is none; an invite key may call
 // redeem and nothing else. Then /_lendisk/ goes to ctl, with the caller
-// in the request context, and everything else to s3. A nil s3 refuses
-// S3 for now (#14).
+// in the request context, and everything else to s3
+// (Bridge.TunnelS3Handler in the daemon). A nil s3 answers S3 with 501.
 func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		isControl := strings.HasPrefix(r.URL.Path, control.Prefix)
