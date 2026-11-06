@@ -13,9 +13,9 @@ import (
 // the place (EP-11, LEND-4, cause NULL), or because the node's own store
 // cannot supply the object as captured (RefuseObject, #50; cause
 // CauseStore or CauseOversize). An identical re-upload of the key heals
-// a refusal: FinishPut queues it again where the place does not already
-// hold the hash, and a refusal a later done write replaced no longer
-// counts (#57, #61).
+// a refusal: FinishPut queues it again except where the place
+// acknowledged the very row it heals, and a refusal a later done write
+// replaced no longer counts (#57, #61).
 const (
 	PlacementQueued  = "queued"
 	PlacementAcked   = "acked"
@@ -65,17 +65,20 @@ type Placement struct {
 // placeTx places a completed queue row. Placement is trivial until
 // pooled placement (#19): every friend gets every row. A healing
 // re-upload (heal, #61) is acked at once, without sending, at a place
-// whose latest acknowledged row for the key is a put of the same hash
-// and that has nothing of the key queued (an earlier row in flight there
-// may still replace what it holds): exactly-once holds for honest places
-// while another place keeps refusing.
+// that acknowledged the very row it heals (the key's previous done row,
+// a put of the same hash) and has nothing of the key queued:
+// exactly-once holds for honest places while another place keeps
+// refusing. An older acknowledgement of the hash is not enough: a row of
+// other bytes sent since may have landed with its answer lost and then
+// been cancelled as superseded, which leaves no row behind.
 func placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) error {
 	_, err := tx.ExecContext(ctx, `WITH c AS (
 		SELECT q.seq, f.peer_key AS place, q.bucket, q.key, q.op, q.sha256,
 			?2 AND q.op = 'put'
-			AND coalesce((SELECT a.op = 'put' AND a.sha256 = q.sha256 FROM placement a
-				WHERE a.place = f.peer_key AND a.bucket = q.bucket AND a.key = q.key AND a.state = 'acked'
-				ORDER BY a.seq DESC LIMIT 1), 0)
+			AND EXISTS (SELECT 1 FROM placement a
+				WHERE a.place = f.peer_key AND a.state = 'acked' AND a.sha256 = q.sha256
+				AND a.seq = (SELECT max(l.seq) FROM queue l
+					WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq < q.seq AND l.state = 'done'))
 			AND NOT EXISTS (SELECT 1 FROM placement w
 				WHERE w.place = f.peer_key AND w.bucket = q.bucket AND w.key = q.key
 				AND w.state = 'queued' AND w.seq < q.seq) AS held
@@ -149,13 +152,20 @@ func (db *DB) RefuseObject(ctx context.Context, seq int64, cause, detail string)
 }
 
 // RequeueOversize puts the rows refused only for being larger than one
-// PUT carries (CauseOversize), and not replaced by a later write of the
-// key, back into their places' FIFOs, and returns how many. Multipart
-// replication (#23) calls it once it can send them.
-func (db *DB) RequeueOversize(ctx context.Context) (int64, error) {
+// PUT carries, and not replaced by a later write of the key, back into
+// their places' FIFOs, and returns how many. Multipart replication (#23)
+// calls it once it can send them, with putLimit the most one PUT
+// carried (replica.MaxPutSize). Those rows have CauseOversize, or, if
+// refused before the cause was told apart (#61), CauseStore and a size
+// above putLimit.
+func (db *DB) RequeueOversize(ctx context.Context, putLimit int64) (int64, error) {
 	r, err := db.ExecContext(ctx, `UPDATE placement SET state = 'queued', detail = NULL, cause = NULL
-		WHERE state = 'refused' AND cause = 'oversize' AND NOT EXISTS (SELECT 1 FROM queue l
-			WHERE l.bucket = placement.bucket AND l.key = placement.key AND l.seq > placement.seq AND l.state = 'done')`)
+		WHERE state = 'refused'
+		AND (cause = 'oversize' OR cause = 'store' AND op = 'put'
+			AND (SELECT q.size FROM queue q WHERE q.seq = placement.seq) > ?)
+		AND NOT EXISTS (SELECT 1 FROM queue l
+			WHERE l.bucket = placement.bucket AND l.key = placement.key AND l.seq > placement.seq AND l.state = 'done')`,
+		putLimit)
 	if err != nil {
 		return 0, err
 	}

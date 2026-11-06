@@ -353,43 +353,94 @@ func TestHealingReuploadIsSentOnlyWhereTheHashIsNotHeld(t *testing.T) {
 	}
 }
 
+// EP-3, REPL-10 (#61): a healing re-upload is acked at placement only
+// where the place acknowledged the very row it heals. An earlier
+// acknowledgement of the same hash proves nothing: a row of other bytes
+// sent since may have landed with its answer lost, and was then
+// cancelled as superseded, leaving no trace.
+func TestHealingDoesNotTrustAnOlderAcknowledgement(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	friend(t, db, "P")
+	friend(t, db, "Q")
+	put := func(hash string) int64 {
+		t.Helper()
+		s, err := db.BeginCaptures(ctx, []Capture{{Bucket: "laptop", Key: "data/1", Op: OpPut, Class: "data"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dup, err := db.FinishPut(ctx, s[0], 1, hash); err != nil || dup {
+			t.Fatalf("put %s: dup %v, %v", hash, dup, err)
+		}
+		return s[0]
+	}
+	ack := func(place string, seq int64, hash string) {
+		t.Helper()
+		if err := db.AckPlacement(ctx, place, seq, hash, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s1 := put("H")
+	ack("P", s1, "H")
+	ack("Q", s1, "H")
+	s2 := put("X")
+	ack("Q", s2, "X") // P stored X, but its answer was lost: s2 stays queued there
+	s3 := put("H")
+	if err := db.CancelPlacement(ctx, "P", s2); err != nil { // superseded by s3
+		t.Fatal(err)
+	}
+	if ok, err := db.RefuseObject(ctx, s3, CauseStore, "the store cannot supply it"); err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	s4 := put("H") // heals s3
+	for _, place := range []string{"P", "Q"} {
+		if p, ok, _ := db.NextPlacement(ctx, place); !ok || p.Seq != s4 {
+			t.Fatalf("%s head %+v %v: the heal must be sent; P may hold X", place, p, ok)
+		}
+	}
+}
+
 // REPL-1 (#61): a row refused only for being larger than one PUT
 // carries keeps that cause and counts against its bucket until
-// multipart replication (#23) re-queues it; one a later write replaced
-// is not re-queued, nor is one refused for another store cause.
+// multipart replication (#23) re-queues it; so is one refused before
+// the cause was told apart (cause store, but larger than one PUT). One a
+// later write replaced is not re-queued, nor is one refused for another
+// store cause.
 func TestOversizeRefusalsCanBeRequeued(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t)
 	friend(t, db, "B")
 	friend(t, db, "C")
+	const putLimit = 10 // capture's sizes are the key's length
 	big := capture(t, db, "laptop", "data/big", OpPut)
+	oldBig := capture(t, db, "laptop", "data/old-big", OpPut)
 	gone := capture(t, db, "laptop", "data/gone", OpPut)
 	replaced := capture(t, db, "laptop", "data/replaced", OpPut)
 	for _, r := range []struct {
 		seq   int64
 		cause string
-	}{{big, CauseOversize}, {gone, CauseStore}, {replaced, CauseOversize}} {
+	}{{big, CauseOversize}, {oldBig, CauseStore}, {gone, CauseStore}, {replaced, CauseOversize}} {
 		if ok, err := db.RefuseObject(ctx, r.seq, r.cause, "refused"); err != nil || !ok {
 			t.Fatal(ok, err)
 		}
 	}
-	if r := mustRefused(t, db); r["laptop"] != 3 {
+	if r := mustRefused(t, db); r["laptop"] != 4 {
 		t.Fatalf("refused %v", r)
 	}
 	later := capture(t, db, "laptop", "data/replaced", OpPut)
-	n, err := db.RequeueOversize(ctx)
-	if err != nil || n != 2 {
-		t.Fatalf("requeued %d %v, want big at B and C", n, err)
+	n, err := db.RequeueOversize(ctx, putLimit)
+	if err != nil || n != 4 {
+		t.Fatalf("requeued %d %v, want big and old-big at B and C", n, err)
 	}
 	for _, place := range []string{"B", "C"} {
-		if p, ok, _ := db.NextPlacement(ctx, place); !ok || p.Seq != big {
-			t.Fatalf("%s head %+v %v", place, p, ok)
-		}
-		if err := db.CancelPlacement(ctx, place, big); err != nil {
-			t.Fatal(err)
-		}
-		if p, ok, _ := db.NextPlacement(ctx, place); !ok || p.Seq != later {
-			t.Fatalf("%s head %+v %v", place, p, ok)
+		for _, want := range []int64{big, oldBig, later} {
+			p, ok, _ := db.NextPlacement(ctx, place)
+			if !ok || p.Seq != want {
+				t.Fatalf("%s head %+v %v, want %d", place, p, ok, want)
+			}
+			if err := db.CancelPlacement(ctx, place, want); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	if r := mustRefused(t, db); r["laptop"] != 1 {

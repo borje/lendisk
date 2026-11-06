@@ -81,8 +81,8 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 // instead and dup is true: an identical re-upload, such as a client's
 // retry after a crash, is not queued twice (EP-3, EP-11). Unless that
 // row was refused at some place: then the re-upload is queued and
-// placed, which heals the refusal (#57), but sent only where the place
-// does not already hold the hash (placeTx, #61).
+// placed, which heals the refusal (#57), but acked at once where the
+// place acknowledged the very row it heals (placeTx, #61).
 func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (dup bool, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

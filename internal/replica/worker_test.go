@@ -54,23 +54,11 @@ func (p *place) enter() func() {
 
 func (p *place) Put(ctx context.Context, o Object) error {
 	defer p.enter()()
-	// Like the HTTP transport, the body is read on its own and a
-	// cancelled request returns while a read may still be blocked.
-	type result struct {
-		b   []byte
-		err error
-	}
-	read := make(chan result, 1)
-	go func() { b, err := io.ReadAll(o.Body); read <- result{b, err} }()
-	var b []byte
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case r := <-read:
-		if r.err != nil {
-			return r.err
-		}
-		b = r.b
+	// Like the HTTP transport, Put does not return while a read of the
+	// body is blocked, whatever ctx does.
+	b, err := io.ReadAll(o.Body)
+	if err != nil {
+		return err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -482,7 +470,7 @@ func TestPermanentLocalErrorsDoNotStallTheFIFO(t *testing.T) {
 	}
 	// Only the huge object is refused as oversize, so multipart
 	// replication (#23) re-queues it and nothing else (#61).
-	if n, err := fx.db.RequeueOversize(t.Context()); err != nil || n != 2 {
+	if n, err := fx.db.RequeueOversize(t.Context(), MaxPutSize); err != nil || n != 2 {
 		t.Fatalf("re-queued %d rows (%v), want data/huge at B and C", n, err)
 	}
 }
@@ -926,10 +914,95 @@ func TestHungStoreReadIsTheStoresFault(t *testing.T) {
 	if len(logs.alerts("store")) == 0 {
 		t.Fatal("not alerted")
 	}
+	// The sender is not stuck behind the hung read: the object is sent
+	// while that read still blocks.
 	hung.Store(false)
-	close(release)
 	fx.drained("B")
+	close(release)
 	if c := fx.condition("B"); c.Condition != state.ConditionOK {
 		t.Fatalf("condition %+v", c)
 	}
+}
+
+// REPL-3, OPS-1 (#61): when a place rejects the bytes, the store's copy
+// is re-hashed; a re-hash read that never returns is the store's
+// failure too, and the sender is not stuck behind it.
+func TestHungReHashIsTheStoresFault(t *testing.T) {
+	fx := newFixture(t, "B")
+	fx.w.StoreStall = 30 * time.Millisecond
+	var reject atomic.Bool
+	reject.Store(true)
+	fx.places["B"].fail = func(string, string) error {
+		if reject.Load() {
+			return fmt.Errorf("%w: BadDigest", ErrRejected)
+		}
+		return nil
+	}
+	fx.write("laptop", "data/1", "one")
+	release := make(chan struct{})
+	var opens, hung atomic.Int32
+	hung.Store(1)
+	fx.w.open = func(name string) (fs.File, error) {
+		f, err := os.Open(name)
+		// The send's open reads; the re-hash's open hangs.
+		if err != nil || opens.Add(1)%2 == 1 || hung.Load() == 0 {
+			return f, err
+		}
+		return &hungFile{File: f, release: release}, nil
+	}
+	fx.run()
+	waitFor(t, "store", func() bool { return fx.condition("B").Condition == state.ConditionStore })
+	if c := fx.condition("B"); !strings.Contains(c.Detail, "did not return") {
+		t.Fatalf("condition %+v", c)
+	}
+	hung.Store(0)
+	reject.Store(false)
+	fx.drained("B")
+	close(release)
+	if c := fx.condition("B"); c.Condition != state.ConditionOK {
+		t.Fatalf("condition %+v", c)
+	}
+}
+
+// REPL-3, OPS-1 (#61): through the real friend client, whose HTTP
+// transport does not return while the request body's Read is blocked, a
+// store read that never returns still ends the send as the store's
+// failure: the sender is not stuck behind the disk.
+func TestHungStoreReadDoesNotHangTheRealClient(t *testing.T) {
+	fx := newFixture(t)
+	self := newID(t)
+	friend, peer := tunnelLender(t, self, &recorder{})
+	place := peer.String()
+	if err := fx.db.AddFriendship(t.Context(), state.Friendship{Peer: place, Address: "tc", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	fx.w.Connect = func(state.Friendship) (Replica, error) { return friend, nil }
+	fx.w.StoreStall = 100 * time.Millisecond
+	fx.write("laptop", "data/1", "one")
+	release := make(chan struct{})
+	var once sync.Once
+	unhang := func() { once.Do(func() { close(release) }) }
+	var hung atomic.Bool
+	hung.Store(true)
+	fx.w.open = func(name string) (fs.File, error) {
+		f, err := os.Open(name)
+		if err != nil || !hung.Load() {
+			return f, err
+		}
+		return &hungFile{File: f, release: release}, nil
+	}
+	fx.run()
+	t.Cleanup(unhang) // runs before the worker stops
+	waitFor(t, "store", func() bool { return fx.condition(place).Condition == state.ConditionStore })
+	if c := fx.condition(place); !strings.Contains(c.Detail, "did not return") {
+		t.Fatalf("condition %+v", c)
+	}
+	// The sender is free while the hung read still blocks: once the
+	// disk answers new reads, the object is sent.
+	hung.Store(false)
+	fx.drained(place)
+	if c := fx.condition(place); c.Condition != state.ConditionOK {
+		t.Fatalf("condition %+v", c)
+	}
+	unhang()
 }
