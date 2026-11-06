@@ -20,7 +20,9 @@ behind Docker's own NAT (D2, G-1).
 
 The TOML file holds settings the user chooses: role, listeners, the
 store, relay policy, replication limits and schedule, the lending cap,
-alert hooks. State the daemon changes is not in it. Friendships,
+alert hooks (`[alerts]`: a hook program, which must exist and be
+executable before `serve` starts, and a webhook). State the daemon
+changes is not in it. Friendships,
 buckets and overflow targets are created with `lendisk invite`,
 `lendisk peer add`, `lendisk bucket add` and `lendisk overflow add`
 and live in `lendisk.db` (PEER-1, EP-6, S3-1), and the node manifest

@@ -52,6 +52,11 @@ type Worker struct {
 	// (default 1 minute: half a friend's stall timeout, so a hung disk is
 	// not blamed on the friend, #61).
 	StoreStall time.Duration
+	// Alerted, if set, is called after the worker records a condition
+	// that raises an alert (a refusal, a store failure), so the alert
+	// service reads it at once (alert.Service.Check, #13). It must not
+	// block.
+	Alerted func()
 	// OnRead, if set, is called after each read of a body sent to a
 	// place, with the bytes read so far. Tests only.
 	OnRead func(place string, seq, read int64)
@@ -69,6 +74,12 @@ func (w *Worker) openFile(name string) (fs.File, error) {
 		return w.open(name)
 	}
 	return os.Open(name)
+}
+
+func (w *Worker) alerted() {
+	if w.Alerted != nil {
+		w.Alerted()
+	}
 }
 
 func (w *Worker) now() time.Time {
@@ -308,6 +319,9 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				log.Debug("replication: this node's store cannot be read; waiting", attrs...)
 			}
 			condition(state.ConditionStore, err.Error())
+			if prev != failing {
+				w.alerted() // the condition is recorded: alert.KindStoreUnreadable
+			}
 			sleep(ctx, backoff)
 			backoff = min(2*backoff, maxB)
 		case errors.Is(err, ErrQuota):
@@ -333,19 +347,21 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	}
 }
 
-// refuse takes a row out of the FIFO for good and raises its alert in
-// the log (alert delivery is #13).
+// refuse takes a row out of the FIFO for good and raises its alert: in
+// the log, and as alert.KindPlaceRefused once recorded (#13).
 func (w *Worker) refuse(log *slog.Logger, place string, p state.Placement, row []any, err error, why string) {
 	log.Error(why, append(row, "sha256", p.SHA256, "alert", true, "err", err)...)
 	if err := w.DB.RefusePlacement(context.Background(), place, p.Seq, err.Error()); err != nil {
 		log.Error("replication: recording a refusal failed", append(row, "err", err)...)
 	}
+	w.alerted()
 }
 
 // refuseObject takes a row whose object the store cannot supply out of
-// every place's FIFO, against its bucket, and raises its alert in the
-// log (alert delivery is #13), once: when another place's sender
-// refused it first, this one only logs at debug level.
+// every place's FIFO, against its bucket, and raises its alert (in the
+// log, and as alert.KindObjectsNotReplicated once recorded, #13) once:
+// when another place's sender refused it first, this one only logs at
+// debug level.
 func (w *Worker) refuseObject(log *slog.Logger, p state.Placement, row []any, err error) {
 	cause := state.CauseStore
 	if errors.Is(err, errOversize) {
@@ -361,6 +377,7 @@ func (w *Worker) refuseObject(log *slog.Logger, p state.Placement, row []any, er
 	}
 	log.Error("replication alert: the store cannot supply the object as captured; not replicated",
 		append(row, "sha256", p.SHA256, "alert", true, "err", err)...)
+	w.alerted()
 }
 
 // rewriting reports whether a later write of the key is in flight or

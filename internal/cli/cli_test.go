@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
@@ -44,6 +45,8 @@ type node struct {
 	stdin io.Reader
 	// tuneBridge, when set, is given to serveLogged's daemon.
 	tuneBridge func(*bridge.Bridge)
+	// tuneAlerts, when set, is given to serveLogged's daemon.
+	tuneAlerts func(*alert.Service)
 }
 
 func newNode(t *testing.T) *node {

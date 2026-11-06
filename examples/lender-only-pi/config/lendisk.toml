@@ -32,7 +32,14 @@ retention_min = "60d"        # Carla's window is longer than the 30-day default
 max_total     = "700G"       # the disk is 1 TB; keep headroom for tombstones (RET-1)
 
 [alerts]
-command = "/etc/lendisk/hooks/ntfy.sh"
+# The hook receives each alert as JSON on stdin (OPS-3). Uncomment once
+# the file exists: serve refuses to start otherwise. It must be an
+# absolute path to one executable file (chmod +x), with no arguments;
+# put arguments in the script. A shell script needs /bin/sh in the
+# image. For example /etc/lendisk/hooks/ntfy.sh:
+#   #!/bin/sh
+#   exec curl -fsS -H 'Title: lendisk alert' --data-binary @- https://ntfy.sh/your-topic
+# command = "/etc/lendisk/hooks/ntfy.sh"
 
 [log]
 level = "info"

@@ -33,6 +33,18 @@ type Status struct {
 	Buckets  []StatusBucket `json:"buckets"`
 	// Places are where replicas go: each friend, for now (#18).
 	Places []StatusPlace `json:"places"`
+	// Alerts are the pending alerts, oldest first (OPS-1, OPS-2, #13):
+	// what the daemon last recorded, also while it is stopped.
+	Alerts []StatusAlert `json:"alerts"`
+}
+
+// StatusAlert is one pending alert: what the hook and the webhook
+// received (alert.Message), less the node.
+type StatusAlert struct {
+	Kind     string `json:"kind"`              // alert.Kind…
+	Subject  string `json:"subject,omitempty"` // node ID, bucket, or absent
+	Message  string `json:"message"`
+	RaisedAt string `json:"raised_at"` // RFC 3339, UTC
 }
 
 // StatusPlace is one place in the pool and its replication FIFO
@@ -232,6 +244,7 @@ func (a *app) statusCmd() *cobra.Command {
 				Versions: StatusVersions{Versitygw: gateway.Version(), Tailcat: transport.Version()},
 				Buckets:  []StatusBucket{},
 				Places:   []StatusPlace{},
+				Alerts:   []StatusAlert{},
 			}
 			if cfg.Role == "full" {
 				st.Endpoint.S3 = "http://" + cfg.Endpoint.Loopback
@@ -261,6 +274,14 @@ func (a *app) statusCmd() *cobra.Command {
 			}
 			if st.Places, err = places(cmd.Context(), db, a.now()); err != nil {
 				return err
+			}
+			as, err := db.ActiveAlerts(cmd.Context())
+			if err != nil {
+				return err
+			}
+			for _, al := range as {
+				st.Alerts = append(st.Alerts, StatusAlert{Kind: al.Kind, Subject: al.Subject, Message: al.Message,
+					RaisedAt: al.RaisedAt.UTC().Format(time.RFC3339)})
 			}
 			if asJSON {
 				enc := json.NewEncoder(a.out)
@@ -303,6 +324,14 @@ func (a *app) statusCmd() *cobra.Command {
 					fmt.Fprintf(a.out, " (%s)", p.Detail)
 				}
 				fmt.Fprintln(a.out)
+			}
+			if len(st.Alerts) == 0 {
+				fmt.Fprintln(a.out, "Alerts:  none")
+			} else {
+				fmt.Fprintf(a.out, "Alerts:  %d\n", len(st.Alerts))
+			}
+			for _, al := range st.Alerts {
+				fmt.Fprintf(a.out, "  since %s: %s\n", al.RaisedAt, al.Message)
 			}
 			fmt.Fprintf(a.out, "versitygw %s, tailcat %s\n", st.Versions.Versitygw, st.Versions.Tailcat)
 			return nil
