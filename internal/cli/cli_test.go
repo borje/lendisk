@@ -320,16 +320,20 @@ func TestCobraUsageErrorsExitTwo(t *testing.T) {
 		{"status", "extra"},        // argument where none is taken
 		{"no-such-command"},        // unknown command
 		{"bucket", "no-such-verb"}, // unknown subcommand
+		{"bucket", "help", "nope"}, // help for an unknown subcommand
 	} {
 		if code, _, e := n.run("", "", args...); code != 2 {
 			t.Errorf("%v: exit %d, want 2 (%s)", args, code, e)
 		}
 	}
 	// A command group on its own still prints its help.
-	for _, args := range [][]string{{}, {"bucket"}} {
+	for _, args := range [][]string{{}, {"bucket"}, {"bucket", "help"}, {"peer", "help"}, {"help", "bucket"}} {
 		if code, out, e := n.run("", "", args...); code != 0 || !strings.Contains(out, "Available Commands") {
 			t.Errorf("%v: exit %d, want 0 and help (%s%s)", args, code, out, e)
 		}
+	}
+	if code, out, e := n.run("", "", "bucket", "help", "add"); code != 0 || !strings.Contains(out, "bucket add") {
+		t.Errorf("bucket help add: exit %d (%s%s)", code, out, e)
 	}
 }
 

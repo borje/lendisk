@@ -116,14 +116,15 @@ func (a *app) rootCmd() *cobra.Command {
 // usageArgs makes cobra's argument errors usage errors, which exit 2: a
 // missing or extra argument, and an unknown command or subcommand. A
 // command group (one with subcommands and nothing to run) refuses any
-// argument as an unknown command and prints its help when given none.
+// argument as an unknown command and prints its help when given none or
+// `help` (`lendisk bucket help add` prints add's help).
 func usageArgs(c *cobra.Command) {
 	for _, sub := range c.Commands() {
 		usageArgs(sub)
 	}
 	if c.HasSubCommands() && !c.Runnable() {
 		c.Args = func(cmd *cobra.Command, args []string) error {
-			if len(args) == 0 {
+			if len(args) == 0 || args[0] == "help" {
 				return nil
 			}
 			msg := fmt.Sprintf("unknown command %q for %q", args[0], cmd.CommandPath())
@@ -132,7 +133,16 @@ func usageArgs(c *cobra.Command) {
 			}
 			return usageError{errors.New(msg)}
 		}
-		c.RunE = func(cmd *cobra.Command, _ []string) error { return cmd.Help() }
+		c.RunE = func(cmd *cobra.Command, args []string) error {
+			if len(args) > 1 {
+				sub, rest, err := cmd.Find(args[1:])
+				if err != nil || sub == cmd || len(rest) > 0 {
+					return usageError{fmt.Errorf("unknown command %q for %q", strings.Join(args[1:], " "), cmd.CommandPath())}
+				}
+				return sub.Help()
+			}
+			return cmd.Help()
+		}
 		return
 	}
 	if check := c.Args; check != nil {
