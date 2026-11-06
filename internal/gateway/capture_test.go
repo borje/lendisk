@@ -94,7 +94,7 @@ func (h *harness) serve(noCapture bool) (stop func()) {
 	}
 	h.socket = g.Socket
 	var once sync.Once
-	stop = func() { once.Do(func() { cancel(); <-errc }) }
+	stop = func() { once.Do(func() { cancel(); within(h.t, "the gateway stopping", errc) }) }
 	h.t.Cleanup(stop)
 	return stop
 }
@@ -304,7 +304,7 @@ func TestPendingResolvedAtStartup(t *testing.T) {
 		t.Fatal(err)
 	}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: be, DB: h.db, Profiles: set, Log: quiet}
 	b := aws.String("laptop")
 	rawPut := func(key, body, token string) {
 		t.Helper()

@@ -90,9 +90,9 @@ func TestConcurrentCapturesAndAcksSeeNoErrors(t *testing.T) {
 			}
 		}()
 	}
-	wg.Wait()
+	finishes(t, "the requests", wg.Wait)
 	close(stop)
-	if n := <-acked; n == 0 {
+	if n := within(t, "the acknowledging worker", acked); n == 0 {
 		t.Error("no placement was acknowledged while the requests ran")
 	}
 	if p, _ := h.db.PendingCaptures(ctx); len(p) != 0 {
@@ -136,7 +136,7 @@ func TestOverlappingWritesToOneKeyKeepTheQueueInStep(t *testing.T) {
 			}
 		}()
 	}
-	wg.Wait()
+	finishes(t, "the requests", wg.Wait)
 	last := map[string]state.Entry{}
 	for _, e := range h.entries("files") {
 		if e.State != state.StateDone {
@@ -179,7 +179,7 @@ func TestSameKeyWriteWaitsForTheOneInFlight(t *testing.T) {
 	set, _ := profile.Load("")
 	stall, stalled := make(chan struct{}), make(chan struct{})
 	var first atomic.Bool
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: be, DB: h.db, Profiles: set, Log: quiet}
 	put := func(body string) error {
 		n := int64(len(body))
 		_, err := d.PutObject(ctx, s3response.PutObjectInput{Bucket: aws.String("files"), Key: aws.String("k"),
@@ -197,7 +197,7 @@ func TestSameKeyWriteWaitsForTheOneInFlight(t *testing.T) {
 	}
 	errY := make(chan error, 1)
 	go func() { errY <- put("YY") }()
-	<-stalled
+	within(t, "the first put reaching the store", stalled)
 	errX := make(chan error, 1)
 	go func() { errX <- put("X") }()
 	select {
@@ -207,10 +207,10 @@ func TestSameKeyWriteWaitsForTheOneInFlight(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 	close(stall)
-	if err := <-errY; err != nil {
+	if err := within(t, "the first put", errY); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-errX; err != nil {
+	if err := within(t, "the second put", errX); err != nil {
 		t.Fatal(err)
 	}
 	es := h.entries("files")
@@ -242,7 +242,7 @@ func TestRetriedCompletionWhileTheFirstIsInFlight(t *testing.T) {
 		t.Fatal(err)
 	}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: be, DB: h.db, Profiles: set, Log: quiet}
 	b, key := aws.String("files"), aws.String("big")
 	up, err := be.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: b, Key: key})
 	if err != nil {
@@ -286,17 +286,17 @@ func TestRetriedCompletionWhileTheFirstIsInFlight(t *testing.T) {
 		}
 	}
 	first := complete()
-	<-stored
+	within(t, "the first completion reaching the store", stored)
 	answered("completion sent while the first is in the store", complete())
 	close(release)
 	answered("first completion, before its hash", first)
-	<-hashing
+	within(t, "the first completion's hash", hashing)
 	answered("completion sent while the first's hash runs", complete())
 	if p, _ := h.db.PendingCaptures(ctx); len(p) != 1 {
 		t.Fatalf("%d rows pending while hashing, want 1", len(p))
 	}
 	close(finish)
-	d.hashes.stop()
+	finishes(t, "the background hashes", d.hashes.stop)
 	es := h.entries("files")
 	if len(es) != 1 || es[0].State != state.StateDone || es[0].SHA256 != sum([]byte(body)) || es[0].Size != n {
 		t.Fatalf("queue: %+v", es)
@@ -315,7 +315,7 @@ func TestFinishingAnUploadSettledElsewhereIsSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := &Decorator{Backend: be, DB: h.db, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: be, DB: h.db, Log: quiet}
 	n := int64(1)
 	if _, err := be.PutObject(ctx, s3response.PutObjectInput{Bucket: aws.String("files"), Key: aws.String("k"),
 		ContentLength: &n, Body: bytes.NewReader([]byte("x"))}); err != nil {
@@ -437,6 +437,19 @@ func within[T any](t *testing.T, what string, c <-chan T) T {
 	}
 }
 
+// finishes runs f, which waits for something, and fails the test if it
+// has not returned within a minute.
+func finishes(t *testing.T, what string, f func()) {
+	t.Helper()
+	c := make(chan struct{})
+	go func() { defer close(c); f() }()
+	select {
+	case <-c:
+	case <-time.After(time.Minute):
+		t.Fatalf("%s: timed out", what)
+	}
+}
+
 // assertOneDoneRow checks that key's object in the store is described by
 // exactly one done row with its hash, size and ETag.
 func assertOneDoneRow(t *testing.T, h *harness, be backend.Backend, key string, body []byte) {
@@ -469,7 +482,7 @@ func TestRetryAfterTheFirstCompletionFailsIsCaptured(t *testing.T) {
 	}
 	be := &failingFirstCompletion{Backend: posix, entered: make(chan struct{}), release: make(chan struct{})}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: posix, DB: h.db, Profiles: set, Log: quiet}
 	inFirst, inRetry, body := twoPartUpload(t, posix, "big")
 	seen := make(chan struct{})
 	var once sync.Once
@@ -494,7 +507,7 @@ func TestRetryAfterTheFirstCompletionFailsIsCaptured(t *testing.T) {
 	if err := within(t, "retried completion", retry); err != nil {
 		t.Fatalf("retried completion: %v", err)
 	}
-	d.hashes.stop()
+	finishes(t, "the background hashes", d.hashes.stop)
 	assertOneDoneRow(t, h, posix, "big", body)
 }
 
@@ -517,7 +530,7 @@ func TestRetryOfAStrandedCompletionIsCaptured(t *testing.T) {
 			be := &failingFirstCompletion{Backend: posix, entered: make(chan struct{}), release: make(chan struct{})}
 			close(be.release)
 			set, _ := profile.Load("")
-			d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+			d := &Decorator{Backend: be, Uploads: posix, DB: h.db, Profiles: set, Log: quiet}
 			inFirst, inRetry, body := twoPartUpload(t, posix, "big")
 			// Removing the failed completion's row fails while the trigger stands.
 			if _, err := h.db.ExecContext(ctx, `CREATE TRIGGER refuse BEFORE DELETE ON queue
@@ -544,7 +557,7 @@ func TestRetryOfAStrandedCompletionIsCaptured(t *testing.T) {
 			if _, _, err := d.CompleteMultipartUpload(ctx, inRetry); err != nil {
 				t.Fatalf("retried completion: %v", err)
 			}
-			d.hashes.stop()
+			finishes(t, "the background hashes", d.hashes.stop)
 			assertOneDoneRow(t, h, posix, "big", body)
 		})
 	}
@@ -559,7 +572,7 @@ func TestWaitingForAKeyRespectsTheRequestContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: be, DB: h.db, Profiles: set, Log: quiet}
 	waiting := make(chan struct{})
 	d.keys.waiting = func(string) { close(waiting) }
 	unlock, err := d.keys.lock(context.Background(), "files", "k")
@@ -597,7 +610,7 @@ func TestDeleteObjectsWaitsHoldingNoOtherKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: be, DB: h.db, Profiles: set, Log: quiet}
 	waiting := make(chan struct{})
 	var once sync.Once
 	d.keys.waiting = func(name string) {
@@ -638,10 +651,10 @@ func TestCompletionAfterStopLeavesItsRowPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: be, DB: h.db, Profiles: set, Log: quiet}
 	d.beforeHash = func() { t.Error("a hash started after stop") }
 	_, in, body := twoPartUpload(t, be, "big")
-	d.hashes.stop()
+	finishes(t, "the background hashes", d.hashes.stop)
 	if _, _, err := d.CompleteMultipartUpload(ctx, in); err != nil {
 		t.Fatal(err)
 	}
@@ -660,8 +673,6 @@ func TestCompletionAfterStopLeavesItsRowPending(t *testing.T) {
 	assertOneDoneRow(t, h, be, "big", body)
 }
 
-func (f *failingFirstCompletion) Unwrap() backend.Backend { return f.Backend }
-
 // failingGets fails GetObject while fail is set and counts the calls.
 type failingGets struct {
 	backend.Backend
@@ -677,8 +688,6 @@ func (f *failingGets) GetObject(ctx context.Context, in *s3.GetObjectInput) (*s3
 	return f.Backend.GetObject(ctx, in)
 }
 
-func (f *failingGets) Unwrap() backend.Backend { return f.Backend }
-
 // EP-3, REPL-10 (#59): a completion whose background hash failed leaves
 // its row stranded. A retry checks only that the object landed, answers
 // from the store without reading the object, and leaves the row pending
@@ -693,12 +702,12 @@ func TestRetryOfAStrandedButLandedUploadDoesNotHash(t *testing.T) {
 	be := &failingGets{Backend: posix}
 	be.fail.Store(true)
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: posix, DB: h.db, Profiles: set, Log: quiet}
 	_, in, body := twoPartUpload(t, posix, "big")
 	if _, _, err := d.CompleteMultipartUpload(ctx, in); err != nil {
 		t.Fatal(err)
 	}
-	d.hashes.wg.Wait()
+	finishes(t, "the background hash", d.hashes.wg.Wait)
 	if p, _ := h.db.PendingCaptures(ctx); len(p) != 1 {
 		t.Fatalf("%d rows pending after the failed hash, want 1", len(p))
 	}
@@ -733,7 +742,7 @@ func TestConcurrentRetriesAfterAFailedCompletionDoNotWaitForTheHash(t *testing.T
 	be := &failingFirstCompletion{Backend: posix, entered: make(chan struct{}), release: make(chan struct{})}
 	close(be.release)
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: posix, DB: h.db, Profiles: set, Log: quiet}
 	inFirst, inRetry, body := twoPartUpload(t, posix, "big")
 	if _, _, err := d.CompleteMultipartUpload(ctx, inFirst); err == nil {
 		t.Fatal("the first completion succeeded")
@@ -771,9 +780,11 @@ func TestConcurrentRetriesAfterAFailedCompletionDoNotWaitForTheHash(t *testing.T
 		}
 	case name := <-waited:
 		t.Fatalf("the second retry waited for the key's lock %q", name)
+	case <-time.After(10 * time.Second):
+		t.Fatal("second retry: timed out")
 	}
 	close(finish)
-	d.hashes.stop()
+	finishes(t, "the background hashes", d.hashes.stop)
 	assertOneDoneRow(t, h, posix, "big", body)
 }
 
@@ -787,7 +798,7 @@ func TestWaitingForARunningCompletionRespectsTheRequestContext(t *testing.T) {
 	}
 	be := &failingFirstCompletion{Backend: posix, entered: make(chan struct{}), release: make(chan struct{})}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: posix, DB: h.db, Profiles: set, Log: quiet}
 	in, _, _ := twoPartUpload(t, posix, "big")
 	first := make(chan error, 1)
 	go func() { _, _, err := d.CompleteMultipartUpload(context.Background(), in); first <- err }()
@@ -818,7 +829,7 @@ func TestPanickingCompletionReleasesTheKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: panickingCompletion{posix}, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: panickingCompletion{posix}, Uploads: posix, DB: h.db, Profiles: set, Log: quiet}
 	in, _, _ := twoPartUpload(t, posix, "big")
 	func() {
 		defer func() {
@@ -852,14 +863,14 @@ func TestPendingCompletionMatchedByUploadNotETag(t *testing.T) {
 		t.Fatal(err)
 	}
 	set, _ := profile.Load("")
-	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	d := &Decorator{Backend: be, Uploads: be, DB: h.db, Profiles: set, Log: quiet}
 	_, a, body := twoPartUpload(t, be, "big")
 	_, b, _ := twoPartUpload(t, be, "big")
 	if _, _, err := d.CompleteMultipartUpload(ctx, a); err != nil {
 		t.Fatal(err)
 	}
-	d.hashes.stop()
-	if id, err := storeUpload(be, "files", "big"); err != nil || id != *a.UploadId {
+	finishes(t, "the background hashes", d.hashes.stop)
+	if id, err := be.UploadID("files", "big"); err != nil || id != *a.UploadId {
 		t.Fatalf("store records upload %q (%v), want %q", id, err, *a.UploadId)
 	}
 	etag, err := backend.ComputeMultipartETagFromPartETags(*b.UploadId, b.MultipartUpload.Parts)

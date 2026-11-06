@@ -110,7 +110,7 @@ func TestLongSocketPathFallsBack(t *testing.T) {
 		t.Fatalf("socket directory: %v %v", fi.Mode(), err)
 	}
 	cancel()
-	if err := <-errc; err != nil {
+	if err := within(t, "the gateway stopping", errc); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Dir(g.Socket)); !os.IsNotExist(err) {
@@ -135,7 +135,7 @@ func TestStopDuringStartDoesNotLeak(t *testing.T) {
 		go func() { errc <- g.Run(ctx, nil) }()
 		time.Sleep(time.Duration(i) * 2 * time.Millisecond)
 		cancel()
-		if err := <-errc; err != nil {
+		if err := within(t, "the gateway stopping", errc); err != nil {
 			t.Fatalf("round %d: %v", i, err)
 		}
 		db.Close()

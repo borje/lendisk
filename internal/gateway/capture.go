@@ -46,6 +46,9 @@ const MetaCapture = "lendisk-capture"
 // refusals (Q-I.5).
 type Decorator struct {
 	backend.Backend
+	// Uploads reads which upload assembled a stored object: the store
+	// the gateway opened, however Backend wraps it (#62).
+	Uploads UploadIDs
 	// DB holds the queue; nil passes everything through.
 	DB       *state.DB
 	Profiles profile.Set
@@ -167,7 +170,9 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 // answered from the store and the row is left for ResolveStranded to
 // hash; not landed, the row is removed. Anything else is captured as a
 // first completion. So no completion stores an object without a row,
-// and no request hashes inline.
+// and no request hashes inline. ResolveStranded claims an upload too
+// while it settles its row, and settles the claim as stored before it
+// hashes, so a retry never waits for that hash either (#62).
 func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
 	class, err := d.classify(in.Bucket, in.Key)
 	if err != nil {
@@ -177,7 +182,7 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 		return d.Backend.CompleteMultipartUpload(ctx, in)
 	}
 	bucket, key, uploadID := *in.Bucket, *in.Key, *in.UploadId
-	id := lockName(bucket, key) + "\x00" + uploadID
+	id := uploadClaim(bucket, key, uploadID)
 	for {
 		_, st, found, err := d.DB.UploadEntry(context.Background(), bucket, key, uploadID)
 		if err != nil {
@@ -299,6 +304,11 @@ func (f *completion) settle(stored bool) {
 		f.stored = stored
 		close(f.done)
 	})
+}
+
+// uploadClaim names the claim on one upload of a key.
+func uploadClaim(bucket, key, uploadID string) string {
+	return lockName(bucket, key) + "\x00" + uploadID
 }
 
 // claim returns the claim on upload id and whether it is the caller's:
