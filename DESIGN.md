@@ -935,7 +935,8 @@ upstream bucket is Q-V.
   inviting node stores only that key's node ID, its own number and
   retention, and the expiry, in the `invite` table; the secret itself
   is written nowhere. Its admission hook admits the invite key, in
-  the `invite` role, until the invite is redeemed or expires (§3.9);
+  the `invite` role, until the invite expires, while it is unused or
+  its redeemer is still a friend (the retry of PEER-2, §3.9);
   the invited node dials with that key to call `redeem`, after which
   its real key replaces it. Expired invite rows, used or not, are
   deleted by `invite` before it adds one, by the daemon at start and
@@ -952,10 +953,26 @@ upstream bucket is Q-V.
   which either side computes and no one else can (ID-1: no
   signature). The inviting node refuses a missing or wrong proof, its
   own address, or a peer that is already a friend; it then marks the
-  invite used and inserts the friendship row in one transaction, so a
-  replay finds no unused invite, answers with its own number and
-  retention, and closes the connection (`Connection: close`). The
-  invited node writes its row only after that answer. Both rows
+  invite used by the proven key (`invite.redeemed_by`, migration 8)
+  and inserts the friendship row in one transaction, answers with its
+  own number and retention, and closes the connection (`Connection:
+  close`). The invited node writes its row only after that answer.
+  The answer can be lost, or the invited node can stop before writing
+  its row, after the inviting node committed (#51). So the invited
+  node first records the terms it offers in `pending_redeem` (keyed
+  by the invite key's node ID) and writes its friendship row and
+  deletes that record in one transaction (`state.DB.FinishRedeem`);
+  running `peer add` with the same invite again finds the record,
+  repeats its number and retention without asking, and redeems again.
+  The retry goes over the invite key, which admission still admits
+  (SEC-10): a used invite answers `redeem` again, until it expires,
+  for the key it was redeemed by while that friendship stands, with
+  the stored terms; the request's address, number and retention are
+  applied as the friend's latest report. A redeem from any other
+  proven key finds the invite used (`409`), and an expired invite is
+  refused, so the PEER-2 AC holds. A refusal (`4xx`) drops the
+  `pending_redeem` record; a timeout, a lost answer or a `5xx` keeps
+  it and tells the user to run the same `peer add` again. Both rows
   hold peer key, address, own number, the other's number as last
   reported and each side's retention (migration 5), and each
   becomes an account in the other's `IAMService`: each is the other's
@@ -1849,7 +1866,9 @@ upstream bucket is Q-V.
   cleared whenever a relationship or invite changes. The lookup is
   `state.DB.PeerRole` over the `friendship` table (keyed by the peer's
   node ID) and the `invite` table (keyed by the invite key's node ID,
-  admitted while `used_at` is null and `expires_at` is in the future).
+  admitted while `expires_at` is in the future and either `used_at` is
+  null or `redeemed_by` still has a friendship row, for PEER-2's
+  retry).
   The cache is `transport.Admission`: it remembers rejections only,
   never admissions or errors, each for 30 seconds
   (`transport.DeniedFor`), empties itself at 4096 keys, and
@@ -1907,7 +1926,11 @@ upstream bucket is Q-V.
   invite key is the proof of the secret, so the secret never crosses
   the wire. It marks the invite used in the same transaction that
   creates the relationship row, and the invite key's connection is then
-  closed; the borrower reconnects with its own key.
+  closed; the borrower reconnects with its own key. A used invite key
+  keeps the `invite` role until expiry while its redeemer is a friend,
+  so the redeemer can retry a redeem whose answer it lost (§3.2,
+  PEER-2); in that role it still reaches `redeem` alone, and `redeem`
+  answers only the key the invite was redeemed by.
 - **SEC-14** `DisablePresharedKey` is set and `Key` is the identity's
   WireGuard key (ID-1), so the `tc…` address is a function of the
   public key and the bootstrap region only. The address embeds the

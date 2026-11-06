@@ -131,4 +131,22 @@ var migrations = []Migration{
 			last_ok   INTEGER           -- unix seconds
 		);`,
 	},
+	{
+		Version: 8, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Redeem retries (PEER-2, #51). On the inviting side, the node
+		-- that redeemed an invite, so it alone may redeem it again until
+		-- it expires; NULL on rows used before this column.
+		ALTER TABLE invite ADD COLUMN redeemed_by TEXT;
+		-- On the invited side, a redeem started but not yet answered:
+		-- the terms this node offered, kept so that running peer add
+		-- again repeats them. Deleted with the friendship row's insert.
+		CREATE TABLE pending_redeem (
+			invite_key TEXT PRIMARY KEY, -- node ID of the invite key
+			peer_key   TEXT NOT NULL,    -- the inviting node's ID
+			number     INTEGER NOT NULL, -- what this node lends, bytes
+			retention  INTEGER NOT NULL, -- seconds
+			started_at INTEGER NOT NULL  -- unix seconds
+		);`,
+	},
 }

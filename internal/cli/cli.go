@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"time"
 
@@ -54,6 +55,12 @@ type app struct {
 	clock       func() time.Time
 	random      io.Reader
 	dialTimeout time.Duration
+	// redeemTransport, if set, wraps peer add's redeem transport, and
+	// beforeFriendship, if set, runs after the redeem answer and before
+	// the friendship row is written, its error ending peer add there:
+	// the lost-answer and crash windows (#51); tests only.
+	redeemTransport  func(http.RoundTripper) http.RoundTripper
+	beforeFriendship func() error
 }
 
 func (a *app) checker() store.Checker {

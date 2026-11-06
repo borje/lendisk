@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,6 +32,10 @@ type node struct {
 	// clock and dialTimeout, when set, are given to every command.
 	clock       func() time.Time
 	dialTimeout time.Duration
+	// redeemTransport and beforeFriendship, when set, are given to
+	// every command (app's fields of those names).
+	redeemTransport  func(http.RoundTripper) http.RoundTripper
+	beforeFriendship func() error
 }
 
 func newNode(t *testing.T) *node {
@@ -48,6 +53,7 @@ func (n *node) run(stdin string, phrase string, args ...string) (int, string, st
 		newPhrase: func() (string, error) { return phrase, nil },
 		regions:   n.regions,
 		clock:     n.clock, dialTimeout: n.dialTimeout,
+		redeemTransport: n.redeemTransport, beforeFriendship: n.beforeFriendship,
 	}
 	args = append(args, "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0")
 	code := a.run(args)
