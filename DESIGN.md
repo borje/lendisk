@@ -1,6 +1,6 @@
 # lendisk — design
 
-Status: draft v0.12, 2026-11-04. Companion to REQUIREMENTS.md v0.11.
+Status: draft v0.13, 2026-11-06. Companion to REQUIREMENTS.md v0.11.
 REQUIREMENTS.md v0.9 made the two requirement changes this design
 needed (Q-T, resolved); its later versions moved third-party
 credentials to the environment,
@@ -72,7 +72,14 @@ node's own store, and evict mode, are post-v1; quotas are two numbers
 people set and the smaller wins; failure domains are gone; lock files
 stay local; one lendisk bridge owns every listener in front of one
 internal socket; the control API gains `list`; the identity key is a
-plain file. The trust model is unchanged throughout.
+plain file. v0.13 takes in the first three tickets: the identity's
+encodings and the state migration rule (§3.1, OPS-8), and the
+versitygw and tailcat spikes (Q-I, Q-Q, Q-R). The operation
+allow-list moves from the decorator to a gate in front of versitygw's
+routing; versitygw's admin API, which cannot be left out, is made
+unreachable; object lock is refused rather than "left off"; the
+tunnel region is saved whole in `lendisk.db`; and v1 does without
+port mapping. The trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -179,8 +186,11 @@ The backup tool talks S3 to the lendisk daemon on `127.0.0.1:9000`. The
 S3 protocol is served by **versitygw embedded in the daemon** (D15): it
 terminates every SigV4 signature, including the `aws-chunked`
 streaming form restic and Kopia send over plain HTTP, routes every
-request, and implements multipart and listings; its versioning and
-object lock are left off (§3.6). Under it sits a lendisk-owned **decorator** of versitygw's
+request, and implements multipart and listings; its versioning is off and
+object lock is refused at the gate (§3.6). In front of its routing sits
+lendisk's **gate**, a fiber middleware passed in through
+`Config.S3Options`, which refuses by S3 action before versitygw routes
+or authenticates (NET-7, SEC-8). Under it sits a lendisk-owned **decorator** of versitygw's
 `backend.Backend` interface, which captures every write and delete
 into the replication queue and enforces the lender's policy. It is the
 only tool-facing endpoint: there is one local copy and one capture
@@ -188,9 +198,9 @@ point.
 
 The same gateway, reached through lendisk's bridge from every
 listener (§3.7), is what a friend's node talks to (D12). Everything the product
-adds to S3 (capture, read-through, quota, immutability, retention, the
-deny-by-default allow-list) lives in the decorator, behind the
-bridge's per-request peer checks (SEC-11, SEC-12); versitygw parses
+adds to S3 (capture, read-through, quota, immutability, retention)
+lives in the decorator, and the deny-by-default allow-list in the gate,
+both behind the bridge's per-request peer checks (SEC-11, SEC-12); versitygw parses
 and authenticates, its backends store.
 
 Why S3 and only S3:
@@ -466,7 +476,7 @@ bundled program, not reimplemented. The daemon is glue around these:
 | Concern | Component | Licence | Notes |
 |---|---|---|---|
 | Backup format, client, encryption | **restic**, **Kopia**, unmodified | BSD-2 / Apache | Never imported; only their S3 usage and key naming conventions are relied on, via tool profiles. |
-| S3 front end and store | **versitygw** via `embedgw`, pinned and vendored | Apache-2.0 | D15. SigV4 incl. `aws-chunked`, routing, multipart, listings; `backend/posix` (`backend/s3` post-v1). Its versioning and object lock are left off. |
+| S3 front end and store | **versitygw** via `embedgw`, pinned and vendored | Apache-2.0 | D15. SigV4 incl. `aws-chunked`, routing, multipart, listings; `backend/posix` (`backend/s3` post-v1). Versioning off; object lock refused at the gate; admin API mounted but unreachable (SEC-8). |
 | Replication transfers, every place in the pool | **minio-go** | Apache-2.0 | D12. In-process S3 client, confined to one package behind the replica interface; the AWS SDK for Go v2 is the replacement if it is withdrawn. |
 | Rate limiting | `golang.org/x/time/rate` | BSD-3 | REPL-7's token bucket around each uploaded part. |
 | Overlay network and NAT traversal | **`github.com/tailscale/tailcat`** | BSD-3 | D5. |
@@ -478,7 +488,7 @@ bundled program, not reimplemented. The daemon is glue around these:
 
 What is written from scratch, because nothing exists: the backend
 decorator (capture, read-through, bucket mapping, quota, immutability,
-tombstones and the purger, the operation allow-list; D4, D15, §3.3,
+tombstones and the purger; D4, D15, §3.3), the gate with the operation allow-list (D4, NET-7, SEC-8; §3.3,
 §3.5, §3.6), the `IAMService` (§3.3, §3.7), the bridge and the peer
 control API (§3.7, §3.9), the replication queue and its ordering guarantee (REPL-1) with
 the replica client's multipart resume loop, rate limiter and timetable
@@ -682,8 +692,11 @@ wraps one of versitygw's own backends, chosen once per node:
 
 - **`backend/posix`, the only v1 store.** Objects are plain files at
   `<dir>/<bucket>/<key>`, written temp-then-rename, with ETags and
-  metadata in xattrs. Versioning and object lock are left off on every
-  bucket (§3.6). One process, no network, and P-5 at its v0.7
+  metadata in xattrs. Versioning is off on every bucket (no
+  `VersioningDir`) and object lock is refused at the gate (§3.6).
+  lendisk sets `PosixOpts.AbsolutePaths`; without it `posix.New`
+  changes the whole process's working directory to the store root.
+  Temporary files live in `<bucket>/.sgwtmp/` (Q-Z). One process, no network, and P-5 at its v0.7
   strength: `restic -r <dir>/<bucket>` works with nothing running.
 - **`backend/s3`, post-v1 (EP-16).** The same gateway becomes a proxy
   that re-signs each call with the store's own credential and forwards
@@ -1165,9 +1178,10 @@ upstream bucket is Q-V.
 - **LEND-2** The decorator refuses `PutObject`, `CreateMultipartUpload`
   and `CreateBucket` with S3 error code `QuotaExceeded`, HTTP 507, when
   the counter would exceed quota or `statfs` on the store is below the
-  floor. Whether a backend error can carry a custom code
-  through versitygw is Q-I.5; the fallback is `AccessDenied` with a
-  distinguishing message the borrower parses.
+  floor. The error is lendisk's own `s3err.APIError` (versitygw's
+  `ErrQuotaExceeded` is a 403) and is returned unwrapped: versitygw
+  type-asserts it, and a wrapped error becomes a 500 that clients
+  retry (Q-I.5).
 - **LEND-4** The decorator hashes the body as it streams it to the
   backend (SHA-256), compares with `x-amz-meta-lendisk-sha256` when the
   backend answers, and on mismatch deletes the object and returns
@@ -1211,7 +1225,7 @@ upstream bucket is Q-V.
   bucket as the tool left it after its last delete, plus a `.lendisk/`
   directory it ignores; export and the recovery sheet's copy command
   exclude it.
-- **RET-2** The decorator admits no versioned, lifecycle,
+- **RET-2** The gate admits no versioned, lifecycle,
   bucket-deletion, object-lock or admin call (§3.7 allow-list), and
   keys beginning with `.lendisk/` are refused from borrowers, so
   nothing a borrower can send reaches the tomb directory or the
@@ -1277,7 +1291,7 @@ upstream bucket is Q-V.
   SEC-12) and then proxied. versitygw terminates the signature;
   lendisk never computes one on any path. The hop costs one in-process
   proxy per request on every listener, loopback included (Q-L).
-- **NET-7** The decorator admits exactly these S3 operations from a
+- **NET-7** The gate admits exactly these S3 operations from a
   borrower's account: `PutObject`, `CreateMultipartUpload`,
   `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`,
   `ListParts`, `GetObject` with Range, `HeadObject`, `HeadBucket`,
@@ -1286,7 +1300,15 @@ upstream bucket is Q-V.
   tombstone, §3.6). Every other operation, including `DeleteObjects`,
   `CopyObject`, `UploadPartCopy`, every versioned call, tagging,
   lifecycle, object-lock and any bucket configuration call, is refused
-  with `AccessDenied` before reaching the backend. The control API
+  with `AccessDenied` before versitygw routes it. The refusal cannot
+  live in the decorator, because versitygw itself calls
+  `GetBucketAcl` and `GetBucketPolicy` on the backend for its access
+  check on every request (Q-I). The gate runs before versitygw
+  authenticates, so, like the bridge (SEC-12), it reads the access key
+  from the request without verifying it and applies this list when the
+  key is a node ID; versitygw then verifies the signature, so a forged
+  key gains nothing. It classifies the request by method, path and
+  query string the way S3 routes them. The control API
   (`redeem`, `challenge`, `manifest`, `quota`, `version`, `undelete`,
   `list`) is plain HTTP under `/_lendisk/` on the same tunnel port,
   authenticated by the tunnel peer key and checked per request against
@@ -1394,8 +1416,15 @@ upstream bucket is Q-V.
 - **SEC-7** The hostile-peer test exercises every S3 operation through
   the tunnel bridge and every control API endpoint, from an allowed
   peer's identity and from an unknown one.
-- **SEC-8** versitygw's admin API, web UI and website endpoints are not
-  configured, and versitygw opens no TCP port at all. lendisk's
+- **SEC-8** versitygw's web UI, website, metrics and event endpoints
+  are not configured, and versitygw opens no TCP port at all. Its admin
+  API cannot be left out: with `AdminPorts` empty, `embedgw` mounts it
+  on the S3 socket, open to any account with the admin role, and
+  `list-users` returns every secret the `IAMService` lists (Q-I). So
+  the root account `RunVersityGW` requires gets a random secret per
+  start, held only in memory; the `IAMService` never returns the admin
+  role and refuses the user-management calls; and the gate refuses
+  every `PATCH`, which S3 does not use and every admin route does. lendisk's
   listeners are the bridge (§3.7) on loopback S3, on each configured
   `endpoint.listen` address (EP-17) and on the one tunnel port inside
   tailcat; loopback metrics, except in the lender-only profile; the
@@ -1405,9 +1434,11 @@ upstream bucket is Q-V.
   process and no other socket. Every listener is one REQUIREMENTS.md
   names. Checked with `ss -lntup` and `ss -lxp`, with and without an
   `endpoint.listen` entry.
-- **SEC-9** The classification table covers every `backend.Backend`
-  method at the pinned versitygw version, each marked admitted,
-  refused or unreachable for a borrower's account, with a test that
+- **SEC-9** The classification table covers every S3 action versitygw
+  routes at the pinned version, plus every `backend.Backend` method,
+  each marked admitted, refused at the gate, internal (`GetBucketAcl`
+  and `GetBucketPolicy`, which versitygw calls for itself) or
+  unreachable for a borrower's account, with a test that
   sends one request per S3 action through the bridge and asserts the
   outcome. It is re-reviewed on every versitygw upgrade, together with
   the replication-hole review (Q-H).
@@ -1415,9 +1446,9 @@ upstream bucket is Q-V.
   lendisk function that looks the key up in `lendisk.db`: a
   relationship row admits it in the `peer` role, an unexpired invite
   key in the `invite` role, and anything else, including a database
-  error or a closed database, is rejected. The hook is never nil and
-  tailcat's `AllowedClients` list is never used, since both admit
-  everyone when unset or empty. tailcat retries a rejected client
+  error or a closed database, is rejected. The hook is never nil:
+  tailcat admits everyone without one (its older `AllowedClients`
+  list, which did the same while empty, is gone at the pinned commit). tailcat retries a rejected client
   about once a second, so the hook keeps a negative cache per key,
   cleared whenever a relationship or invite changes. The server starts
   even with zero rows, so the address exists from `init` on and every
@@ -1453,10 +1484,14 @@ upstream bucket is Q-V.
   the borrower reconnects with its own key.
 - **SEC-14** `DisablePresharedKey` is set and `Key` is the identity's
   WireGuard key (ID-1), so the `tc…` address is a function of the
-  public key and the bootstrap region only. `Region` is set from the
-  region chosen at `init` and saved in the config, rather than picked
-  by latency at each start, because the address embeds it and would
-  otherwise change on restart. Without a pre-shared key the tunnel is
+  public key and the bootstrap region only. The address embeds the
+  region's relay nodes, not just its ID (Q-Q), so the whole
+  `tailcfg.DERPRegion` is chosen once (the `tunnel.region` setting, or
+  by latency when unset) and saved in `lendisk.db`, never in the config
+  file (OPS-6), and `Region` is set from that saved copy at every
+  start. Picking by latency, or re-reading the region from the DERP
+  map, would change the address on restart or whenever the map
+  changes. Without a pre-shared key the tunnel is
   WireGuard's standard Noise IK handshake; what is given up is the
   pre-shared key's hedge against a future break of X25519, which for
   lendisk exposes S3 headers and control API traffic, never backup
@@ -1466,9 +1501,13 @@ upstream bucket is Q-V.
   clears the hook's cache, cancels the contexts of in-flight requests
   from that key and closes its connections (the bridge tracks them per
   key, including the proxied half to `gw.sock`), and, when no
-  relationship is left, calls `Server.DisconnectClient`. tailcat's
-  disconnect alone does not reset connections, which would stall until
-  they time out, so lendisk closes its own. Later requests are answered
+  relationship is left, calls `Server.DisconnectClient`, in that
+  order. tailcat's disconnect alone resets nothing and cuts only the
+  server-to-client direction: the client's packets still arrive on
+  open connections for some seconds, and a connection closed after
+  the disconnect never tells the client (Q-Q). So lendisk closes its
+  own connections first, and SEC-11's per-request check refuses
+  anything that arrives meanwhile. Later requests are answered
   according to the relationship's new state (PEER-5, PEER-6).
 - **SEC-16** The sealed name (§3, bucket naming) is the only bucket
   name that crosses the tunnel: in S3 paths and in any control API
