@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -41,6 +42,11 @@ type app struct {
 	serving func(addr string)
 	// regions offers the tunnel's relay regions; nil means the public map.
 	regions transport.RegionSource
+	// clock, random and dialTimeout serve invites and peer add (peer.go);
+	// zero values mean time.Now, crypto/rand and a minute.
+	clock       func() time.Time
+	random      io.Reader
+	dialTimeout time.Duration
 }
 
 func (a *app) checker() store.Checker {
@@ -86,6 +92,7 @@ func (a *app) rootCmd() *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
+	root.AddCommand(a.inviteCmd(), a.peerCmd())
 	return root
 }
 

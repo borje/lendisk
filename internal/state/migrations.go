@@ -44,4 +44,26 @@ var migrations = []Migration{
 			used_at    INTEGER           -- unix seconds; NULL while unused
 		);`,
 	},
+	// TEMPORARY placeholder for the Version 4 another branch adds (#6).
+	// It exists only so this branch's Version 5 has no gap; drop it when
+	// merging that branch's real Version 4.
+	{
+		Version: 4, Compat: 1, Release: "0.1",
+		SQL: `SELECT 1;`,
+	},
+	{
+		Version: 5, Compat: 1, Release: "0.1",
+		SQL: `
+		-- A friendship's terms (PEER-2, LEND-8, RET-1). Numbers are bytes,
+		-- retentions seconds. The quota is the smaller number, computed.
+		ALTER TABLE friendship ADD COLUMN address        TEXT;    -- the friend's tc… address
+		ALTER TABLE friendship ADD COLUMN own_number     INTEGER; -- what this node lends the friend
+		ALTER TABLE friendship ADD COLUMN peer_number    INTEGER; -- what the friend lends, as last reported
+		ALTER TABLE friendship ADD COLUMN own_retention  INTEGER; -- how long this node keeps the friend's deletes
+		ALTER TABLE friendship ADD COLUMN peer_retention INTEGER; -- how long the friend keeps this node's
+		-- What an invite offers: the inviting side's terms. The secret is
+		-- never stored, only the public key derived from it (invite_key).
+		ALTER TABLE invite ADD COLUMN number    INTEGER;
+		ALTER TABLE invite ADD COLUMN retention INTEGER;`,
+	},
 }

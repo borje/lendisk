@@ -59,6 +59,30 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 	}, nil
 }
 
+// NewDialer returns a transport that only dials, with a key that need
+// not be a node's identity: an invited node dials the inviting node with
+// the invite key (PEER-1). It has no region, so Listen refuses.
+func NewDialer(id *identity.Identity, log *slog.Logger) (*Tailcat, error) {
+	if id == nil {
+		return nil, errors.New("transport: no key")
+	}
+	t, err := NewTailcat(id, &tailcfg.DERPRegion{RegionID: -1}, log)
+	if err != nil {
+		return nil, err
+	}
+	t.region = nil
+	return t, nil
+}
+
+// KeyOf is the node ID an address names.
+func KeyOf(addr string) (identity.NodeID, error) {
+	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
+	if err != nil {
+		return identity.NodeID{}, fmt.Errorf("not a tunnel address: %w", err)
+	}
+	return nodeIDOf(ci.ServerPublic.NodePublic), nil
+}
+
 // AddressOf is the address a node with id and the saved region has
 // (SEC-14): the identity's public key, the disco key derived from it and
 // the region's relay nodes, and no pre-shared key. It is what the
@@ -77,7 +101,13 @@ func addressOf(k key.NodePrivate, region *tailcfg.DERPRegion) string {
 }
 
 // Address is this node's address.
-func (t *Tailcat) Address() string { return addressOf(t.key, t.region) }
+// A dialer has none and returns "".
+func (t *Tailcat) Address() string {
+	if t.region == nil {
+		return ""
+	}
+	return addressOf(t.key, t.region)
+}
 
 // Admit sets the admission function.
 func (t *Tailcat) Admit(fn func(identity.NodeID) bool) {
@@ -108,6 +138,9 @@ func (t *Tailcat) Listen(ctx context.Context) (net.Listener, error) {
 	}
 	if t.server != nil {
 		return nil, errors.New("transport: already listening")
+	}
+	if t.region == nil {
+		return nil, errors.New("transport: a dialer does not listen")
 	}
 	s := &tailcat.Server{
 		Key:                 t.key,

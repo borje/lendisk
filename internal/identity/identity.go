@@ -63,6 +63,22 @@ func FromPhrase(phrase string) (*Identity, error) {
 	return fromPrivateBytes(k)
 }
 
+// FromSecret derives a key that is not the node's identity from a
+// secret: HKDF-SHA256 with info, clamped for X25519. Invites use it for
+// the key an invited node dials with (PEER-1). The same secret and info
+// always give the same key.
+func FromSecret(secret []byte, info string) (*Identity, error) {
+	if len(secret) < 16 {
+		return nil, fmt.Errorf("secret of %d bytes is too short", len(secret))
+	}
+	k, err := hkdf.Key(sha256.New, secret, nil, info, 32)
+	if err != nil {
+		return nil, err
+	}
+	clamp(k)
+	return fromPrivateBytes(k)
+}
+
 func clamp(k []byte) {
 	k[0] &= 248
 	k[31] &= 127

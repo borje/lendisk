@@ -28,6 +28,9 @@ type node struct {
 	config  string
 	data    string
 	regions transport.RegionSource
+	// clock and dialTimeout, when set, are given to every command.
+	clock       func() time.Time
+	dialTimeout time.Duration
 }
 
 func newNode(t *testing.T) *node {
@@ -44,6 +47,7 @@ func (n *node) run(stdin string, phrase string, args ...string) (int, string, st
 		pick:      func(int, int) []int { return []int{0, 11, 23} },
 		newPhrase: func() (string, error) { return phrase, nil },
 		regions:   n.regions,
+		clock:     n.clock, dialTimeout: n.dialTimeout,
 	}
 	args = append(args, "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0")
 	code := a.run(args)

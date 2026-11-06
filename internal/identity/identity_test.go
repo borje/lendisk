@@ -53,6 +53,27 @@ func TestDerivationIsStable(t *testing.T) {
 	}
 }
 
+// A key from a secret is deterministic, depends on the info string, is
+// clamped, and refuses a secret too short to be one.
+func TestFromSecretIsDeterministicAndSeparated(t *testing.T) {
+	secret := []byte("0123456789abcdef0123456789abcdef")
+	a, err := FromSecret(secret, "info-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := FromSecret(secret, "info-a")
+	c, _ := FromSecret(secret, "info-b")
+	if a.NodeID() != b.NodeID() || a.NodeID() == c.NodeID() {
+		t.Fatal("derivation not deterministic or not separated by info")
+	}
+	if k := a.PrivateKey().Bytes(); k[0]&7 != 0 || k[31]&128 != 0 || k[31]&64 == 0 {
+		t.Fatalf("key not clamped: %x", k)
+	}
+	if _, err := FromSecret([]byte("short"), "info-a"); err == nil {
+		t.Fatal("a 5-byte secret was accepted")
+	}
+}
+
 func TestKeyIsClamped(t *testing.T) {
 	id, err := FromPhrase(vector)
 	if err != nil {

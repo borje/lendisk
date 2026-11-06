@@ -40,7 +40,9 @@ func (s *syncBuffer) String() string {
 }
 
 // serveLogged runs the daemon until the returned stop is called, after the
-// tunnel is listening. stop returns the daemon's log.
+// tunnel is listening and the gateway serving: a gateway stopped while
+// starting can outlive the daemon and refuse the next one in this
+// process. stop returns the daemon's log.
 func (n *node) serveLogged(args ...string) (stop func() string) {
 	n.t.Helper()
 	var out, errOut syncBuffer
@@ -51,7 +53,7 @@ func (n *node) serveLogged(args ...string) (stop func() string) {
 		done <- a.run(append([]string{"serve", "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0"}, args...))
 	}()
 	deadline := time.After(20 * time.Second)
-	for !strings.Contains(out.String(), "tunnel listening") {
+	for !strings.Contains(out.String(), "tunnel listening") || !strings.Contains(out.String(), "gateway serving") {
 		select {
 		case code := <-done:
 			cancel()
