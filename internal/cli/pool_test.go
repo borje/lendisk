@@ -10,15 +10,11 @@ import (
 	"github.com/borje/lendisk/internal/state"
 )
 
-// nudge is what bucket add and status say of a bucket at copies = 1
-// that the user did not ask for (EP-6).
-const nudge = "one lost friend loses data"
-
-// EP-6 (#19): `bucket add --copies N` sets the bucket's copies; with
-// copies = 1 from the default (replication.copies) bucket add and status
-// nudge towards 2, and say nothing when the user gave --copies 1. When
-// the pool has fewer places than copies, bucket add says so (OPS-2).
-func TestBucketAddCopiesAndTheCopiesOneNudge(t *testing.T) {
+// EP-6 (#19): `bucket add --copies N` sets the bucket's copies, and
+// without it the bucket gets replication.copies. With copies = 1, from
+// the flag or from the setting, bucket add warns, always. When the pool
+// has fewer places than copies, bucket add says so (OPS-2).
+func TestBucketAddCopiesAndTheCopiesOneWarning(t *testing.T) {
 	n := newNode(t)
 	n.mustInit(t)
 	code, out, errOut := n.run("", "", "bucket", "add", "three", "--profile", "restic", "--copies", "3")
@@ -28,16 +24,14 @@ func TestBucketAddCopiesAndTheCopiesOneNudge(t *testing.T) {
 	if !strings.Contains(out, "copies 3") || !strings.Contains(out, "has 0 places, fewer than copies 3") {
 		t.Fatalf("bucket add --copies 3 said:\n%s", out)
 	}
-	if strings.Contains(out, nudge) {
-		t.Fatalf("nudge at copies 3:\n%s", out)
+	if strings.Contains(out, "Warning: copies") {
+		t.Fatalf("warning at copies 3:\n%s", out)
 	}
-	code, out, errOut = n.run("", "", "bucket", "add", "explicit", "--profile", "restic", "--copies", "1")
-	if code != 0 || strings.Contains(out, nudge) {
-		t.Fatalf("bucket add --copies 1 (%d %s):\n%s", code, errOut, out)
-	}
-	code, out, errOut = n.run("", "", "bucket", "add", "implicit", "--profile", "restic", "--replication-copies", "1")
-	if code != 0 || !strings.Contains(out, "copies 1") || !strings.Contains(out, nudge) {
-		t.Fatalf("bucket add with replication.copies = 1 (%d %s):\n%s", code, errOut, out)
+	for _, args := range [][]string{{"flag", "--copies", "1"}, {"setting", "--replication-copies", "1"}} {
+		code, out, errOut := n.run("", "", append([]string{"bucket", "add", args[0], "--profile", "restic"}, args[1:]...)...)
+		if code != 0 || !strings.Contains(out, "copies 1") || !strings.Contains(out, singleCopyWarning) {
+			t.Fatalf("bucket add with %v (%d %s):\n%s", args[1:], code, errOut, out)
+		}
 	}
 	if code, _, _ := n.run("", "", "bucket", "add", "none", "--profile", "restic", "--copies", "0"); code != 2 {
 		t.Fatalf("--copies 0 exit %d, want 2", code)
@@ -47,22 +41,81 @@ func TestBucketAddCopiesAndTheCopiesOneNudge(t *testing.T) {
 	for _, b := range st.Buckets {
 		got[b.Name] = b
 	}
-	if got["three"].Copies != 3 || got["implicit"].Copies != 1 || got["explicit"].Copies != 1 {
+	if got["three"].Copies != 3 || got["flag"].Copies != 1 || got["setting"].Copies != 1 {
 		t.Fatalf("buckets %+v", st.Buckets)
 	}
-	if !got["implicit"].CopiesNudge || got["explicit"].CopiesNudge || got["three"].CopiesNudge {
-		t.Fatalf("nudges %+v", st.Buckets)
+	if !got["flag"].SingleCopy || !got["setting"].SingleCopy || got["three"].SingleCopy {
+		t.Fatalf("single_copy %+v", st.Buckets)
+	}
+	_, out, _ = n.run("", "", "status", "--json")
+	if !strings.Contains(out, `"single_copy": false`) || !strings.Contains(out, `"single_copy": true`) {
+		t.Fatalf("status --json:\n%s", out)
 	}
 	_, text, _ := n.run("", "", "status")
-	var lines []string
-	for _, l := range strings.Split(text, "\n") {
-		if strings.Contains(l, nudge) {
-			lines = append(lines, l)
+	lines := strings.Split(text, "\n")
+	var under []string
+	for i, l := range lines {
+		if strings.Contains(l, singleCopyLine) {
+			under = append(under, strings.Fields(lines[i-1])[0])
 		}
 	}
-	if len(lines) != 1 || !strings.Contains(lines[0], "implicit") {
-		t.Fatalf("status nudges %q:\n%s", lines, text)
+	if strings.Join(under, " ") != "flag setting" {
+		t.Fatalf("the one-copy line is under %v:\n%s", under, text)
 	}
+}
+
+// EP-6 (#19): with exactly one friend in the pool, whatever the
+// buckets' copies, status heads the friends with a warning, and
+// status --json says so under pool; not with two, and a friend gone
+// past replace_after is not counted. It is not an alert.
+func TestStatusWarnsOfAOneFriendPool(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(t)
+	ctx := context.Background()
+	friend := func(peer string) {
+		t.Helper()
+		db, err := state.Open(ctx, n.data, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		if err := db.AddFriendship(ctx, state.Friendship{Peer: peer, Address: "tc" + peer, OwnNumber: 1 << 30,
+			PeerNumber: 1 << 30, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(friends int, single bool) {
+		t.Helper()
+		st := n.status()
+		if st.Pool.Friends != friends || st.Pool.SingleFriend != single {
+			t.Fatalf("pool %+v, want %d friends", st.Pool, friends)
+		}
+		if len(st.Alerts) != 0 {
+			t.Fatalf("alerts %+v", st.Alerts)
+		}
+		_, text, _ := n.run("", "", "status")
+		if strings.Contains(text, singleFriendLine) != single {
+			t.Fatalf("one-friend line %v with %d friends:\n%s", !single, friends, text)
+		}
+	}
+	check(0, false)
+	friend("B")
+	check(1, true)
+	friend("C")
+	check(2, false)
+	db, err := state.Open(ctx, n.data, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := db.SetPlaceCondition(ctx, "C", state.ConditionOK, "", now.Add(-9*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPlaceCondition(ctx, "C", state.ConditionRetrying, "dial: no route", now.Add(-8*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	check(1, true) // C is gone past replace_after
 }
 
 // REPL-4, OPS-1 (#19): status shows the bytes held at fewer than copies

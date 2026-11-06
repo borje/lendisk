@@ -148,7 +148,7 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 		return err
 	}
 	b := state.Bucket{
-		Name: name, Profile: profile, Copies: copies, CopiesExplicit: explicit,
+		Name: name, Profile: profile, Copies: copies,
 		AccessKey: access, SecretKey: secret, CreatedAt: a.now(),
 	}
 	if err := db.AddBucket(ctx, b); errors.Is(err, state.ErrExists) {
@@ -165,9 +165,10 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 		return err
 	}
 	fmt.Fprintf(a.out, "Created bucket %s (profile %s, copies %d).\n", name, profile, copies)
-	if nudgeCopies(b) {
-		fmt.Fprintf(a.out, "Warning: %s. Give --copies 1 to say you mean it.\n", copiesNudge)
+	if copies == 1 {
+		fmt.Fprintln(a.out, singleCopyWarning)
 	}
+	db.ReplaceAfter = cfg.ReplaceAfter()
 	if places, err := db.PoolSize(ctx); err != nil {
 		return err
 	} else if places < copies {
@@ -179,13 +180,14 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 	return nil
 }
 
-// copiesNudge is what bucket add and status say of a bucket at copies 1
-// that came from the default (EP-6).
-const copiesNudge = "copies 1: one lost friend loses data; 2 is recommended"
-
-// nudgeCopies reports whether b gets the copies-1 nudge: the user did
-// not choose copies 1 with --copies (EP-6).
-func nudgeCopies(b state.Bucket) bool { return b.Copies == 1 && !b.CopiesExplicit }
+// What bucket add and status say of a bucket at copies 1, however
+// copies was set, and status of a pool of one friend (EP-6). Neither is
+// an alert.
+const (
+	singleCopyWarning = "Warning: copies = 1. Each object is held by one friend only, so if that friend's disk is lost, this bucket has no offsite copy left. Add a second friend, or recreate the bucket with --copies 2."
+	singleCopyLine    = "! one copy: losing that friend's disk loses the offsite copy"
+	singleFriendLine  = "Friends (1: one lost disk loses every offsite copy)"
+)
 
 // printToolLines prints the lines for loopback and, for each
 // [[endpoint.listen]] address, for another machine (EP-17).

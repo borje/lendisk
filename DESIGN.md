@@ -1,6 +1,6 @@
 # lendisk — design
 
-Status: draft v0.15, 2026-11-06. Companion to REQUIREMENTS.md v0.11.
+Status: draft v0.15, 2026-11-06. Companion to REQUIREMENTS.md v0.11.1.
 REQUIREMENTS.md v0.9 made the two requirement changes this design
 needed (Q-T, resolved); its later versions moved third-party
 credentials to the environment,
@@ -1411,15 +1411,18 @@ upstream bucket is Q-V.
   and then creates the bucket directly through the posix backend, so it
   needs no running daemon; `bucket show` prints the lines again.
   `--copies N` sets the bucket's `copies`; without it the bucket gets
-  `replication.copies` (default 2). *Decision (#19):* EP-6's nudge
-  needs a `copies = 1` the user did not set explicitly, and the only
-  such source is that setting: `buckets.copies_explicit` (schema 13)
-  records whether `--copies` was given, and a bucket at `copies` 1
-  without it gets the nudge ("one lost friend loses data; 2 is
-  recommended") in `bucket add` and `status` (`buckets[].copies_nudge`
-  in `status --json`). `bucket add` also says when the pool has fewer
+  `replication.copies` (default 2). A bucket at `copies` 1, however it
+  was set (flag or setting; EP-6 v0.11.1, decided 2026-11-06), gets a
+  warning that is never suppressed, never an alert and never a
+  daily-summary line: `bucket add` prints "Warning: copies = 1. Each
+  object is held by one friend only, so if that friend's disk is lost,
+  this bucket has no offsite copy left. Add a second friend, or
+  recreate the bucket with --copies 2." (`bucket set` comes with
+  REPL-13), and `status` prints "! one copy: losing that friend's disk
+  loses the offsite copy" under the bucket (`buckets[].single_copy` in
+  `status --json`). `bucket add` also says when the pool has fewer
   places than `copies` (OPS-2), as does the `pool_too_small` alert
-  (§3.8). The daily summary's nudge comes with the summary.
+  (§3.8).
 - **EP-7** Profiles are TOML files compiled into the binary
   (`internal/profile/profiles/<name>.toml`) and overridable in
   `<config>/profiles/`: a file there replaces the compiled-in profile
@@ -1501,6 +1504,15 @@ upstream bucket is Q-V.
   `buckets[].below_copies` in `status --json`: live objects and bytes,
   the key's latest done write a put). Each `placement` row in state
   `queued` is an entry in that place's FIFO.
+  *Thin pools (EP-6, #19).* Two `status` lines, neither an alert: a
+  bucket at `copies` 1 gets "! one copy: losing that friend's disk
+  loses the offsite copy" under it (`buckets[].single_copy`; `bucket
+  add` warns too, see EP-6 below), and a pool of exactly one friend,
+  counted as `state.DB.PoolSize` counts (not removed, not gone past
+  `replace_after`), whatever the buckets' `copies`, gets "Friends (1:
+  one lost disk loses every offsite copy)" above the places
+  (`pool: {"friends": N, "single_friend": true|false}` in
+  `status --json`).
   *Reachability* until the probe (#65) is the place's condition: a
   friend is unreachable once it has been `retrying` or `removed` for
   `replication.reroute_after` (1 hour; a shorter failure is a blip),
@@ -2768,8 +2780,8 @@ Release gates on the product (field connectivity, soak, small hardware)
 are G-1 to G-3 in REQUIREMENTS.md §6. The gates here are on the current
 design and disappear with it.
 
-- **Q-A (resolved)** `copies` defaults to 2, with a nudge when set to 1
-  (EP-6). Until v0.10 it was `min_replicas`, defaulting to 1.
+- **Q-A (resolved)** `copies` defaults to 2, with a warning in
+  `bucket add` and `status` when it is 1, however set (EP-6). Until v0.10 it was `min_replicas`, defaulting to 1.
 - **Q-B (resolved)** Relays are reused, not built: DERP via tailcat
   (D5). The project runs a few `derper` instances; the cost is a couple
   of small VPSes. Tailscale's hosted relays are a bootstrap convenience
