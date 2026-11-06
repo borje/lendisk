@@ -236,7 +236,7 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 			why = "it refused: " + ce.Message
 		}
 		return fmt.Errorf("this invite has expired or node %s cannot be reached (%s). An earlier redeem with that node, started %s, did not finish, "+
-			"so it may already count you as a friend. Ask them for a new invite and run `lendisk peer add` with it: that settles this one",
+			"so it may already count you as a friend. Ask them for a new invite and run `lendisk peer add` with it: that settles this one. If they were only offline and the invite is still valid, running the same `lendisk peer add` again also works",
 			them, why, earlier[0].StartedAt.UTC().Format(time.RFC3339))
 	case errors.As(err, &ce):
 		if ce.Status < http.StatusInternalServerError {
