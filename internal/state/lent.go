@@ -66,23 +66,105 @@ func (db *DB) GetLentUpload(ctx context.Context, uploadID string) (LentUpload, e
 	return u, err
 }
 
-// SetLentUploadCounted records the part bytes counted for an upload.
-func (db *DB) SetLentUploadCounted(ctx context.Context, uploadID string, n int64) error {
-	_, err := db.ExecContext(ctx, `UPDATE lent_upload SET counted = ? WHERE upload_id = ?`, n, uploadID)
-	return err
+// SettleLentPart records that part of upload uploadID now holds size
+// bytes, and moves the upload's count and peer's usage by what that
+// changes, in one transaction; it returns the change. ErrNotFound if
+// the upload is not recorded.
+func (db *DB) SettleLentPart(ctx context.Context, peer, uploadID string, part int32, size int64) (int64, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM lent_upload WHERE upload_id = ?)`, uploadID).Scan(&exists); err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, ErrNotFound
+	}
+	var old int64
+	err = tx.QueryRowContext(ctx, `SELECT size FROM lent_part WHERE upload_id = ? AND part = ?`, uploadID, part).Scan(&old)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return 0, err
+	}
+	delta := size - old
+	if delta == 0 && err == nil {
+		return 0, nil
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO lent_part (upload_id, part, size) VALUES (?, ?, ?)
+		ON CONFLICT (upload_id, part) DO UPDATE SET size = excluded.size`, uploadID, part, size); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE lent_upload SET counted = counted + ? WHERE upload_id = ?`, delta, uploadID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO lent_usage (peer_key, bytes) VALUES (?, MAX(?, 0))
+		ON CONFLICT (peer_key) DO UPDATE SET bytes = MAX(bytes + ?, 0)`, peer, delta, delta); err != nil {
+		return 0, err
+	}
+	return delta, tx.Commit()
 }
 
-// DropLentUploadsBefore forgets peer's uploads begun before cutoff
-// (abandoned, LEND-1).
-func (db *DB) DropLentUploadsBefore(ctx context.Context, peer string, cutoff time.Time) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM lent_upload WHERE peer_key = ? AND created_at < ?`, peer, cutoff.Unix())
-	return err
+// SetLentUploadParts replaces an upload's counted parts with those a
+// listing found, and its count with their sum.
+func (db *DB) SetLentUploadParts(ctx context.Context, uploadID string, parts map[int32]int64) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM lent_part WHERE upload_id = ?`, uploadID); err != nil {
+		return err
+	}
+	var total int64
+	for p, n := range parts {
+		total += n
+		if _, err := tx.ExecContext(ctx, `INSERT INTO lent_part (upload_id, part, size) VALUES (?, ?, ?)`, uploadID, p, n); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE lent_upload SET counted = ? WHERE upload_id = ?`, total, uploadID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// LentUploads lists peer's recorded uploads.
+func (db *DB) LentUploads(ctx context.Context, peer string) ([]LentUpload, error) {
+	rows, err := db.QueryContext(ctx, `SELECT upload_id, sealed, key, sha256, created_at, counted FROM lent_upload
+		WHERE peer_key = ? ORDER BY upload_id`, peer)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LentUpload
+	for rows.Next() {
+		u := LentUpload{Peer: peer}
+		var created int64
+		if err := rows.Scan(&u.UploadID, &u.Sealed, &u.Key, &u.SHA256, &created, &u.Counted); err != nil {
+			return nil, err
+		}
+		u.CreatedAt = time.Unix(created, 0)
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 // DropLentUpload forgets a completed or aborted upload.
 func (db *DB) DropLentUpload(ctx context.Context, uploadID string) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM lent_upload WHERE upload_id = ?`, uploadID)
-	return err
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM lent_part WHERE upload_id = ?`, uploadID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM lent_upload WHERE upload_id = ?`, uploadID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // LentBucket is a bucket a borrower created on this node (PEER-8): the

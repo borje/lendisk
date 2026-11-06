@@ -102,30 +102,54 @@ func TestLentUploadKeepsTheDeclaredHash(t *testing.T) {
 	}
 }
 
-// LEND-1: an upload keeps the part bytes counted for it; rows of one
-// borrower older than a cutoff are dropped, others kept.
-func TestLentUploadCountedAndAbandonedRowsDropped(t *testing.T) {
+// LEND-1: settling a part counts what it changes over the part of that
+// number counted before, in the upload's count and the borrower's usage
+// at once; a re-sent part counts once. An upload's parts can be set
+// from a listing, and dropping the upload drops them.
+func TestLentPartsSettleOnce(t *testing.T) {
 	ctx := context.Background()
 	db := openPeers(t)
-	old, recent := time.Unix(1_800_000_000, 0), time.Unix(1_800_900_000, 0)
-	for _, u := range []LentUpload{{UploadID: "old", Peer: "bob", CreatedAt: old}, {UploadID: "new", Peer: "bob", CreatedAt: recent},
-		{UploadID: "carol", Peer: "carol", CreatedAt: old}} {
-		if err := db.AddLentUpload(ctx, u); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := db.SetLentUploadCounted(ctx, "new", 77); err != nil {
+	if err := db.AddLentUpload(ctx, LentUpload{UploadID: "up", Peer: "bob", CreatedAt: time.Unix(1_800_000_000, 0)}); err != nil {
 		t.Fatal(err)
 	}
-	if u, _ := db.GetLentUpload(ctx, "new"); u.Counted != 77 {
+	for _, s := range []struct {
+		part        int32
+		size, delta int64
+	}{{1, 100, 100}, {1, 100, 0}, {1, 40, -60}, {2, 7, 7}} {
+		d, err := db.SettleLentPart(ctx, "bob", "up", s.part, s.size)
+		if err != nil || d != s.delta {
+			t.Fatalf("part %d of %d: delta %d (%v), want %d", s.part, s.size, d, err, s.delta)
+		}
+	}
+	if u, _ := db.GetLentUpload(ctx, "up"); u.Counted != 47 {
 		t.Fatalf("counted %d", u.Counted)
 	}
-	if err := db.DropLentUploadsBefore(ctx, "bob", old.Add(time.Hour)); err != nil {
+	if n, _, _ := db.LentUsage(ctx, "bob"); n != 47 {
+		t.Fatalf("usage %d", n)
+	}
+	if _, err := db.SettleLentPart(ctx, "bob", "gone", 1, 5); err != ErrNotFound {
+		t.Fatalf("a part of an unknown upload: %v", err)
+	}
+	if err := db.SetLentUploadParts(ctx, "up", map[int32]int64{1: 10, 3: 5}); err != nil {
 		t.Fatal(err)
 	}
-	for id, want := range map[string]bool{"old": false, "new": true, "carol": true} {
-		if _, err := db.GetLentUpload(ctx, id); (err == nil) != want {
-			t.Errorf("%s: %v", id, err)
-		}
+	if u, _ := db.GetLentUpload(ctx, "up"); u.Counted != 15 {
+		t.Fatalf("counted after a listing %d", u.Counted)
+	}
+	if d, _ := db.SettleLentPart(ctx, "bob", "up", 3, 5); d != 0 {
+		t.Fatalf("part 3 again: %d", d)
+	}
+	ups, err := db.LentUploads(ctx, "bob")
+	if err != nil || len(ups) != 1 || ups[0].UploadID != "up" {
+		t.Fatalf("bob's uploads %+v %v", ups, err)
+	}
+	if err := db.DropLentUpload(ctx, "up"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddLentUpload(ctx, LentUpload{UploadID: "up", Peer: "bob"}); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := db.SettleLentPart(ctx, "bob", "up", 1, 10); d != 10 {
+		t.Fatalf("a dropped upload's parts are kept: delta %d", d)
 	}
 }

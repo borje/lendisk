@@ -74,17 +74,17 @@ type Lending struct {
 	Floor    *config.Floor
 	Statfs   func(dir string) (store.Space, error)
 	Log      *slog.Logger
-	// Stall and MinProgress bound a borrower's body: a write whose body
-	// brings fewer than MinProgress bytes in any Stall period ends
-	// (defaults DefaultStall, DefaultMinProgress). AbandonAfter is how
-	// old a borrower's multipart upload may grow before the reconcile
-	// aborts it (default DefaultAbandonAfter).
-	Stall        time.Duration
-	MinProgress  int64
+	// AbandonAfter is how long a borrower's multipart upload may go
+	// without a part before the reconcile aborts it (default
+	// DefaultAbandonAfter).
 	AbandonAfter time.Duration
-	// beforeComplete, if set, runs just before a borrower's upload is
-	// completed in the store. Tests only.
-	beforeComplete func()
+	// Tests only: beforeComplete runs just before a borrower's upload is
+	// completed in the store; afterList when a reconcile has listed a
+	// borrower and not yet set its count; afterPartStored when a part is
+	// stored and not yet counted.
+	beforeComplete  func()
+	afterList       func()
+	afterPartStored func(part int32, size int64)
 
 	keys     keyLocks // one multipart create, completion or delete per borrower's key at a time
 	uploads  keyLocks // one accounting step per borrower's upload at a time
@@ -467,6 +467,9 @@ func (l *Lending) UploadPart(ctx context.Context, in *s3.UploadPartInput) (*s3.U
 	if err != nil {
 		return nil, err
 	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return nil, kerr
+	}
 	c := *in
 	c.Bucket = b
 	if peer, ok := borrower(ctx); ok {
@@ -642,7 +645,7 @@ func (l *Lending) RestoreObject(ctx context.Context, in *s3.RestoreObjectInput) 
 
 func (l *Lending) SelectObjectContent(ctx context.Context, in *s3.SelectObjectContentInput) func(w *bufio.Writer) {
 	b, err := l.ptr(ctx, in.Bucket)
-	if err != nil {
+	if err != nil || borrowerKey(ctx, in.Key) != nil {
 		return func(*bufio.Writer) {} // not on posix anyway; answer nothing
 	}
 	c := *in
@@ -679,6 +682,9 @@ func (l *Lending) GetObjectTagging(ctx context.Context, bucket, object, versionI
 	if err != nil {
 		return nil, err
 	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return nil, kerr
+	}
 	return l.Next.GetObjectTagging(ctx, b, object, versionID)
 }
 
@@ -687,6 +693,9 @@ func (l *Lending) PutObjectTagging(ctx context.Context, bucket, object, versionI
 	if err != nil {
 		return err
 	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return kerr
+	}
 	return l.Next.PutObjectTagging(ctx, b, object, versionID, tags)
 }
 
@@ -694,6 +703,9 @@ func (l *Lending) DeleteObjectTagging(ctx context.Context, bucket, object, versi
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
+	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return kerr
 	}
 	return l.Next.DeleteObjectTagging(ctx, b, object, versionID)
 }
@@ -719,6 +731,9 @@ func (l *Lending) PutObjectRetention(ctx context.Context, bucket, object, versio
 	if err != nil {
 		return err
 	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return kerr
+	}
 	return l.Next.PutObjectRetention(ctx, b, object, versionID, retention)
 }
 
@@ -726,6 +741,9 @@ func (l *Lending) GetObjectRetention(ctx context.Context, bucket, object, versio
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return nil, err
+	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return nil, kerr
 	}
 	return l.Next.GetObjectRetention(ctx, b, object, versionID)
 }
@@ -735,6 +753,9 @@ func (l *Lending) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 	if err != nil {
 		return err
 	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return kerr
+	}
 	return l.Next.PutObjectLegalHold(ctx, b, object, versionID, status)
 }
 
@@ -742,6 +763,9 @@ func (l *Lending) GetObjectLegalHold(ctx context.Context, bucket, object, versio
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return nil, err
+	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return nil, kerr
 	}
 	return l.Next.GetObjectLegalHold(ctx, b, object, versionID)
 }

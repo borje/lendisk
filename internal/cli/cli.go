@@ -17,6 +17,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
@@ -48,6 +49,8 @@ type app struct {
 	// afterStore is the capture crash-window hook (gateway.AfterStore);
 	// tests only.
 	afterStore func()
+	// tuneBridge, if set, adjusts the bridge before it serves. Tests only.
+	tuneBridge func(*bridge.Bridge)
 	// tuneReplication, if set, adjusts the replication worker before it
 	// starts (timings, the OnRead hook); tests only.
 	tuneReplication func(*replica.Worker)

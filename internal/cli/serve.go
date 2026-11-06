@@ -94,6 +94,9 @@ func (a *app) serveCmd() *cobra.Command {
 
 			running := 1
 			br := bridge.New(gw.Socket, log)
+			if a.tuneBridge != nil {
+				a.tuneBridge(br)
+			}
 			tun.S3.Set(br.TunnelS3Handler()) // S3 for friends (NET-7, SEC-12)
 			// LAN listeners (EP-17); config load refuses them for a lender.
 			if len(cfg.Endpoint.Listen) > 0 {

@@ -1804,26 +1804,33 @@ capture decorator, so nothing stands between that and posix (#62).
   inode, metadata and database row each item costs, so a borrower under
   quota cannot make empty objects, buckets or uploads without end. The
   counter lives in memory under one lock, loaded from `lent_usage` in
-  `lendisk.db` once and written through on every change: a put adds
-  its bytes and overhead; a delete removes them; a bucket or upload
-  adds its overhead; a part is counted by re-reading the upload's
-  parts (`ListParts`) after the write, under a per-upload lock, against
-  what `lent_upload.counted` says was counted, so re-sent parts, racing
-  or not, count once; a completion adds the object less its parts; an
-  abort, or a refused completion, removes the parts and the upload's
-  overhead. Each change is made holding the borrower's publication
-  lock shared, from the moment the store may publish (a body's last
-  read, or the store call) until it is counted. The counter is
-  reconciled against a listing (`ListObjectsV2` of each `lent-` bucket
-  and its rows in `lent_bucket`, plus `ListParts` of each upload
-  `ListMultipartUploads` shows) at start and then once a day, checked
-  hourly. The reconcile holds the publication lock exclusively while it
-  lists, so every write is either counted or not yet published; it
-  waits only for publications in progress, never for a body still
-  streaming. *Decision (#16 review):* an upload left open longer than 7
-  days (`Lending.AbandonAfter`) is aborted by the reconcile and its
-  `lent_upload` row dropped, with rows older than that whose upload is
-  gone. `lending.max_total` bounds the sum of the node's own numbers;
+  `lendisk.db` once; every change is written to the database first
+  and reaches memory only once the database took it. A put adds its
+  bytes and overhead; a delete removes them; a bucket or upload adds
+  its overhead; a part adds what it changes over the part of that
+  number counted before (`lent_part`), in one transaction with
+  `lent_upload.counted` and `lent_usage`, so settling a part costs the
+  same whatever the upload holds and re-sent parts count once; a
+  completion adds the object less its parts; an abort, or a refused
+  completion, removes the parts and the upload's overhead. Each change
+  is made holding the borrower's publication lock shared, from the
+  moment the store may publish (a body's last read, or the store call)
+  until it is counted; a part also holds its upload's lock over that
+  span, so parts of one number are published and counted in the same
+  order. The counter is reconciled against a listing (`ListObjectsV2`
+  of each `lent-` bucket and its rows in `lent_bucket`, plus
+  `ListParts` of each upload `ListMultipartUploads` shows, which also
+  resets `lent_part`) once at every start, whatever the last run was,
+  since one that did not finish leaves no trace, and then once a day,
+  checked hourly. The reconcile holds the publication lock exclusively
+  while it lists and sets the count, so every write is either counted
+  or not yet published; it waits only for publications in progress,
+  never for a body still streaming. *Decision (#16 review):* an upload
+  that has had no part for 7 days (`Lending.AbandonAfter`, against
+  posix's `Initiated`, which each part refreshes) is aborted by the
+  reconcile and its `lent_upload` row dropped. Otherwise a row is
+  dropped only when its upload is finished, aborted, or gone from the
+  store; an upload begun long ago that still gets parts keeps it. `lending.max_total` bounds the sum of the node's own numbers;
   `peer quota` refuses a value that would exceed it (LEND-8). The
   borrower side keeps its own count of what it has stored at each
   place, for D6's free fraction, and corrects it from the lender's
@@ -1846,15 +1853,23 @@ capture decorator, so nothing stands between that and posix (#62).
   `s3err.APIError` (versitygw's `ErrQuotaExceeded` is a 403) and is
   returned unwrapped: versitygw type-asserts it, and a wrapped error
   becomes a 500 that clients retry (Q-I.5).
-- **LEND-2, SEC-5 (stall bound)** No listener sets a read timeout on a
-  body, so `Lending` bounds a borrower's put and part bodies itself: a
-  body that brings fewer than 64 KiB in any 2-minute window (the
-  borrower's own stall watchdog, §3.4; `Lending.Stall` and
-  `MinProgress`) ends the write with `RequestTimeout` (400), which the
-  borrower retries. A body longer than its `Content-Length` ends it with
-  `InvalidRequest`. So a body that stops or trickles holds its quota
-  and floor reservation for minutes, not forever. The read it gave up
-  on is left to a goroutine that ends with the connection.
+- **LEND-2, SEC-5 (stall bound)** The bridge bounds every request body
+  on the tunnel, since nothing behind it does: fasthttp, behind
+  `gw.sock`, reads the first min(`Content-Length`, 8 KiB) before any
+  handler runs and the rest as the store asks, with no timeout.
+  `TunnelS3Handler` sets the connection's read deadline
+  (`http.ResponseController`) a stall period ahead before the body
+  starts, and pushes it a stall period on each time 64 KiB more arrive
+  (`bridge.Bridge.Stall`, 2 minutes, the borrower's own stall watchdog
+  of §3.4, and `MinProgress`). A body that stops, trickles below that
+  rate, or never starts though its headers promised one fails its read;
+  the proxy drops the request to `gw.sock`, which ends it there, and
+  answers `RequestTimeout` (400), which the borrower retries. The
+  deadline is cleared when the body ends and when the handler returns.
+  So a stalled body holds its quota and floor reservation for minutes,
+  not forever, and nothing reads the body but the store. A body longer
+  than its `Content-Length` ends the write in `Lending` with
+  `InvalidRequest`.
 - **LEND-4** `Lending` hashes a borrower's body as it streams it to the
   backend (SHA-256) and compares with `x-amz-meta-lendisk-sha256` at
   the end of the stream: a mismatch fails that last read, so posix
@@ -1888,11 +1903,13 @@ capture decorator, so nothing stands between that and posix (#62).
   A borrower's put or multipart create without the hash (64 hex
   digits) is refused with `InvalidRequest` (400); node-ID accounts are
   served on the tunnel only (SEC-12), so this is the tunnel side.
-- **SEC-5** Every key a borrower names is checked, on writes, deletes,
-  multipart calls, reads and heads: 1 to 1024 bytes of UTF-8 without
-  control characters, segments separated by single slashes, none
-  empty, `.` or `..`, and not under `.lendisk/` (tombstones),
-  `.sgwtmp/` or `.vgwlocks/` (posix's own); anything else is
+- **SEC-5** Every key a borrower names is checked, by every `Lending`
+  method that takes one (writes, deletes, multipart calls, reads,
+  heads, tagging, retention, legal hold, select; a test lists them all
+  and finds any added later): 1 to 1024 bytes of UTF-8 without control
+  characters, segments separated by single slashes, none empty, `.` or
+  `..`, and not under `.lendisk/` (tombstones), `.sgwtmp/` or
+  `.vgwlocks/` (posix's own), in any case; anything else is
   `InvalidArgument` (400). Buckets are confined by the mapping
   (PEER-8). `Lending` also refuses `DeleteObjects` to a borrower (NET-7
   lists it), so every delete is one counted `DeleteObject`.

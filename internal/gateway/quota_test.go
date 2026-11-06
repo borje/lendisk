@@ -578,48 +578,6 @@ func TestStalledPutDoesNotBlockTheKey(t *testing.T) {
 	l.wantUsage(2*ov + int64(len(fresh)))
 }
 
-// tricklingReader gives one byte every gap.
-type tricklingReader struct {
-	gap  time.Duration
-	left int
-}
-
-func (r *tricklingReader) Read(p []byte) (int, error) {
-	if r.left == 0 {
-		return 0, io.EOF
-	}
-	time.Sleep(r.gap)
-	r.left--
-	p[0] = 'x'
-	return 1, nil
-}
-
-// SEC-5: a borrower's body that brings less than the minimum in a stall
-// period ends the write, whether it stops or trickles, so it holds no
-// reservation of quota or floor for long. Nothing is stored.
-func TestStalledOrTricklingBodyEnds(t *testing.T) {
-	l := lendTo(t, 1<<30, func(h *harness) {
-		h.lending = func(l *Lending) { l.Stall, l.MinProgress = 300*time.Millisecond, 1000 }
-	})
-	stopped := newStalledReader(nil)
-	t.Cleanup(func() { close(stopped.release) })
-	for name, body := range map[string]io.Reader{"stopped": stopped, "trickling": &tricklingReader{gap: 20 * time.Millisecond, left: 100}} {
-		start := time.Now()
-		done := make(chan error, 1)
-		go func() { done <- l.putDirect("data/"+name, body, 100, hashMeta(bytes.Repeat([]byte("x"), 100))) }()
-		if err := within(t, name, done); !isCode(err, "RequestTimeout") {
-			t.Errorf("%s: %v", name, err)
-		}
-		if d := time.Since(start); d > 5*time.Second {
-			t.Errorf("%s ended after %v", name, d)
-		}
-		if _, ok := l.stored("data/" + name); ok {
-			t.Errorf("%s stored", name)
-		}
-	}
-	l.wantUsage(ov)
-}
-
 // LEND-1: a reconcile while a put's body is stalled does not wait for it
 // and still corrects a counter that drifted.
 func TestReconcileWhileAPutIsStalled(t *testing.T) {
@@ -716,28 +674,195 @@ func TestMultipartVerifiedAsAWhole(t *testing.T) {
 	l.wantUsage(2*ov + int64(len(whole)))
 }
 
-// LEND-1, SEC-5: re-sends of one part racing each other are counted
-// once: the counter equals what is stored, and the next put over quota
-// is refused.
-func TestRacingPartResendsCountedOnce(t *testing.T) {
-	l := lendTo(t, 3*ov+1500, nil)
+// LEND-1, SEC-5: re-sends of one part, of different sizes and racing,
+// are counted as the store holds them: the counter equals the bucket,
+// the upload and the stored part, and the next put over quota is
+// refused. The second re-send is forced to store while the first,
+// already stored, has not been counted yet.
+func TestRacingPartResendsCountedAsStored(t *testing.T) {
+	aStored, bDone := make(chan struct{}), make(chan error, 1)
+	var once sync.Once
+	l := lendTo(t, 3*ov+2500, func(h *harness) {
+		h.lending = func(l *Lending) {
+			l.afterPartStored = func(part int32, size int64) {
+				if size != 1000 {
+					return
+				}
+				once.Do(func() { close(aStored) })
+				select { // B stores and counts here unless the upload is locked
+				case err := <-bDone:
+					bDone <- err
+				case <-time.After(500 * time.Millisecond):
+				}
+			}
+		}
+	})
 	id, err := l.create("data/mp", hashMeta(nil))
 	if err != nil {
 		t.Fatal(err)
 	}
-	part := bytes.Repeat([]byte("p"), 1000)
-	if _, err := l.part("data/mp", id, 1, part); err != nil {
+	aDone := make(chan error, 1)
+	go func() { _, err := l.part("data/mp", id, 1, bytes.Repeat([]byte("a"), 1000)); aDone <- err }()
+	within(t, "A stored", aStored)
+	go func() { _, err := l.part("data/mp", id, 1, bytes.Repeat([]byte("b"), 2000)); bDone <- err }()
+	if err := within(t, "A", aDone); err != nil {
 		t.Fatal(err)
 	}
-	var wg sync.WaitGroup
-	for range 8 {
-		wg.Go(func() { l.part("data/mp", id, 1, part) })
+	if err := within(t, "B", bDone); err != nil {
+		t.Fatal(err)
 	}
-	wg.Wait()
-	l.wantUsage(2*ov + 1000)
+	ps, err := l.lending().parts(context.Background(), l.store, "data/mp", *id)
+	if err != nil || len(ps) != 1 {
+		t.Fatalf("parts %v %v", ps, err)
+	}
+	l.wantUsage(2*ov + ps[1])
+	if ps[1] != 2000 {
+		t.Fatalf("the store holds a %d-byte part; B came last", ps[1])
+	}
 	over := bytes.Repeat([]byte("o"), 600)
 	if err := l.put("data/over", over, hashMeta(over)); code(err) != "QuotaExceeded" {
 		t.Fatalf("a put over quota after the re-sends: %v", err)
+	}
+}
+
+// countingParts counts ListParts calls.
+type countingParts struct {
+	*Store
+	n atomic.Int64
+}
+
+func (c *countingParts) ListParts(ctx context.Context, in *s3.ListPartsInput) (s3response.ListPartsResult, error) {
+	c.n.Add(1)
+	return c.Store.ListParts(ctx, in)
+}
+
+// LEND-1: counting a part costs the same whatever the upload holds: no
+// listing of its parts.
+func TestCountingAPartListsNothing(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	be, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateBucket(ctx, be, "lent-x", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.AddFriendship(ctx, state.Friendship{Peer: "peer", CreatedAt: time.Now(), OwnNumber: 1 << 30, PeerNumber: 1 << 30}); err != nil {
+		t.Fatal(err)
+	}
+	next := &countingParts{Store: be}
+	l := &Lending{Next: next, DB: h.db, Uploads: be, StoreDir: h.store, Log: quiet}
+	res, err := l.createUploadLent(ctx, "peer", "sx", s3response.CreateMultipartUploadInput{Bucket: aws.String("lent-x"),
+		Key: aws.String("k"), Metadata: hashMeta(nil)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		n, body := int32(i+1), []byte("part")
+		size := int64(len(body))
+		if _, err := l.uploadPartLent(ctx, "peer", "sx", &s3.UploadPartInput{Bucket: aws.String("lent-x"), Key: aws.String("k"),
+			UploadId: &res.UploadId, PartNumber: &n, ContentLength: &size, Body: bytes.NewReader(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c := next.n.Load(); c != 0 {
+		t.Fatalf("%d part listings for 5 parts", c)
+	}
+	if u, _ := h.db.GetLentUpload(ctx, res.UploadId); u.Counted != 20 {
+		t.Fatalf("counted %d", u.Counted)
+	}
+}
+
+// LEND-1: a reconcile's listing and the count it sets are one step for
+// the borrower's writes: a put that would publish meanwhile waits, and
+// is counted after, so the counter misses nothing.
+func TestReconcileWaitsForPublications(t *testing.T) {
+	var during atomic.Pointer[func()]
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.lending = func(l *Lending) {
+			l.afterList = func() {
+				if f := during.Load(); f != nil {
+					(*f)()
+				}
+			}
+		}
+	})
+	body := bytes.Repeat([]byte("p"), 300)
+	putDone := make(chan error, 1)
+	f := func() {
+		go func() { putDone <- l.put("data/p", body, hashMeta(body)) }()
+		select { // the put publishes and counts here unless the reconcile holds it
+		case err := <-putDone:
+			putDone <- err
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	during.Store(&f)
+	if err := l.lending().reconcile(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	during.Store(nil)
+	if err := within(t, "the put", putDone); err != nil {
+		t.Fatal(err)
+	}
+	l.wantUsage(2*ov + 300)
+}
+
+// LEND-1: an upload begun more than the abandon period ago that still
+// gets parts keeps its row through the reconcile and goes on working:
+// its parts are counted, and it completes.
+func TestSlowUploadKeepsItsRow(t *testing.T) {
+	var now atomic.Int64
+	now.Store(time.Now().Add(-8 * 24 * time.Hour).Unix())
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.lending = func(l *Lending) { l.Now = func() time.Time { return time.Unix(now.Load(), 0) } }
+	})
+	ctx := context.Background()
+	p := []byte("slow part")
+	id, err := l.create("data/slow", hashMeta(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now.Store(time.Now().Unix()) // eight days on; the store saw a part just now
+	cp, err := l.part("data/slow", id, 1, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.lending().reconcile(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.h.db.GetLentUpload(ctx, *id); err != nil {
+		t.Fatalf("the slow upload's row: %v", err)
+	}
+	l.wantUsage(2*ov + int64(len(p)))
+	if err := l.complete("data/slow", id, cp); err != nil {
+		t.Fatalf("completing the slow upload: %v", err)
+	}
+	l.wantUsage(2*ov + int64(len(p)))
+}
+
+// LEND-1: the reconcile at start runs whenever the last one ran, so a
+// count left wrong by a run that did not finish is set right.
+func TestStartReconcilesWhateverTheLastRun(t *testing.T) {
+	h := newHarness(t, nil)
+	h.self = newIdentity(t)
+	b := newIdentity(t)
+	h.befriendWith(b, 1<<30)
+	if err := h.db.SetLentUsage(context.Background(), b.NodeID().String(), 12345, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	h.serve(false)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		n, _, _ := h.db.LentUsage(context.Background(), b.NodeID().String())
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("usage %d after start; want 0", n)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -817,7 +942,7 @@ func TestBorrowerKeysValidated(t *testing.T) {
 		}
 	}
 	for _, k := range []string{"", "/abs", "a/../b", "..", "../x", "a/./b", ".", "a//b", "a/", "a\x00b", "a\nb",
-		".lendisk/tomb/x", ".lendisk", ".sgwtmp/multipart/x", ".vgwlocks/x", string(bytes.Repeat([]byte("k"), 1025)), "\xff"} {
+		".lendisk/tomb/x", ".lendisk", ".LENDISK/x", ".SgwTmp/x", ".sgwtmp/multipart/x", ".vgwlocks/x", string(bytes.Repeat([]byte("k"), 1025)), "\xff"} {
 		if err := checkKey(k); err == nil {
 			t.Errorf("%q accepted", k)
 		}

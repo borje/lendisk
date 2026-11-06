@@ -31,7 +31,12 @@ import (
 type Bridge struct {
 	Socket string
 	Log    *slog.Logger
-	proxy  *httputil.ReverseProxy
+	// Stall and MinProgress bound a request body on the tunnel: one that
+	// brings fewer than MinProgress bytes in a Stall period ends the
+	// request (defaults DefaultStall, DefaultMinProgress).
+	Stall       time.Duration
+	MinProgress int64
+	proxy       *httputil.ReverseProxy
 }
 
 // New returns a bridge to the gateway on socket.
@@ -56,6 +61,11 @@ func New(socket string, log *slog.Logger) *Bridge {
 		Transport:     tr,
 		FlushInterval: -1, // stream responses as they come
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if stalledBody(r) {
+				log.Info("tunnel: a request body stalled; ended the request", "method", r.Method, "path", r.URL.Path)
+				writeError(w, errStalled)
+				return
+			}
 			if !errors.Is(err, context.Canceled) {
 				log.Warn("proxy to gateway failed", "method", r.Method, "path", r.URL.Path, "err", err)
 			}

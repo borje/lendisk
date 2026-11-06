@@ -43,8 +43,9 @@ import (
 //     key is still absent (If-None-Match: *, which posix checks under
 //     its publish lock): puts take no key lock, so a stalled body never
 //     holds up its retry.
-//   - A borrower's body that brings less than MinProgress bytes in any
-//     Stall period, or more than its Content-Length, ends the write.
+//   - A borrower's body longer than its Content-Length ends the write.
+//     A body that stalls or trickles is ended by the tunnel bridge's
+//     read deadline (bridge.boundedBody), before it reaches the store.
 //   - Writes are admitted against the friendship's quota and the
 //     store's free-space floor (reserve), and move the borrower's
 //     counter once published.
@@ -63,12 +64,9 @@ import (
 // costs against quota besides its bytes (LEND-1, SEC-5).
 const itemOverhead = 4096
 
-// Defaults for Lending's body bounds and abandoned uploads.
-const (
-	DefaultStall        = 2 * time.Minute
-	DefaultMinProgress  = 64 << 10
-	DefaultAbandonAfter = 7 * 24 * time.Hour
-)
+// DefaultAbandonAfter is how long a borrower's multipart upload may go
+// without a part before the reconcile aborts it.
+const DefaultAbandonAfter = 7 * 24 * time.Hour
 
 // metaSHA256 is the user metadata key carrying an object's SHA-256, in
 // hex (REPL-10; replica.MetaSHA256 on the sending side).
@@ -95,16 +93,26 @@ var (
 		Description: "lendisk: an object key must be a relative path of non-empty segments, without . or .. segments, " +
 			"control characters, or the reserved .lendisk, .sgwtmp and .vgwlocks directories"}
 	errNoSuchUpload = s3err.GetAPIError(s3err.ErrNoSuchUpload)
-	errStalled      = s3err.APIError{Code: "RequestTimeout", HTTPStatusCode: 400,
-		Description: "lendisk: the body brought too little for too long; send it again"}
-	errTooLong = s3err.APIError{Code: "InvalidRequest", HTTPStatusCode: 400,
+	errTooLong      = s3err.APIError{Code: "InvalidRequest", HTTPStatusCode: 400,
 		Description: "lendisk: the body is longer than its Content-Length"}
 	errNotFriend = s3err.APIError{Code: "AccessDenied", HTTPStatusCode: 403, Description: "lendisk: " + state.NoRelationship}
 )
 
 // reservedDirs are the top-level directories of a bucket that belong to
 // lendisk (tombstones, §3.6) or to versitygw's posix backend.
-var reservedDirs = map[string]bool{".lendisk": true, ".sgwtmp": true, ".vgwlocks": true}
+var reservedDirs = []string{".lendisk", ".sgwtmp", ".vgwlocks"}
+
+// reserved reports whether a key's first segment names a reserved
+// directory, in any case: a case-insensitive filesystem would put it
+// there.
+func reserved(seg string) bool {
+	for _, d := range reservedDirs {
+		if strings.EqualFold(seg, d) {
+			return true
+		}
+	}
+	return false
+}
 
 // checkKey accepts a borrower's object key (SEC-5): 1 to 1024 bytes of
 // UTF-8 without control characters, segments separated by single
@@ -119,7 +127,7 @@ func checkKey(key string) error {
 		}
 	}
 	segs := strings.Split(key, "/")
-	if reservedDirs[segs[0]] {
+	if reserved(segs[0]) {
 		return errBadKey
 	}
 	for _, s := range segs {
@@ -208,20 +216,6 @@ func (l *Lending) statfs() (store.Space, error) {
 	return store.DefaultChecker.Statfs(l.StoreDir)
 }
 
-func (l *Lending) stall() time.Duration {
-	if l.Stall > 0 {
-		return l.Stall
-	}
-	return DefaultStall
-}
-
-func (l *Lending) minProgress() int64 {
-	if l.MinProgress > 0 {
-		return l.MinProgress
-	}
-	return DefaultMinProgress
-}
-
 func (l *Lending) abandonAfter() time.Duration {
 	if l.AbandonAfter > 0 {
 		return l.AbandonAfter
@@ -303,56 +297,55 @@ func (l *Lending) reserveFloor(n int64) (release func(), err error) {
 }
 
 // count moves peer's counter by what a write stored or removed; the
-// caller holds the borrower's pub lock shared. A failure to write it
-// through is logged; the daily reconcile corrects lendisk.db.
+// caller holds the borrower's pub lock shared. lendisk.db is written
+// first and memory follows only once it took the change; a failure is
+// logged, and the reconcile corrects both.
 func (l *Lending) count(peer string, delta int64) {
 	if delta == 0 {
 		return
 	}
 	u := l.use(peer)
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if err := l.loadLocked(peer, u); err != nil {
-		l.mu.Unlock()
-		l.log().Error("lending: reading the borrower's usage failed; the daily reconcile corrects it", "peer", peer, "err", err)
+		l.log().Error("lending: reading the borrower's usage failed; the reconcile corrects it", "peer", peer, "err", err)
+		return
+	}
+	if err := l.DB.AddLentUsage(context.Background(), peer, delta); err != nil {
+		l.log().Error("lending: updating the borrower's usage failed; the reconcile corrects it", "peer", peer, "delta", delta, "err", err)
 		return
 	}
 	u.used = max(u.used+delta, 0)
-	err := l.DB.AddLentUsage(context.Background(), peer, delta)
-	l.mu.Unlock()
-	if err != nil {
-		l.log().Error("lending: updating the borrower's usage failed; the daily reconcile corrects it", "peer", peer, "delta", delta, "err", err)
+}
+
+// counted moves peer's counter in memory by a change lendisk.db already
+// took (a settled part).
+func (l *Lending) counted(peer string, delta int64) {
+	u := l.use(peer)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if u.loaded {
+		u.used = max(u.used+delta, 0)
 	}
 }
 
-// body bounds and hashes a borrower's request body (LEND-4, SEC-5): it
-// fails with errStalled when fewer than minProgress bytes arrive in any
-// stall period, with errTooLong past limit bytes, and with what onEOF
-// returns at the end. A read that outlives the stall is abandoned to a
-// goroutine that ends with the connection.
+// body hashes a borrower's request body (LEND-4) and fails it with
+// errTooLong past limit bytes (SEC-5), and with what onEOF returns at
+// its end. Stalls are the bridge's to end (bridge.boundedBody).
 type body struct {
-	r           io.Reader
-	limit, n    int64
-	stall       time.Duration
-	minProgress int64
-	winStart    time.Time
-	winBytes    int64
-	h           hash.Hash
-	buf         []byte
-	failed      error
-	ended       bool
-	onEOF       func() error
-}
-
-type readResult struct {
-	n   int
-	err error
+	r        io.Reader
+	limit, n int64
+	h        hash.Hash
+	failed   error
+	ended    bool
+	onEOF    func() error
 }
 
 func (l *Lending) body(r io.Reader, limit int64) *body {
 	if r == nil {
 		r = eofReader{}
 	}
-	return &body{r: r, limit: limit, stall: l.stall(), minProgress: l.minProgress(), h: sha256.New()}
+	return &body{r: r, limit: limit, h: sha256.New()}
 }
 
 func (b *body) hex() string { return hex.EncodeToString(b.h.Sum(nil)) }
@@ -364,54 +357,23 @@ func (b *body) Read(p []byte) (int, error) {
 	if b.ended {
 		return 0, io.EOF
 	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-	now := time.Now()
-	if b.winStart.IsZero() {
-		b.winStart = now
-	}
-	if cap(b.buf) < len(p) {
-		b.buf = make([]byte, len(p))
-	}
-	buf := b.buf[:len(p)]
-	ch := make(chan readResult, 1)
-	r := b.r
-	go func() {
-		n, err := r.Read(buf)
-		ch <- readResult{n, err}
-	}()
-	t := time.NewTimer(max(b.stall-now.Sub(b.winStart), 0))
-	defer t.Stop()
-	var res readResult
-	select {
-	case res = <-ch:
-	case <-t.C:
-		b.failed = errStalled
-		b.buf = nil // the abandoned read still owns it
-		return 0, errStalled
-	}
-	n := copy(p, buf[:res.n])
+	n, err := b.r.Read(p)
 	b.n += int64(n)
 	if b.n > b.limit {
 		b.failed = errTooLong
 		return 0, errTooLong
 	}
 	b.h.Write(p[:n])
-	b.winBytes += int64(n)
-	if b.winBytes >= b.minProgress {
-		b.winStart, b.winBytes = time.Now(), 0
-	}
-	if res.err == io.EOF {
+	if err == io.EOF {
 		b.ended = true
 		if b.onEOF != nil {
-			if err := b.onEOF(); err != nil {
-				b.failed = err
-				return n, err
+			if e := b.onEOF(); e != nil {
+				b.failed = e
+				return n, e
 			}
 		}
 	}
-	return n, res.err
+	return n, err
 }
 
 // reader is b as the store reads it: versitygw's ChecksumReader on the
@@ -720,63 +682,46 @@ func (l *Lending) lockUpload(ctx context.Context, uploadID string) (func(), erro
 	return l.uploads.lock(ctx, "", uploadID)
 }
 
-// partsSize sums the parts stored for an upload.
-func (l *Lending) partsSize(ctx context.Context, bucket, key, uploadID string) (int64, error) {
-	var total int64
+// parts lists the parts stored for an upload, by number.
+func (l *Lending) parts(ctx context.Context, bucket, key, uploadID string) (map[int32]int64, error) {
+	out := map[int32]int64{}
 	marker, page := "", int32(1000)
 	for {
 		res, err := l.Next.ListParts(ctx, &s3.ListPartsInput{Bucket: &bucket, Key: &key, UploadId: &uploadID,
 			PartNumberMarker: &marker, MaxParts: &page})
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 		for _, p := range res.Parts {
-			total += p.Size
+			out[int32(p.PartNumber)] = p.Size
 		}
 		if !res.IsTruncated || res.NextPartNumberMarker == 0 {
-			return total, nil
+			return out, nil
 		}
 		marker = strconv.Itoa(res.NextPartNumberMarker)
 	}
 }
 
-// settleParts counts what an upload's parts hold now against what was
-// counted for them, read after the writes it settles, under the upload's
-// lock: re-sent parts, racing or not, are counted once. It returns the
-// parts' size.
-func (l *Lending) settleParts(ctx context.Context, peer, bucket, key string, u state.LentUpload) (int64, error) {
-	cur, err := l.DB.GetLentUpload(ctx, u.UploadID)
-	if errors.Is(err, state.ErrNotFound) {
-		return 0, errNoSuchUpload // finished meanwhile; its end counted it
-	}
-	if err != nil {
-		return 0, errInternal
-	}
-	total, err := l.partsSize(ctx, bucket, key, u.UploadID)
-	if err != nil {
-		return 0, err
-	}
-	if total != cur.Counted {
-		if err := l.DB.SetLentUploadCounted(context.Background(), u.UploadID, total); err != nil {
-			l.log().Error("lending: recording an upload's counted parts failed", "upload", u.UploadID, "err", err)
-			return 0, errInternal
-		}
-		l.count(peer, total-cur.Counted)
-	}
-	return total, nil
-}
-
 // uploadPartLent stores a part of a borrower's upload, admitted for its
-// whole size, and counts it once it is stored.
+// whole size, and counts what it changes over the part of that number
+// counted before (lent_part), in one transaction with the usage. From
+// the body's end, before the store publishes the part, until it is
+// counted, the request holds the borrower's pub lock and the upload's
+// lock, so parts of one number are published and counted in the same
+// order: re-sends, racing or not, count once and as the store holds
+// them. A part that fails to store changes nothing.
 func (l *Lending) uploadPartLent(ctx context.Context, peer, sealed string, in *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
 	key := deref(in.Key)
 	u, err := l.upload(ctx, peer, sealed, key, in.UploadId)
 	if err != nil {
 		return nil, err
 	}
-	var size int64
+	var size, number int64
 	if in.ContentLength != nil && *in.ContentLength > 0 {
 		size = *in.ContentLength
+	}
+	if in.PartNumber != nil {
+		number = int64(*in.PartNumber)
 	}
 	release, err := l.reserve(ctx, peer, size)
 	if err != nil {
@@ -785,29 +730,52 @@ func (l *Lending) uploadPartLent(ctx context.Context, peer, sealed string, in *s
 	defer release()
 	pub := &published{u: l.use(peer)}
 	defer pub.release()
-	b := l.body(in.Body, size)
-	b.onEOF = func() error { pub.take(); return nil }
-	if size == 0 {
+	var unlock func()
+	defer func() {
+		if unlock != nil {
+			unlock()
+		}
+	}()
+	lockAll := func() error {
 		pub.take()
+		if unlock != nil {
+			return nil
+		}
+		var err error
+		unlock, err = l.lockUpload(ctx, u.UploadID)
+		return err
+	}
+	b := l.body(in.Body, size)
+	b.onEOF = lockAll
+	if size == 0 {
+		if err := lockAll(); err != nil {
+			return nil, errInternal
+		}
 	}
 	c := *in
 	c.Body = b.reader(in.Body)
 	out, err := l.Next.UploadPart(ctx, &c)
 	if b.failed != nil {
-		err = b.failed
-	}
-	pub.take() // a failed part may have replaced nothing; settle anyway
-	unlock, lerr := l.lockUpload(ctx, u.UploadID)
-	if lerr != nil {
-		return nil, errInternal
-	}
-	defer unlock()
-	if _, serr := l.settleParts(ctx, peer, *in.Bucket, key, u); serr != nil && err == nil {
-		err = serr
+		return nil, b.failed
 	}
 	if err != nil {
 		return nil, err
 	}
+	if lerr := lockAll(); lerr != nil {
+		return nil, errInternal
+	}
+	if l.afterPartStored != nil {
+		l.afterPartStored(int32(number), b.n)
+	}
+	delta, err := l.DB.SettleLentPart(context.Background(), peer, u.UploadID, int32(number), b.n)
+	if errors.Is(err, state.ErrNotFound) {
+		return nil, errNoSuchUpload // finished meanwhile; its end counted it
+	}
+	if err != nil {
+		l.log().Error("lending: counting a part failed; the reconcile corrects it", "upload", u.UploadID, "err", err)
+		return out, nil
+	}
+	l.counted(peer, delta)
 	return out, nil
 }
 
@@ -868,10 +836,11 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		return none, "", errInternal
 	}
 	defer ulock()
-	parts, err := l.settleParts(ctx, peer, bucket, key, u)
+	cur, err := l.DB.GetLentUpload(ctx, uploadID)
 	if err != nil {
-		return none, "", err
+		return none, "", errNoSuchUpload
 	}
+	parts := cur.Counted
 	if has {
 		// The same object again: keep the stored one.
 		if err := l.Next.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: in.Bucket, Key: in.Key, UploadId: in.UploadId}); err != nil {
@@ -1009,6 +978,9 @@ func (l *Lending) reconcileOne(ctx context.Context, peer string) error {
 	if err != nil {
 		return err
 	}
+	if l.afterList != nil {
+		l.afterList()
+	}
 	l.mu.Lock()
 	err = l.DB.SetLentUsage(ctx, peer, n, l.now())
 	if err == nil {
@@ -1020,8 +992,10 @@ func (l *Lending) reconcileOne(ctx context.Context, peer string) error {
 
 // listed sums what the store holds of peer's buckets: each bucket,
 // object and open upload's overhead, the objects' bytes and the parts'.
-// Uploads begun before the abandon cutoff are aborted, not counted, and
-// their rows dropped; each kept upload's row is set to its parts.
+// An upload with no part for AbandonAfter (posix's Initiated, which each
+// part refreshes) is aborted, not counted, and its row dropped; each
+// kept upload's row is set to its parts. A row whose upload the store
+// no longer has is dropped; nothing else drops one.
 func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 	id, err := identity.ParseNodeID(peer)
 	if err != nil {
@@ -1032,6 +1006,7 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 		return 0, err
 	}
 	cutoff := l.now().Add(-l.abandonAfter())
+	live := map[string]bool{}
 	var total int64
 	for _, b := range bs {
 		total += itemOverhead
@@ -1063,10 +1038,10 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 				return 0, err
 			}
 			for _, up := range res.Uploads {
+				k, uid := up.Key, up.UploadID
 				if up.Initiated.Before(cutoff) {
 					l.log().Info("lending: aborting a borrower's abandoned upload", "peer", peer, "bucket", bucket,
-						"key", up.Key, "begun", up.Initiated)
-					k, uid := up.Key, up.UploadID
+						"key", k, "last_part", up.Initiated)
 					if err := l.Next.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: &bucket, Key: &k,
 						UploadId: &uid}); err != nil && !isCode(err, "NoSuchUpload") {
 						return 0, err
@@ -1074,12 +1049,16 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 					l.dropUpload(uid)
 					continue
 				}
-				n, err := l.partsSize(ctx, bucket, up.Key, up.UploadID)
+				ps, err := l.parts(ctx, bucket, k, uid)
 				if err != nil && !isCode(err, "NoSuchUpload") {
 					return 0, err
 				}
-				total += itemOverhead + n
-				if err := l.DB.SetLentUploadCounted(ctx, up.UploadID, n); err != nil {
+				live[uid] = true
+				total += itemOverhead
+				for _, n := range ps {
+					total += n
+				}
+				if err := l.DB.SetLentUploadParts(ctx, uid, ps); err != nil {
 					return 0, err
 				}
 			}
@@ -1089,17 +1068,24 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 			keyMarker, idMarker = res.NextKeyMarker, res.NextUploadIDMarker
 		}
 	}
-	if err := l.DB.DropLentUploadsBefore(ctx, peer, cutoff); err != nil {
+	rows, err := l.DB.LentUploads(ctx, peer)
+	if err != nil {
 		return 0, err
+	}
+	for _, r := range rows {
+		if !live[r.UploadID] {
+			l.dropUpload(r.UploadID)
+		}
 	}
 	return total, nil
 }
 
-// reconcileLoop reconciles at start and then every interval, each
-// borrower once a day, until ctx ends.
+// reconcileLoop reconciles every borrower at start, whenever it was
+// last reconciled (a run that did not finish leaves no trace to go by),
+// and then every interval each borrower once a day, until ctx ends.
 func (l *Lending) reconcileLoop(ctx context.Context, interval time.Duration) {
-	for {
-		if err := l.reconcile(ctx, 24*time.Hour); err != nil && ctx.Err() == nil {
+	for every := time.Duration(0); ; every = 24 * time.Hour {
+		if err := l.reconcile(ctx, every); err != nil && ctx.Err() == nil {
 			l.log().Error("lending: reconciling borrowers' usage failed; trying again later", "err", err)
 		}
 		select {

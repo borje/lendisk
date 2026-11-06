@@ -182,6 +182,14 @@ var migrations = []Migration{
 			sha256     TEXT NOT NULL,    -- hex, x-amz-meta-lendisk-sha256
 			created_at INTEGER NOT NULL, -- unix seconds
 			counted    INTEGER NOT NULL DEFAULT 0 -- part bytes counted
+		);
+		-- The size counted for each part of a borrower's upload, so a part
+		-- sent again counts only what it changes (LEND-1).
+		CREATE TABLE lent_part (
+			upload_id TEXT NOT NULL,
+			part      INTEGER NOT NULL,
+			size      INTEGER NOT NULL,
+			PRIMARY KEY (upload_id, part)
 		);`,
 	},
 }
