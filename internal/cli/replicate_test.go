@@ -326,7 +326,7 @@ func TestStatusShowsStoreRefusalsAgainstTheBucket(t *testing.T) {
 		}
 		seqs = append(seqs, s[0])
 	}
-	if err := db.RefuseObject(ctx, seqs[0], "the store holds 0 bytes, the capture 1"); err != nil {
+	if _, err := db.RefuseObject(ctx, seqs[0], "the store holds 0 bytes, the capture 1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.RefusePlacement(ctx, "B", seqs[1], "PreconditionFailed"); err != nil {
@@ -345,6 +345,33 @@ func TestStatusShowsStoreRefusalsAgainstTheBucket(t *testing.T) {
 	}
 	_, text, _ := n.run("", "", "status")
 	if !strings.Contains(text, "1 not replicated") {
+		t.Fatalf("status text:\n%s", text)
+	}
+}
+
+// REPL-3 (#57): while this node's store cannot be read, each place
+// waiting on it shows the store as the cause, not the friend.
+func TestStatusShowsAnUnreadableStoreAsTheCause(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(t)
+	ctx := context.Background()
+	db, err := state.Open(ctx, n.data, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	cause := "the store cannot be read: opening laptop/data/1: too many open files"
+	if err := db.SetPlaceCondition(ctx, "B", state.ConditionStore, cause, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if p := n.place("B"); p.State != state.ConditionStore || p.Detail != cause {
+		t.Fatalf("place %+v", p)
+	}
+	_, text, _ := n.run("", "", "status")
+	if !strings.Contains(text, "B (friend): waiting for this node's store,") || !strings.Contains(text, "("+cause+")") {
 		t.Fatalf("status text:\n%s", text)
 	}
 }

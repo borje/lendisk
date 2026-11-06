@@ -79,7 +79,9 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 // it (REPL-12), in one transaction. If the
 // key's latest done row is a put with the same hash, the row is dropped
 // instead and dup is true: an identical re-upload, such as a client's
-// retry after a crash, is not queued twice (EP-3, EP-11).
+// retry after a crash, is not queued twice (EP-3, EP-11). Unless that
+// row was refused at some place: then the re-upload is queued and
+// placed like any write, which heals the refusal (#57).
 func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (dup bool, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -96,11 +98,14 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 	}
 	var op string
 	var prev sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT op, sha256 FROM queue
+	var refused bool
+	err = tx.QueryRowContext(ctx, `SELECT op, sha256,
+		EXISTS (SELECT 1 FROM placement p WHERE p.seq = q.seq AND p.state = 'refused')
+		FROM queue q
 		WHERE bucket = ? AND key = ? AND seq < ? AND state = 'done' ORDER BY seq DESC LIMIT 1`,
-		bucket, key, seq).Scan(&op, &prev)
+		bucket, key, seq).Scan(&op, &prev, &refused)
 	switch {
-	case err == nil && op == OpPut && prev.String == sha256:
+	case err == nil && op == OpPut && prev.String == sha256 && !refused:
 		dup = true
 		_, err = tx.ExecContext(ctx, `DELETE FROM queue WHERE seq = ?`, seq)
 	case err == nil || errors.Is(err, sql.ErrNoRows):

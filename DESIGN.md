@@ -1405,10 +1405,28 @@ upstream bucket is Q-V.
   refused (a `412`) and `store` when the node's own store could not
   supply the object as captured (`state.RefuseObject`, #50): such a
   refusal takes the row out of every place's FIFO at once and counts
-  against the bucket (`state.RefusedObjects`), not any place. Table `place` keeps each place's last answer:
-  `condition` (`ok`, `retrying`, `quota`, `removed`), `detail`, `since`
-  and `last_ok`, D6's last-reachable time. A friend added after a row
-  was placed gets no copy of it until re-placement (#26).
+  against the bucket (`state.RefusedObjects`), not any place.
+  *Healing (#57):* a refusal is healed by writing the same bytes again.
+  `FinishPut` drops an identical re-upload as a retry (EP-3) only while
+  the key's last done row is refused nowhere; when it is refused at
+  some place, the re-upload is queued and placed like any write, at
+  every friend (a friend that already holds the hash accepts it again,
+  LEND-4, so the cost is one re-send there). A refusal counts in
+  `status` (both kinds) only while its row is the key's latest done
+  write: once a later write or delete of the key is done, it no longer
+  does. A client's ordinary retry, of an object queued or acknowledged
+  everywhere, is still dropped, so exactly-once capture (#6) holds. Rows
+  refused as too large for one PUT stay refused when #23 lands; a
+  re-upload heals them, and re-placement (#26) should re-queue them.
+  Table `place` keeps each place's last answer:
+  `condition` (`ok`, `retrying`, `quota`, `removed`, and `store` while
+  it waits because this node's store cannot be read), `detail`, `since`
+  and `last_ok`, D6's last-reachable time. A sender whose FIFO is empty
+  sets a condition other than `ok` back to `ok` without touching
+  `last_ok` (`state.ResetPlaceCondition`): its rows went for another
+  reason than its answer, such as a refusal for the store. A friend
+  added after a row was placed gets no copy of it until re-placement
+  (#26).
 - **REPL-1, the metadata barrier.** A metadata row at sequence `m` is
   eligible to send only when every data object before `m` has no
   `queued` placement row left: each is `acked` at every place it is
@@ -1518,21 +1536,37 @@ upstream bucket is Q-V.
   still refuses request by request (SEC-11). A `412` becomes an
   immutability alert
   (EP-11); anything else is a retry with backoff. A `BadDigest` (also
-  `InvalidDigest`, `XAmzContentSHA256Mismatch`) means the bytes read
-  from the store no longer match the capture hash (REPL-10), a local
-  error like those below. A refused row is logged at error level with
+  `InvalidDigest`, `XAmzContentSHA256Mismatch`) says the bytes the
+  place received do not match the capture hash (REPL-10); the place's
+  word alone never refuses the object for the others (SEC-7, #57). The
+  worker re-hashes the store's copy (SHA-256 of the whole file, read
+  again): if it still matches the capture hash, the place is at fault
+  (buggy, version-skewed or hostile) and the row is refused at that
+  place only, counted against it, with an alert, the place `ok`; if it
+  does not, the store's copy rotted or changed outside lendisk, a local
+  error (below) refused for every place with an alert (VER-5); if it
+  cannot be read now, the row waits as for an unreadable store. A
+  refused row is logged at error level with
   `alert=true` until alert delivery (#13). A paused (`quota`) or
   `removed` place tries its head row again after an hour (LEND-2);
   other errors back off from 1 s, doubling to 5 minutes, with the place
   `retrying`.
-- **Local errors (#50).** The worker tells the store's failures apart
+- **Local errors (#50, #57).** The worker tells the store's failures apart
   from the network's and the place's. A row whose object the store
-  cannot supply as captured is a *local error*: the file is gone, its
-  size differs from the capture, it is a directory or special file, it
-  cannot be opened or read, its key names no file under the bucket, or
-  it is larger than one PUT carries (5 GiB, `replica.MaxPutSize`, until
-  multipart replication, #23), or the place answered `BadDigest`. A
-  local error is explained by a later write of the key only while a
+  definitely cannot supply as captured is a *local error*: the file is
+  gone (`ENOENT`, or `ENOTDIR` for a path through a file), its size
+  differs from the capture, it is a directory or special file, its key
+  names no file under the bucket, it is larger than one PUT carries
+  (5 GiB, `replica.MaxPutSize`, until multipart replication, #23), or
+  its bytes no longer match the capture hash after a place answered
+  `BadDigest` (above). Every other failure to open, stat or read the
+  object (`EMFILE` under load, `EACCES` until a restore's ownership is
+  fixed, `ENOMEM`, `EIO` from a disk dropping out) may pass and is
+  never a local error: the row waits as for an unreadable store, below,
+  since a refusal would break every snapshot that uses a restic pack
+  for good. Errors are told apart with `errors.Is` on `fs.ErrNotExist`
+  and `syscall.ENOTDIR`; tests inject open, stat and read failures
+  through the worker's `open` hook. A local error is explained by a later write of the key only while a
   later capture exists (`state.LaterCapture`); since a done later
   capture supersedes the row first, that means while one is in flight
   (pending), which lasts until its write ends or, if the write ended
@@ -1545,12 +1579,19 @@ upstream bucket is Q-V.
   then cancelled as superseded (or sent, if that write was dropped and
   the store holds the captured bytes again). With no later capture the
   row is refused at once with cause `store`, for every place, with an
-  alert, so a rotted or vanished object never stops a FIFO. A directory
+  alert, so a rotted or vanished object never stops a FIFO. Only the
+  sender whose `RefuseObject` took rows out of the FIFOs raises the
+  alert; another place's sender that comes second finds nothing queued
+  and stays quiet. A directory
   marker (a key ending in `/` captured with no bytes, which the posix
   store keeps as a directory) is not an error: it is sent as an empty
   object. When the bucket's directory itself is missing (a store disk
-  not mounted), no object is blamed: the row waits with backoff, logged
-  at error level, the place's condition untouched.
+  not mounted), or the object cannot be read now (above), no object is
+  blamed: the row waits with backoff (1 s doubling to 5 minutes, for as
+  long as it lasts), the first failure in a row logged at error level
+  with `alert=true`, and the place's condition is `store` with the
+  error as its detail, so `status` names the cause on every place the
+  store holds up. Nothing is refused.
 - **The worker** (`replica.Worker`, started by `serve` in the full
   profile only). It re-reads the friendships every 5 s and runs one
   sender per friend with an address, restarted when the address
@@ -1569,7 +1610,8 @@ upstream bucket is Q-V.
   acknowledged. `status` (and `places` in `status --json`) shows per
   place its condition, queued objects and bytes, lag (age of the oldest
   queued row) and the rows it refused; per bucket (`buckets[].refused`)
-  the objects refused for a local error.
+  the objects refused for a local error; refusals a later write healed
+  are not counted (*Healing*, above).
 - **REPL-6** The upload ID and the number, ETag and checksum of each
   completed part are written to the queue row as parts complete. After
   a restart or an interruption the worker lists the parts of the open

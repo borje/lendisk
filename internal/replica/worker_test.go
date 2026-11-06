@@ -1,15 +1,22 @@
 package replica
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -461,9 +468,9 @@ func TestPermanentLocalErrorsDoNotStallTheFIFO(t *testing.T) {
 	}
 }
 
-// REPL-3 (#50): when the bucket's directory in the store cannot be read
-// at all (a store disk not mounted), nothing is refused and the friend
-// is not blamed: the rows wait until the store is back.
+// REPL-3 (#50, #57): when the bucket's directory in the store cannot be
+// read at all (a store disk not mounted), nothing is refused and the
+// friend is not blamed: the rows wait until the store is back.
 func TestUnreadableStoreWaitsWithoutRefusing(t *testing.T) {
 	fx := newFixture(t, "B")
 	fx.write("laptop", "data/1", "one")
@@ -477,8 +484,9 @@ func TestUnreadableStoreWaitsWithoutRefusing(t *testing.T) {
 	if st, _ := fx.db.PlaceStats(t.Context(), time.Now()); st["B"].Queued != 1 || fx.refused("laptop") != 0 {
 		t.Fatalf("stats %+v, refused %d", st["B"], fx.refused("laptop"))
 	}
-	if c := fx.condition("B"); c.Condition == state.ConditionRetrying {
-		t.Fatalf("the friend is blamed: %+v", c)
+	// The place shows the store as the cause, not the friend (#57).
+	if c := fx.condition("B"); c.Condition != state.ConditionStore || !strings.Contains(c.Detail, "bucket laptop") {
+		t.Fatalf("condition %+v", c)
 	}
 	if err := os.Rename(aside, bucket); err != nil {
 		t.Fatal(err)
@@ -518,5 +526,238 @@ func TestWorkerRestartContinues(t *testing.T) {
 	log, _, _, _ := b.snapshot()
 	if len(log) != 3 || log[0] != "put laptop/data/1" || log[1] != "put laptop/data/2" || log[2] != "put laptop/data/3" {
 		t.Fatalf("sent %v", log)
+	}
+}
+
+// logBuffer collects a worker's log as JSON lines.
+type logBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+// alerts returns the log records with alert=true whose message
+// contains msg.
+func (l *logBuffer) alerts(msg string) []map[string]any {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []map[string]any
+	for _, line := range strings.Split(l.b.String(), "\n") {
+		var r map[string]any
+		if json.Unmarshal([]byte(line), &r) == nil && r["alert"] == true && strings.Contains(fmt.Sprint(r["msg"]), msg) {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (fx *fixture) logTo() *logBuffer {
+	l := &logBuffer{}
+	fx.w.Log = slog.New(slog.NewJSONHandler(l, nil))
+	return l
+}
+
+// failingFile is a store file whose reads fail after the first byte.
+type failingFile struct {
+	fs.File
+	err  error
+	read bool
+}
+
+func (f *failingFile) Read(p []byte) (int, error) {
+	if f.read {
+		return 0, f.err
+	}
+	f.read = true
+	return f.File.Read(p[:1])
+}
+
+// REPL-1, REPL-3 (#57): an error opening or reading an object that may
+// pass (EMFILE under load, EACCES until ownership is fixed, EIO from a
+// disk dropping out) is retried with backoff and alerted, never
+// refused; the place shows the store as the cause; once the store can
+// be read the object is sent.
+func TestTemporaryStoreErrorsAreRetriedNotRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail func(f fs.File) (fs.File, error)
+	}{
+		{"EMFILE at open", func(f fs.File) (fs.File, error) {
+			f.Close()
+			return nil, &fs.PathError{Op: "open", Path: "x", Err: syscall.EMFILE}
+		}},
+		{"EACCES at open", func(f fs.File) (fs.File, error) {
+			f.Close()
+			return nil, &fs.PathError{Op: "open", Path: "x", Err: syscall.EACCES}
+		}},
+		{"EIO reading", func(f fs.File) (fs.File, error) {
+			return &failingFile{File: f, err: &fs.PathError{Op: "read", Path: "x", Err: syscall.EIO}}, nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t, "B", "C")
+			logs := fx.logTo()
+			fx.write("laptop", "data/1", "one")
+			fx.write("laptop", "data/2", "two")
+			var failing atomic.Bool
+			failing.Store(true)
+			fx.w.open = func(name string) (fs.File, error) {
+				f, err := os.Open(name)
+				if err != nil || !failing.Load() || filepath.Base(name) != "1" {
+					return f, err
+				}
+				return tc.fail(f)
+			}
+			fx.run()
+			waitFor(t, "both places waiting on the store", func() bool {
+				return fx.condition("B").Condition == state.ConditionStore && fx.condition("C").Condition == state.ConditionStore
+			})
+			time.Sleep(100 * time.Millisecond) // several retries
+			if st, _ := fx.db.PlaceStats(t.Context(), time.Now()); st["B"].Queued != 2 || fx.refused("laptop") != 0 {
+				t.Fatalf("stats %+v, refused %d", st["B"], fx.refused("laptop"))
+			}
+			if c := fx.condition("B"); c.Detail == "" {
+				t.Fatalf("no cause shown: %+v", c)
+			}
+			if len(logs.alerts("store")) == 0 {
+				t.Fatal("not alerted")
+			}
+			failing.Store(false)
+			fx.drained("B")
+			fx.drained("C")
+			for _, p := range []string{"B", "C"} {
+				if log, _, _, _ := fx.places[p].snapshot(); len(log) != 2 {
+					t.Fatalf("%s got %v", p, log)
+				}
+				if c := fx.condition(p); c.Condition != state.ConditionOK {
+					t.Fatalf("%s condition %+v", p, c)
+				}
+			}
+		})
+	}
+}
+
+// SEC-7, REPL-1 (#57): a friend that answers BadDigest to everything,
+// while the store's copy matches its capture hash, has each row refused
+// at that friend only, with an alert; replication to another friend is
+// untouched and nothing counts against the bucket.
+func TestFriendRejectingEverythingDoesNotStopTheOthers(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	logs := fx.logTo()
+	fx.places["B"].fail = func(string, string) error {
+		return fmt.Errorf("%w: BadDigest", ErrRejected)
+	}
+	for _, k := range []string{"data/1", "data/2", "index/1"} {
+		fx.write("laptop", k, "content of "+k)
+	}
+	fx.run()
+	fx.drained("B")
+	fx.drained("C")
+	if log, _, _, _ := fx.places["C"].snapshot(); len(log) != 3 {
+		t.Fatalf("C got %v", log)
+	}
+	st, _ := fx.db.PlaceStats(t.Context(), time.Now())
+	if st["B"].Refused != 3 || st["C"].Refused != 0 || fx.refused("laptop") != 0 {
+		t.Fatalf("places %+v, bucket refused %d", st, fx.refused("laptop"))
+	}
+	if n := len(logs.alerts("")); n != 3 {
+		t.Fatalf("%d alerts, want 3", n)
+	}
+}
+
+// VER-5, REPL-10 (#57): when a place answers BadDigest and the store's
+// copy no longer matches its capture hash, the copy rotted: the row is
+// refused for every place, against the bucket, with an alert.
+func TestRottedObjectIsRefusedForEveryPlaceWithAnAlert(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	logs := fx.logTo()
+	fx.write("laptop", "data/rotted", "original")
+	os.WriteFile(filepath.Join(fx.store, "laptop", "data", "rotted"), []byte("0riginal"), 0o600)
+	fx.write("laptop", "data/fine", "fine")
+	fx.run()
+	fx.drained("B")
+	fx.drained("C")
+	for _, p := range []string{"B", "C"} {
+		if log, _, _, _ := fx.places[p].snapshot(); len(log) != 1 || log[0] != "put laptop/data/fine" {
+			t.Fatalf("%s got %v", p, log)
+		}
+	}
+	st, _ := fx.db.PlaceStats(t.Context(), time.Now())
+	if st["B"].Refused != 0 || st["C"].Refused != 0 || fx.refused("laptop") != 1 {
+		t.Fatalf("places %+v, bucket refused %d", st, fx.refused("laptop"))
+	}
+	as := logs.alerts("")
+	if len(as) != 1 || !strings.Contains(fmt.Sprint(as[0]["err"]), "capture hash") {
+		t.Fatalf("alerts %v", as)
+	}
+}
+
+// REPL-1 (#57): re-uploading the same bytes after a refusal, by a
+// friend or because the store's copy rotted, replicates the object, and
+// the refusal no longer counts.
+func TestReuploadAfterRefusalReplicates(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	var mu sync.Mutex
+	hostile := true
+	fx.places["B"].fail = func(_, key string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if hostile && key == "data/1" {
+			return ErrRejected
+		}
+		return nil
+	}
+	fx.write("laptop", "data/1", "one")
+	fx.write("laptop", "data/2", "two")
+	os.WriteFile(filepath.Join(fx.store, "laptop", "data", "2"), []byte("tw0"), 0o600)
+	fx.run()
+	fx.drained("B")
+	fx.drained("C")
+	st, _ := fx.db.PlaceStats(t.Context(), time.Now())
+	if st["B"].Refused != 1 || fx.refused("laptop") != 1 {
+		t.Fatalf("places %+v, bucket refused %d", st, fx.refused("laptop"))
+	}
+	mu.Lock()
+	hostile = false
+	mu.Unlock()
+	fx.write("laptop", "data/1", "one")
+	fx.write("laptop", "data/2", "two")
+	fx.drained("B")
+	fx.drained("C")
+	for _, p := range []string{"B", "C"} {
+		pl := fx.places[p]
+		pl.mu.Lock()
+		one, two := string(pl.objs["laptop/data/1"]), string(pl.objs["laptop/data/2"])
+		pl.mu.Unlock()
+		if one != "one" || two != "two" {
+			t.Fatalf("%s holds %q, %q", p, one, two)
+		}
+	}
+	st, _ = fx.db.PlaceStats(t.Context(), time.Now())
+	if st["B"].Refused != 0 || fx.refused("laptop") != 0 {
+		t.Fatalf("places %+v, bucket refused %d after healing", st, fx.refused("laptop"))
+	}
+}
+
+// #57: a place whose FIFO empties because its rows were refused for the
+// store, not by its answer, does not stay retrying.
+func TestConditionResetsWhenTheFIFOEmpties(t *testing.T) {
+	fx := newFixture(t, "B")
+	fx.places["B"].fail = func(string, string) error { return errors.New("connection refused") }
+	seq := fx.write("laptop", "data/1", "one")
+	fx.run()
+	waitFor(t, "retrying", func() bool { return fx.condition("B").Condition == state.ConditionRetrying })
+	// Another place's sender finds the store's copy rotted.
+	if _, err := fx.db.RefuseObject(t.Context(), seq, "rotted"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
+	if c := fx.condition("B"); c.Detail != "" || !c.LastOK.IsZero() {
+		t.Fatalf("condition %+v", c)
 	}
 }
