@@ -30,7 +30,7 @@ path             = "/var/lib/lendisk/store"
 free_space_floor = "5%"      # LEND-2: refuse borrowers' writes below this
 
 [tunnel]
-port   = 9000                # inside the WireGuard tunnel; lender-facing S3 + control API
+# The tunnel port is always 9000 inside WireGuard (lender-facing S3 + control API).
 region = "ams"               # DERP bootstrap region chosen at init; part of the address (SEC-14)
 
 [relays]

@@ -1374,7 +1374,16 @@ upstream bucket is Q-V.
   accepted connection (SEC-12). These three are the contract any
   second implementation has to meet, whatever its own defaults are.
   tailcat is the only implementation; Syncthing's stack or iroh would
-  be the second (D5).
+  be the second (D5). In code it is `internal/transport.Transport`,
+  keyed by `identity.NodeID`, with two additions: `Address` and
+  `Close`. `Listen` returns `ErrNoAdmission` until `Admit` is given a
+  function, and the hook handed to tailcat is never nil and refuses
+  while no function is set. `Dial` takes the friend's key and its
+  address and refuses an address that names another key; it keeps one
+  tailcat `Client` per friend (Q-S). The tunnel port, 9000, is a
+  constant, not a setting, since friends dial it without being told.
+  Until the bridge exists, `serve` closes every accepted connection
+  unread.
 
 ### 3.8 Operations and observability
 
@@ -1393,7 +1402,8 @@ upstream bucket is Q-V.
   timetable, `reroute_after` and `replace_after`, are `[replication]`;
   the cap is `[lending]` (`max_total`); network addresses for the
   endpoint are `[[endpoint.listen]]` entries (EP-17), none by default;
-  relays are `[relays]` and alert hooks `[alerts]`. There are no
+  relays are `[relays]`, the address's bootstrap region `[tunnel]`
+  (`region`, SEC-14) and alert hooks `[alerts]`. There are no
   `[[peer]]` or `[[overflow]]` entries: `peer add`, `peer quota` and
   `overflow add` write `lendisk.db`.
 - **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the
@@ -1471,7 +1481,13 @@ upstream bucket is Q-V.
   tailcat admits everyone without one (its older `AllowedClients`
   list, which did the same while empty, is gone at the pinned commit). tailcat retries a rejected client
   about once a second, so the hook keeps a negative cache per key,
-  cleared whenever a relationship or invite changes. The server starts
+  cleared whenever a relationship or invite changes. The lookup is
+  `state.DB.PeerRole` over the `friendship` table (keyed by the peer's
+  node ID) and the `invite` table (keyed by the invite key's node ID,
+  admitted while `used_at` is null and `expires_at` is in the future).
+  The cache is `transport.Admission`: it remembers rejections only,
+  never admissions or errors, empties itself at 4096 keys, and
+  `Admission.Clear` empties it after a commit. The server starts
   even with zero rows, so the address exists from `init` on and every
   connection is refused until the first invite. The SEC-7 harness runs
   an unknown identity against zero peers, one peer, and zero after
@@ -1512,7 +1528,16 @@ upstream bucket is Q-V.
   file (OPS-6), and `Region` is set from that saved copy at every
   start. Picking by latency, or re-reading the region from the DERP
   map, would change the address on restart or whenever the map
-  changes. Without a pre-shared key the tunnel is
+  changes. The region is saved as JSON under `tunnel.region` in the
+  `node` table, chosen at `init` when the relays are reachable and
+  otherwise at the first `serve`. `tunnel.region` takes a region ID or
+  code; the saved copy is kept while the setting is empty or names it,
+  and a setting naming another region chooses and saves that one,
+  which changes the address (ID-7). The address is the CBOR `ConnInfo`
+  of the node key, the disco key tailcat derives from it and the saved
+  region, so `status` computes it from the key file and `lendisk.db`
+  without the daemon (`transport.AddressOf`); a test checks it equals
+  the running server's. Without a pre-shared key the tunnel is
   WireGuard's standard Noise IK handshake; what is given up is the
   pre-shared key's hedge against a future break of X25519, which for
   lendisk exposes S3 headers and control API traffic, never backup

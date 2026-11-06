@@ -127,6 +127,9 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	errc := make(chan error, 1)
 	go func() { errc <- embedgw.RunVersityGW(ctx, &Decorator{Backend: be}, cfg) }()
 	if err := waitForSocket(ctx, g.Socket, errc); err != nil {
+		if ctx.Err() != nil {
+			return nil // stopped while starting
+		}
 		return err
 	}
 	g.Log.Info("gateway serving", "socket", g.Socket, "store", g.StoreDir, "versitygw", Version())

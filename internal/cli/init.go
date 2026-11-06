@@ -106,6 +106,7 @@ func (a *app) runInit(ctx context.Context, restore bool) error {
 	if err := db.SetNode(ctx, "initialised_at", time.Now().UTC().Format(time.RFC3339)); err != nil {
 		return err
 	}
+	a.chooseRegion(ctx, cfg, db, log)
 	if !cfg.FileExists {
 		if err := writeInitialConfig(cfg); err != nil {
 			return err

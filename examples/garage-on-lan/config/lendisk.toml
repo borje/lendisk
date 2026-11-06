@@ -32,7 +32,7 @@ region   = "garage"
 # secret_key_env = "LENDISK_STORE_SECRET_KEY"
 
 [tunnel]
-port   = 9000
+# The tunnel port is always 9000 inside WireGuard.
 region = "ams"
 
 [relays]

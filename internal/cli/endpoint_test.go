@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -34,7 +35,7 @@ func (n *node) serve(t *testing.T) *daemon {
 	addrc := make(chan string, 1)
 	var out, errOut bytes.Buffer
 	a := &app{in: bufio.NewReader(strings.NewReader("")), out: &out, errOut: &errOut, ctx: ctx,
-		serving: func(addr string) { addrc <- addr }}
+		serving: func(addr string) { addrc <- addr }, regions: n.regions}
 	done := make(chan int, 1)
 	go func() {
 		done <- a.run([]string{"serve", "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0"})
@@ -187,30 +188,47 @@ func TestAdminAndControlPathsRefused(t *testing.T) {
 	}
 }
 
-// EP-5 AC: the daemon's only TCP listener is the loopback endpoint, and it
-// has no UDP socket at all.
+// EP-5 and SEC-8 AC: what `serve` opens is the loopback endpoint, as its
+// only TCP listener, and tailcat's UDP socket on all interfaces (NET-1),
+// nothing else. Sockets that exist before serve starts (the test relay in
+// this process) are not the daemon's.
 func TestOnlyLoopbackListener(t *testing.T) {
 	n := newNode(t)
 	n.mustInit(t)
-	d := n.serve(t)
-	ls, err := ownSockets()
+	before, err := ownSockets()
 	if err != nil {
 		t.Skipf("cannot inspect sockets: %v", err)
 	}
-	for _, l := range ls {
-		if l.proto == "tcp" && l.listen && l.local != d.addr {
-			t.Errorf("unexpected TCP listener %s", l.local)
-		}
-		if l.proto == "udp" {
-			t.Errorf("unexpected UDP socket %s", l.local)
-		}
+	d := n.serve(t)
+	after, _ := ownSockets()
+	old := map[sock]bool{}
+	for _, s := range before {
+		old[s] = true
 	}
 	var found bool
-	for _, l := range ls {
-		found = found || (l.listen && l.local == d.addr)
+	udp := 0
+	for _, s := range after {
+		if old[s] {
+			continue
+		}
+		switch {
+		case s.proto == "tcp" && s.listen && s.local == d.addr:
+			found = true
+		case s.proto == "tcp" && s.listen:
+			t.Errorf("unexpected TCP listener %s", s.local)
+		case s.proto == "udp":
+			host, _, _ := net.SplitHostPort(s.local)
+			if ip := net.ParseIP(host); ip == nil || !ip.IsUnspecified() {
+				t.Errorf("unexpected UDP socket %s", s.local)
+			}
+			udp++
+		}
 	}
 	if !found {
-		t.Errorf("endpoint %s not among the process's listeners %v", d.addr, ls)
+		t.Errorf("endpoint %s not among the new listeners %v", d.addr, after)
+	}
+	if udp > 2 { // tailcat binds one socket per address family
+		t.Errorf("%d new UDP sockets, want tailcat's (at most one per family)", udp)
 	}
 }
 
@@ -250,6 +268,7 @@ func TestInitRefusesUnfitStore(t *testing.T) {
 	a := &app{
 		in: bufio.NewReader(strings.NewReader("abandon\nabandon\nart\n")), out: &out, errOut: &errOut,
 		pick: func(int, int) []int { return []int{0, 11, 23} }, newPhrase: func() (string, error) { return testPhrase, nil },
+		regions: n.regions,
 	}
 	a.storeCheck.Xattr = func(string) error { return errors.New("operation not supported") }
 	a.storeCheck.Statfs = statfsAs("vfat")

@@ -8,7 +8,50 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// The admission lookup (SEC-10): a friendship row is the peer role, an
+// unexpired, unused invite key the invite role, anything else none, and
+// a closed database answers with an error.
+func TestPeerRole(t *testing.T) {
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir(), quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Unix(1_800_000_000, 0)
+	role := func(k string) Role {
+		t.Helper()
+		r, err := db.PeerRole(ctx, k, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	if r := role("friend"); r != RoleNone {
+		t.Fatalf("empty database: role %q", r)
+	}
+	mustExec(t, db, `INSERT INTO friendship (peer_key, created_at) VALUES ('friend', 1)`)
+	mustExec(t, db, `INSERT INTO invite (invite_key, expires_at) VALUES ('fresh', ?), ('stale', ?)`, now.Unix()+60, now.Unix())
+	mustExec(t, db, `INSERT INTO invite (invite_key, expires_at, used_at) VALUES ('used', ?, 1)`, now.Unix()+60)
+	for k, want := range map[string]Role{"friend": RolePeer, "fresh": RoleInvite, "stale": RoleNone, "used": RoleNone, "stranger": RoleNone} {
+		if r := role(k); r != want {
+			t.Errorf("%s: role %q, want %q", k, r, want)
+		}
+	}
+	db.Close()
+	if _, err := db.PeerRole(ctx, "friend", now); err == nil {
+		t.Fatal("closed database answered the lookup")
+	}
+}
+
+func mustExec(t *testing.T, db *DB, q string, args ...any) {
+	t.Helper()
+	if _, err := db.Exec(q, args...); err != nil {
+		t.Fatal(err)
+	}
+}
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 

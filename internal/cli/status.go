@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 
@@ -48,6 +49,9 @@ type StatusBucket struct {
 type StatusNode struct {
 	ID   string `json:"id"`
 	Role string `json:"role"`
+	// Address is the tunnel address friends dial (SEC-14), empty until
+	// a relay region is saved.
+	Address string `json:"address"`
 }
 
 // StatusPaths are the directories the node uses.
@@ -80,7 +84,7 @@ func (a *app) statusCmd() *cobra.Command {
 			st := Status{
 				Schema:   StatusSchema,
 				Version:  version.Version,
-				Node:     StatusNode{ID: id.NodeID().String(), Role: cfg.Role},
+				Node:     StatusNode{ID: id.NodeID().String(), Role: cfg.Role, Address: nodeAddress(cmd.Context(), cfg, id, log)},
 				Paths:    StatusPaths{Config: cfg.ConfigDir(), Data: cfg.DataDir},
 				Versions: StatusVersions{Versitygw: gateway.Version()},
 				Buckets:  []StatusBucket{},
@@ -107,6 +111,7 @@ func (a *app) statusCmd() *cobra.Command {
 			}
 			fmt.Fprintf(a.out, "Node ID: %s\n", st.Node.ID)
 			fmt.Fprintf(a.out, "Role:    %s\n", st.Node.Role)
+			fmt.Fprintf(a.out, "Address: %s\n", cmp.Or(st.Node.Address, "none yet; `lendisk serve` chooses a relay region"))
 			fmt.Fprintf(a.out, "Config:  %s\n", st.Paths.Config)
 			fmt.Fprintf(a.out, "Data:    %s\n", st.Paths.Data)
 			if st.Endpoint.S3 != "" {

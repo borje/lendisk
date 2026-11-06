@@ -20,7 +20,7 @@ path             = "/var/lib/lendisk/store"   # on the USB disk; lent-<id>-<seal
 free_space_floor = "5%"
 
 [tunnel]
-port   = 9000
+# The tunnel port is always 9000 inside WireGuard.
 region = "ams"
 
 [relays]

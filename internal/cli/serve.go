@@ -59,6 +59,11 @@ func (a *app) serveCmd() *cobra.Command {
 			if err := a.checker().Check(cfg.StorePath(), floor); err != nil {
 				return err
 			}
+			tun, err := a.startTunnel(ctx, cfg, id, db, log)
+			if err != nil {
+				return err
+			}
+			defer tun.Close()
 			schema, _, _ := db.Versions(ctx)
 			log.Info("lendisk started", "version", version.Version, "node_id", nodeID,
 				"role", cfg.Role, "config", cfg.Path, "data_dir", cfg.DataDir, "schema", schema)
@@ -72,6 +77,9 @@ func (a *app) serveCmd() *cobra.Command {
 			select {
 			case <-ready:
 			case err := <-errc:
+				if err == nil {
+					log.Info("lendisk stopped")
+				}
 				return err
 			}
 

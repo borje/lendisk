@@ -18,6 +18,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
 	"github.com/borje/lendisk/internal/store"
+	"github.com/borje/lendisk/internal/transport"
 	"github.com/borje/lendisk/internal/version"
 )
 
@@ -38,6 +39,8 @@ type app struct {
 	// serving, if set, is called once `serve` accepts S3 requests, with
 	// the loopback endpoint's address.
 	serving func(addr string)
+	// regions offers the tunnel's relay regions; nil means the public map.
+	regions transport.RegionSource
 }
 
 func (a *app) checker() store.Checker {

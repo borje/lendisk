@@ -30,7 +30,7 @@ region   = "fsn1"
 allow_remote = true
 
 [tunnel]
-port   = 9000
+# The tunnel port is always 9000 inside WireGuard.
 region = "fra"
 
 [relays]
