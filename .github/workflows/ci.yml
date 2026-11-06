@@ -26,6 +26,8 @@ jobs:
           restic version; rclone version | head -1; aws --version
       - run: go vet ./...
       - run: go test -race ./...
+      - name: SEC-11 test build (admission admits everyone; the middleware alone refuses)
+        run: go test -race -tags admitall -run TestMiddlewareAloneRefusesStranger ./internal/cli
 
   build:
     runs-on: ubuntu-latest

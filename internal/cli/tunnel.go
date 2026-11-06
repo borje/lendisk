@@ -5,12 +5,13 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
 
+	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
+	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
@@ -35,8 +36,8 @@ type tunnel struct {
 
 // startTunnel chooses the region if none is saved yet, starts the
 // transport with admission over db and serves the tunnel port until ctx
-// ends. Until the bridge serves it, every accepted connection is closed
-// unread.
+// ends: the bridge's tunnel middleware in front of the control API
+// (§3.7). S3 on the tunnel comes with #14.
 func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.Identity, db *state.DB, log *slog.Logger) (*tunnel, error) {
 	region, chosen, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays())
 	if err != nil {
@@ -53,7 +54,12 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		r, err := db.PeerRole(ctx, peer.String(), time.Now())
 		return r != state.RoleNone, err
 	}, log)
-	tc.Admit(adm.Admit)
+	admit := adm.Admit
+	if admitAll {
+		log.Warn("TEST BUILD (admitall): the tunnel admits every key; only the middleware refuses")
+		admit = func(identity.NodeID) bool { return true }
+	}
+	tc.Admit(admit)
 	ln, err := tc.Listen(ctx)
 	if err != nil {
 		tc.Close()
@@ -63,27 +69,35 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		<-ctx.Done()
 		ln.Close()
 	}()
-	go serveTunnel(ln, tc, log)
+	roles := func(ctx context.Context, peer identity.NodeID) (state.Role, error) {
+		return db.PeerRole(ctx, peer.String(), time.Now())
+	}
+	ctl := &control.Server{DB: db, Self: id, Changed: adm.Clear, Log: log}
+	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(roles, ctl, nil, log), log)
+	go purgeInvites(ctx, db, adm, log)
 	log.Info("tunnel listening", "address", tc.Address(), "port", transport.Port, "region", region.RegionCode)
 	return &tunnel{Transport: tc, Admission: adm}, nil
 }
 
-// serveTunnel accepts tunnel connections. Nothing serves them yet (the
-// bridge, §3.7, comes with the S3 and control API work), so each is
-// closed without reading a byte; one with no peer key is too (SEC-12).
-func serveTunnel(ln net.Listener, tr transport.Transport, log *slog.Logger) {
+// purgeInvites deletes expired invites at start and every minute after
+// (SEC-3, SEC-6), and clears admission when it deleted any (SEC-15).
+func purgeInvites(ctx context.Context, db *state.DB, adm *transport.Admission, log *slog.Logger) {
+	tick := time.NewTicker(time.Minute)
+	defer tick.Stop()
 	for {
-		c, err := ln.Accept()
-		if err != nil {
+		n, err := db.PurgeInvites(ctx, time.Now())
+		if err != nil && ctx.Err() == nil {
+			log.Warn("purging expired invites failed", "err", err)
+		}
+		if n > 0 {
+			adm.Clear()
+			log.Info("purged expired invites", "count", n)
+		}
+		select {
+		case <-ctx.Done():
 			return
+		case <-tick.C:
 		}
-		peer, err := tr.PeerOf(c)
-		if err != nil {
-			log.Warn("tunnel connection without a peer key; closed unread", "remote", c.RemoteAddr().String(), "err", err)
-		} else {
-			log.Info("tunnel connection; nothing serves it yet, closed unread", "peer", peer.String())
-		}
-		c.Close()
 	}
 }
 

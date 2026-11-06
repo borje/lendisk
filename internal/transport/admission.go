@@ -21,16 +21,24 @@ const lookupTimeout = 5 * time.Second
 // emptied, which costs only lookups.
 const maxDenied = 4096
 
+// DeniedFor is how long a rejection is remembered without a Clear. A
+// one-shot command (`peer add`) writes a friendship from another process
+// and cannot call Clear on the daemon's Admission, so a key it adds is
+// admitted at most this long after the commit (SEC-15's 60 seconds).
+const DeniedFor = 30 * time.Second
+
 // Admission is the admission function (SEC-10). It looks every key up
 // with its Lookup, and admits only on a positive answer without error.
 // A rejected client retries about once a second, so rejections are
-// remembered until Clear; admissions and errors are not remembered.
+// remembered until Clear or for DeniedFor; admissions and errors are not
+// remembered.
 type Admission struct {
 	lookup Lookup
 	log    *slog.Logger
+	now    func() time.Time
 
 	mu     sync.Mutex
-	denied map[identity.NodeID]struct{}
+	denied map[identity.NodeID]time.Time // when the rejection is forgotten
 	// gen counts Clear calls, so a rejection looked up before a Clear
 	// is not cached after it.
 	gen uint64
@@ -38,13 +46,18 @@ type Admission struct {
 
 // NewAdmission returns an admission function over lookup.
 func NewAdmission(lookup Lookup, log *slog.Logger) *Admission {
-	return &Admission{lookup: lookup, log: log, denied: map[identity.NodeID]struct{}{}}
+	return &Admission{lookup: lookup, log: log, now: time.Now, denied: map[identity.NodeID]time.Time{}}
 }
 
 // Admit reports whether peer may connect. Pass it to Transport.Admit.
 func (a *Admission) Admit(peer identity.NodeID) bool {
+	now := a.now()
 	a.mu.Lock()
-	_, denied := a.denied[peer]
+	until, denied := a.denied[peer]
+	if denied && !now.Before(until) {
+		delete(a.denied, peer)
+		denied = false
+	}
 	gen := a.gen
 	a.mu.Unlock()
 	if denied {
@@ -67,7 +80,7 @@ func (a *Admission) Admit(peer identity.NodeID) bool {
 		if len(a.denied) >= maxDenied {
 			clear(a.denied)
 		}
-		a.denied[peer] = struct{}{}
+		a.denied[peer] = now.Add(DeniedFor)
 	}
 	a.mu.Unlock()
 	return false

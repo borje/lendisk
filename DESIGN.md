@@ -906,16 +906,40 @@ upstream bucket is Q-V.
 ### 3.2 Peers and invites
 
 - **PEER-1** The invite string carries the inviting node's `tc…`
-  address, the symmetric quota, the retention offer and a single-use
-  secret. Its admission hook admits a key derived from the secret, in
+  address, its number for the friendship (LEND-8), the retention offer
+  and a single-use secret, and nothing else: five fields joined by dots,
+  `li1.<address>.<number in bytes>.<retention in seconds>.<secret>`,
+  the secret being 32 random bytes in unpadded base64url (package
+  `invite`). `lendisk invite --quota 80G [--retention 30d] [--expires
+  7d]` prints it on stdout; `--retention` and `--expires` take days
+  (`30d`) or a Go duration. The invite key is the X25519 key
+  `HKDF-SHA256(secret, info="lendisk-invite-key-v1")`, clamped. The
+  inviting node stores only that key's node ID, its own number and
+  retention, and the expiry, in the `invite` table; the secret itself
+  is written nowhere. Its admission hook admits the invite key, in
   the `invite` role, until the invite is redeemed or expires (§3.9);
   the invited node dials with that key to call `redeem`, after which
-  its real key replaces it.
-- **PEER-2** `redeem` carries the invited node's `tc…` address, its
-  retention offer and the number its user chose (LEND-8). Both nodes
-  then write a friendship row in `lendisk.db` (peer key, address, own
-  number, the other's number as last reported, each side's retention),
-  and each
+  its real key replaces it. Expired invite rows, used or not, are
+  deleted by `invite` before it adds one, by the daemon at start and
+  every minute after, which then clears the admission cache.
+- **PEER-2** `peer add <invite>` shows the inviter's number and
+  retention and reads the user's own number from stdin (Enter keeps
+  the inviter's); `--retention` is its own offer, 30 days by default.
+  `redeem` (POST, JSON) carries the invited node's `tc…` address, its
+  retention offer, the number its user chose (LEND-8) and a proof that
+  it holds the key its address names, since the connection is
+  authenticated by the invite key, not by that key: HMAC-SHA256 over
+  the invite key's 32 bytes, keyed with
+  `HKDF-SHA256(X25519(own key, other key), info="lendisk-redeem-v1")`,
+  which either side computes and no one else can (ID-1: no
+  signature). The inviting node refuses a missing or wrong proof, its
+  own address, or a peer that is already a friend; it then marks the
+  invite used and inserts the friendship row in one transaction, so a
+  replay finds no unused invite, answers with its own number and
+  retention, and closes the connection (`Connection: close`). The
+  invited node writes its row only after that answer. Both rows
+  hold peer key, address, own number, the other's number as last
+  reported and each side's retention (migration 5), and each
   becomes an account in the other's `IAMService`: each is the other's
   lender and borrower. The derived secret (NET-7a) serves both
   directions: the X25519 shared secret is the same either way, the
@@ -957,7 +981,12 @@ upstream bucket is Q-V.
   friends lend it back has no buckets to fill, and `status` shows it as
   unused. Adding a bucket later is a change of `role` and a restart.
 - **PEER-10** Peers are rows in `lendisk.db`; nothing in the control API
-  or the S3 surface returns them.
+  or the S3 surface returns them. `redeem` answers with the inviting
+  node's own terms only. `peer list` (`--json` too) shows each friend's
+  node ID, address, quota, both numbers, both retentions and since
+  when. The AC test runs A–B and B–D in one process and searches A's
+  and D's files, logs, `status` and `peer list` for the other's node
+  ID, address and raw key.
 
 ### 3.3 Endpoint and local store
 
@@ -1455,7 +1484,16 @@ upstream bucket is Q-V.
 - **NET-5a** `relays.accept_peer_hints` controls whether a peer's
   `tc…` relay hints are merged into the node's DERP map.
 - **NET-6** The version is carried by the control API `version`
-  endpoint; the S3 surface is governed by its own stability.
+  endpoint; the S3 surface is governed by its own stability. The peer
+  protocol version is `major.minor` (`control.Protocol`, now `0.1`);
+  every control API request and answer carries it in the
+  `Lendisk-Protocol` header. Two versions interoperate when the majors
+  match and the minors are at most one apart. `GET
+  /_lendisk/version` answers whatever the caller speaks, so it can
+  learn why it is refused; every other call from a version outside
+  that range, or without the header, is answered 400 with an error
+  naming both versions and which side to upgrade, and the client
+  refuses an answer whose header is outside the range the same way.
 - **The bridge.** `embedgw` takes listener addresses, not a
   `net.Listener` (D15), so versitygw is given one internal unix
   socket, `<data>/run/gw.sock`, and lendisk's bridge owns every
@@ -1548,8 +1586,11 @@ upstream bucket is Q-V.
   address and refuses an address that names another key; it keeps one
   tailcat `Client` per friend (Q-S). The tunnel port, 9000, is a
   constant, not a setting, since friends dial it without being told.
-  Until the bridge exists, `serve` closes every accepted connection
-  unread.
+  `transport.NewDialer` is a dial-only transport with any key and no
+  region, which never listens: `peer add` dials with the invite key
+  through it. `serve` hands the tunnel listener to
+  `bridge.ServeTunnel`; until #14 the tunnel answers S3 requests that
+  pass the middleware with 501.
 
 ### 3.8 Operations and observability
 
@@ -1589,9 +1630,11 @@ upstream bucket is Q-V.
 
 ### 3.9 Security
 
-- **SEC-3** Per-bucket S3 keys and the secrets of unexpired invites
-  live in `lendisk.db`, which lendisk creates at mode 0600; versitygw's
-  `IAMDir` is not used. Overflow target credentials (and, post-v1, a
+- **SEC-3** Per-bucket S3 keys live in `lendisk.db`, which lendisk
+  creates at mode 0600; versitygw's `IAMDir` is not used. An invite's
+  secret is not stored at all: the inviting node keeps only the public
+  invite key derived from it, and deletes that row once the invite
+  expires (§3.2, PEER-1). Overflow target credentials (and, post-v1, a
   `backend/s3` store credential) are read from environment variables
   at start: `LENDISK_OVERFLOW_<NAME>_ACCESS_KEY` and
   `LENDISK_OVERFLOW_<NAME>_SECRET_KEY` for each overflow target, the
@@ -1652,8 +1695,14 @@ upstream bucket is Q-V.
   node ID) and the `invite` table (keyed by the invite key's node ID,
   admitted while `used_at` is null and `expires_at` is in the future).
   The cache is `transport.Admission`: it remembers rejections only,
-  never admissions or errors, empties itself at 4096 keys, and
-  `Admission.Clear` empties it after a commit. The server starts
+  never admissions or errors, each for 30 seconds
+  (`transport.DeniedFor`), empties itself at 4096 keys, and
+  `Admission.Clear` empties it after a commit. The expiry is for
+  changes a one-shot command commits from another process (`peer add`
+  writing the invited side's row), which cannot reach the daemon's
+  cache. tailcat keeps a once-admitted key's tunnel, so a used invite
+  key may still connect for a while; the middleware refuses it
+  (SEC-11). The server starts
   even with zero rows, so the address exists from `init` on and every
   connection is refused until the first invite. The SEC-7 harness runs
   an unknown identity against zero peers, one peer, and zero after
@@ -1664,12 +1713,20 @@ upstream bucket is Q-V.
   and role from `lendisk.db` and answers `AccessDenied` (403) before
   routing or proxying if there is none. It reads the row on every
   request, not once per connection, so quota and state changes apply
-  to the next request (SEC-15). The `IAMService` repeats the
+  to the next request (SEC-15). It is `bridge.TunnelHandler`: it puts
+  the caller (key and role) in the request context as a
+  `control.Caller`, sends `/_lendisk/` to the `control.Server` and
+  everything else to the S3 handler (#14). A refusal is a JSON error
+  on the control path and S3 `AccessDenied` XML elsewhere; a failed
+  lookup is a 503, never an admission. The `IAMService` repeats the
   relationship check when it resolves a node-ID access key, so a
   request reaching versitygw by any path is refused without one. A
   build tag `admitall`, used only by the SEC-11 test, replaces the
   admission hook with one that admits everyone, to show the middleware
-  alone refuses an unknown peer.
+  alone refuses an unknown peer; the daemon logs a warning when built
+  with it, and CI runs that one test with the tag
+  (`go test -tags admitall -run TestMiddlewareAloneRefusesStranger
+  ./internal/cli`).
 - **SEC-12** The bridge resolves each accepted connection with
   `Server.PeerKey(conn.RemoteAddr())` and puts the key in the request
   context through `http.Server.ConnContext`; a connection without a key
@@ -1679,12 +1736,19 @@ upstream bucket is Q-V.
   request unless it equals the peer key; versitygw then verifies the
   signature for that access key. A request with neither form is
   refused. The control API takes the borrower from the context, never
-  from a parameter.
-- **SEC-13** In the `invite` role the middleware admits `redeem` and
-  refuses every other S3 and control API request. `redeem` checks the
-  invite secret, marks it used in the same transaction that creates the
-  relationship row, and the invite key's connection is then closed;
-  the borrower reconnects with its own key.
+  from a parameter. `redeem` is the one call whose connection is not
+  the friend's own key; the friend's key comes from its address and is
+  accepted only with the key-agreement proof of §3.2 (PEER-2).
+  `bridge.ServeTunnel` does this: a listener wrapper resolves
+  `Transport.PeerOf` at accept and closes a connection without a key
+  unread, and `ConnContext` puts the key in the request context.
+- **SEC-13** In the `invite` role the middleware admits `POST
+  /_lendisk/redeem` and refuses every other S3 and control API request,
+  `version` included. `redeem` checks the role again; holding the
+  invite key is the proof of the secret, so the secret never crosses
+  the wire. It marks the invite used in the same transaction that
+  creates the relationship row, and the invite key's connection is then
+  closed; the borrower reconnects with its own key.
 - **SEC-14** `DisablePresharedKey` is set and `Key` is the identity's
   WireGuard key (ID-1), so the `tc…` address is a function of the
   public key and the bootstrap region only. The address embeds the

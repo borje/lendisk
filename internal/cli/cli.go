@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -44,6 +45,11 @@ type app struct {
 	// afterStore is the capture crash-window hook (gateway.AfterStore);
 	// tests only.
 	afterStore func()
+	// clock, random and dialTimeout serve invites and peer add (peer.go);
+	// zero values mean time.Now, crypto/rand and a minute.
+	clock       func() time.Time
+	random      io.Reader
+	dialTimeout time.Duration
 }
 
 func (a *app) checker() store.Checker {
@@ -90,6 +96,7 @@ func (a *app) rootCmd() *cobra.Command {
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
 	root.AddCommand(a.endpointCmd())
+	root.AddCommand(a.inviteCmd(), a.peerCmd())
 	return root
 }
 
