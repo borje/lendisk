@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -182,7 +183,7 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 	if errors.Is(err, errLocked) {
 		return errors.New(redeemInProgress)
 	} else if err != nil {
-		return err
+		return fmt.Errorf("cannot take the redeem lock in %s: %w; run `lendisk peer add` as the user that owns that directory", filepath.Join(cfg.ConfigDir(), "locks"), err)
 	}
 	defer release()
 
