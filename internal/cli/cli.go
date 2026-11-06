@@ -22,6 +22,7 @@ import (
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
+	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/store"
 	"github.com/borje/lendisk/internal/transport"
@@ -58,6 +59,9 @@ type app struct {
 	// tuneAlerts, if set, adjusts the alert service before it starts
 	// (its interval); tests only.
 	tuneAlerts func(*alert.Service)
+	// tuneManifest, if set, adjusts the manifest pusher before it
+	// starts (its poll); tests only.
+	tuneManifest func(*manifest.Pusher)
 	// clock, random and dialTimeout serve invites and peer add (peer.go);
 	// zero values mean time.Now, crypto/rand and a minute.
 	clock       func() time.Time

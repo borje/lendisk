@@ -276,4 +276,20 @@ var migrations = []Migration{
 		ALTER TABLE friendship ADD COLUMN dial_key TEXT;
 		CREATE UNIQUE INDEX friendship_dial_key ON friendship (dial_key);`,
 	},
+	{
+		Version: 14, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Node manifest delivery (ID-4, #28): per friend, the manifest
+		-- version it last acknowledged and the last attempt. The current
+		-- version is in the node table (manifest_seq, manifest_hash,
+		-- manifest_updated_at). A friend without a row, or with seq below
+		-- the current version, is pushed to.
+		CREATE TABLE manifest_push (
+			peer_key     TEXT PRIMARY KEY, -- the friend's node ID
+			seq          INTEGER,          -- version acknowledged; NULL until one is
+			delivered_at INTEGER,          -- unix seconds
+			tried_at     INTEGER NOT NULL, -- unix seconds: the last attempt
+			error        TEXT              -- the last attempt's failure; NULL after a success
+		);`,
+	},
 }

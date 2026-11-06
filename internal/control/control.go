@@ -12,6 +12,8 @@
 //     and with it the redeemer's dial key, proven by DialProof (#69).
 //   - Only redeem is open to the invite role (SEC-13); the middleware
 //     enforces it, and Server checks the role again.
+//   - manifest stores and returns the caller's own manifest only, keyed
+//     by the connection's key; no parameter names whose (ID-4).
 //   - Nothing here returns another peer, ever (PEER-10).
 package control
 
@@ -38,13 +40,44 @@ const Protocol = "0.1"
 // API request and response.
 const ProtocolHeader = "Lendisk-Protocol"
 
-// Paths of the control API. Only redeem and version are served so far;
-// the others are refused as not yet served.
+// Paths of the control API. Only redeem, version and manifest are served
+// so far; the others are refused as not yet served.
 const (
-	Prefix      = gateway.ControlPrefix
-	RedeemPath  = Prefix + "redeem"
-	VersionPath = Prefix + "version"
+	Prefix       = gateway.ControlPrefix
+	RedeemPath   = Prefix + "redeem"
+	VersionPath  = Prefix + "version"
+	ManifestPath = Prefix + "manifest"
 )
+
+// MaxManifest bounds one node manifest envelope (ID-4). A friend keeps
+// one here, so this bounds what the manifest call can make a lender
+// store per friend; a manifest of hundreds of friends and buckets is a
+// few tens of KiB.
+const MaxManifest = 1 << 20
+
+// ManifestStore keeps the node manifests friends push to this node
+// (ID-4), one per friend, outside lendisk.db. The control API is its
+// only caller; manifest.Store is the implementation.
+type ManifestStore interface {
+	// Put replaces peer's manifest with blob, durably. It returns
+	// ErrBadManifest for a blob that is not a manifest envelope.
+	Put(peer identity.NodeID, blob []byte) error
+	// Get returns peer's manifest, or ErrNoManifest.
+	Get(peer identity.NodeID) ([]byte, error)
+}
+
+var (
+	// ErrNoManifest means no manifest is stored for the node.
+	ErrNoManifest = errors.New("no manifest stored here for this node")
+	// ErrBadManifest means a pushed body is not a manifest envelope.
+	ErrBadManifest = errors.New("not a lendisk manifest envelope")
+)
+
+// ManifestReceipt answers a manifest push: what the lender stored.
+type ManifestReceipt struct {
+	Size   int64  `json:"size"`
+	SHA256 string `json:"sha256"` // hex
+}
 
 // Compatible reports whether a peer speaking theirs interoperates with
 // ours: same major, minors at most one apart (NET-6). The error says

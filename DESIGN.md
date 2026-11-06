@@ -825,7 +825,8 @@ Paths used below: `<config>` is the config directory (mode 0700),
 `<data>` the data directory. The store is `<data>/store/` (or a
 directory the user names, such as a USB disk), holding the node's own
 buckets and the `lent-*` buckets side by side, each lent bucket with a
-`.lendisk/tomb/` directory for its tombstones (§3.6); `lendisk.db`
+`.lendisk/tomb/` directory for its tombstones (§3.6), and
+`.lendisk/manifests/` for the friends' node manifests (§3.1 ID-4); `lendisk.db`
 (SQLite) is in `<data>`; `<data>/run/` (mode 0700) holds the internal
 gateway socket `gw.sock`; `<config>/locks/` (mode 0700) holds the
 `peer add` redeem locks (§3.2, #64). `init` creates a missing `<config>` or
@@ -854,8 +855,11 @@ borrower's sealed bucket `t` as `lent-<id16>-t`, where `id16` is the
 first 16 characters of the borrower's node ID in lowercase base32: 49
 characters whatever the real name, so own bucket names may use S3's
 full 63. `bucket add` refuses own names beginning with `lent-` and the
-reserved name `lendisk-manifests`. The borrower's `lendisk.db` and its
-encrypted manifest (ID-4) hold the name-to-sealed-name map; the
+name `lendisk-manifests`, which stays reserved though manifests are kept
+under `.lendisk/` (§3.1 ID-4). The borrower's `lendisk.db` holds the
+bucket names and recomputes each sealed name (`identity.SealedName`);
+its encrypted manifest (ID-4) lists each bucket with its sealed name,
+for `recover` and the recovery sheet (ID-7); the
 lender's mapping table holds only sealed names and is authoritative on
 its side; the stored name is a stable label for reading the store with
 no lendisk running (P-5). On the wire the borrower names its bucket
@@ -913,24 +917,85 @@ upstream bucket is Q-V.
 - **ID-3** The private key is `<config>/identity.key`, base64 of the
   32 bytes, at mode 0600; lendisk refuses to load it if group or others
   can read it. The phrase is never written.
-- **ID-4** The manifest is encrypted with a key derived from the
-  identity (HKDF over the private key with a fixed info string) and
-  pushed to every lender through the control API `manifest` endpoint
-  (D12). The lender writes it through its backend as the object
-  `<borrower-id>` in the reserved bucket `lendisk-manifests`, which no
-  borrower's account can name or list (PEER-8), so it survives the loss
-  of `lendisk.db` and is part of a lender's disk handed over (P-5).
-  Addressing hints are the peer's `tc…` string plus any explicit
-  addresses (NET-3).
+- **ID-4** Package `manifest` (#28). *Contents*, JSON, `format` 1:
+  the node ID, a version `seq` and `updated_at`, and the content:
+  `settings` (the node's own `tc…` address and the saved relay region
+  it embeds, so a rebuilt node keeps its address, SEC-14; the config
+  file is the user's and is not in it), `friends` (node ID, `tc…`
+  address as the addressing hint, both numbers, both retentions, since
+  when), `overflow` (name, endpoint, bucket, prefix and credential,
+  S3-1; empty until #38 fills it) and `buckets` (name, sealed name,
+  `copies`, profile, created at). Placement (REPL-12) and the buckets'
+  own S3 credentials (SEC-3) are not in it. *Envelope*: `ldm1` ‖
+  24-byte nonce ‖ XChaCha20-Poly1305 (`golang.org/x/crypto`) of the
+  JSON, with `ldm1` ‖ the node's 32 key bytes as additional data,
+  under `identity.ManifestKey` =
+  `HKDF-SHA256(private key, info="lendisk-manifest-v1")`. The fourth
+  byte versions the envelope and `format` the plaintext; `Open`
+  refuses a version it does not know, and checks the node ID inside.
+  *Version*: the daemon's `manifest.Pusher` builds the content from
+  `lendisk.db` at start, every 15 s and when `redeem` commits a
+  friendship, and hashes it (SHA-256 of the JSON); a new hash counts
+  `seq` up (`node` keys `manifest_seq`, `manifest_hash`,
+  `manifest_updated_at`), so a change made by another process
+  (`bucket add`, `peer quota`) is pushed within 15 s. *Push*: each
+  friend whose acknowledged `seq` differs from the current one gets
+  the sealed manifest by `PUT /_lendisk/manifest`, all friends at
+  once, 30 s each; the lender answers with the size and SHA-256 it
+  stored, which the pusher checks. The table `manifest_push`
+  (migration 12) keeps per friend the `seq` acknowledged, when, and
+  the last attempt and its failure, so a friend that missed a push
+  (it was offline, or this node was) gets it at the first round it
+  answers, and `status` shows each friend still lacking the current
+  version (`manifest.pending`). Both profiles push: a lender-only node
+  is rebuilt from its manifest too. *Lender*: the call is open to the
+  `peer` role only (SEC-11, SEC-13) and keyed by the connection's key,
+  so a friend stores and reads its own manifest and no other; no
+  parameter names whose. The body is at most 1 MiB
+  (`control.MaxManifest`) and must have the envelope's shape (`ldm`,
+  any version, at least header, nonce and tag), so a friend can make
+  the lender keep one small file and nothing else; it is not counted
+  against the quota. `manifest.Store` writes it to
+  `<store>/.lendisk/manifests/<node ID>`, 0600 in 0700 directories,
+  through a synced temporary file renamed over the old one. It is a
+  file, not an object in a `lendisk-manifests` bucket as planned: a
+  name beginning with a dot is no valid bucket name, so versitygw
+  serves it to no account at all (no borrower, no bucket key, not the
+  gateway's root) and lists it in no `ListBuckets`, with no reliance on
+  ACLs. Being in the store, it survives the loss of `lendisk.db` and
+  goes with a lender's disk handed over (P-5). The lender sees that a
+  manifest exists, its size and when it changes, nothing else.
+  *Lender's database loss*: the manifest files stay, but the
+  friendships go with `lendisk.db`, so the lender admits the borrower
+  again only once a friendship is back (SEC-10 admits no identity
+  without one): by the lender's own `recover` (its manifest names its
+  friends), or by a new invite, which a borrower that kept its row
+  answers with the stored terms (§3.2 PEER-2). The relay region saved
+  in `lendisk.db` goes too; the lender picks one again, the same
+  nearest region in practice, and `tunnel.region` pins it.
 - **ID-5** A lender's address is its tailcat `tc…` string, which carries
   the public key and relay bootstrap info and no pre-shared key
   (SEC-14). `recover` derives the key
   from the phrase, dials the lender, fetches the manifest over the
-  control API (no S3 credential needed yet), then derives the per-pair
-  S3 credentials (§3.7) for every lender listed, and re-derives its
-  dial key for each friend the manifest lists (§3.1 ID-1), which the
-  friend still admits; the lender dialled first gets its own the same
-  way, from its key in the address. Overflow target
+  control API (`GET /_lendisk/manifest`, `manifest.Fetch`: no bucket,
+  no S3 credential and no `lendisk.db` needed), sets its `seq` as the
+  node's manifest version so later changes count on from it, then
+  derives the per-pair S3 credentials (§3.7) for every lender listed,
+  and re-derives its dial key for each friend the manifest lists (§3.1
+  ID-1), which the friend still admits.
+  The fetch dials with the node's own key, because the lender answers
+  for the connection's key alone and knows no other (SEC-11, SEC-12).
+  A separate fetch key derived from the identity was rejected: the
+  lender would have to learn and keep it in `lendisk.db`, and `recover`
+  dials with the node's key anyway for `list` and the S3 reads, so it
+  would move the #52 problem rather than remove it. That problem: two
+  tailcat clients of one key at one relay stall each other (§3.7), so
+  while the old node still runs, its connections and the recovering
+  machine's stall. `recover` (#29) is for a node whose machine is gone or
+  stopped; it says to stop the old node first, uses one transport for
+  every call of the recovery, and closes it before the daemon starts.
+  Two nodes running with one identity are wrong in any case (both would
+  replicate and push manifests). Overflow target
   credentials found in the manifest are shown once, for the user to
   put in the environment (SEC-3); they are not written to disk. The
   `placement` table (D6) and the hash index are then rebuilt from the
@@ -2287,7 +2352,8 @@ capture decorator, so nothing stands between that and posix (#62).
   (`redeem`, `challenge`, `manifest`, `quota`, `version`, `undelete`,
   `list`) is plain HTTP under `/_lendisk/` on the same tunnel port,
   authenticated by the tunnel peer key and checked per request against
-  `lendisk.db` (SEC-11). `list` (bucket, after, limit) pages the
+  `lendisk.db` (SEC-11). `manifest` (`PUT` and `GET`, the caller's own
+  sealed manifest, §3.1 ID-4) is served (#28). `list` (bucket, after, limit) pages the
   lender's index for that borrower's bucket from `lendisk.db`: key,
   size, SHA-256 and, if tombstoned, when; it is what `recover` (ID-5),
   `import` (REPL-8) and `undelete` previews read, so none of them
@@ -2764,8 +2830,9 @@ capture decorator, so nothing stands between that and posix (#62).
   `<store>/<bucket>/<key>` as plain files with versitygw's xattrs and
   its `.sgwtmp/` and `.vgwlocks/` housekeeping directories; borrowers'
   buckets under `lent-<id16>-` and their sealed names (SEC-16), each
-  with its `.lendisk/tomb/` directory (§3.6); the reserved
-  `lendisk-manifests` bucket; `lendisk.db` and its tables; and the export layout
+  with its `.lendisk/tomb/` directory (§3.6); the friends' sealed
+  manifests as `.lendisk/manifests/<node ID>` at the store's top (§3.1
+  ID-4); `lendisk.db` and its tables; and the export layout
   (one file per key at its key path; Kopia's sharded form with
   `--kopia-layout`). Every object lendisk stores carries
   `x-amz-meta-lendisk-sha256`, so the hash index can be rebuilt from

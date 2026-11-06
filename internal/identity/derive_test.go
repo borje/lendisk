@@ -124,3 +124,23 @@ func TestDialKeyPerFriendIsDerivedAndDistinct(t *testing.T) {
 		t.Fatalf("dial key of the test phrase is %s; the derivation changed", got)
 	}
 }
+
+// ID-4: the manifest key is derived from the phrase alone, with its own
+// info string: the same for two machines restored from one phrase, and
+// unlike K_name or another identity's.
+func TestManifestKeyIsItsOwnDerivation(t *testing.T) {
+	a, _ := FromPhrase(vector)
+	again, _ := FromPhrase(vector)
+	k := a.ManifestKey()
+	if len(k) != 32 || string(k) != string(again.ManifestKey()) {
+		t.Fatalf("manifest key %x is not 32 bytes, stable across restores", k)
+	}
+	p, _ := NewPhrase()
+	other, _ := FromPhrase(p)
+	if string(other.ManifestKey()) == string(k) {
+		t.Fatal("two identities share a manifest key")
+	}
+	if string(a.nameKey()) == string(k) {
+		t.Fatal("the manifest key is K_name")
+	}
+}

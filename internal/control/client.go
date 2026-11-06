@@ -3,6 +3,8 @@ package control
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -62,6 +64,30 @@ func (c *Client) Do(ctx context.Context, method, path string, body io.Reader) (*
 	return c.HTTP.Do(r)
 }
 
+// PutManifest stores this node's sealed manifest at the peer (ID-4) and
+// checks that the peer's receipt names exactly those bytes.
+func (c *Client) PutManifest(ctx context.Context, blob []byte) (ManifestReceipt, error) {
+	var rc ManifestReceipt
+	b, err := c.send(ctx, http.MethodPut, ManifestPath, bytes.NewReader(blob), "application/octet-stream", maxBody)
+	if err != nil {
+		return rc, err
+	}
+	if err := json.Unmarshal(b, &rc); err != nil {
+		return rc, fmt.Errorf("the peer's answer to %s is malformed: %w", ManifestPath, err)
+	}
+	sum := sha256.Sum256(blob)
+	if rc.Size != int64(len(blob)) || rc.SHA256 != hex.EncodeToString(sum[:]) {
+		return rc, fmt.Errorf("the peer stored %d bytes (sha256 %s), not the %d bytes sent", rc.Size, rc.SHA256, len(blob))
+	}
+	return rc, nil
+}
+
+// GetManifest fetches the manifest the peer keeps for this node's key
+// (ID-4); a *CallError with status 404 means it keeps none.
+func (c *Client) GetManifest(ctx context.Context) ([]byte, error) {
+	return c.send(ctx, http.MethodGet, ManifestPath, nil, "", MaxManifest)
+}
+
 func (c *Client) call(ctx context.Context, method, path string, in, out any) error {
 	var body io.Reader
 	if in != nil {
@@ -71,35 +97,56 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 		}
 		body = bytes.NewReader(b)
 	}
-	resp, err := c.Do(ctx, method, path, body)
+	b, err := c.send(ctx, method, path, body, "application/json", maxBody)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err := json.Unmarshal(b, out); err != nil {
+		return fmt.Errorf("the peer's answer to %s is malformed: %w", path, err)
+	}
+	return nil
+}
+
+// send makes one call and returns the body of a 200 answer, at most max
+// bytes; any other answer is a *CallError.
+func (c *Client) send(ctx context.Context, method, path string, body io.Reader, contentType string, max int64) ([]byte, error) {
+	r, err := http.NewRequestWithContext(ctx, method, "http://lendisk"+path, body)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	r.Header.Set(ProtocolHeader, c.protocol())
+	if body != nil {
+		r.Header.Set("Content-Type", contentType)
+	}
+	resp, err := c.HTTP.Do(r)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
+	if err != nil {
+		return nil, err
 	}
 	// Every answer from a lendisk control API, refusals included,
 	// carries the protocol header (NET-6); one without it is from
 	// something else on that port and is not trusted.
 	v := resp.Header.Get(ProtocolHeader)
 	if v == "" {
-		return fmt.Errorf("the peer's answer to %s (%d) has no %s header: whatever answered is not a lendisk control API",
+		return nil, fmt.Errorf("the peer's answer to %s (%d) has no %s header: whatever answered is not a lendisk control API",
 			path, resp.StatusCode, ProtocolHeader)
 	}
 	if err := Compatible(c.protocol(), v); err != nil {
-		return err
+		return nil, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		var e errorBody
 		if json.Unmarshal(b, &e) != nil || e.Error == "" {
 			e.Error = http.StatusText(resp.StatusCode)
 		}
-		return &CallError{Status: resp.StatusCode, Message: e.Error}
+		return nil, &CallError{Status: resp.StatusCode, Message: e.Error}
 	}
-	if err := json.Unmarshal(b, out); err != nil {
-		return fmt.Errorf("the peer's answer to %s is malformed: %w", path, err)
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("the peer's answer to %s is over %d bytes", path, max)
 	}
-	return nil
+	return b, nil
 }

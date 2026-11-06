@@ -38,6 +38,57 @@ type Status struct {
 	// Alerts are the pending alerts, oldest first (OPS-1, OPS-2, #13):
 	// what the daemon last recorded, also while it is stopped.
 	Alerts []StatusAlert `json:"alerts"`
+	// Manifest is the node manifest's version and which friends do not
+	// hold it yet (ID-4, #28).
+	Manifest StatusManifest `json:"manifest"`
+}
+
+// StatusManifest is the node manifest's delivery (ID-4).
+type StatusManifest struct {
+	// Version counts the manifest's content changes; 0 before the
+	// daemon first built it.
+	Version   int64  `json:"version"`
+	UpdatedAt string `json:"updated_at,omitempty"` // RFC 3339, UTC
+	// Friends is how many friends should hold it.
+	Friends int `json:"friends"`
+	// Pending are the friends that do not hold this version yet.
+	Pending []StatusManifestPending `json:"pending"`
+}
+
+// StatusManifestPending is a friend still to receive the manifest.
+type StatusManifestPending struct {
+	Peer string `json:"peer"`
+	// Held is the version it last acknowledged; 0 if none.
+	Held int64 `json:"held"`
+	// Error is why the last push failed, if it did.
+	Error string `json:"error,omitempty"`
+}
+
+// manifestStatus reads the manifest's version and its delivery.
+func manifestStatus(ctx context.Context, db *state.DB) (StatusManifest, error) {
+	out := StatusManifest{Pending: []StatusManifestPending{}}
+	v, err := db.ManifestVersion(ctx)
+	if err != nil {
+		return out, err
+	}
+	pushes, err := db.ManifestPushes(ctx)
+	if err != nil {
+		return out, err
+	}
+	fs, err := db.Friendships(ctx)
+	if err != nil {
+		return out, err
+	}
+	out.Version, out.Friends = v.Seq, len(fs)
+	if v.Seq > 0 {
+		out.UpdatedAt = v.UpdatedAt.UTC().Format(time.RFC3339)
+	}
+	for _, f := range fs {
+		if p := pushes[f.Peer]; p.Seq != v.Seq || v.Seq == 0 {
+			out.Pending = append(out.Pending, StatusManifestPending{Peer: f.Peer, Held: p.Seq, Error: p.Error})
+		}
+	}
+	return out, nil
 }
 
 // StatusAlert is one pending alert: what the hook and the webhook
@@ -318,6 +369,9 @@ func (a *app) statusCmd() *cobra.Command {
 				st.Alerts = append(st.Alerts, StatusAlert{Kind: al.Kind, Subject: al.Subject, Message: al.Message,
 					RaisedAt: al.RaisedAt.UTC().Format(time.RFC3339)})
 			}
+			if st.Manifest, err = manifestStatus(cmd.Context(), db); err != nil {
+				return err
+			}
 			if asJSON {
 				enc := json.NewEncoder(a.out)
 				enc.SetIndent("", "  ")
@@ -369,6 +423,23 @@ func (a *app) statusCmd() *cobra.Command {
 					fmt.Fprintf(a.out, " (%s)", p.Detail)
 				}
 				fmt.Fprintln(a.out)
+			}
+			switch m := st.Manifest; {
+			case m.Version == 0:
+				fmt.Fprintln(a.out, "Manifest: not built yet; `lendisk serve` builds it")
+			case m.Friends == 0:
+				fmt.Fprintf(a.out, "Manifest: version %d, no friend to hold it\n", m.Version)
+			case len(m.Pending) == 0:
+				fmt.Fprintf(a.out, "Manifest: version %d, held by every friend\n", m.Version)
+			default:
+				fmt.Fprintf(a.out, "Manifest: version %d, not yet at %d of %d friends\n", m.Version, len(m.Pending), m.Friends)
+				for _, p := range m.Pending {
+					fmt.Fprintf(a.out, "  %s holds version %d", p.Peer, p.Held)
+					if p.Error != "" {
+						fmt.Fprintf(a.out, " (last push: %s)", p.Error)
+					}
+					fmt.Fprintln(a.out)
+				}
 			}
 			if len(st.Alerts) == 0 {
 				fmt.Fprintln(a.out, "Alerts:  none")

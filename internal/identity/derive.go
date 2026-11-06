@@ -22,6 +22,9 @@ const (
 	// changing it makes every friend refuse this node's dials until they
 	// learn the new key.
 	dialInfo = "lendisk-dial-v1"
+	// manifestInfo fixes the node manifest's key (ID-4); changing it
+	// makes every stored manifest unreadable.
+	manifestInfo = "lendisk-manifest-v1"
 	// sealedLen is the characters of the HMAC kept: 130 bits.
 	sealedLen = 26
 )
@@ -32,13 +35,27 @@ const (
 // K_name = HKDF-SHA256(private key, info="lendisk-bucket-name-v1"). It
 // depends on the phrase and the name alone.
 func (id *Identity) SealedName(bucket string) string {
-	k, err := hkdf.Key(sha256.New, id.priv.Bytes(), nil, nameInfo, 32)
+	m := hmac.New(sha256.New, id.nameKey())
+	m.Write([]byte(bucket))
+	return "s" + b32.EncodeToString(m.Sum(nil))[:sealedLen]
+}
+
+// nameKey is K_name.
+func (id *Identity) nameKey() []byte { return id.derive(nameInfo) }
+
+// ManifestKey is the node manifest's AEAD key (ID-4):
+// HKDF-SHA256(private key, info="lendisk-manifest-v1"), 32 bytes. It
+// depends on the phrase alone, so a node restored from it reads the
+// manifest its lenders hold. Never write it anywhere.
+func (id *Identity) ManifestKey() []byte { return id.derive(manifestInfo) }
+
+// derive is a 32-byte HKDF-SHA256 of the private key with info.
+func (id *Identity) derive(info string) []byte {
+	k, err := hkdf.Key(sha256.New, id.priv.Bytes(), nil, info, 32)
 	if err != nil {
 		panic(err) // only for a length HKDF cannot produce
 	}
-	m := hmac.New(sha256.New, k)
-	m.Write([]byte(bucket))
-	return "s" + b32.EncodeToString(m.Sum(nil))[:sealedLen]
+	return k
 }
 
 // DialKeyFor is the key this node dials friend with (ID-1, #69):
