@@ -58,6 +58,15 @@ type Decorator struct {
 	keys     keyLocks // one captured request per key at a time
 	mu       sync.Mutex
 	stranded map[int64]bool // rows to settle while running (strand)
+
+	// ctx bounds the background hashes of completed uploads (nil: never
+	// cancelled); hashes counts them, so the gateway waits for them to
+	// stop before it returns.
+	ctx    context.Context
+	hashes sync.WaitGroup
+	// beforeHash, if set, is called before a completed upload is hashed.
+	// Tests only.
+	beforeHash func()
 }
 
 var (
@@ -131,8 +140,13 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 // arrive separately, possibly in parallel, so there is no single stream
 // to hash on the way in; the hash is the SHA-256 of the whole object,
 // read once from the store after it is assembled (§3.3, REPL-10). The
-// read is usually from the page cache, but it makes completing a large
-// upload take as long as hashing it.
+// client is answered as soon as the store has assembled the object; the
+// hash runs after, in the background, still holding the key's lock, and
+// a crash before it finishes leaves the row pending for startup (#49).
+//
+// A completion of an upload that already has a row is a client's retry:
+// posix answers it from the object finished or being finished, without
+// changing it, so it is passed to the store, not queued or hashed again.
 func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
 	class, err := d.classify(in.Bucket, in.Key)
 	if err != nil {
@@ -141,49 +155,82 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 	if !captured(class) || in.UploadId == nil || in.MultipartUpload == nil {
 		return d.Backend.CompleteMultipartUpload(ctx, in)
 	}
-	bg := context.Background()
 	bucket, key, uploadID := *in.Bucket, *in.Key, *in.UploadId
-	defer d.keys.lock(bucket, key)()
-	// A retried completion is not queued twice: posix answers it from the
-	// finished object. A row left pending by a failed hash is finished now.
-	seq, st, found, err := d.DB.UploadEntry(bg, bucket, key, uploadID)
-	if err != nil {
-		return s3response.CompleteMultipartUploadResult{}, "", errInternal
+	retried := func() (bool, error) {
+		_, _, found, err := d.DB.UploadEntry(context.Background(), bucket, key, uploadID)
+		if err != nil {
+			d.Log.Error("capture: reading the queue failed; refusing the request", "bucket", bucket, "key", key, "err", err)
+			return false, errInternal
+		}
+		return found, nil
 	}
-	if found && st == state.StateDone {
-		return d.Backend.CompleteMultipartUpload(ctx, in)
-	}
-	if !found {
-		etag, err := backend.ComputeMultipartETagFromPartETags(uploadID, in.MultipartUpload.Parts)
+	// A retry does not wait for the key's lock, which a first completion
+	// holds while it hashes.
+	if found, err := retried(); err != nil || found {
 		if err != nil {
 			return s3response.CompleteMultipartUploadResult{}, "", err
 		}
-		if seq, err = d.begin(state.Capture{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(class),
-			ETag: etag, UploadID: uploadID}); err != nil {
+		return d.Backend.CompleteMultipartUpload(ctx, in)
+	}
+	unlock := d.keys.lock(bucket, key)
+	if found, err := retried(); err != nil || found {
+		unlock()
+		if err != nil {
 			return s3response.CompleteMultipartUploadResult{}, "", err
 		}
+		return d.Backend.CompleteMultipartUpload(ctx, in)
+	}
+	etag, err := backend.ComputeMultipartETagFromPartETags(uploadID, in.MultipartUpload.Parts)
+	if err != nil {
+		unlock()
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+	seq, err := d.begin(state.Capture{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(class),
+		ETag: etag, UploadID: uploadID})
+	if err != nil {
+		unlock()
+		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	res, ver, err := d.Backend.CompleteMultipartUpload(ctx, in)
 	if err != nil {
-		if !found {
-			d.drop(seq)
-		}
+		d.drop(seq)
+		unlock()
 		return res, ver, err
 	}
 	d.stored()
-	if err := d.finishUpload(bg, seq, bucket, key, deref(res.ETag)); err != nil {
-		// The row stays pending until it is settled against the store.
-		d.Log.Error("capture: hashing a completed upload failed", "bucket", bucket, "key", key, "seq", seq, "err", err)
-		d.strand(seq)
-		return s3response.CompleteMultipartUploadResult{}, "", errInternal
-	}
+	d.hashes.Add(1)
+	go func() {
+		defer d.hashes.Done()
+		defer unlock()
+		ctx := d.hashCtx()
+		if err := d.finishUpload(ctx, seq, bucket, key, deref(res.ETag)); err != nil {
+			if ctx.Err() != nil {
+				return // stopping: the row stays pending for startup
+			}
+			// The row stays pending until it is settled against the store.
+			d.Log.Error("capture: hashing a completed upload failed", "bucket", bucket, "key", key, "seq", seq, "err", err)
+			d.strand(seq)
+		}
+	}()
 	return res, ver, nil
 }
 
+// hashCtx bounds the background hashes of completed uploads.
+func (d *Decorator) hashCtx() context.Context {
+	if d.ctx != nil {
+		return d.ctx
+	}
+	return context.Background()
+}
+
 // finishUpload hashes a completed upload's object and marks its row done.
-// If the key already holds another object (a later write won the race),
-// the row is dropped: the later write has its own row.
+// If the key holds another object (it changed outside lendisk), the row
+// is dropped. A row someone else settled first (FinishPut's ErrNotFound)
+// is success.
 func (d *Decorator) finishUpload(ctx context.Context, seq int64, bucket, key, etag string) error {
+	if d.beforeHash != nil {
+		d.beforeHash()
+	}
 	out, err := d.Backend.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
 	if notFound(err) {
 		d.drop(seq)
@@ -198,12 +245,29 @@ func (d *Decorator) finishUpload(ctx context.Context, seq int64, bucket, key, et
 		return nil
 	}
 	h := sha256.New()
-	n, err := io.Copy(h, out.Body)
+	n, err := io.Copy(h, ctxReader{ctx, out.Body})
 	if err != nil {
 		return err
 	}
 	_, err = d.DB.FinishPut(ctx, seq, n, hex.EncodeToString(h.Sum(nil)))
+	if errors.Is(err, state.ErrNotFound) {
+		d.Log.Debug("capture: a completed upload's row was settled elsewhere", "bucket", bucket, "key", key, "seq", seq)
+		return nil
+	}
 	return err
+}
+
+// ctxReader stops a long read when ctx ends.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // DeleteObject captures a successful delete (EP-2).

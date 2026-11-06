@@ -226,6 +226,110 @@ func TestSameKeyWriteWaitsForTheOneInFlight(t *testing.T) {
 	}
 }
 
+// EP-3, REPL-10 (#49): a completion answers once the store has assembled
+// the object, and the whole-object hash follows in the background. A
+// second completion of the same upload, sent while the first is in the
+// store and again while its hash runs, succeeds without hashing again,
+// and the upload ends as exactly one done row.
+func TestRetriedCompletionWhileTheFirstIsInFlight(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	ctx := context.Background()
+	be, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set, _ := profile.Load("")
+	d := &Decorator{Backend: be, DB: h.db, Profiles: set, Log: quiet}
+	b, key := aws.String("files"), aws.String("big")
+	up, err := be.CreateMultipartUpload(ctx, s3response.CreateMultipartUploadInput{Bucket: b, Key: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	one := int32(1)
+	body := "the whole object"
+	n := int64(len(body))
+	part, err := be.UploadPart(ctx, &s3.UploadPartInput{Bucket: b, Key: key, UploadId: &up.UploadId,
+		PartNumber: &one, ContentLength: &n, Body: bytes.NewReader([]byte(body))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &s3.CompleteMultipartUploadInput{Bucket: b, Key: key, UploadId: &up.UploadId,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{{PartNumber: &one, ETag: part.ETag}}}}
+	complete := func() chan error {
+		c := make(chan error, 1)
+		go func() { _, _, err := d.CompleteMultipartUpload(ctx, in); c <- err }()
+		return c
+	}
+	answered := func(what string, c chan error) {
+		t.Helper()
+		select {
+		case err := <-c:
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: no answer", what)
+		}
+	}
+
+	stored, release := make(chan struct{}), make(chan struct{})
+	d.AfterStore = func() { close(stored); <-release }
+	var hashes atomic.Int32
+	hashing, finish := make(chan struct{}), make(chan struct{})
+	d.beforeHash = func() {
+		if hashes.Add(1) == 1 {
+			close(hashing)
+			<-finish
+		}
+	}
+	first := complete()
+	<-stored
+	answered("completion sent while the first is in the store", complete())
+	close(release)
+	answered("first completion, before its hash", first)
+	<-hashing
+	answered("completion sent while the first's hash runs", complete())
+	if p, _ := h.db.PendingCaptures(ctx); len(p) != 1 {
+		t.Fatalf("%d rows pending while hashing, want 1", len(p))
+	}
+	close(finish)
+	d.hashes.Wait()
+	es := h.entries("files")
+	if len(es) != 1 || es[0].State != state.StateDone || es[0].SHA256 != sum([]byte(body)) || es[0].Size != n {
+		t.Fatalf("queue: %+v", es)
+	}
+	if hashes.Load() != 1 {
+		t.Errorf("hashed %d times", hashes.Load())
+	}
+}
+
+// EP-3 (#49): a completion whose row another settled first (FinishPut
+// answers ErrNotFound) has succeeded; it is not an error.
+func TestFinishingAnUploadSettledElsewhereIsSuccess(t *testing.T) {
+	h := newHarness(t, map[string]string{"files": "generic"})
+	ctx := context.Background()
+	be, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &Decorator{Backend: be, DB: h.db, Log: quiet}
+	n := int64(1)
+	if _, err := be.PutObject(ctx, s3response.PutObjectInput{Bucket: aws.String("files"), Key: aws.String("k"),
+		ContentLength: &n, Body: bytes.NewReader([]byte("x"))}); err != nil {
+		t.Fatal(err)
+	}
+	seqs, err := h.db.BeginCaptures(ctx, []state.Capture{{Bucket: "files", Key: "k", Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.db.FinishPut(ctx, seqs[0], 1, sum([]byte("x"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.finishUpload(ctx, seqs[0], "files", "k", ""); err != nil {
+		t.Fatalf("finishing a row already done: %v", err)
+	}
+}
+
 // EP-3 (#47): a row whose request ended without completing it (the state
 // database refused the write) is settled against the store while the
 // gateway runs, not left pending until the next start.

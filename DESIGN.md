@@ -1197,15 +1197,32 @@ upstream bucket is Q-V.
     parts in parallel, so parts are not hashed. The completion writes a
     pending row with the ETag the completion will give the object, the
     store assembles it, and the decorator then reads the finished object
-    once and records its whole-object SHA-256 and size. If the key
-    already holds another object by then (a later write won the race),
-    the row is dropped, since that write has its own. The read is
-    usually served from the page cache, but completing a large upload
-    takes as long as hashing it (decided 2026-11-06: one canonical hash
-    for every object is worth the second read, and replication may then
-    use any part size). A failed read leaves the row pending and stranded; a retried
-    completion or `ResolveStranded` finishes it. A retried completion of an
-    upload already done is passed to the store but not queued again.
+    once and records its whole-object SHA-256 and size (decided
+    2026-11-06: one canonical hash for every object is worth the second
+    read, and replication may then use any part size). If the key holds
+    another object by then (it changed outside lendisk), the row is
+    dropped.
+    *The completion answers before the hash finishes* (decided
+    2026-11-06, #49). On a Pi a multi-GB object can take longer to hash
+    than a client's read timeout (the AWS CLI's is 60 s), and a client
+    that times out retries the completion and may report the upload as
+    failed. So the client gets its answer as soon as the store has
+    assembled the object, and the hash runs in the background, still
+    holding the key's lock (same-key ordering above), so a later write of
+    the key waits for it. Nothing is lost by answering first: the pending
+    row was written before the store call, so if the process dies before
+    the hash is recorded, startup finds the object carrying the row's
+    ETag and hashes it (*Startup*); a graceful stop cancels the hash
+    with the same result. A failed read leaves the row stranded for
+    `ResolveStranded`. A `FinishPut` that answers `ErrNotFound` (the row
+    was settled elsewhere) counts as success.
+    *Retried completions.* A completion of an upload that already has a
+    queue row is a client's retry. posix answers it, without changing
+    anything, from the object being assembled or finished, so the
+    decorator passes it to the store without queueing or hashing it, and
+    without waiting for the key's lock, which the first completion may
+    hold while it hashes. A retry that arrives before the first has
+    written its row waits for the key's lock, then finds the row.
   - *Exactly once.* A put whose hash equals the key's latest done row,
     a put, is not queued again (`FinishPut` drops it): this is the
     client's retry after a crash it saw as a failure, and an identical

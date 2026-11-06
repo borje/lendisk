@@ -156,6 +156,9 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		// and the gate refuses it (SEC-8).
 	}
 
+	// Hashes of completed uploads end with ctx; a cancelled one leaves its
+	// row pending for the next start.
+	defer dec.hashes.Wait()
 	if dec.DB != nil {
 		every := g.ResolveEvery
 		if every <= 0 {
@@ -191,7 +194,7 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 // decorator wraps be and settles what a crash left pending before
 // anything is served (EP-3).
 func (g *Gateway) decorator(ctx context.Context, be backend.Backend) (*Decorator, error) {
-	d := &Decorator{Backend: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore}
+	d := &Decorator{Backend: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore, ctx: ctx}
 	if d.Profiles == nil {
 		set, err := profile.Load("")
 		if err != nil {

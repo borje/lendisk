@@ -119,6 +119,19 @@ func (h *harness) entries(bucket string) []state.Entry {
 	return es
 }
 
+// settled waits until no queue row is pending: a completed upload's row
+// is finished in the background after the client's answer.
+func (h *harness) settled() {
+	h.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for p, _ := h.db.PendingCaptures(context.Background()); len(p) != 0; p, _ = h.db.PendingCaptures(context.Background()) {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("still pending: %+v", p)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func sum(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 
 func code(err error) string {
@@ -218,6 +231,7 @@ func TestCaptureWritesAndDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	h.settled()
 	type row struct{ key, op, class, sha string }
 	var rows []row
 	for _, e := range h.entries("laptop") {
