@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/versity/versitygw/backend"
@@ -35,7 +36,8 @@ const MetaCapture = "lendisk-capture"
 // Capture is a pending row written before the backend call, marked done
 // with the SHA-256 taken from the request stream as it passes (REPL-10),
 // or removed when the call fails; ResolvePending settles rows a crash
-// left. Bodies are never buffered or read twice.
+// left, and ResolveStranded those a failed completion or removal left
+// while running. Bodies are never buffered or read twice.
 //
 // Overrides must return unwrapped s3err.APIError values for client-visible
 // refusals (Q-I.5).
@@ -49,6 +51,9 @@ type Decorator struct {
 	// request and before its row is completed: the crash window startup
 	// settles. Tests only.
 	AfterStore func()
+
+	mu       sync.Mutex
+	stranded map[int64]bool // rows to settle while running (strand)
 }
 
 var (
@@ -108,9 +113,10 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 	}
 	d.stored()
 	if _, err := d.DB.FinishPut(context.Background(), seq, h.n, h.hex()); err != nil {
-		// The object is stored and the row stays pending: startup
-		// resolves it. The client sees a retryable error.
+		// The object is stored and the row stays pending until it is
+		// settled against the store. The client sees a retryable error.
 		d.Log.Error("capture: completing a queue row failed", "bucket", *in.Bucket, "key", *in.Key, "seq", seq, "err", err)
+		d.strand(seq)
 		return s3response.PutObjectOutput{}, errInternal
 	}
 	return out, nil
@@ -160,9 +166,9 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 	}
 	d.stored()
 	if err := d.finishUpload(bg, seq, bucket, key, deref(res.ETag)); err != nil {
-		// The row stays pending; a retried completion or the next start
-		// finishes it.
+		// The row stays pending until it is settled against the store.
 		d.Log.Error("capture: hashing a completed upload failed", "bucket", bucket, "key", key, "seq", seq, "err", err)
+		d.strand(seq)
 		return s3response.CompleteMultipartUploadResult{}, "", errInternal
 	}
 	return res, ver, nil
@@ -215,6 +221,7 @@ func (d *Decorator) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput) 
 	d.stored()
 	if err := d.DB.FinishDelete(context.Background(), seq); err != nil {
 		d.Log.Error("capture: completing a queue row failed", "bucket", *in.Bucket, "key", *in.Key, "seq", seq, "err", err)
+		d.strand(seq)
 		return nil, errInternal
 	}
 	return out, nil
@@ -267,6 +274,7 @@ func (d *Decorator) DeleteObjects(ctx context.Context, in *s3.DeleteObjectsInput
 	d.drop(failed...)
 	if err := d.DB.FinishDelete(bg, done...); err != nil {
 		d.Log.Error("capture: completing queue rows failed", "bucket", *in.Bucket, "err", err)
+		d.strand(done...)
 		return s3response.DeleteResult{}, errInternal
 	}
 	return res, nil
@@ -315,8 +323,9 @@ func (d *Decorator) begin(c state.Capture) (int64, error) {
 
 func (d *Decorator) drop(seqs ...int64) {
 	if err := d.DB.DropCaptures(context.Background(), seqs...); err != nil {
-		// Left pending, the rows are resolved at the next start.
+		// Left pending, the rows are settled against the store later.
 		d.Log.Warn("capture: removing the rows of a failed request failed", "seqs", seqs, "err", err)
+		d.strand(seqs...)
 	}
 }
 

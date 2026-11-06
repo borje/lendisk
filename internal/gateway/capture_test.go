@@ -79,7 +79,8 @@ func newHarnessIn(t *testing.T, dir string, buckets map[string]string) *harness 
 // serve runs the gateway until stop is called or the test ends.
 func (h *harness) serve(noCapture bool) (stop func()) {
 	h.t.Helper()
-	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: quiet, noCapture: noCapture}
+	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: quiet,
+		ResolveEvery: 20 * time.Millisecond, noCapture: noCapture}
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan struct{})
 	errc := make(chan error, 1)

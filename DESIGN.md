@@ -1161,6 +1161,23 @@ upstream bucket is Q-V.
     a delete is done if the key is gone. A `PutObject` that reached the
     store but not its row is hashed by reading the object once: the
     only read capture makes of a stored object, and only after a crash.
+  - *While running.* A row whose request ended without completing or
+    removing it (the state database refused the write, or a multipart
+    hash failed) is remembered by the decorator as stranded, and
+    `ResolveStranded` settles it against the store as startup would,
+    every minute (`Gateway.ResolveEvery`) until it succeeds, so a
+    failed request does not leave its row pending until the next start.
+    The list is in memory; after a crash startup settles every pending
+    row anyway.
+  - *Concurrent requests.* Capture writes `lendisk.db` from many
+    requests at once, alongside the replication worker. Write
+    transactions begin `IMMEDIATE` (`_txlock=immediate` in the modernc
+    DSN), so `FinishPut`, which reads the key's latest done row and then
+    writes, holds the write lock from its start and cannot fail with
+    `SQLITE_BUSY_SNAPSHOT` when another connection commits in between
+    (#47); writers wait for the lock up to `busy_timeout`, 30 s, which is
+    a queue of millisecond transactions, never a held lock, since no
+    transaction does I/O other than SQLite's own.
   - *Multipart.* There is no single stream to hash, and clients upload
     parts in parallel, so parts are not hashed. The completion writes a
     pending row with the ETag the completion will give the object, the
@@ -1171,8 +1188,8 @@ upstream bucket is Q-V.
     usually served from the page cache, but completing a large upload
     takes as long as hashing it (decided 2026-11-06: one canonical hash
     for every object is worth the second read, and replication may then
-    use any part size). A failed read leaves the row pending; a retried
-    completion or the next start finishes it. A retried completion of an
+    use any part size). A failed read leaves the row pending and stranded; a retried
+    completion or `ResolveStranded` finishes it. A retried completion of an
     upload already done is passed to the store but not queued again.
   - *Exactly once.* A put whose hash equals the key's latest done row,
     a put, is not queued again (`FinishPut` drops it): this is the
