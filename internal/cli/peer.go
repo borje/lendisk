@@ -176,6 +176,15 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 		return err
 	}
 	ikID := ik.NodeID().String()
+	// One peer add per invite at a time: two dialling with the invite
+	// key at one relay stall each other (#52, #64).
+	release, err := tryLock(cfg.ConfigDir(), "redeem-"+ikID+".lock")
+	if errors.Is(err, errLocked) {
+		return errors.New(redeemInProgress)
+	} else if err != nil {
+		return err
+	}
+	defer release()
 
 	fmt.Fprintf(a.out, "Invite from node %s.\n", them)
 	fmt.Fprintf(a.out, "They lend you %s and keep what you delete for %s.\n", formatSize(inv.Number), formatDays(inv.Retention))
@@ -214,7 +223,7 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 		err = db.StartRedeem(ctx, state.PendingRedeem{InviteKey: ikID, Peer: them.String(),
 			Number: number, Retention: ret, StartedAt: a.now()})
 		if errors.Is(err, state.ErrExists) {
-			return errors.New("a redeem of this invite is already in progress (another `lendisk peer add` started it while this one asked); let it finish, then check `lendisk peer list`")
+			return errors.New(redeemInProgress)
 		} else if err != nil {
 			return err
 		}
@@ -272,6 +281,10 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 	fmt.Fprintf(a.out, "Now friends with %s. Quota: %s each way.\n", them, formatSize(f.Quota()))
 	return nil
 }
+
+// redeemInProgress is peer add's answer when another peer add of the same
+// invite is running.
+const redeemInProgress = "a redeem of this invite is already in progress (another `lendisk peer add` of it is running); let it finish, then check `lendisk peer list`"
 
 // redeem calls redeem at them, dialling with the invite key; the proof
 // by self binds that key. timedOut reports that the call ran out of

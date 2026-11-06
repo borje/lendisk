@@ -979,10 +979,18 @@ upstream bucket is Q-V.
   `peer add` with the same invite again finds the record, repeats its
   number and retention without asking, and redeems again; a record
   with the same inviter from another invite is named on stdout (its
-  invite key's node ID and start time) and settled by this redeem. If
-  the record of this invite appears while `peer add` asks for the
-  number, another `peer add` of it is running, and this one stops with
-  "a redeem of this invite is already in progress".
+  invite key's node ID and start time) and settled by this redeem.
+  Only one `peer add` per invite runs past parsing at a time, since
+  two dialling with the invite key at one relay stall each other
+  (#52, #64): before it reads the record or asks for the number it
+  takes `flock(LOCK_EX|LOCK_NB)` on
+  `<config dir>/locks/redeem-<invite key node ID>.lock` (directory
+  0700, file 0600, the file left in place), which the kernel drops
+  when the process ends, even on a crash. A second run that cannot
+  take it stops with "a redeem of this invite is already in progress"
+  and does not dial. If the record of this invite still appears while
+  `peer add` asks for the number (a backstop: a run not holding the
+  lock, such as an older binary), it stops with the same message.
   A proven key that is already a friend is answered, not refused: any
   unexpired invite, used by it, unused or used by another, answers
   `redeem` with the stored friendship's terms, the request's address,
