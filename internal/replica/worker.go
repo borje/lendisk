@@ -472,6 +472,9 @@ func (w *Worker) openCaptured(ctx context.Context, p state.Placement) (io.Reader
 	}, func(o opened) { o.f.Close() })
 	switch {
 	case ctx.Err() != nil:
+		if err == nil {
+			o.f.Close() // opened just as the sender was cancelled
+		}
 		return nil, nil, ctx.Err()
 	case err != nil && o.doing == "":
 		return nil, nil, fmt.Errorf("%w: %w", errStore, err) // it stalled
