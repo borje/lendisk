@@ -165,7 +165,7 @@ func (t *Tailcat) Listen(ctx context.Context) (net.Listener, error) {
 }
 
 // Dial connects to peer's tunnel port at addr, through a client kept per
-// peer.
+// peer until a dial through it fails.
 func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (net.Conn, error) {
 	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))
 	if err != nil {
@@ -189,7 +189,19 @@ func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (
 		t.clients[peer] = c
 	}
 	t.mu.Unlock()
-	return c.DialTCPPort(ctx, Port)
+	conn, err := c.DialTCPPort(ctx, Port)
+	if err != nil {
+		// tailcat admits a client as a WireGuard peer at its first ping
+		// only, so a client that fails may be talking to a server that
+		// restarted and forgot it. Drop it; the next dial starts afresh.
+		t.mu.Lock()
+		if t.clients[peer] == c {
+			delete(t.clients, peer)
+		}
+		t.mu.Unlock()
+		c.Close()
+	}
+	return conn, err
 }
 
 // PeerOf returns the key of the client that opened an accepted connection.

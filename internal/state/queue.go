@@ -75,7 +75,8 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 	return seqs, tx.Commit()
 }
 
-// FinishPut marks a pending put done with its size and hash. If the
+// FinishPut marks a pending put done with its size and hash and places
+// it (REPL-12), in one transaction. If the
 // key's latest done row is a put with the same hash, the row is dropped
 // instead and dup is true: an identical re-upload, such as a client's
 // retry after a crash, is not queued twice (EP-3, EP-11).
@@ -105,6 +106,9 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 	case err == nil || errors.Is(err, sql.ErrNoRows):
 		_, err = tx.ExecContext(ctx, `UPDATE queue SET state = 'done', size = ?, sha256 = ?, token = NULL WHERE seq = ?`,
 			size, sha256, seq)
+		if err == nil {
+			err = placeTx(ctx, tx, seq)
+		}
 	}
 	if err != nil {
 		return false, err
@@ -112,9 +116,31 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 	return dup, tx.Commit()
 }
 
-// FinishDelete marks pending deletes done.
+// FinishDelete marks pending deletes done and places them, in one
+// transaction.
 func (db *DB) FinishDelete(ctx context.Context, seqs ...int64) error {
-	return db.eachSeq(ctx, `UPDATE queue SET state = 'done' WHERE seq = ? AND state = 'pending'`, seqs)
+	if len(seqs) == 0 {
+		return nil
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, s := range seqs {
+		r, err := tx.ExecContext(ctx, `UPDATE queue SET state = 'done' WHERE seq = ? AND state = 'pending'`, s)
+		if err != nil {
+			return err
+		}
+		if n, err := r.RowsAffected(); err != nil {
+			return err
+		} else if n == 1 {
+			if err := placeTx(ctx, tx, s); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit()
 }
 
 // DropCaptures removes pending rows whose backend call failed or never

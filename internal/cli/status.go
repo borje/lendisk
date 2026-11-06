@@ -2,8 +2,11 @@ package cli
 
 import (
 	"cmp"
+	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -27,6 +30,78 @@ type Status struct {
 	Endpoint StatusEndpoint `json:"endpoint"`
 	Versions StatusVersions `json:"versions"`
 	Buckets  []StatusBucket `json:"buckets"`
+	// Places are where replicas go: each friend, for now (#18).
+	Places []StatusPlace `json:"places"`
+}
+
+// StatusPlace is one place in the pool and its replication FIFO
+// (REPL-1, REPL-4, REPL-11).
+type StatusPlace struct {
+	Place string `json:"place"` // the friend's node ID
+	Kind  string `json:"kind"`  // friend
+	// State is how the place answered last: ok, retrying, quota (paused
+	// for quota, LEND-2), removed (PEER-5); empty before its first answer.
+	State  string `json:"state"`
+	Detail string `json:"detail,omitempty"`
+	// Queue is what waits to be sent there.
+	Queue StatusQueue `json:"queue"`
+	// LagSeconds is the age of the oldest object waiting (REPL-11).
+	LagSeconds int64 `json:"lag_seconds"`
+	// Refused counts objects the place refused for good (EP-11, LEND-4).
+	Refused int64 `json:"refused"`
+	// LastOK is when the place last acknowledged anything (RFC 3339).
+	LastOK string `json:"last_ok,omitempty"`
+}
+
+// placeStates are StatusPlace.State in words.
+var placeStates = map[string]string{
+	state.ConditionOK:       "ok",
+	state.ConditionRetrying: "retrying",
+	state.ConditionQuota:    "paused for quota",
+	state.ConditionRemoved:  "removed",
+	"":                      "not contacted yet",
+}
+
+// places lists every friend and every other place with rows, friends
+// first in friendship order.
+func places(ctx context.Context, db *state.DB, now time.Time) ([]StatusPlace, error) {
+	fs, err := db.Friendships(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stats, err := db.PlaceStats(ctx, now)
+	if err != nil {
+		return nil, err
+	}
+	conds, err := db.PlaceConditions(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	seen := map[string]bool{}
+	for _, f := range fs {
+		names = append(names, f.Peer)
+		seen[f.Peer] = true
+	}
+	var rest []string
+	for p := range stats {
+		if !seen[p] {
+			rest = append(rest, p)
+		}
+	}
+	slices.Sort(rest)
+	out := []StatusPlace{}
+	for _, p := range append(names, rest...) {
+		st, c := stats[p], conds[p]
+		sp := StatusPlace{Place: p, Kind: "friend", State: c.Condition, Detail: c.Detail,
+			Queue:      StatusQueue{Objects: st.Queued, Bytes: st.QueuedBytes},
+			LagSeconds: int64(st.Lag / time.Second), Refused: st.Refused}
+		if !c.LastOK.IsZero() {
+			sp.LastOK = c.LastOK.UTC().Format(time.RFC3339)
+		}
+		out = append(out, sp)
+	}
+	return out, nil
 }
 
 // StatusEndpoint is where backup tools reach the node (EP-1). S3 is empty
@@ -139,6 +214,7 @@ func (a *app) statusCmd() *cobra.Command {
 				Paths:    StatusPaths{Config: cfg.ConfigDir(), Data: cfg.DataDir},
 				Versions: StatusVersions{Versitygw: gateway.Version()},
 				Buckets:  []StatusBucket{},
+				Places:   []StatusPlace{},
 			}
 			if cfg.Role == "full" {
 				st.Endpoint.S3 = "http://" + cfg.Endpoint.Loopback
@@ -162,6 +238,9 @@ func (a *app) statusCmd() *cobra.Command {
 				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}})
 			}
+			if st.Places, err = places(cmd.Context(), db, time.Now()); err != nil {
+				return err
+			}
 			if asJSON {
 				enc := json.NewEncoder(a.out)
 				enc.SetIndent("", "  ")
@@ -184,6 +263,20 @@ func (a *app) statusCmd() *cobra.Command {
 					b.Queue.Objects, b.Queue.Bytes)
 				if b.Queue.Pending > 0 {
 					fmt.Fprintf(a.out, ", %d writes in flight", b.Queue.Pending)
+				}
+				fmt.Fprintln(a.out)
+			}
+			if len(st.Places) > 0 {
+				fmt.Fprintf(a.out, "Places:  %d\n", len(st.Places))
+			}
+			for _, p := range st.Places {
+				fmt.Fprintf(a.out, "  %s (%s): %s, queue %d objects, %d bytes, lag %s", p.Place, p.Kind, placeStates[p.State],
+					p.Queue.Objects, p.Queue.Bytes, time.Duration(p.LagSeconds)*time.Second)
+				if p.Refused > 0 {
+					fmt.Fprintf(a.out, ", %d refused", p.Refused)
+				}
+				if p.Detail != "" {
+					fmt.Fprintf(a.out, " (%s)", p.Detail)
 				}
 				fmt.Fprintln(a.out)
 			}

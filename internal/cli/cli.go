@@ -18,6 +18,7 @@ import (
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
+	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/store"
 	"github.com/borje/lendisk/internal/transport"
 	"github.com/borje/lendisk/internal/version"
@@ -45,6 +46,9 @@ type app struct {
 	// afterStore is the capture crash-window hook (gateway.AfterStore);
 	// tests only.
 	afterStore func()
+	// tuneReplication, if set, adjusts the replication worker before it
+	// starts (timings, the OnRead hook); tests only.
+	tuneReplication func(*replica.Worker)
 	// clock, random and dialTimeout serve invites and peer add (peer.go);
 	// zero values mean time.Now, crypto/rand and a minute.
 	clock       func() time.Time

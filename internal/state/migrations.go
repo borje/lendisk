@@ -97,4 +97,38 @@ var migrations = []Migration{
 			PRIMARY KEY (peer_key, sealed)
 		);`,
 	},
+	{
+		Version: 7, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Placement (D6, REPL-1, REPL-10): one row per queue row and place
+		-- it was placed at, decided in the transaction that completes the
+		-- capture. A place's queued rows in seq order are its FIFO. On
+		-- acknowledgement the row keeps the hash the place verified: the
+		-- index of acknowledged hashes. Bucket, key and op are copied from the
+		-- queue row so the index outlives it. Place is the friend's node ID.
+		CREATE TABLE placement (
+			seq      INTEGER NOT NULL, -- the queue row
+			place    TEXT NOT NULL,
+			bucket   TEXT NOT NULL,
+			key      TEXT NOT NULL,
+			op       TEXT NOT NULL,    -- put | delete
+			state    TEXT NOT NULL,    -- queued | acked | refused
+			sha256   TEXT,             -- acked put: the hash the place verified
+			detail   TEXT,             -- refused: why
+			acked_at INTEGER,          -- unix seconds
+			PRIMARY KEY (place, seq)
+		);
+		CREATE INDEX placement_queued ON placement (place, seq) WHERE state = 'queued';
+		CREATE INDEX placement_key ON placement (place, bucket, key, seq);
+		-- How each place answered last (#18): ok, retrying, quota (paused
+		-- for quota, LEND-2) or removed (PEER-5). last_ok is when it last
+		-- acknowledged anything, D6's last-reachable time.
+		CREATE TABLE place (
+			place     TEXT PRIMARY KEY,
+			condition TEXT NOT NULL,
+			detail    TEXT,
+			since     INTEGER NOT NULL, -- unix seconds: condition entered
+			last_ok   INTEGER           -- unix seconds
+		);`,
+	},
 }
