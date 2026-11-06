@@ -37,8 +37,8 @@ LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# AF_NETLINK may be needed if tailcat's port mapper (UPnP/NAT-PMP/PCP)
-# enumerates interfaces; add it if `status` reports no direct paths (Q-R).
+# v1 does not use UPnP/NAT-PMP/PCP port mapping (DESIGN Q-R); if a later
+# release adds it (#46), AF_NETLINK may be needed here.
 
 [Install]
 WantedBy=multi-user.target
