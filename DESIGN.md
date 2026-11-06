@@ -1830,7 +1830,8 @@ capture decorator, so nothing stands between that and posix (#62).
   posix's `Initiated`, which each part refreshes) is aborted by the
   reconcile and its `lent_upload` row dropped. Otherwise a row is
   dropped only when its upload is finished, aborted, or gone from the
-  store; an upload begun long ago that still gets parts keeps it. `lending.max_total` bounds the sum of the node's own numbers;
+  store; an upload begun long ago that still gets parts keeps it.
+  `lending.max_total` bounds the sum of the node's own numbers;
   `peer quota` refuses a value that would exceed it (LEND-8). The
   borrower side keeps its own count of what it has stored at each
   place, for D6's free fraction, and corrects it from the lender's
@@ -1866,8 +1867,13 @@ capture decorator, so nothing stands between that and posix (#62).
   the proxy drops the request to `gw.sock`, which ends it there, and
   answers `RequestTimeout` (400), which the borrower retries. The
   deadline is cleared when the body ends and when the handler returns.
-  So a stalled body holds its quota and floor reservation for minutes,
-  not forever, and nothing reads the body but the store. A body longer
+  So a stalled body releases its quota and floor reservation within
+  one stall period, and a body trickling at the minimum rate holds it
+  until it ends (Content-Length ÷ the minimum rate, which can be long,
+  but the reservation is within the borrower's own quota);
+  an honest borrower whose lender's store stops reading for a stall
+  period gets `RequestTimeout` and retries. Nothing reads the body but
+  the store. A body longer
   than its `Content-Length` ends the write in `Lending` with
   `InvalidRequest`.
 - **LEND-4** `Lending` hashes a borrower's body as it streams it to the
