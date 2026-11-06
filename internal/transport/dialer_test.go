@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tailscale/tailcat"
 	"tailscale.com/tailcfg"
 
 	"github.com/borje/lendisk/internal/identity"
@@ -438,31 +439,63 @@ func TestFailedCheckKeepsAWorkingTransfer(t *testing.T) {
 	}
 }
 
-// NET-1, NET-8 (#58): the successor of a closed client is not dialled
-// until the closed one is down, so two clients with one key never run
-// at one relay.
+// NET-1, NET-8 (#58, #60): the successor of a closed client is not
+// dialled until the closed one is down, so two clients with one key
+// never run at one relay. The friend restarts; a dial fails, the
+// transport's own check fails too, and the quiet client is closed. Its
+// close is held up, and the next dial waits for it.
 func TestSuccessorWaitsForTheClosingClient(t *testing.T) {
 	d := transporttest.Start(t)
 	srvID, me := newID(t), newID(t)
-	srv := newTailcat(t, srvID, d)
-	srv.Admit(func(identity.NodeID) bool { return true })
-	l := listen(t, srv)
+	serve := func() (*Tailcat, *listener) {
+		srv := newTailcat(t, srvID, d)
+		srv.Admit(func(identity.NodeID) bool { return true })
+		return srv, listen(t, srv)
+	}
+	srv, l := serve()
 	dl, err := NewDialer(me, quiet)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer dl.Close()
+	dl.probeTimeout = time.Second
+	dl.quietFor = 300 * time.Millisecond
 	peer := srvID.NodeID()
-	dialed(t, dl, srv, peer, l)
+	dialed(t, dl, srv, peer, l) // stays open, and goes quiet
 	dying := dl.client(peer)
-	// Mark it closed as a failed check does, without shutting it yet.
-	dl.mu.Lock()
-	delete(dl.clients, peer)
-	dl.closeLocked(dying)
-	dl.mu.Unlock()
+	closing, release := make(chan struct{}), make(chan struct{})
+	dl.closeTailcat = func(c io.Closer) error {
+		if c == dying.Client {
+			close(closing)
+			<-release
+		}
+		return c.Close()
+	}
+	srv.Close()
+	srv, l = serve()
+
+	// Dials go to the stale session until the check replaces the client.
+	for start := time.Now(); ; {
+		select {
+		case <-closing:
+		default:
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			if c, err := dl.Dial(ctx, peer, srv.Address()); err == nil {
+				c.Close()
+				cancel()
+				t.Fatal("the stale client reached the restarted friend")
+			}
+			cancel()
+			if time.Since(start) > 20*time.Second {
+				t.Fatal("the client whose check failed was never closed")
+			}
+			continue
+		}
+		break
+	}
 	done := make(chan error, 1)
 	go func() {
-		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 		defer cancel()
 		c, err := dl.Dial(ctx, peer, srv.Address())
 		if err == nil {
@@ -478,11 +511,274 @@ func TestSuccessorWaitsForTheClosingClient(t *testing.T) {
 	if dl.client(peer) != nil {
 		t.Fatal("a successor was built while the old client was closing")
 	}
-	dying.shut()
+	close(release)
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
 	if c := dl.client(peer); c == nil || c == dying {
 		t.Fatal("no new client after the old one was down")
+	}
+	select {
+	case c := <-l.conns:
+		c.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("the successor's connection never reached the restarted friend")
+	}
+}
+
+// NET-1, NET-8 (#60): a dial that succeeds through a client the
+// transport closes meanwhile returns an error, not a dead connection,
+// and the next dial reaches the friend through a new client.
+func TestDialRacingAClosingClientFails(t *testing.T) {
+	d := transporttest.Start(t)
+	srvID, me := newID(t), newID(t)
+	srv := newTailcat(t, srvID, d)
+	srv.Admit(func(identity.NodeID) bool { return true })
+	l := listen(t, srv)
+	dl, err := NewDialer(me, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dl.Close()
+	peer := srvID.NodeID()
+	a, _ := dialed(t, dl, srv, peer, l)
+	a.Close() // nothing keeps the client up but the racing dial
+	first := dl.client(peer)
+
+	var hold atomic.Bool
+	through := make(chan struct{})
+	dial := dl.dial
+	dl.dial = func(ctx context.Context, c *tailcatClient) (net.Conn, error) {
+		conn, err := dial(ctx, c)
+		if err == nil && hold.CompareAndSwap(true, false) {
+			close(through)
+			<-c.down // the transport closes the client meanwhile
+		}
+		return conn, err
+	}
+	dl.check = func(context.Context, *tailcatClient) error { return errors.New("the friend is gone") }
+	hold.Store(true)
+	racing := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		defer cancel()
+		c, err := dl.Dial(ctx, peer, srv.Address())
+		if err == nil {
+			c.Close()
+		}
+		racing <- err
+	}()
+	select {
+	case <-through:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the racing dial never got through")
+	}
+	// A failed dial starts the check, which fails and closes the client.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if c, err := dl.Dial(ctx, peer, srv.Address()); err == nil {
+		c.Close()
+		t.Fatal("a cancelled dial succeeded")
+	}
+	select {
+	case err := <-racing:
+		if err == nil {
+			t.Fatal("a dial through a client closed under it returned a connection")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the racing dial never returned")
+	}
+	if !first.isClosed() {
+		t.Fatal("the client was not closed")
+	}
+	dl.check = dl.dialCheck
+	b, sb := dialed(t, dl, srv, peer, l)
+	if dl.client(peer) == first {
+		t.Fatal("the closed client is still used")
+	}
+	echo(t, b, sb, "fresh")
+}
+
+// NET-1, NET-8 (#60): the quiet period is measured on the transport's
+// own monotonic clock, not the wall clock. While that clock holds still
+// (as it does through an NTP step of the wall clock) a failed check
+// keeps a client whose connection just moved bytes, however much real
+// time passes; a clock read behind the last activity never makes the
+// transport wait longer than quietFor between checks; and once the
+// clock passes quietFor, the next failed check closes the client.
+func TestQuietPeriodFollowsTheMonotonicClock(t *testing.T) {
+	d := transporttest.Start(t)
+	srvID, me := newID(t), newID(t)
+	srv := newTailcat(t, srvID, d)
+	srv.Admit(func(identity.NodeID) bool { return true })
+	l := listen(t, srv)
+	dl, err := NewDialer(me, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dl.Close()
+	var now atomic.Int64
+	now.Store(int64(time.Hour))
+	dl.elapsed = func() time.Duration { return time.Duration(now.Load()) }
+	peer := srvID.NodeID()
+	dialed(t, dl, srv, peer, l) // moves bytes at 1h on the clock
+	shared := dl.client(peer)
+	var checks atomic.Int64
+	dl.quietFor = 200 * time.Millisecond
+	dl.check = func(context.Context, *tailcatClient) error {
+		checks.Add(1)
+		return errors.New("the relay is down")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if c, err := dl.Dial(ctx, peer, srv.Address()); err == nil {
+		c.Close()
+		t.Fatal("a cancelled dial succeeded")
+	}
+	time.Sleep(time.Second)
+	if checks.Load() < 2 {
+		t.Fatalf("%d checks in a second with a quietFor of 200ms", checks.Load())
+	}
+	if shared.isClosed() {
+		t.Fatal("real time passing closed a client the clock says is active")
+	}
+	// The clock reads an hour behind the last activity.
+	now.Store(0)
+	before := checks.Load()
+	time.Sleep(time.Second)
+	if checks.Load() == before {
+		t.Fatal("a clock behind the last activity stopped the checks")
+	}
+	if shared.isClosed() {
+		t.Fatal("a clock behind the last activity closed the client")
+	}
+	now.Store(int64(time.Hour + time.Second))
+	for deadline := time.Now().Add(5 * time.Second); !shared.isClosed(); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("a client quiet for longer than quietFor on the clock was never closed")
+		}
+	}
+}
+
+// NET-1, NET-8 (#60): two addresses name the same relay when they share
+// a DERP server the client could connect to, whatever else their node
+// lists hold and in whatever order; nodes with no host name are told
+// apart by IP.
+func TestRelayIdentity(t *testing.T) {
+	node := func(host, v4 string, port int) *tailcfg.DERPNode {
+		return &tailcfg.DERPNode{HostName: host, IPv4: v4, IPv6: "none", DERPPort: port}
+	}
+	stun := &tailcfg.DERPNode{HostName: "stun.example", STUNOnly: true}
+	ci := func(nodes ...*tailcfg.DERPNode) tailcat.ConnInfo {
+		return tailcat.ConnInfo{Region: []*tailcfg.DERPRegion{{RegionID: 900, Nodes: nodes}}}
+	}
+	a := node("derp1.example", "", 0)
+	b := node("derp2.example", "192.0.2.2", 443)
+	for _, tc := range []struct {
+		name string
+		x, y tailcat.ConnInfo
+		same bool
+	}{
+		{"identical", ci(a, b), ci(a, b), true},
+		{"reordered", ci(a, b), ci(b, a), true},
+		{"node added", ci(a), ci(node("derp9.example", "", 0), a), true},
+		{"node removed", ci(a, b), ci(b), true},
+		{"port 0 is 443", ci(a), ci(node("DERP1.example.", "", 443)), true},
+		{"host name and its IP", ci(b), ci(node("", "192.0.2.2", 443)), true},
+		{"IP-only nodes differ by IP", ci(node("", "192.0.2.1", 0)), ci(node("", "192.0.2.7", 0)), false},
+		{"another port", ci(a), ci(node("derp1.example", "", 8443)), false},
+		{"STUN-only nodes do not count", ci(a, stun), ci(b, stun), false},
+		{"disjoint", ci(a), ci(b), false},
+		{"public regions by ID", tailcat.ConnInfo{RegionID: 1}, tailcat.ConnInfo{RegionID: 1}, true},
+		{"other public regions", tailcat.ConnInfo{RegionID: 1}, tailcat.ConnInfo{RegionID: 2}, false},
+	} {
+		if got := relayOf(tc.x).overlaps(relayOf(tc.y)); got != tc.same {
+			t.Errorf("%s: same relay = %v, want %v (%v vs %v)", tc.name, got, tc.same, relayOf(tc.x), relayOf(tc.y))
+		}
+	}
+}
+
+// NET-1, NET-8 (#60): a friend whose address carries another node list
+// for the same relay (a re-init, a #51 re-redeem with a newer DERP map)
+// keeps its one client, so no second client with the same key is built
+// for the server the first one still talks to.
+func TestNodeListChangeKeepsTheClient(t *testing.T) {
+	d := transporttest.Start(t)
+	srvID, me := newID(t), newID(t)
+	srv := newTailcat(t, srvID, d)
+	srv.Admit(func(identity.NodeID) bool { return true })
+	l := listen(t, srv)
+	dl, err := NewDialer(me, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dl.Close()
+	peer := srvID.NodeID()
+	a, sa := dialed(t, dl, srv, peer, l)
+	old := dl.client(peer)
+	local := d.Region.Nodes[0]
+	other := *local
+	other.Name, other.HostName, other.IPv4 = "900b", "derp-b.invalid", "192.0.2.9"
+	ipOnly := *local
+	ipOnly.HostName = ""
+	for _, nodes := range [][]*tailcfg.DERPNode{
+		{local, &other},
+		{&other, local},
+		{&ipOnly},
+	} {
+		r := *d.Region
+		r.Nodes = nodes
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+		c, err := dl.Dial(ctx, peer, AddressOf(srvID, &r))
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Close()
+		if dl.client(peer) != old {
+			t.Fatalf("a second client was built for the node list %v", relayOf(tailcat.ConnInfo{Region: []*tailcfg.DERPRegion{&r}}))
+		}
+		echo(t, a, sa, "still the one client")
+	}
+}
+
+// #60: Close releases the transport's lock before it closes tailcat's
+// clients and server, whose shutdown may wait on the admission hook,
+// which takes that lock.
+func TestCloseReleasesTheLockBeforeClosingTailcat(t *testing.T) {
+	d := transporttest.Start(t)
+	srvID, me := newID(t), newID(t)
+	srv := newTailcat(t, srvID, d)
+	srv.Admit(func(identity.NodeID) bool { return true })
+	l := listen(t, srv)
+	dl, err := NewDialer(me, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := srvID.NodeID()
+	dialed(t, dl, srv, peer, l)
+	for _, tc := range []struct {
+		name string
+		t    *Tailcat
+	}{{"dialer", dl}, {"server", srv}} {
+		var calls, locked int
+		tc.t.closeTailcat = func(c io.Closer) error {
+			calls++
+			if tc.t.mu.TryLock() {
+				tc.t.mu.Unlock()
+			} else {
+				locked++
+			}
+			return c.Close()
+		}
+		if err := tc.t.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if calls == 0 {
+			t.Fatalf("%s: Close closed nothing", tc.name)
+		}
+		if locked > 0 {
+			t.Fatalf("%s: Close held its lock across %d of %d tailcat closes", tc.name, locked, calls)
+		}
 	}
 }

@@ -1862,24 +1862,41 @@ upstream bucket is Q-V.
   client with an open connection is replaced up to about 40 s later
   than a client with none, and a write that only fills the send buffer
   of a dead connection counts as bytes moved, which delays the close
-  by one more round. The next dial after the close builds a new client,
-  which pings first (#52), and not before the old one has finished
-  closing.
+  by one more round. Activity is stamped on the transport's monotonic
+  clock (the time since the transport was made), so an NTP step of the
+  wall clock on a board without a real-time clock neither delays a
+  check nor cuts a live transfer (#60). The next dial after the close
+  builds a new client, which pings first (#52), and not before the old
+  one has finished closing; a dial that succeeded through the client
+  as it was closed closes its connection and fails, so its caller
+  dials again.
 
   Two clients of one key never run at one relay: tailcat's server
   keeps one WireGuard session per client key, so a live old client
   would fight its successor for that session (measured: a second
   client of the same key to the same server stalls the first one's
-  connections). The client is keyed by the friend and its relay
-  (`relayOf`: a public region's ID, or the DERP servers' host and
-  port; tailcat strips region and node names from an address), not by
-  the address string, so an address that changes but keeps the relay
-  (a re-encoded region, a #51 re-redeem) reuses the client. When the
-  address moves to another relay, the old client takes no new dials
-  and its check stops, but it stays up until its last connection
+  connections). The client is keyed by the friend and its relay, not
+  by the address string. tailcat's client connects to the first node
+  of the address's region that answers, in order, and does not report
+  which, so `relayOf` names every DERP server the address could reach:
+  each node that is not STUN-only, by host name and by each IP it
+  gives, with its DERP port (0 is 443); an address naming a public
+  region by ID only gives that ID. tailcat strips region and node
+  names from an address. Two addresses are one relay when those sets
+  share a server, whatever the node order, so an address that keeps a
+  server of the client's (a re-encoded region, a node added or removed
+  by a re-init or a #51 re-redeem with a newer DERP map) reuses the
+  client, and nodes with no host name are told apart by IP. The match
+  errs towards one relay: a client wrongly kept fails its check and is
+  replaced, while a second client wrongly built stalls the first. When
+  the address moves to another relay, the old client takes no new
+  dials and its check stops, but it stays up until its last connection
   closes, since clients on different relays coexist; if the address
   comes back to its relay first, that client is put back in service
-  rather than a second one built.
+  rather than a second one built. `Tailcat.Close` marks every client
+  closed under its lock and closes them and the server after releasing
+  it, since tailcat's shutdown may wait on the admission hook, which
+  takes that lock.
 - **Dialling a friend.** The replica client's HTTP transport uses the
   tailcat `Client.Dial` for that peer as its dial function, so
   replication traffic enters the tunnel from inside the process. No
