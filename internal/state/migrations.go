@@ -192,4 +192,25 @@ var migrations = []Migration{
 			PRIMARY KEY (upload_id, part)
 		);`,
 	},
+	{
+		Version: 11, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Pending alerts (OPS-2, OPS-3, #13): one row per condition, keyed
+		-- kind:subject, so an alert is raised once while its condition
+		-- holds. cleared_at is set when it ends; a later raise of the same
+		-- key replaces the row. hook_at and webhook_at record delivery of
+		-- the current raise to each channel; NULL until delivered.
+		CREATE TABLE alert (
+			key        TEXT PRIMARY KEY, -- kind, or kind:subject
+			kind       TEXT NOT NULL,    -- friend_unreachable, store_unreadable, …
+			subject    TEXT NOT NULL,    -- the friend's node ID, the bucket, or ''
+			message    TEXT NOT NULL,
+			raised_at  INTEGER NOT NULL, -- unix seconds
+			cleared_at INTEGER,          -- unix seconds; NULL while it holds
+			hook_at    INTEGER,          -- unix seconds
+			webhook_at INTEGER           -- unix seconds
+		);
+		-- Refusals, which the alert evaluator counts every minute.
+		CREATE INDEX placement_refused ON placement (place) WHERE state = 'refused';`,
+	},
 }

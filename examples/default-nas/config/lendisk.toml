@@ -64,6 +64,7 @@ bjorn = "8M"                 # REPL-7: Björn is relayed through DERP; be gentle
 [alerts]
 command = "/etc/lendisk/hooks/ntfy.sh"    # OPS-3: receives JSON on stdin
 webhook = "https://hc-ping.com/your-uuid" # OPS-3: healthchecks.io style
+unreachable_after = "24h"                 # OPS-2: the default
 
 [log]
 level = "info"               # OPS-5: structured, to stdout

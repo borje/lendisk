@@ -1660,7 +1660,8 @@ upstream bucket is Q-V.
   error (below) refused for every place with an alert (VER-5); if it
   cannot be read now, the row waits as for an unreadable store. A
   refused row is logged at error level with
-  `alert=true` until alert delivery (#13). A paused (`quota`) or
+  `alert=true`, and the refusal it records raises the
+  `place_refused` or `objects_not_replicated` alert (§3.8, #13). A paused (`quota`) or
   `removed` place tries its head row again after an hour (LEND-2);
   other errors back off from 1 s, doubling to 5 minutes, with the place
   `retrying`.
@@ -1709,7 +1710,8 @@ upstream bucket is Q-V.
   store holds up. Nothing is refused. The first store failure after any
   other outcome (an acknowledgement, a refusal, a network error at any
   backoff) is logged at error level with `alert=true` and starts its
-  backoff at 1 s; the network's backoff never decides it (#61). A read
+  backoff at 1 s; the network's backoff never decides it (#61). The
+  `store` condition raises the `store_unreadable` alert (§3.8, #13). A read
   of the store that does not return while an object is sent, or while
   it is re-hashed after a `BadDigest`, is such a failure: the store is
   read on a goroutine of its own and handed to the client through a
@@ -2172,6 +2174,54 @@ capture decorator, so nothing stands between that and posix (#62).
 
 ### 3.8 Operations and observability
 
+- **OPS-2, OPS-3, alerts (#13).** Package `alert`. An alert is a
+  condition read from `lendisk.db`, never an event: `alert.Service`
+  re-reads every condition each minute (the first pass a minute after
+  start, so the replication worker has contacted each friend again),
+  and at once when the worker records a refusal or a store failure
+  (`replica.Worker.Alerted` calls `Service.Check`, which never
+  blocks). Table `alert` (migration 11) keeps one row per condition,
+  keyed `kind` or `kind:subject`: `state.SyncAlerts` raises a row
+  when its condition starts, keeps it (updating its message) while
+  the condition holds, so an alert is raised and delivered once, and
+  sets `cleared_at` when it ends. A later raise of the same key
+  replaces the row and is delivered again. The kinds so far:
+  - `friend_unreachable`, subject the friend: its place has been
+    `retrying` (a network error) for longer than
+    `alerts.unreachable_after` (24h), counted from the place's `since`.
+    Reachability is learned only from replication attempts, so a friend
+    with nothing queued is not judged until a probe exists;
+  - `store_unreadable`, no subject: a place waits with condition
+    `store` (§3.4 *Local errors*);
+  - `objects_not_replicated`, subject the bucket: objects refused
+    because the store could not supply them (VER-5, #50), until written
+    again;
+  - `place_refused`, subject the place: rows it refused for good
+    (EP-11, a `BadDigest` for bytes that match, #57), until written
+    again.
+  Later tickets add a kind to `alert.kinds` and its condition to the
+  evaluator. Each raise is delivered once to each configured channel,
+  recorded in `hook_at` and `webhook_at`, so a restarted daemon
+  delivers what was not delivered and nothing twice. A cleared alert
+  is not delivered (decided for #13: the minimal option; the
+  `event` field leaves room for `cleared`). The body is
+  `alert.Message`, JSON:
+  `{"schema":1,"event":"raised","kind":…,"subject":…,"message":…,"raised_at":RFC 3339 UTC,"node":node ID}`
+  (`subject` omitted when empty; fields are added, never renamed).
+  `alerts.command` is a program run without a shell, the body on
+  stdin, delivered on exit status 0; `alerts.webhook` receives the
+  same body as a `POST` with `Content-Type: application/json`,
+  delivered on a 2xx. Each attempt has 30 s; a failure is logged at
+  warn level and every undelivered channel is retried after a backoff
+  of 1 s doubling to 5 minutes, for as long as the alert holds.
+  Delivery runs on its own goroutine and the evaluator on another,
+  both only reading and writing state, so neither replication nor the
+  gateway ever waits for a hook or a webhook. The webhook URL may hold
+  a secret (a healthchecks.io UUID, an ntfy topic): it is logged as
+  scheme and host only (`alert.Redact`), also inside errors, and a
+  config refusal never echoes it. `status` and `status --json`
+  (`alerts`: kind, subject, message, raised_at) show the pending
+  alerts, also while the daemon is stopped.
 - **OPS-4** `prometheus/client_golang` on a loopback port, not started
   in the lender-only profile (PEER-9). Transfer
   counters (bytes, objects, retries, lag, per place) come from the
@@ -2188,7 +2238,8 @@ capture decorator, so nothing stands between that and posix (#62).
   the cap is `[lending]` (`max_total`); network addresses for the
   endpoint are `[[endpoint.listen]]` entries (EP-17), none by default;
   relays are `[relays]`, the address's bootstrap region `[tunnel]`
-  (`region`, SEC-14) and alert hooks `[alerts]`. There are no
+  (`region`, SEC-14) and alerts `[alerts]` (`command`, `webhook`,
+  `unreachable_after`). There are no
   `[[peer]]` or `[[overflow]]` entries: `peer add`, `peer quota` and
   `overflow add` write `lendisk.db`.
 - **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the

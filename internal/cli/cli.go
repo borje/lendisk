@@ -17,6 +17,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
@@ -54,6 +55,9 @@ type app struct {
 	// tuneReplication, if set, adjusts the replication worker before it
 	// starts (timings, the OnRead hook); tests only.
 	tuneReplication func(*replica.Worker)
+	// tuneAlerts, if set, adjusts the alert service before it starts
+	// (its interval); tests only.
+	tuneAlerts func(*alert.Service)
 	// clock, random and dialTimeout serve invites and peer add (peer.go);
 	// zero values mean time.Now, crypto/rand and a minute.
 	clock       func() time.Time

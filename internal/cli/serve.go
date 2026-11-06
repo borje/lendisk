@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/gateway"
@@ -93,6 +94,13 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 
 			running := 1
+			// Alerts (OPS-2, OPS-3) read state and deliver on goroutines
+			// of their own: nothing else waits for them.
+			alerts := &alert.Service{DB: db, Log: log, Node: nodeID, Command: cfg.Alerts.Command, Webhook: cfg.Alerts.Webhook,
+				UnreachableAfter: cfg.UnreachableAfter(), Now: a.clock}
+			if a.tuneAlerts != nil {
+				a.tuneAlerts(alerts)
+			}
 			br := bridge.New(gw.Socket, log)
 			if a.tuneBridge != nil {
 				a.tuneBridge(br)
@@ -135,13 +143,16 @@ func (a *app) serveCmd() *cobra.Command {
 
 				// Replication to friends (#18) never blocks the endpoint
 				// (REPL-9): it reads the store and lendisk.db only.
-				w := &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log}
+				w := &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
+					Alerted: alerts.Check}
 				if a.tuneReplication != nil {
 					a.tuneReplication(w)
 				}
 				running++
 				go func() { w.Run(ctx); errc <- nil }()
 			}
+			running++
+			go func() { alerts.Run(ctx); errc <- nil }()
 
 			var first error
 			for i := 0; i < running; i++ {

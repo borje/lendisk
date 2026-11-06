@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/pflag"
 )
@@ -296,6 +297,40 @@ func TestEndpointListenRefused(t *testing.T) {
 	for _, good := range []string{"address=192.168.1.10:9000", "address=[fd00::1]:9000,tls=off", "interface=lo,port=9000"} {
 		if _, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "x.toml"), "--endpoint-listen", good}, nil); err != nil {
 			t.Errorf("refused %q: %v", good, err)
+		}
+	}
+}
+
+// OPS-2, OPS-3 (#13): the [alerts] section, its default threshold, and
+// refusals that never echo the webhook, which may hold a secret.
+func TestAlertSettings(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Alerts.Command != "" || l.Alerts.Webhook != "" || l.Alerts.UnreachableAfter != "24h" || l.UnreachableAfter() != 24*time.Hour {
+		t.Fatalf("defaults %+v", l.Alerts)
+	}
+	p := writeFile(t, "[alerts]\ncommand = \"/etc/lendisk/hooks/ntfy.sh\"\nwebhook = \"https://hc-ping.com/uuid\"\nunreachable_after = \"6h\"\n")
+	l, err = load(t, []string{"--config", p}, map[string]string{"LENDISK_ALERTS_UNREACHABLE_AFTER": "90m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Alerts.Command != "/etc/lendisk/hooks/ntfy.sh" || l.Alerts.Webhook != "https://hc-ping.com/uuid" || l.UnreachableAfter() != 90*time.Minute {
+		t.Fatalf("alerts %+v", l.Alerts)
+	}
+	for _, bad := range []string{"0", "-1h", "a day"} {
+		if _, err := load(t, []string{"--config", none, "--alerts-unreachable-after", bad}, nil); err == nil {
+			t.Errorf("accepted unreachable_after %q", bad)
+		}
+	}
+	for _, bad := range []string{"hc-ping.com/s3cr3t", "ftp://host/s3cr3t", "https:///s3cr3t"} {
+		_, err := load(t, []string{"--config", none, "--alerts-webhook", bad}, nil)
+		if err == nil {
+			t.Errorf("accepted webhook %q", bad)
+		} else if strings.Contains(err.Error(), "s3cr3t") {
+			t.Errorf("the refusal echoes the webhook: %v", err)
 		}
 	}
 }

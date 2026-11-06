@@ -104,6 +104,8 @@ type fixture struct {
 	store  string
 	places map[string]*place
 	w      *Worker
+	// alerted counts the worker's Alerted calls (#13).
+	alerted atomic.Int32
 }
 
 func newFixture(t *testing.T, friends ...string) *fixture {
@@ -123,7 +125,7 @@ func newFixture(t *testing.T, friends ...string) *fixture {
 	fx.w = &Worker{DB: db, StoreDir: fx.store, Log: quiet,
 		Connect: func(f state.Friendship) (Replica, error) { return fx.places[f.Peer], nil },
 		Poll:    10 * time.Millisecond, MinBackoff: 10 * time.Millisecond, MaxBackoff: 20 * time.Millisecond,
-		PauseRetry: 50 * time.Millisecond}
+		PauseRetry: 50 * time.Millisecond, Alerted: func() { fx.alerted.Add(1) }}
 	return fx
 }
 
@@ -375,6 +377,10 @@ func TestImmutabilityAndRejectedHashAreRefused(t *testing.T) {
 	st, _ := fx.db.PlaceStats(t.Context(), time.Now())
 	if st["B"].Refused != 1 || fx.refused("laptop") != 1 {
 		t.Fatalf("stats %+v, bucket refused %d", st["B"], fx.refused("laptop"))
+	}
+	// Each refusal asked the alert service to look (#13).
+	if n := fx.alerted.Load(); n != 2 {
+		t.Fatalf("alert service told %d times, want 2", n)
 	}
 }
 
@@ -847,6 +853,9 @@ func TestStoreFailureAlertsAtMaximumNetworkBackoff(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // several store retries
 	if n := len(logs.alerts("store")); n != 1 {
 		t.Fatalf("%d store alerts, want 1", n)
+	}
+	if n := fx.alerted.Load(); n != 1 {
+		t.Fatalf("alert service told %d times, want 1 (#13)", n)
 	}
 }
 

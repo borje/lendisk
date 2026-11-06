@@ -22,12 +22,14 @@ import (
 	"fmt"
 	"io/fs"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/pflag"
@@ -50,6 +52,7 @@ type Config struct {
 	Store    Store    `toml:"store"`
 	Endpoint Endpoint `toml:"endpoint"`
 	Tunnel   Tunnel   `toml:"tunnel"`
+	Alerts   Alerts   `toml:"alerts"`
 	Log      Log      `toml:"log"`
 }
 
@@ -152,6 +155,19 @@ type Tunnel struct {
 	Region string `toml:"region" help:"DERP relay region in this node's address, by ID or code; empty picks the nearest once. Changing it changes the address"`
 }
 
+// Alerts is the [alerts] section (OPS-2, OPS-3).
+type Alerts struct {
+	Command          string `toml:"command" help:"program run for each alert with a JSON object on stdin, without a shell (OPS-3); empty for none"`
+	Webhook          string `toml:"webhook" help:"http or https URL each alert's JSON is POSTed to (OPS-3); may hold a secret, never logged in full; empty for none"`
+	UnreachableAfter string `toml:"unreachable_after" default:"24h" help:"alert when a friend has not answered for this long (OPS-2), such as 24h or 90m"`
+}
+
+// UnreachableAfter is alerts.unreachable_after, which Validate checked.
+func (c *Config) UnreachableAfter() time.Duration {
+	d, _ := time.ParseDuration(c.Alerts.UnreachableAfter)
+	return d
+}
+
 // Validate checks values that have a fixed set of choices.
 func (c *Config) Validate() error {
 	var errs []error
@@ -189,6 +205,16 @@ func (c *Config) Validate() error {
 	for i, l := range c.Endpoint.Listen {
 		if err := l.check(); err != nil {
 			errs = append(errs, fmt.Errorf("endpoint.listen entry %d (%s): %w", i+1, l, err))
+		}
+	}
+	if d, err := time.ParseDuration(c.Alerts.UnreachableAfter); err != nil || d <= 0 {
+		errs = append(errs, fmt.Errorf("alerts.unreachable_after = %q: want a positive duration such as 24h or 90m", c.Alerts.UnreachableAfter))
+	}
+	if c.Alerts.Webhook != "" {
+		// Never echo the URL: its path or query may be a secret.
+		u, err := url.Parse(c.Alerts.Webhook)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			errs = append(errs, errors.New("alerts.webhook: want an http:// or https:// URL with a host"))
 		}
 	}
 	return errors.Join(errs...)
