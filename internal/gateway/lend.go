@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -14,8 +16,10 @@ import (
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
+	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/store"
 )
 
 // LentPrefix begins the store name of every bucket a borrower keeps here.
@@ -51,12 +55,42 @@ func borrowerOf(access string) (identity.NodeID, bool) {
 // passing a borrower's sealed name through unmapped. For a borrower,
 // calls that would weaken the ownership wall (ACLs, policies, ownership
 // controls, bucket owner), copies (their source names a bucket in a
-// string) and DeleteBucket are refused; the NET-7 allow-list in the gate
+// string), DeleteBucket and DeleteObjects are refused; the NET-7 allow-list in the gate
 // (#15) narrows the rest.
+//
+// For a borrower it also enforces quota, the free-space floor, object
+// integrity and key names on every write (quota.go: LEND-1, LEND-2,
+// LEND-4, SEC-5).
 type Lending struct {
 	Next backend.Backend
 	DB   *state.DB
 	Now  func() time.Time
+	// Uploads reads which upload assembled a stored object (#62), to
+	// tell a retried completion.
+	Uploads UploadIDs
+	// StoreDir, Floor and Statfs give the free-space floor (LEND-2): a
+	// nil Floor is DefaultFloor, a nil Statfs the real filesystem's.
+	StoreDir string
+	Floor    *config.Floor
+	Statfs   func(dir string) (store.Space, error)
+	Log      *slog.Logger
+	// AbandonAfter is how long a borrower's multipart upload may go
+	// without a part before the reconcile aborts it (default
+	// DefaultAbandonAfter).
+	AbandonAfter time.Duration
+	// Tests only: beforeComplete runs just before a borrower's upload is
+	// completed in the store; afterList when a reconcile has listed a
+	// borrower and not yet set its count; afterPartStored when a part is
+	// stored and not yet counted.
+	beforeComplete  func()
+	afterList       func()
+	afterPartStored func(part int32, size int64)
+
+	keys     keyLocks // one multipart create, completion or delete per borrower's key at a time
+	uploads  keyLocks // one accounting step per borrower's upload at a time
+	mu       sync.Mutex
+	peers    map[string]*borrowerUse
+	reserved int64 // admitted bytes of every borrower's writes in flight
 }
 
 var (
@@ -186,7 +220,8 @@ func (l *Lending) GetBucketAcl(ctx context.Context, in *s3.GetBucketAclInput) ([
 // CreateBucket creates a borrower's bucket under its store name, private
 // and owned by the borrower's account alone, and records it in the
 // mapping table (PEER-2, PEER-8). The name sent must be a sealed name.
-// A retry finds the bucket already its own and records it.
+// A new bucket is admitted like a write (createBucketLent). A retry finds
+// the bucket already its own and records it.
 func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, acl []byte) error {
 	peer, ok := borrower(ctx)
 	if !ok {
@@ -203,14 +238,16 @@ func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, ac
 	c := *in
 	c.Bucket = &stored
 	c.ObjectOwnership = types.ObjectOwnershipBucketOwnerEnforced
-	err = l.Next.CreateBucket(ctx, &c, own)
-	if err != nil && !isCode(err, "BucketAlreadyOwnedByYou") {
+	return l.createBucketLent(ctx, peer.String(), sealed, func() error {
+		err := l.Next.CreateBucket(ctx, &c, own)
+		if err != nil && !isCode(err, "BucketAlreadyOwnedByYou") {
+			return err
+		}
+		if rerr := l.DB.AddLentBucket(context.Background(), peer.String(), sealed, l.now()); rerr != nil {
+			return errInternal
+		}
 		return err
-	}
-	if rerr := l.DB.AddLentBucket(context.Background(), peer.String(), sealed, l.now()); rerr != nil {
-		return errInternal
-	}
-	return err
+	})
 }
 
 func (l *Lending) now() time.Time {
@@ -233,7 +270,8 @@ func (l *Lending) PutBucketAcl(ctx context.Context, bucket string, data []byte) 
 }
 
 // DeleteBucket is refused to a borrower: its row in the mapping table and
-// the quota count go with it, which is not built (#15, #16).
+// its bytes in the quota count would have to go with it, which is not
+// built (#15).
 func (l *Lending) DeleteBucket(ctx context.Context, bucket string) error {
 	if refused(ctx) {
 		return errNotForBorrower
@@ -354,8 +392,14 @@ func (l *Lending) CreateMultipartUpload(ctx context.Context, in s3response.Creat
 	if err != nil {
 		return s3response.InitiateMultipartUploadResult{}, err
 	}
+	sealed := deref(in.Bucket)
 	in.Bucket = b
-	res, err := l.Next.CreateMultipartUpload(ctx, in)
+	var res s3response.InitiateMultipartUploadResult
+	if peer, ok := borrower(ctx); ok {
+		res, err = l.createUploadLent(ctx, peer.String(), sealed, in)
+	} else {
+		res, err = l.Next.CreateMultipartUpload(ctx, in)
+	}
 	res.Bucket = sealedOf(ctx, res.Bucket)
 	return res, err
 }
@@ -367,7 +411,13 @@ func (l *Lending) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMu
 	}
 	c := *in
 	c.Bucket = b
-	res, ver, err := l.Next.CompleteMultipartUpload(ctx, &c)
+	var res s3response.CompleteMultipartUploadResult
+	var ver string
+	if peer, ok := borrower(ctx); ok {
+		res, ver, err = l.completeLent(ctx, peer.String(), deref(in.Bucket), &c)
+	} else {
+		res, ver, err = l.Next.CompleteMultipartUpload(ctx, &c)
+	}
 	res.Bucket = sealedPtr(ctx, res.Bucket)
 	return res, ver, err
 }
@@ -379,6 +429,9 @@ func (l *Lending) AbortMultipartUpload(ctx context.Context, in *s3.AbortMultipar
 	}
 	c := *in
 	c.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		return l.abortLent(ctx, peer.String(), deref(in.Bucket), &c)
+	}
 	return l.Next.AbortMultipartUpload(ctx, &c)
 }
 
@@ -399,6 +452,9 @@ func (l *Lending) ListParts(ctx context.Context, in *s3.ListPartsInput) (s3respo
 	if err != nil {
 		return s3response.ListPartsResult{}, err
 	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return s3response.ListPartsResult{}, kerr
+	}
 	c := *in
 	c.Bucket = b
 	res, err := l.Next.ListParts(ctx, &c)
@@ -411,8 +467,14 @@ func (l *Lending) UploadPart(ctx context.Context, in *s3.UploadPartInput) (*s3.U
 	if err != nil {
 		return nil, err
 	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return nil, kerr
+	}
 	c := *in
 	c.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		return l.uploadPartLent(ctx, peer.String(), deref(in.Bucket), &c)
+	}
 	return l.Next.UploadPart(ctx, &c)
 }
 
@@ -431,6 +493,9 @@ func (l *Lending) PutObject(ctx context.Context, in s3response.PutObjectInput) (
 		return s3response.PutObjectOutput{}, err
 	}
 	in.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		return l.putLent(ctx, peer.String(), in)
+	}
 	return l.Next.PutObject(ctx, in)
 }
 
@@ -438,6 +503,9 @@ func (l *Lending) HeadObject(ctx context.Context, in *s3.HeadObjectInput) (*s3.H
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return nil, err
+	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return nil, kerr
 	}
 	c := *in
 	c.Bucket = b
@@ -449,6 +517,9 @@ func (l *Lending) GetObject(ctx context.Context, in *s3.GetObjectInput) (*s3.Get
 	if err != nil {
 		return nil, err
 	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return nil, kerr
+	}
 	c := *in
 	c.Bucket = b
 	return l.Next.GetObject(ctx, &c)
@@ -459,6 +530,9 @@ func (l *Lending) GetObjectAcl(ctx context.Context, in *s3.GetObjectAclInput) (*
 	if err != nil {
 		return nil, err
 	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return nil, kerr
+	}
 	c := *in
 	c.Bucket = b
 	return l.Next.GetObjectAcl(ctx, &c)
@@ -468,6 +542,9 @@ func (l *Lending) GetObjectAttributes(ctx context.Context, in *s3.GetObjectAttri
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.GetObjectAttributesResponse{}, err
+	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return s3response.GetObjectAttributesResponse{}, kerr
 	}
 	c := *in
 	c.Bucket = b
@@ -513,10 +590,18 @@ func (l *Lending) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput) (*
 	}
 	c := *in
 	c.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		return l.deleteLent(ctx, peer.String(), &c)
+	}
 	return l.Next.DeleteObject(ctx, &c)
 }
 
+// DeleteObjects is refused to a borrower (NET-7): each delete is one
+// DeleteObject, so the counter and, later, tombstones see each.
 func (l *Lending) DeleteObjects(ctx context.Context, in *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
+	if refused(ctx) {
+		return s3response.DeleteResult{}, errNotForBorrower
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.DeleteResult{}, err
@@ -550,6 +635,9 @@ func (l *Lending) RestoreObject(ctx context.Context, in *s3.RestoreObjectInput) 
 	if err != nil {
 		return err
 	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return kerr
+	}
 	c := *in
 	c.Bucket = b
 	return l.Next.RestoreObject(ctx, &c)
@@ -557,7 +645,7 @@ func (l *Lending) RestoreObject(ctx context.Context, in *s3.RestoreObjectInput) 
 
 func (l *Lending) SelectObjectContent(ctx context.Context, in *s3.SelectObjectContentInput) func(w *bufio.Writer) {
 	b, err := l.ptr(ctx, in.Bucket)
-	if err != nil {
+	if err != nil || borrowerKey(ctx, in.Key) != nil {
 		return func(*bufio.Writer) {} // not on posix anyway; answer nothing
 	}
 	c := *in
@@ -594,6 +682,9 @@ func (l *Lending) GetObjectTagging(ctx context.Context, bucket, object, versionI
 	if err != nil {
 		return nil, err
 	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return nil, kerr
+	}
 	return l.Next.GetObjectTagging(ctx, b, object, versionID)
 }
 
@@ -602,6 +693,9 @@ func (l *Lending) PutObjectTagging(ctx context.Context, bucket, object, versionI
 	if err != nil {
 		return err
 	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return kerr
+	}
 	return l.Next.PutObjectTagging(ctx, b, object, versionID, tags)
 }
 
@@ -609,6 +703,9 @@ func (l *Lending) DeleteObjectTagging(ctx context.Context, bucket, object, versi
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
+	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return kerr
 	}
 	return l.Next.DeleteObjectTagging(ctx, b, object, versionID)
 }
@@ -634,6 +731,9 @@ func (l *Lending) PutObjectRetention(ctx context.Context, bucket, object, versio
 	if err != nil {
 		return err
 	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return kerr
+	}
 	return l.Next.PutObjectRetention(ctx, b, object, versionID, retention)
 }
 
@@ -641,6 +741,9 @@ func (l *Lending) GetObjectRetention(ctx context.Context, bucket, object, versio
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return nil, err
+	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return nil, kerr
 	}
 	return l.Next.GetObjectRetention(ctx, b, object, versionID)
 }
@@ -650,6 +753,9 @@ func (l *Lending) PutObjectLegalHold(ctx context.Context, bucket, object, versio
 	if err != nil {
 		return err
 	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return kerr
+	}
 	return l.Next.PutObjectLegalHold(ctx, b, object, versionID, status)
 }
 
@@ -657,6 +763,9 @@ func (l *Lending) GetObjectLegalHold(ctx context.Context, bucket, object, versio
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return nil, err
+	}
+	if kerr := borrowerKey(ctx, &object); kerr != nil {
+		return nil, kerr
 	}
 	return l.Next.GetObjectLegalHold(ctx, b, object, versionID)
 }

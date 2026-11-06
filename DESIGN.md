@@ -1219,7 +1219,9 @@ upstream bucket is Q-V.
     the same storer and bucket paths posix writes it with. The gateway
     hands the `Store` to the decorator as `Decorator.Uploads`, apart from
     the backend it wraps, so a wrapper between the decorator and posix
-    (quota #16, tombstones #17) cannot hide it (#62). The ETag never
+    (tombstones #17) cannot hide it (#62); quota is enforced above the
+    decorator, in `Lending` (§3.5), and the gateway gives `Lending` the
+    same `Store`. The ETag never
     stands in for a missing attribute. versitygw v1.10.0's
     `CompleteMultipartUpload` writes `mp-metadata` with the ETag, so an
     object without one is either a `PutObject`'s (a plain MD5 ETag:
@@ -1788,30 +1790,129 @@ upstream bucket is Q-V.
 
 ### 3.5 Lending and quotas
 
-- **LEND-1** The decorator keeps a per-friend byte counter in
-  `lendisk.db` (live objects plus tombstones,
-  updated on every completed put and every purge) and reconciles it
-  daily against a listing, and enforces the friendship's quota on it.
-  `lending.max_total` bounds the sum of the node's own numbers; `peer
-  quota` refuses a value that would exceed it (LEND-8). The borrower side keeps its own count of what
-  it has stored at each place, for D6's free fraction, and corrects it
-  from the lender's `quota` answer.
-- **LEND-2** The decorator refuses `PutObject`, `CreateMultipartUpload`
-  and `CreateBucket` with S3 error code `QuotaExceeded`, HTTP 507, when
-  the counter would exceed quota or `statfs` on the store is below the
-  floor. The error is lendisk's own `s3err.APIError` (versitygw's
-  `ErrQuotaExceeded` is a 403) and is returned unwrapped: versitygw
-  type-asserts it, and a wrapped error becomes a 500 that clients
-  retry (Q-I.5).
-- **LEND-4** The decorator hashes the body as it streams it to the
-  backend (SHA-256), compares with `x-amz-meta-lendisk-sha256` when the
-  backend answers, and on mismatch deletes the object and returns
-  `BadDigest`. The existing-key check happens before any byte is
-  stored: a key present in the index, live or tombstoned, with a
-  different hash is refused with `PreconditionFailed`; with the same
-  hash the put is accepted, and a tombstone for the key is dropped
-  (§3.6). No store feature is relied on for this. A put without the
-  hash is refused on the tunnel side.
+The lender's policy on a borrower's requests lives in the decorator's
+outer layer, `gateway.Lending` (`internal/gateway/quota.go`), which
+knows the borrower from the request's account; it sits above the
+capture decorator, so nothing stands between that and posix (#62).
+
+- **LEND-1** `Lending` keeps a per-friend counter and enforces the
+  friendship's quota (`Friendship.Quota`, the smaller number) on it.
+  The counter holds the bytes of the borrower's objects and of the
+  parts of its open multipart uploads, plus tombstones once #17 lands,
+  plus a fixed overhead of 4 KiB for each object, each bucket and each
+  open upload. *Decision (#16 review):* the overhead stands for the
+  inode, metadata and database row each item costs, so a borrower under
+  quota cannot make empty objects, buckets or uploads without end. The
+  counter lives in memory under one lock, loaded from `lent_usage` in
+  `lendisk.db` once; every change is written to the database first
+  and reaches memory only once the database took it. A put adds its
+  bytes and overhead; a delete removes them; a bucket or upload adds
+  its overhead; a part adds what it changes over the part of that
+  number counted before (`lent_part`), in one transaction with
+  `lent_upload.counted` and `lent_usage`, so settling a part costs the
+  same whatever the upload holds and re-sent parts count once; a
+  completion adds the object less its parts; an abort, or a refused
+  completion, removes the parts and the upload's overhead. Each change
+  is made holding the borrower's publication lock shared, from the
+  moment the store may publish (a body's last read, or the store call)
+  until it is counted; a part also holds its upload's lock over that
+  span, so parts of one number are published and counted in the same
+  order. The counter is reconciled against a listing (`ListObjectsV2`
+  of each `lent-` bucket and its rows in `lent_bucket`, plus
+  `ListParts` of each upload `ListMultipartUploads` shows, which also
+  resets `lent_part`) once at every start, whatever the last run was,
+  since one that did not finish leaves no trace, and then once a day,
+  checked hourly. The reconcile holds the publication lock exclusively
+  while it lists and sets the count, so every write is either counted
+  or not yet published; it waits only for publications in progress,
+  never for a body still streaming. *Decision (#16 review):* an upload
+  that has had no part for 7 days (`Lending.AbandonAfter`, against
+  posix's `Initiated`, which each part refreshes) is aborted by the
+  reconcile and its `lent_upload` row dropped. Otherwise a row is
+  dropped only when its upload is finished, aborted, or gone from the
+  store; an upload begun long ago that still gets parts keeps it. `lending.max_total` bounds the sum of the node's own numbers;
+  `peer quota` refuses a value that would exceed it (LEND-8). The
+  borrower side keeps its own count of what it has stored at each
+  place, for D6's free fraction, and corrects it from the lender's
+  `quota` answer.
+- **LEND-2** `Lending` refuses a borrower's `PutObject`,
+  `CreateMultipartUpload`, `UploadPart` and `CreateBucket` of a new
+  bucket with S3 error code `QuotaExceeded`, HTTP 507, when the counter
+  plus what the borrower's admitted writes in flight may add plus the
+  request (its `Content-Length`, plus the overhead for a new object,
+  bucket or upload) would exceed quota, or when `statfs` on the store,
+  less what every borrower's writes in flight may add and less the
+  request, is below the floor (`store.free_space_floor`, default 5%).
+  The check reads the counter under the same lock that admits the
+  write. A completion is checked against the floor alone, for the size
+  of its parts: posix assembles the object in a staging file while the
+  parts still exist, so it needs that much again for a while; the
+  parts are already counted against quota. A create of a bucket the
+  borrower already has is not refused, and the same bytes put again
+  add nothing and are not refused. The error is lendisk's own
+  `s3err.APIError` (versitygw's `ErrQuotaExceeded` is a 403) and is
+  returned unwrapped: versitygw type-asserts it, and a wrapped error
+  becomes a 500 that clients retry (Q-I.5).
+- **LEND-2, SEC-5 (stall bound)** The bridge bounds every request body
+  on the tunnel, since nothing behind it does: fasthttp, behind
+  `gw.sock`, reads the first min(`Content-Length`, 8 KiB) before any
+  handler runs and the rest as the store asks, with no timeout.
+  `TunnelS3Handler` sets the connection's read deadline
+  (`http.ResponseController`) a stall period ahead before the body
+  starts, and pushes it a stall period on each time 64 KiB more arrive
+  (`bridge.Bridge.Stall`, 2 minutes, the borrower's own stall watchdog
+  of §3.4, and `MinProgress`). A body that stops, trickles below that
+  rate, or never starts though its headers promised one fails its read;
+  the proxy drops the request to `gw.sock`, which ends it there, and
+  answers `RequestTimeout` (400), which the borrower retries. The
+  deadline is cleared when the body ends and when the handler returns.
+  So a stalled body holds its quota and floor reservation for minutes,
+  not forever, and nothing reads the body but the store. A body longer
+  than its `Content-Length` ends the write in `Lending` with
+  `InvalidRequest`.
+- **LEND-4** `Lending` hashes a borrower's body as it streams it to the
+  backend (SHA-256) and compares with `x-amz-meta-lendisk-sha256` at
+  the end of the stream: a mismatch fails that last read, so posix
+  never publishes the object (it is deleted should it land anyway), and
+  the answer is `BadDigest` (400). The hash is taken in lower case and
+  stored so. There are no part or composite hashes: a multipart upload
+  declares the whole object's hash at `CreateMultipartUpload`, which is
+  kept in `lent_upload` with the upload ID, and after
+  `CompleteMultipartUpload` the assembled object is read once, whole,
+  and compared; a mismatch is removed and refused. The existing-key
+  check happens before any byte is stored: the key's stored object
+  carries its own `lendisk-sha256` (COMPAT-4), read with a `HEAD`;
+  another hash is refused with `PreconditionFailed` (412), at
+  `PutObject`, `CreateMultipartUpload` and again at completion. With
+  the same hash the put is accepted without storing anything: its body
+  is hashed and discarded, so a body that only claims the hash gets
+  `BadDigest` and the stored copy is never touched; a completion with
+  the same hash aborts the upload and answers with the stored object's
+  ETag. A put takes no key lock, since a body that stalls (a borrower
+  killed mid-transfer) would hold up its own retry. This relies on one
+  store feature: a put of an absent key, and a completion, is stored
+  with `If-None-Match: *`, which posix evaluates under its publish lock
+  together with the publication, so of two racing writes of one key
+  the second is refused (or accepted unstored if it carries the same
+  bytes). Multipart create and completion and deletes hold a per-key
+  lock; none of them waits on a body. Once tombstones land (#17) a
+  tombstoned key is checked the same way and a same-hash put drops the
+  tombstone (§3.6). A retried completion of an upload already in the
+  store (its `mp-metadata` upload ID) is answered by posix, and
+  verified first if a crash came between completion and verification.
+  A borrower's put or multipart create without the hash (64 hex
+  digits) is refused with `InvalidRequest` (400); node-ID accounts are
+  served on the tunnel only (SEC-12), so this is the tunnel side.
+- **SEC-5** Every key a borrower names is checked, by every `Lending`
+  method that takes one (writes, deletes, multipart calls, reads,
+  heads, tagging, retention, legal hold, select; a test lists them all
+  and finds any added later): 1 to 1024 bytes of UTF-8 without control
+  characters, segments separated by single slashes, none empty, `.` or
+  `..`, and not under `.lendisk/` (tombstones), `.sgwtmp/` or
+  `.vgwlocks/` (posix's own), in any case; anything else is
+  `InvalidArgument` (400). Buckets are confined by the mapping
+  (PEER-8). `Lending` also refuses `DeleteObjects` to a borrower (NET-7
+  lists it), so every delete is one counted `DeleteObject`.
 - **LEND-6** The lending store is the set of `lent-<id16>-<sealed>`
   buckets in the node's one store, beside its own, plus versioning or
   tombstones and the hash index. With lendisk stopped they are plain

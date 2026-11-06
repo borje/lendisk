@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/transport"
@@ -41,6 +42,8 @@ type node struct {
 	beforeFriendship func() error
 	// stdin, when set, is every command's stdin in place of run's.
 	stdin io.Reader
+	// tuneBridge, when set, is given to serveLogged's daemon.
+	tuneBridge func(*bridge.Bridge)
 }
 
 func newNode(t *testing.T) *node {

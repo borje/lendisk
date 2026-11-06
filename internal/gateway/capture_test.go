@@ -25,9 +25,11 @@ import (
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3response"
 
+	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/store"
 )
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -41,6 +43,14 @@ type harness struct {
 	socket string
 	keys   map[string][2]string
 	self   *identity.Identity // the lender, for friends' accounts; nil serves none
+	// statfs and floor, if set, are the gateway's (LEND-2).
+	statfs func(dir string) (store.Space, error)
+	floor  *config.Floor
+	gw     *Gateway // the last one served
+	// lending, if set, adjusts the gateway's Lending before it serves.
+	lending func(*Lending)
+	// reconcileEvery is the gateway's ReconcileEvery.
+	reconcileEvery time.Duration
 }
 
 func newHarness(t *testing.T, buckets map[string]string) *harness {
@@ -80,7 +90,10 @@ func newHarnessIn(t *testing.T, dir string, buckets map[string]string) *harness 
 func (h *harness) serve(noCapture bool) (stop func()) {
 	h.t.Helper()
 	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: quiet,
-		ResolveEvery: 20 * time.Millisecond, noCapture: noCapture}
+		ResolveEvery: 20 * time.Millisecond, noCapture: noCapture, Statfs: h.statfs, Floor: h.floor,
+		ReconcileEvery: h.reconcileEvery}
+	h.gw = g
+	g.lendingHook = h.lending
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan struct{})
 	errc := make(chan error, 1)

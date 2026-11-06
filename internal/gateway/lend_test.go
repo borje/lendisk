@@ -33,10 +33,15 @@ func newIdentity(t *testing.T) *identity.Identity {
 	return id
 }
 
-// befriend makes friend a friend of the harness's lender.
-func (h *harness) befriend(friend *identity.Identity) {
+// befriend makes friend a friend of the harness's lender, with a quota
+// of 1 GiB.
+func (h *harness) befriend(friend *identity.Identity) { h.befriendWith(friend, 1<<30) }
+
+// befriendWith makes friend a friend with the given quota (LEND-8).
+func (h *harness) befriendWith(friend *identity.Identity, quota int64) {
 	h.t.Helper()
-	if err := h.db.AddFriendship(context.Background(), state.Friendship{Peer: friend.NodeID().String(), CreatedAt: time.Now()}); err != nil {
+	if err := h.db.AddFriendship(context.Background(), state.Friendship{Peer: friend.NodeID().String(), CreatedAt: time.Now(),
+		OwnNumber: quota, PeerNumber: quota}); err != nil {
 		h.t.Fatal(err)
 	}
 }
@@ -97,7 +102,7 @@ func TestFriendBorrowsUnderSealedName(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := []byte("encrypted pack")
-	if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: bucket, Key: aws.String("data/ab/pack"), Body: bytes.NewReader(body)}); err != nil {
+	if _, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: bucket, Key: aws.String("data/ab/pack"), Body: bytes.NewReader(body), Metadata: hashMeta(body)}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: bucket, Key: aws.String("data/ab/pack")})
@@ -160,7 +165,7 @@ func TestBorrowersAreIsolated(t *testing.T) {
 	if _, err := ca.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(aSealed)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ca.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(aSealed), Key: aws.String("config"), Body: bytes.NewReader([]byte("a's"))}); err != nil {
+	if _, err := ca.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(aSealed), Key: aws.String("config"), Body: bytes.NewReader([]byte("a's")), Metadata: hashMeta([]byte("a's"))}); err != nil {
 		t.Fatal(err)
 	}
 	// The lender's own bucket has an object too.
@@ -183,7 +188,7 @@ func TestBorrowersAreIsolated(t *testing.T) {
 		if _, err := cb.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: bk}); err == nil {
 			t.Errorf("B lists %s", name)
 		}
-		if _, err := cb.PutObject(ctx, &s3.PutObjectInput{Bucket: bk, Key: aws.String("planted"), Body: bytes.NewReader([]byte("x"))}); err == nil {
+		if _, err := cb.PutObject(ctx, &s3.PutObjectInput{Bucket: bk, Key: aws.String("planted"), Body: bytes.NewReader([]byte("x")), Metadata: hashMeta([]byte("x"))}); err == nil {
 			t.Errorf("B wrote into %s", name)
 		}
 		cb.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: bk, Key: aws.String("config")})

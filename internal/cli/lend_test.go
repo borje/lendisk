@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -22,8 +24,84 @@ import (
 
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/transport"
 )
+
+// hashMeta is the hash metadata a borrower sends with an object (REPL-10).
+func hashMeta(body []byte) map[string]string {
+	return map[string]string{replica.MetaSHA256: sha256Hex(body)}
+}
+
+func sha256Hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
+
+// The lender's policy seen by the borrower's own replica client through
+// the tunnel (#16): A lends B 13000 bytes, room for its bucket, one
+// 600-byte object and one small one, with their overheads (4 KiB each).
+//
+//   - LEND-1, LEND-2, Q-I.5: once B's objects fill the quota, the next is
+//     refused with 507 QuotaExceeded, which B's client takes as "paused
+//     for quota" (replica.ErrQuota), not as a retry.
+//   - LEND-4, EP-11: a put of other bytes to a stored key is an
+//     immutability refusal (ErrImmutable); the same bytes again are
+//     accepted; bytes that do not match the hash sent are rejected
+//     (ErrRejected) and not kept.
+//   - LEND-4: a put without the hash metadata is refused.
+func TestLenderPolicyAsTheBorrowerSeesIt(t *testing.T) {
+	a, b := friendNode(t), friendNode(t)
+	stop := a.serveLogged()
+	defer stop()
+	s := a.invite("--quota", "13000")
+	if code, _, errOut := b.run("\n", "", "peer", "add", s); code != 0 {
+		t.Fatalf("peer add: %d %s", code, errOut)
+	}
+	aAddr := a.status().Node.Address
+	aKey, err := transport.KeyOf(aAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bID := b.identity()
+	dl, err := transport.NewDialer(bID, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dl.Close() })
+	f, err := replica.NewFriend(bID, aKey, aAddr, dl.Dial, replica.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := t.Context()
+	put := func(key string, body []byte, hash string) error {
+		return f.Put(ctx, replica.Object{Bucket: "laptop", Key: key, Size: int64(len(body)), SHA256: hash, Body: bytes.NewReader(body)})
+	}
+	first := bytes.Repeat([]byte("1"), 600)
+	if err := put("data/one", first, sha256Hex(first)); err != nil {
+		t.Fatalf("first put: %v", err)
+	}
+	second := bytes.Repeat([]byte("2"), 600)
+	if err := put("data/two", second, sha256Hex(second)); !errors.Is(err, replica.ErrQuota) {
+		t.Fatalf("put over quota: %v", err)
+	}
+	if err := put("data/one", second[:10], sha256Hex(second[:10])); !errors.Is(err, replica.ErrImmutable) {
+		t.Fatalf("other bytes to a stored key: %v", err)
+	}
+	if err := put("data/one", first, sha256Hex(first)); err != nil {
+		t.Fatalf("the same bytes again: %v", err)
+	}
+	if err := put("data/three", second[:10], sha256Hex(first[:10])); !errors.Is(err, replica.ErrRejected) {
+		t.Fatalf("bytes that do not match their hash: %v", err)
+	}
+	if got := lentObjects(t, a, bID, "laptop"); len(got) != 1 || got["data/one"] == "" {
+		t.Fatalf("A holds %v; want data/one alone", got)
+	}
+
+	creds, _ := pairCreds(t, bID, aKey)
+	cb := s3Over(tunnelHTTP(t, bID, aAddr), creds)
+	sealed := aws.String(bID.SealedName("laptop"))
+	if _, err := cb.PutObject(ctx, &s3.PutObjectInput{Bucket: sealed, Key: aws.String("data/four"), Body: strings.NewReader("x")}); s3Code(err) != "InvalidRequest" {
+		t.Fatalf("a put without the hash: %v", err)
+	}
+}
 
 func (n *node) identity() *identity.Identity {
 	n.t.Helper()
@@ -131,7 +209,7 @@ func TestFriendBorrowsOverTunnel(t *testing.T) {
 		t.Fatalf("create: %v", err)
 	}
 	body := bytes.Repeat([]byte("restic pack "), 10_000)
-	if _, err := cb.PutObject(ctx, &s3.PutObjectInput{Bucket: bucket, Key: aws.String("data/ab/abcd"), Body: bytes.NewReader(body)}); err != nil {
+	if _, err := cb.PutObject(ctx, &s3.PutObjectInput{Bucket: bucket, Key: aws.String("data/ab/abcd"), Body: bytes.NewReader(body), Metadata: hashMeta(body)}); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	got, err := cb.GetObject(ctx, &s3.GetObjectInput{Bucket: bucket, Key: aws.String("data/ab/abcd")})

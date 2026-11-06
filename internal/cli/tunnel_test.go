@@ -47,7 +47,8 @@ func (n *node) serveLogged(args ...string) (stop func() string) {
 	n.t.Helper()
 	var out, errOut syncBuffer
 	ctx, cancel := context.WithCancel(context.Background())
-	a := &app{in: bufio.NewReader(strings.NewReader("")), out: &out, errOut: &errOut, ctx: ctx, regions: n.regions}
+	a := &app{in: bufio.NewReader(strings.NewReader("")), out: &out, errOut: &errOut, ctx: ctx, regions: n.regions,
+		tuneBridge: n.tuneBridge}
 	done := make(chan int)
 	go func() {
 		done <- a.run(append([]string{"serve", "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0"}, args...))

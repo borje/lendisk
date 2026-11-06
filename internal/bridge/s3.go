@@ -60,6 +60,9 @@ func headerAccessKey(h string) (string, bool) {
 // peer key, or that carries no credential, is refused with AccessDenied;
 // anything else is proxied to gw.sock unchanged, where versitygw
 // verifies the signature and its IAM service resolves the key (NET-7a).
+// A request body is bounded by the connection's read deadline (bound):
+// fasthttp behind gw.sock reads without a timeout, so the bound has to
+// be here.
 func (b *Bridge) TunnelS3Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		caller, ok := control.CallerFrom(r.Context())
@@ -80,6 +83,7 @@ func (b *Bridge) TunnelS3Handler() http.Handler {
 				Description: "lendisk: the access key must be the node ID this connection authenticated as"})
 			return
 		}
+		defer b.bound(w, r)()
 		b.proxy.ServeHTTP(w, r)
 	})
 }
