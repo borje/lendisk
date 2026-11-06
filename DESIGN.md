@@ -1722,7 +1722,23 @@ upstream bucket is Q-V.
   net/http does not return while the body's `Read` is blocked.) The
   goroutine stuck in the read is left behind until the disk answers;
   the sender goes on, and a hung disk shows as `store`, not as the
-  friend's `retrying`.
+  friend's `retrying`. Every open and stat before a read is
+  guarded by the same rule (#63): opening and stating the object (one
+  call), and stating the bucket's directory (to tell a missing object
+  from a missing store) each run on a goroutine of their own
+  (`replica.storeCall`) and fail as `store` when they do not return
+  within `StoreStall`; when the sender stops, they return at once, so a
+  wedged disk (a hard NFS mount) never holds up `Worker.Run`'s stop. A
+  stuck open or stat goroutine is left behind until the disk answers,
+  as a read is; a file it then opens is closed there, and one opened
+  just as the sender stops is closed by the sender. Closing a file is
+  not guarded (a regular file's close does not wait for a stuck read),
+  and each stalled attempt leaves a goroutine and its thread behind, so
+  a disk wedged for weeks piles them up (#67). A body that ends before the row's size
+  (the file truncated under the sender) is the store's failure too,
+  not the friend's: the read ends with "the object ended after n of
+  size bytes" and the place shows `store`; the next try sees the size
+  differ and treats it as a local error, above.
 - **The worker** (`replica.Worker`, started by `serve` in the full
   profile only). It re-reads the friendships every 5 s and runs one
   sender per friend with an address, restarted when the address
