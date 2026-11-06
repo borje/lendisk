@@ -47,7 +47,8 @@ type StatusPlace struct {
 	Queue StatusQueue `json:"queue"`
 	// LagSeconds is the age of the oldest object waiting (REPL-11).
 	LagSeconds int64 `json:"lag_seconds"`
-	// Refused counts objects the place refused for good (EP-11, LEND-4).
+	// Refused counts objects the place refused for good (EP-11, LEND-4);
+	// objects the store could not supply count against their bucket.
 	Refused int64 `json:"refused"`
 	// LastOK is when the place last acknowledged anything (RFC 3339).
 	LastOK string `json:"last_ok,omitempty"`
@@ -149,6 +150,10 @@ type StatusBucket struct {
 	Copies  int    `json:"copies"`
 	// Queue is the bucket's replication queue (REPL-3).
 	Queue StatusQueue `json:"queue"`
+	// Refused counts objects not replicated because the store could not
+	// supply them as captured: gone, changed or rotted since capture, a
+	// directory, or too large for one PUT (#50). Each raised an alert.
+	Refused int64 `json:"refused"`
 }
 
 // StatusQueue is a bucket's replication queue: captured writes and
@@ -233,10 +238,14 @@ func (a *app) statusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			refused, err := db.RefusedObjects(cmd.Context())
+			if err != nil {
+				return err
+			}
 			for _, b := range bs {
 				q := queues[b.Name]
 				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
-					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}})
+					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name]})
 			}
 			if st.Places, err = places(cmd.Context(), db, time.Now()); err != nil {
 				return err
@@ -263,6 +272,9 @@ func (a *app) statusCmd() *cobra.Command {
 					b.Queue.Objects, b.Queue.Bytes)
 				if b.Queue.Pending > 0 {
 					fmt.Fprintf(a.out, ", %d writes in flight", b.Queue.Pending)
+				}
+				if b.Refused > 0 {
+					fmt.Fprintf(a.out, ", %d not replicated (the store's copy changed or cannot be sent; see the log)", b.Refused)
 				}
 				fmt.Fprintln(a.out)
 			}

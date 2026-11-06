@@ -131,4 +131,13 @@ var migrations = []Migration{
 			last_ok   INTEGER           -- unix seconds
 		);`,
 	},
+	{
+		Version: 8, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Why a placement row was refused (#50): 'store' when the node's
+		-- own store could not supply the object as captured (gone, changed,
+		-- a directory, too large, rotted); the refusal counts against the
+		-- bucket. NULL when the place itself refused (EP-11).
+		ALTER TABLE placement ADD COLUMN cause TEXT;`,
+	},
 }
