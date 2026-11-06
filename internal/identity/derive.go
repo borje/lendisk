@@ -18,6 +18,9 @@ const (
 	nameInfo = "lendisk-bucket-name-v1"
 	// s3Info fixes the per-pair S3 secret (NET-7a).
 	s3Info = "lendisk-s3-v1"
+	// dialInfo fixes the dial key; changing it makes every friend refuse
+	// this node's dials until they learn the new key.
+	dialInfo = "lendisk-dial-v1"
 	// sealedLen is the characters of the HMAC kept: 130 bits.
 	sealedLen = 26
 )
@@ -35,6 +38,20 @@ func (id *Identity) SealedName(bucket string) string {
 	m := hmac.New(sha256.New, k)
 	m.Write([]byte(bucket))
 	return "s" + b32.EncodeToString(m.Sum(nil))[:sealedLen]
+}
+
+// DialKey is the key this node dials its friends with (ID-1, #69):
+// HKDF-SHA256(private key, info="lendisk-dial-v1"), clamped for X25519.
+// The identity key serves; a second key dials, because one key held by
+// a node's server and its client at one relay lets the relay deliver
+// the server's packets to the client (DESIGN §3.7). It depends on the
+// phrase alone, so recovery gives the same dial key.
+func (id *Identity) DialKey() *Identity {
+	d, err := FromSecret(id.priv.Bytes(), dialInfo)
+	if err != nil {
+		panic(err) // a 32-byte secret always derives
+	}
+	return d
 }
 
 // IsSealedName reports whether s has the form of a sealed name.

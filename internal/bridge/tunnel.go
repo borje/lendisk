@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,9 +17,26 @@ import (
 	"github.com/borje/lendisk/internal/state"
 )
 
-// RoleOf looks up what a tunnel peer may do now (state.DB.PeerRole). An
-// error refuses the request.
-type RoleOf func(ctx context.Context, peer identity.NodeID) (state.Role, error)
+// RoleOf resolves the key a tunnel connection authenticated with to whom
+// it speaks for and what that one may do now (state.DB.TunnelPeer): a
+// friend's dial key names the friend (#69). An error refuses the
+// request.
+type RoleOf func(ctx context.Context, key identity.NodeID) (identity.NodeID, state.Role, error)
+
+// RolesIn is the RoleOf that reads db at now().
+func RolesIn(db *state.DB, now func() time.Time) RoleOf {
+	return func(ctx context.Context, key identity.NodeID) (identity.NodeID, state.Role, error) {
+		p, r, err := db.TunnelPeer(ctx, key.String(), now())
+		if err != nil || r == state.RoleNone {
+			return key, r, err
+		}
+		peer, err := identity.ParseNodeID(p)
+		if err != nil {
+			return key, state.RoleNone, fmt.Errorf("the relationship of %s names %q: %w", key, p, err)
+		}
+		return peer, r, nil
+	}
+}
 
 // PeerOf returns the key that authenticated an accepted tunnel
 // connection (transport.Transport.PeerOf).
@@ -26,10 +44,11 @@ type PeerOf func(net.Conn) (identity.NodeID, error)
 
 // TunnelHandler is the tunnel port's one middleware (SEC-11, SEC-12,
 // SEC-13), in front of everything served there. On every request it
-// takes the connection's key, loads that key's role from lendisk.db and
-// refuses before routing if there is none; an invite key may call
-// redeem and nothing else. Then /_lendisk/ goes to ctl, with the caller
-// in the request context, and everything else to s3
+// takes the connection's key, resolves it in lendisk.db to a peer and
+// its role, and refuses before routing if there is none; an invite key
+// may call redeem and nothing else. Then /_lendisk/ goes to ctl, with
+// the caller (the resolved peer: a friend's node ID, never its dial
+// key) in the request context, and everything else to s3
 // (Bridge.TunnelS3Handler in the daemon). A nil s3 answers S3 with 501.
 func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Logger) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -48,14 +67,14 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Lo
 			}
 			writeError(w, s3err.APIError{Code: s3code, Description: "lendisk: " + msg, HTTPStatusCode: code})
 		}
-		peer, ok := r.Context().Value(peerKey{}).(identity.NodeID)
+		key, ok := r.Context().Value(peerKey{}).(identity.NodeID)
 		if !ok {
 			refuse(http.StatusForbidden, "connection has no peer key")
 			return
 		}
-		role, err := roles(r.Context(), peer)
+		peer, role, err := roles(r.Context(), key)
 		if err != nil {
-			log.Error("tunnel request refused: relationship lookup failed", "peer", peer.String(), "err", err)
+			log.Error("tunnel request refused: relationship lookup failed", "peer", key.String(), "err", err)
 			refuse(http.StatusServiceUnavailable, "cannot read relationships; try again later")
 			return
 		}
@@ -68,7 +87,7 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Lo
 				return
 			}
 		default:
-			log.Warn("tunnel request refused: no relationship", "peer", peer.String())
+			log.Warn("tunnel request refused: no relationship", "peer", key.String())
 			if r.URL.Path == control.RedeemPath {
 				// A used invite's key keeps its tunnel for a while.
 				refuse(http.StatusForbidden, "no pending invite for this key: it was already used or has expired; ask for a new one")

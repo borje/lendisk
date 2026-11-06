@@ -162,7 +162,7 @@ func dbAdmission(t *testing.T) (*Admission, *state.DB, *atomic.Int64) {
 	var lookups atomic.Int64
 	adm := NewAdmission(func(ctx context.Context, peer identity.NodeID) (bool, error) {
 		lookups.Add(1)
-		r, err := db.PeerRole(ctx, peer.String(), time.Now())
+		_, r, err := db.TunnelPeer(ctx, peer.String(), time.Now())
 		return r != state.RoleNone, err
 	}, quiet)
 	return adm, db, &lookups
@@ -204,13 +204,15 @@ func TestUnknownIdentityRefusedOnNodeWithZeroPeers(t *testing.T) {
 	}
 }
 
-// A friend is admitted, its connection names its key (SEC-12), the
-// dialler sees a path, and Disconnect drops it.
+// A friend is admitted by the dial key it dials with (#69), its
+// connection names that key, which lendisk.db resolves to the friend
+// (SEC-12), the dialler sees a path, and Disconnect drops it.
 func TestFriendAdmittedAndNamed(t *testing.T) {
 	d := transporttest.Start(t)
 	adm, db, _ := dbAdmission(t)
 	srvID, cliID := newID(t), newID(t)
-	if _, err := db.Exec(`INSERT INTO friendship (peer_key, created_at) VALUES (?, 0)`, cliID.NodeID().String()); err != nil {
+	if _, err := db.Exec(`INSERT INTO friendship (peer_key, created_at, dial_key) VALUES (?, 0, ?)`,
+		cliID.NodeID().String(), cliID.DialKey().NodeID().String()); err != nil {
 		t.Fatal(err)
 	}
 	srv := newTailcat(t, srvID, d)
@@ -237,8 +239,11 @@ func TestFriendAdmittedAndNamed(t *testing.T) {
 	}
 	defer sc.Close()
 	got, err := srv.PeerOf(sc)
-	if err != nil || got != cliID.NodeID() {
-		t.Fatalf("PeerOf = %v, %v; want %v", got, err, cliID.NodeID())
+	if err != nil || got != cliID.DialKey().NodeID() {
+		t.Fatalf("PeerOf = %v, %v; want the dial key %v", got, err, cliID.DialKey().NodeID())
+	}
+	if friend, role, err := db.TunnelPeer(ctx, got.String(), time.Now()); err != nil || friend != cliID.NodeID().String() || role != state.RolePeer {
+		t.Fatalf("the dial key resolves to %s %q %v", friend, role, err)
 	}
 	io.WriteString(cc, "ping\n")
 	sc.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -261,7 +266,7 @@ func TestFriendAdmittedAndNamed(t *testing.T) {
 	if _, err := srv.PeerOf(&net.TCPConn{}); err == nil {
 		t.Fatal("PeerOf a connection that is not the tunnel's succeeded")
 	}
-	if !srv.Disconnect(cliID.NodeID()) {
+	if !srv.Disconnect(cliID.DialKey().NodeID()) {
 		t.Fatal("Disconnect: friend was not connected")
 	}
 }

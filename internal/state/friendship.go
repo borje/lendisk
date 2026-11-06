@@ -17,7 +17,15 @@ type Friendship struct {
 	OwnRetention  time.Duration // how long this node keeps the friend's deletes (RET-1)
 	PeerRetention time.Duration // how long the friend keeps this node's
 	CreatedAt     time.Time
+	// DialKey is the key the friend dials with (#69), node-ID form,
+	// learnt at redeem; "" for a friendship made before it existed.
+	DialKey string
 }
+
+// ErrDialKeyTaken means a dial key is already another friend's dial key
+// or node ID, or a friend's node ID is another friend's dial key: each
+// key names one friend.
+var ErrDialKeyTaken = errors.New("the dial key already names another friend")
 
 // Quota is the friendship's quota: the smaller number (LEND-8).
 func (f Friendship) Quota() int64 { return min(f.OwnNumber, f.PeerNumber) }
@@ -114,11 +122,35 @@ func (db *DB) RedeemInvite(ctx context.Context, key string, f Friendship, now ti
 // friendship with f's peer as the friend's latest report and returns
 // the row; ErrNotFound if f's peer is not a friend.
 func refreshFriendship(ctx context.Context, tx *sql.Tx, f Friendship) (Friendship, error) {
+	if err := checkDialKey(ctx, tx, f); err != nil {
+		return Friendship{}, err
+	}
 	return scanFriendship(tx.QueryRowContext(ctx, `UPDATE friendship
-		SET address = ?, peer_number = ?, peer_retention = ? WHERE peer_key = ?
+		SET address = ?, peer_number = ?, peer_retention = ?, dial_key = coalesce(?, dial_key)
+		WHERE peer_key = ?
 		RETURNING `+friendshipCols,
-		f.Address, f.PeerNumber, int64(f.PeerRetention/time.Second), f.Peer))
+		f.Address, f.PeerNumber, int64(f.PeerRetention/time.Second), nullString(f.DialKey), f.Peer))
 }
+
+// checkDialKey refuses f when its dial key or node ID would name two
+// friends (ErrDialKeyTaken).
+func checkDialKey(ctx context.Context, q queryer, f Friendship) error {
+	var taken bool
+	err := q.QueryRowContext(ctx, `SELECT
+		coalesce(?2 = ?1, 0)
+		OR EXISTS (SELECT 1 FROM friendship WHERE peer_key != ?1 AND (peer_key = ?2 OR dial_key = ?2))
+		OR EXISTS (SELECT 1 FROM friendship WHERE peer_key != ?1 AND dial_key = ?1)`,
+		f.Peer, nullString(f.DialKey)).Scan(&taken)
+	if err != nil {
+		return err
+	}
+	if taken {
+		return ErrDialKeyTaken
+	}
+	return nil
+}
+
+func nullString(s string) sql.NullString { return sql.NullString{String: s, Valid: s != ""} }
 
 // PendingRedeem is a redeem the invited node started and has not
 // finished (PEER-2, #51): the terms it offered, so that running peer
@@ -222,12 +254,22 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-func addFriendship(ctx context.Context, x execer, f Friendship) error {
+type queryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+func addFriendship(ctx context.Context, x interface {
+	execer
+	queryer
+}, f Friendship) error {
+	if err := checkDialKey(ctx, x, f); err != nil {
+		return err
+	}
 	res, err := x.ExecContext(ctx, `INSERT INTO friendship
-		(peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention)
-		VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (peer_key) DO NOTHING`,
+		(peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention, dial_key)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (peer_key) DO NOTHING`,
 		f.Peer, f.CreatedAt.Unix(), f.Address, f.OwnNumber, f.PeerNumber,
-		int64(f.OwnRetention/time.Second), int64(f.PeerRetention/time.Second))
+		int64(f.OwnRetention/time.Second), int64(f.PeerRetention/time.Second), nullString(f.DialKey))
 	if err != nil {
 		return err
 	}
@@ -239,14 +281,14 @@ func addFriendship(ctx context.Context, x execer, f Friendship) error {
 	return nil
 }
 
-const friendshipCols = `peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention`
+const friendshipCols = `peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention, dial_key`
 
 func scanFriendship(row interface{ Scan(...any) error }) (Friendship, error) {
 	var f Friendship
 	var created int64
-	var addr sql.NullString
+	var addr, dial sql.NullString
 	var own, peer, ownRet, peerRet sql.NullInt64
-	err := row.Scan(&f.Peer, &created, &addr, &own, &peer, &ownRet, &peerRet)
+	err := row.Scan(&f.Peer, &created, &addr, &own, &peer, &ownRet, &peerRet, &dial)
 	if errors.Is(err, sql.ErrNoRows) {
 		return f, ErrNotFound
 	} else if err != nil {
@@ -254,6 +296,7 @@ func scanFriendship(row interface{ Scan(...any) error }) (Friendship, error) {
 	}
 	f.CreatedAt = time.Unix(created, 0)
 	f.Address = addr.String
+	f.DialKey = dial.String
 	f.OwnNumber, f.PeerNumber = own.Int64, peer.Int64
 	f.OwnRetention = time.Duration(ownRet.Int64) * time.Second
 	f.PeerRetention = time.Duration(peerRet.Int64) * time.Second

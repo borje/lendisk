@@ -2,6 +2,8 @@ package state
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -21,9 +23,32 @@ const (
 // "removed by the friend" (PEER-5), so the two sides must agree on it.
 const NoRelationship = "no relationship with this node"
 
-// PeerRole looks a tunnel key (a node ID in display form) up in the
-// friendship and invite tables. Callers deciding admission must treat an
-// error like RoleNone: a database that cannot be read admits nobody.
+// TunnelPeer resolves a key that authenticated a tunnel connection, in
+// node-ID form, to whom it speaks for and that one's role (SEC-10,
+// SEC-12): a friend's node ID or its dial key names the friend in the
+// peer role (#69); an invite key names itself. Callers deciding
+// admission must treat an error like RoleNone.
+func (db *DB) TunnelPeer(ctx context.Context, key string, now time.Time) (string, Role, error) {
+	role, err := db.PeerRole(ctx, key, now)
+	if err != nil || role != RoleNone {
+		return key, role, err
+	}
+	var peer string
+	err = db.QueryRowContext(ctx, `SELECT peer_key FROM friendship WHERE dial_key = ?`, key).Scan(&peer)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return key, RoleNone, nil
+	case err != nil:
+		return key, RoleNone, err
+	}
+	return peer, RolePeer, nil
+}
+
+// PeerRole looks a node ID in display form up in the friendship and
+// invite tables. A dial key has no role here: S3 accounts and control
+// calls are keyed by node ID; TunnelPeer resolves a tunnel key. Callers
+// deciding admission must treat an error like RoleNone: a database that
+// cannot be read admits nobody.
 func (db *DB) PeerRole(ctx context.Context, key string, now time.Time) (Role, error) {
 	var peer, invite bool
 	err := db.QueryRowContext(ctx, `SELECT

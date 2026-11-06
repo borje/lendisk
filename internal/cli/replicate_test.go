@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"fmt"
@@ -15,6 +16,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
@@ -298,6 +302,99 @@ func TestReplicateResticBackupToFriend(t *testing.T) {
 	}
 	// SEC-16: B's store and database never hold the bucket's name.
 	assertNotIn(t, bn, "laptop")
+}
+
+// REPL-3, NET-1 (#69): two friends on one relay, each with a bucket,
+// replicate to each other at the same time and both queues drain. Each
+// daemon serves with its identity key and dials with its dial key; with
+// one key for both, a node's own client took the packets meant for its
+// server at the relay, and the second node to dial never got through.
+func TestFriendsReplicateToEachOtherAtOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	an := friendNode(t)
+	bn := newNode(t)
+	bn.regions = an.regions // one relay for both
+	phrase, _ := identity.NewPhrase()
+	if code, _, e := bn.run(phrase+"\n", "", "init", "--restore"); code != 0 {
+		t.Fatal(e)
+	}
+	ca := an.addBucket(t, "laptop", "generic")
+	cb := bn.addBucket(t, "desktop", "generic")
+	fast := envReplFast + "=1"
+	a, b := newProcNode(t, an, fast), newProcNode(t, bn, fast)
+	b.start()
+	a.start()
+	befriend(t, bn, an) // B lends to A, and A to B
+	aID, bID := an.identity(), bn.identity()
+
+	put := func(addr string, c creds, bucket, prefix string, done chan<- error) {
+		cl := s3client(addr, c)
+		buf := make([]byte, 256<<10)
+		for i := range 8 {
+			rand.Read(buf)
+			if _, err := cl.PutObject(context.Background(), &s3.PutObjectInput{Bucket: aws.String(bucket),
+				Key: aws.String(fmt.Sprintf("%s-%02d", prefix, i)), Body: bytes.NewReader(buf)}); err != nil {
+				done <- fmt.Errorf("put to %s: %w", bucket, err)
+				return
+			}
+		}
+		done <- nil
+	}
+	both := func(prefix string) {
+		t.Helper()
+		done := make(chan error, 2)
+		go put(a.addr, ca, "laptop", prefix, done)
+		go put(b.addr, cb, "desktop", prefix, done)
+		for range 2 {
+			if err := <-done; err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Both daemons replicate at once; the checks merely wait in turn.
+		an.drained(bID.NodeID().String(), 90*time.Second)
+		bn.drained(aID.NodeID().String(), 90*time.Second)
+		sameObjects(t, replicable(t, an, "laptop"), lentObjects(t, bn, aID, "laptop"))
+		sameObjects(t, replicable(t, bn, "desktop"), lentObjects(t, an, bID, "desktop"))
+	}
+	both("one")
+	if len(lentObjects(t, bn, aID, "laptop")) != 8 || len(lentObjects(t, an, bID, "desktop")) != 8 {
+		t.Fatal("a friend holds fewer than the 8 objects written")
+	}
+
+	// B restarts having forgotten A, as after losing lendisk.db, and
+	// refuses A, whose client keeps trying while A writes on. Then the
+	// friendship is restored behind B's daemon (as a one-shot command
+	// does), and both write again: each reaches the other, and A without
+	// a restart.
+	b.p.kill()
+	db := openDB(t, bn)
+	f, err := db.GetFriendship(t.Context(), aID.NodeID().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(t.Context(), `DELETE FROM friendship WHERE peer_key = ?`, f.Peer); err != nil {
+		t.Fatal(err)
+	}
+	b.start()
+	done := make(chan error, 1)
+	go put(a.addr, ca, "laptop", "refused", done)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	bKey := bID.NodeID().String()
+	deadline := time.Now().Add(30 * time.Second)
+	for p := an.place(bKey); p.State != "retrying"; p = an.place(bKey) {
+		if time.Now().After(deadline) {
+			t.Fatalf("A does not retry B while B refuses it: %+v", p)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err := db.AddFriendship(t.Context(), f); err != nil {
+		t.Fatal(err)
+	}
+	both("two")
 }
 
 // REPL-3, VER-5 (#50): an object the store could not supply as captured
