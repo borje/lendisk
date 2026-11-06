@@ -7,12 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"slices"
-	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/backend/meta"
+	"github.com/versity/versitygw/backend/posix"
 	"github.com/versity/versitygw/s3err"
 
 	"github.com/borje/lendisk/internal/state"
@@ -22,7 +26,7 @@ import (
 // against the store, before the gateway serves anything:
 //
 //   - a put is done if the object on disk carries the row's capture token
-//     (PutObject) or the ETag its completion was to give it (multipart);
+//     (PutObject) or was assembled from the row's upload (multipart);
 //     else it never took effect and the row is removed. A put that took
 //     effect is hashed by reading the object once;
 //   - a delete is done if the key is gone, else removed.
@@ -145,7 +149,8 @@ func (d *Decorator) landed(ctx context.Context, e state.Entry) (bool, error) {
 	case e.Op == state.OpDelete:
 		return false, nil
 	case e.Upload != "":
-		return head.ETag != nil && strings.Trim(*head.ETag, `"`) == strings.Trim(e.ETag, `"`), nil
+		id, err := storeUpload(d.Backend, e.Bucket, e.Key)
+		return id == e.Upload, err
 	default:
 		return head.Metadata[MetaCapture] == e.Token, nil
 	}
@@ -159,11 +164,48 @@ func (d *Decorator) hashStored(ctx context.Context, bucket, key string) (int64, 
 	}
 	defer out.Body.Close()
 	h := sha256.New()
-	n, err := io.Copy(h, out.Body)
+	n, err := io.Copy(h, ctxReader{ctx, out.Body})
 	if err != nil {
 		return 0, "", err
 	}
 	return n, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// mpMetaAttr is the attribute in which posix records, on an object it
+// assembled from a multipart upload, the upload's ID (and part sizes):
+// versitygw v1.10.0 backend/posix/posix.go, mpMetaKey, written by
+// CompleteMultipartUpload and checked there to answer a retried
+// completion. TestPendingCompletionMatchedByUploadNotETag pins it.
+const mpMetaAttr = "mp-metadata"
+
+// storeUpload returns the ID of the multipart upload that assembled
+// key's object, or "" if it was stored another way (a PutObject drops
+// the attribute) or is gone. It matches a pending completion's row to
+// its own upload, where an ETag would also match an earlier upload of
+// the same parts (#59). be is the posix store, or wraps it with an
+// Unwrap method.
+func storeUpload(be backend.Backend, bucket, key string) (string, error) {
+	for {
+		switch b := be.(type) {
+		case *posix.Posix:
+			v, err := meta.XattrMeta{}.RetrieveAttribute(nil, b.BucketPath(bucket), key, mpMetaAttr)
+			if errors.Is(err, meta.ErrNoSuchKey) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+				return "", nil
+			}
+			if err != nil {
+				return "", fmt.Errorf("reading the upload ID of %s/%s: %w", bucket, key, err)
+			}
+			m, err := backend.UnmarshalMpUploadMetadata(v, false)
+			if err != nil {
+				return "", fmt.Errorf("reading the upload ID of %s/%s: %w", bucket, key, err)
+			}
+			return m.UploadID, nil
+		case interface{ Unwrap() backend.Backend }:
+			be = b.Unwrap()
+		default:
+			return "", fmt.Errorf("the store (%T) records no multipart upload IDs", be)
+		}
+	}
 }
 
 func notFound(err error) bool {

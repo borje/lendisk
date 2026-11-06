@@ -1186,12 +1186,17 @@ upstream bucket is Q-V.
   - *Which write is on disk.* Each captured `PutObject` stores a random
     token as user metadata `lendisk-capture` (it is visible on `HEAD`
     as `x-amz-meta-lendisk-capture`; tools ignore it), and the pending
-    row keeps it. A pending completion keeps the ETag the upload will
-    have, which versitygw computes from the part ETags in the request
-    (`backend.ComputeMultipartETagFromPartETags`).
+    row keeps it. A pending completion keeps its upload ID (and the ETag
+    the upload will have, `backend.ComputeMultipartETagFromPartETags`).
+    posix records the upload ID on the object it assembles, in the
+    `mp-metadata` attribute (`user.mp-metadata` xattr; versitygw v1.10.0
+    `posix.go`, which checks it to answer a retried completion), and the
+    decorator reads the same attribute (`storeUpload`), so a row matches
+    its own upload exactly; an ETag would also match an earlier upload
+    of the same parts (#59). A `PutObject` drops the attribute.
   - *Startup.* Before the gateway serves anything, `ResolvePending`
     settles every pending row with `HeadObject`: a put is done if the
-    object carries the row's token (or ETag), and is otherwise removed;
+    object carries the row's token (or upload ID), and is otherwise removed;
     a delete is done if the key is gone. A `PutObject` that reached the
     store but not its row is hashed by reading the object once: the
     only read capture makes of a stored object, and only after a crash.
@@ -1251,7 +1256,7 @@ upstream bucket is Q-V.
     the key waits for it. Nothing is lost by answering first: the pending
     row was written before the store call, so if the process dies before
     the hash is recorded, startup finds the object carrying the row's
-    ETag and hashes it (*Startup*); a graceful stop cancels the hash
+    upload ID and hashes it (*Startup*); a graceful stop cancels the hash
     with the same result. `Gateway.Run` waits for running hashes after
     versitygw has shut down; a completion handler that outlives
     versitygw's 10 s shutdown starts no hash once that wait has begun
@@ -1265,23 +1270,34 @@ upstream bucket is Q-V.
     is answered from the object without changing it (or `NoSuchUpload`
     if its parts give another ETag), but a retry after the first failed
     finds the upload rolled back and assembles the object itself. So
-    the decorator decides by the row:
-    - *done*: the object is linked; the retry goes to the store
+    one request per upload at a time *claims* it (a per-upload signal,
+    registered before it waits for the key's lock), and the decorator
+    decides by the row and the claim:
+    - *done row*: the object is linked; the retry goes to the store
       uncaptured, without the key's lock.
-    - *pending, first completion still running*: the retry waits (with
-      its request context) for the first's store call to return, through
-      a per-upload signal, not the key's lock, which the first holds
-      while it hashes. Stored: as *done*. Failed: the first has removed
-      its row (or stranded it), and the retry continues below.
-    - *pending, no completion running* (stranded), or *no row*: the
-      retry takes the key's lock; a stranded row is settled against the
-      store there as `ResolveStranded` would (done if the object carries
-      its ETag, else removed); then a done row is answered as above and
-      anything else is captured as a first completion, with its own
-      row and ETag.
-    So no completion stores an object without a row. A retry that
-    arrives before the first has written its row waits for the key's
-    lock, then finds the row.
+    - *pending or no row, claimed by another request*: the retry waits
+      (with its request context) for the claimant's store call to
+      return, not for the key's lock, which the claimant holds while it
+      hashes. Stored: as *done*. Failed (or the claimant gave up): the
+      claimant has removed its row (or stranded it) and released the
+      claim, and the retry looks again. Two retries that both found no
+      row therefore never both wait for the lock: the second finds the
+      first's claim (#59).
+    - *pending, unclaimed* (stranded), or *no row, unclaimed*: the retry
+      claims the upload and takes the key's lock. A stranded row is
+      checked against the store with a `HEAD` and the upload-ID
+      attribute only: landed, the retry is answered from the store and
+      the row stays pending and stranded for `ResolveStranded` (or
+      startup) to hash; not landed, the row is removed. The request
+      never hashes the object inline, so a client's timeout cannot
+      waste a multi-GB read and every retry is cheap (#59). Anything
+      else is captured as a first completion, with its own row, upload
+      ID and ETag.
+    So no completion stores an object without a row. The claim, the
+    key's lock and an unsettled row are released (the row stranded) by
+    a deferred step, so a panic in the store leaks neither (#59). Every
+    hash of a stored object (`hashStored`, the background hash) stops
+    when its context ends.
   - *Exactly once.* A put whose hash equals the key's latest done row,
     a put, is not queued again (`FinishPut` drops it): this is the
     client's retry after a crash it saw as a failure, and an identical
@@ -1572,9 +1588,11 @@ upstream bucket is Q-V.
   (pending), which lasts until its write ends or, if the write ended
   without settling it, until `ResolveStranded` or the next start settles
   it (§3.3). Every write the decorator passes to the store has a row
-  first, a retried multipart completion included (§3.3 *Retried
-  completions*), so a store that changed with no later capture changed
-  outside lendisk. Only then does the row wait,
+  first; a retried multipart completion is passed on uncaptured only
+  when its upload already has a done row or a pending row whose object
+  landed, and posix then answers from the finished object without
+  writing (§3.3 *Retried completions*). So a store that changed with no
+  later capture changed outside lendisk. Only then does the row wait,
   polling every second, with the place's condition untouched; it is
   then cancelled as superseded (or sent, if that write was dropped and
   the store holds the captured bytes again). With no later capture the
