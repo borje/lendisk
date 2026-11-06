@@ -40,7 +40,7 @@ const MetaCapture = "lendisk-capture"
 // while running. Bodies are never buffered or read twice. A captured
 // request holds its key's lock from before its row is written until the
 // row is settled, so one key's rows reach the store in sequence order
-// (#48).
+// (#48); waiting for it ends with the request's context (#55).
 //
 // Overrides must return unwrapped s3err.APIError values for client-visible
 // refusals (Q-I.5).
@@ -59,14 +59,20 @@ type Decorator struct {
 	mu       sync.Mutex
 	stranded map[int64]bool // rows to settle while running (strand)
 
+	// completing holds each upload's first completion while it runs
+	// (under mu), so a retry can wait for its outcome.
+	completing map[string]*completion
+
 	// ctx bounds the background hashes of completed uploads (nil: never
 	// cancelled); hashes counts them, so the gateway waits for them to
 	// stop before it returns.
 	ctx    context.Context
-	hashes sync.WaitGroup
-	// beforeHash, if set, is called before a completed upload is hashed.
-	// Tests only.
+	hashes hashGroup
+	// beforeHash, if set, is called before a completed upload is hashed;
+	// seenUpload when a completion finds its upload's row, with the row's
+	// state. Tests only.
 	beforeHash func()
+	seenUpload func(state string)
 }
 
 var (
@@ -107,7 +113,11 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 		}
 		return d.Backend.PutObject(ctx, in)
 	}
-	defer d.keys.lock(*in.Bucket, *in.Key)()
+	unlock, err := d.keys.lock(ctx, *in.Bucket, *in.Key)
+	if err != nil {
+		return s3response.PutObjectOutput{}, errInternal
+	}
+	defer unlock()
 	token := randomHex(8)
 	in.Metadata = maps.Clone(in.Metadata)
 	if in.Metadata == nil {
@@ -144,9 +154,16 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 // hash runs after, in the background, still holding the key's lock, and
 // a crash before it finishes leaves the row pending for startup (#49).
 //
-// A completion of an upload that already has a row is a client's retry:
-// posix answers it from the object finished or being finished, without
-// changing it, so it is passed to the store, not queued or hashed again.
+// A completion of an upload that already has a row is a client's retry
+// (#55). If the row is done, posix answers it from the finished object
+// without changing anything, so it goes to the store uncaptured. If the
+// row is pending and the first completion is still in the store, the
+// retry waits for that call's outcome (not for the key's lock, which the
+// first holds while it hashes): stored, it is answered as a done row's
+// would be; failed, it is captured as a first completion. A pending row
+// whose request has ended (stranded) is settled under the key's lock
+// before the retry is decided. So no completion stores an object
+// without a row.
 func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
 	class, err := d.classify(in.Bucket, in.Key)
 	if err != nil {
@@ -156,27 +173,47 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 		return d.Backend.CompleteMultipartUpload(ctx, in)
 	}
 	bucket, key, uploadID := *in.Bucket, *in.Key, *in.UploadId
-	retried := func() (bool, error) {
-		_, _, found, err := d.DB.UploadEntry(context.Background(), bucket, key, uploadID)
+	id := lockName(bucket, key) + "\x00" + uploadID
+	for {
+		_, st, found, err := d.DB.UploadEntry(context.Background(), bucket, key, uploadID)
 		if err != nil {
 			d.Log.Error("capture: reading the queue failed; refusing the request", "bucket", bucket, "key", key, "err", err)
-			return false, errInternal
+			return s3response.CompleteMultipartUploadResult{}, "", errInternal
 		}
-		return found, nil
-	}
-	// A retry does not wait for the key's lock, which a first completion
-	// holds while it hashes.
-	if found, err := retried(); err != nil || found {
-		if err != nil {
-			return s3response.CompleteMultipartUploadResult{}, "", err
+		if !found {
+			break
 		}
-		return d.Backend.CompleteMultipartUpload(ctx, in)
+		if d.seenUpload != nil {
+			d.seenUpload(st)
+		}
+		if st != state.StatePending {
+			return d.Backend.CompleteMultipartUpload(ctx, in)
+		}
+		f := d.completion(id)
+		if f == nil {
+			break // stranded: settled under the key's lock below
+		}
+		select {
+		case <-f.done:
+		case <-ctx.Done():
+			return s3response.CompleteMultipartUploadResult{}, "", errInternal
+		}
+		if f.stored {
+			return d.Backend.CompleteMultipartUpload(ctx, in)
+		}
+		// The first failed and removed its row, or left it stranded.
 	}
-	unlock := d.keys.lock(bucket, key)
-	if found, err := retried(); err != nil || found {
+	unlock, err := d.keys.lock(ctx, bucket, key)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", errInternal
+	}
+	// Under the key's lock no completion of this upload is in the store.
+	done, err := d.uploadDone(ctx, bucket, key, uploadID)
+	if err != nil || done {
 		unlock()
 		if err != nil {
-			return s3response.CompleteMultipartUploadResult{}, "", err
+			d.Log.Error("capture: settling a retried completion's row failed; refusing the request", "bucket", bucket, "key", key, "err", err)
+			return s3response.CompleteMultipartUploadResult{}, "", errInternal
 		}
 		return d.Backend.CompleteMultipartUpload(ctx, in)
 	}
@@ -185,23 +222,45 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 		unlock()
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
+	f := &completion{done: make(chan struct{})}
+	d.mu.Lock()
+	if d.completing == nil {
+		d.completing = map[string]*completion{}
+	}
+	d.completing[id] = f
+	d.mu.Unlock()
+	end := func() {
+		d.mu.Lock()
+		delete(d.completing, id)
+		d.mu.Unlock()
+		unlock()
+	}
 	seq, err := d.begin(state.Capture{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(class),
 		ETag: etag, UploadID: uploadID})
 	if err != nil {
-		unlock()
+		end()
+		close(f.done)
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
 	res, ver, err := d.Backend.CompleteMultipartUpload(ctx, in)
 	if err != nil {
 		d.drop(seq)
-		unlock()
+		// A waiting retry, woken, must not find this completion again.
+		end()
+		close(f.done)
 		return res, ver, err
 	}
+	f.stored = true
+	close(f.done)
 	d.stored()
-	d.hashes.Add(1)
+	if !d.hashes.start() {
+		// Stopping: the row stays pending for startup.
+		end()
+		return res, ver, nil
+	}
 	go func() {
-		defer d.hashes.Done()
-		defer unlock()
+		defer d.hashes.done()
+		defer end()
 		ctx := d.hashCtx()
 		if err := d.finishUpload(ctx, seq, bucket, key, deref(res.ETag)); err != nil {
 			if ctx.Err() != nil {
@@ -213,6 +272,69 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 		}
 	}()
 	return res, ver, nil
+}
+
+// completion is a first CompleteMultipartUpload of an upload while it
+// runs: done is closed when its store call has returned, and stored then
+// tells whether the store assembled the object.
+type completion struct {
+	done   chan struct{}
+	stored bool
+}
+
+// completion returns the running first completion of upload id, if any.
+func (d *Decorator) completion(id string) *completion {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.completing[id]
+}
+
+// uploadDone reports whether an upload has a done row, holding the key's
+// lock. A pending row there is stranded (its request has ended); it is
+// settled against the store first, as ResolveStranded would.
+func (d *Decorator) uploadDone(ctx context.Context, bucket, key, uploadID string) (bool, error) {
+	seq, st, found, err := d.DB.UploadEntry(ctx, bucket, key, uploadID)
+	if err != nil || !found || st != state.StatePending {
+		return found, err
+	}
+	e, ok, err := d.DB.PendingCapture(ctx, seq)
+	if err != nil {
+		return false, err
+	}
+	if !ok {
+		return d.uploadDone(ctx, bucket, key, uploadID)
+	}
+	return d.resolve(ctx, e)
+}
+
+// hashGroup counts the background hashes of completed uploads, so the
+// gateway waits for them before it returns. Once stopped it starts no
+// more: a completion handler can outlive versitygw's shutdown (#55).
+type hashGroup struct {
+	mu      sync.Mutex
+	stopped bool
+	wg      sync.WaitGroup
+}
+
+// start counts a hash about to run; false means the group is stopped.
+func (g *hashGroup) start() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return false
+	}
+	g.wg.Add(1)
+	return true
+}
+
+func (g *hashGroup) done() { g.wg.Done() }
+
+// stop starts no more hashes and waits for the running ones.
+func (g *hashGroup) stop() {
+	g.mu.Lock()
+	g.stopped = true
+	g.mu.Unlock()
+	g.wg.Wait()
 }
 
 // hashCtx bounds the background hashes of completed uploads.
@@ -279,7 +401,11 @@ func (d *Decorator) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput) 
 	if !captured(class) {
 		return d.Backend.DeleteObject(ctx, in)
 	}
-	defer d.keys.lock(*in.Bucket, *in.Key)()
+	unlock, err := d.keys.lock(ctx, *in.Bucket, *in.Key)
+	if err != nil {
+		return nil, errInternal
+	}
+	defer unlock()
 	seq, err := d.begin(state.Capture{Bucket: *in.Bucket, Key: *in.Key, Op: state.OpDelete, Class: string(class)})
 	if err != nil {
 		return nil, err
@@ -320,7 +446,11 @@ func (d *Decorator) DeleteObjects(ctx context.Context, in *s3.DeleteObjectsInput
 	for i, c := range cs {
 		keys[i] = c.Key
 	}
-	defer d.keys.lock(*in.Bucket, keys...)()
+	unlock, err := d.keys.lock(ctx, *in.Bucket, keys...)
+	if err != nil {
+		return s3response.DeleteResult{}, errInternal
+	}
+	defer unlock()
 	bg := context.Background()
 	seqs, err := d.DB.BeginCaptures(bg, cs)
 	if err != nil {

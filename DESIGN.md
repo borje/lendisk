@@ -1199,15 +1199,20 @@ upstream bucket is Q-V.
     before the store call, so two overlapping writes to one key could
     reach the store in the other order and leave the key's last done row
     describing an object that is not on disk (#48). The decorator
-    therefore holds a per-key lock (`keyLocks`, a map of mutexes that
-    exist only while held or awaited) from before a captured request
-    writes its row until the row is done or removed: writes and deletes
-    of one key are applied in `seq` order, and the key's last done row
-    always describes the object on disk. Different keys never wait for
-    each other. `DeleteObjects` takes the locks of all its captured keys
-    in sorted order, so two of them cannot deadlock. restic and Kopia
-    never write one key concurrently, so the lock costs them one
-    uncontended mutex per request. `ResolveStranded` settles a row only
+    therefore holds a per-key lock (`keyLocks`, a map of one-slot
+    channels that exist only while held or awaited) from before a
+    captured request writes its row until the row is done or removed:
+    writes and deletes of one key are applied in `seq` order, and the
+    key's last done row always describes the object on disk. Different
+    keys never wait for each other. A request waiting for a key gives
+    up when its context ends (the client went away), so a key held for
+    minutes by a completed upload's hash keeps no abandoned goroutines
+    (#55). `DeleteObjects` blocks on one of its captured keys at a time
+    holding none of the others, then takes the rest only if they are
+    free (else it lets go and waits for the busy one), so two batches
+    cannot deadlock and a batch never holds a key while it waits for
+    another. restic and Kopia never write one key concurrently, so the
+    lock costs them one uncontended channel send per request. `ResolveStranded` settles a row only
     if its key's lock is free, and otherwise leaves it for the next
     round.
   - *Multipart.* There is no single stream to hash, and clients upload
@@ -1230,16 +1235,36 @@ upstream bucket is Q-V.
     row was written before the store call, so if the process dies before
     the hash is recorded, startup finds the object carrying the row's
     ETag and hashes it (*Startup*); a graceful stop cancels the hash
-    with the same result. A failed read leaves the row stranded for
+    with the same result. `Gateway.Run` waits for running hashes after
+    versitygw has shut down; a completion handler that outlives
+    versitygw's 10 s shutdown starts no hash once that wait has begun
+    and leaves its row pending for startup (#55). A failed read leaves the row stranded for
     `ResolveStranded`. A `FinishPut` that answers `ErrNotFound` (the row
     was settled elsewhere) counts as success.
     *Retried completions.* A completion of an upload that already has a
-    queue row is a client's retry. posix answers it, without changing
-    anything, from the object being assembled or finished, so the
-    decorator passes it to the store without queueing or hashing it, and
-    without waiting for the key's lock, which the first completion may
-    hold while it hashes. A retry that arrives before the first has
-    written its row waits for the key's lock, then finds the row.
+    queue row is a client's retry (#55). posix claims an upload by
+    renaming its directory: a retry while the first is in the store is
+    answered "done" at once, a retry after the first linked the object
+    is answered from the object without changing it (or `NoSuchUpload`
+    if its parts give another ETag), but a retry after the first failed
+    finds the upload rolled back and assembles the object itself. So
+    the decorator decides by the row:
+    - *done*: the object is linked; the retry goes to the store
+      uncaptured, without the key's lock.
+    - *pending, first completion still running*: the retry waits (with
+      its request context) for the first's store call to return, through
+      a per-upload signal, not the key's lock, which the first holds
+      while it hashes. Stored: as *done*. Failed: the first has removed
+      its row (or stranded it), and the retry continues below.
+    - *pending, no completion running* (stranded), or *no row*: the
+      retry takes the key's lock; a stranded row is settled against the
+      store there as `ResolveStranded` would (done if the object carries
+      its ETag, else removed); then a done row is answered as above and
+      anything else is captured as a first completion, with its own
+      row and ETag.
+    So no completion stores an object without a row. A retry that
+    arrives before the first has written its row waits for the key's
+    lock, then finds the row.
   - *Exactly once.* A put whose hash equals the key's latest done row,
     a put, is not queued again (`FinishPut` drops it): this is the
     client's retry after a crash it saw as a failure, and an identical
@@ -1480,8 +1505,12 @@ upstream bucket is Q-V.
   local error is explained by a later write of the key only while a
   later capture exists (`state.LaterCapture`); since a done later
   capture supersedes the row first, that means while one is in flight
-  (pending), which lasts until its write ends or, after a crash, until
-  the next start settles it (§3.3). Only then does the row wait,
+  (pending), which lasts until its write ends or, if the write ended
+  without settling it, until `ResolveStranded` or the next start settles
+  it (§3.3). Every write the decorator passes to the store has a row
+  first, a retried multipart completion included (§3.3 *Retried
+  completions*), so a store that changed with no later capture changed
+  outside lendisk. Only then does the row wait,
   polling every second, with the place's condition untouched; it is
   then cancelled as superseded (or sent, if that write was dropped and
   the store holds the captured bytes again). With no later capture the

@@ -157,8 +157,9 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	}
 
 	// Hashes of completed uploads end with ctx; a cancelled one leaves its
-	// row pending for the next start.
-	defer dec.hashes.Wait()
+	// row pending for the next start. A completion handler that outlives
+	// versitygw's shutdown starts no hash once this has begun waiting.
+	defer dec.hashes.stop()
 	if dec.DB != nil {
 		every := g.ResolveEvery
 		if every <= 0 {
