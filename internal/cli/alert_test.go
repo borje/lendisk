@@ -31,7 +31,7 @@ func TestUnreachableFriendAlertedThroughHookWebhookAndStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", CreatedAt: time.Now()}); err != nil {
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", OwnNumber: 1 << 30, PeerNumber: 1 << 30, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.SetPlaceCondition(ctx, "B", state.ConditionRetrying, "dial tcB: no route", time.Now().Add(-7*time.Hour)); err != nil {

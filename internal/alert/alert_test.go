@@ -34,7 +34,7 @@ func openDB(t *testing.T) *state.DB {
 
 func addFriend(t *testing.T, db *state.DB, peer string) {
 	t.Helper()
-	if err := db.AddFriendship(t.Context(), state.Friendship{Peer: peer, Address: "tc" + peer, CreatedAt: time.Now()}); err != nil {
+	if err := db.AddFriendship(t.Context(), state.Friendship{Peer: peer, Address: "tc" + peer, OwnNumber: 1 << 40, PeerNumber: 1 << 40, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 }

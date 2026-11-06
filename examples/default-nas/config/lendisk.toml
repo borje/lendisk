@@ -45,6 +45,9 @@ max_total     = "600G"       # LEND-1: cap on the sum of Anna's own numbers
 upload_limit   = "20M"       # REPL-7: global cap on upstream bandwidth
 schedule       = "01:00-07:00, 12:00-13:00"   # when replication may run
 part_size      = "16M"       # REPL-6: multipart part, resumes at the next part
+copies         = 2           # EP-6: for `bucket add` without --copies; the default
+reroute_after  = "1h"        # D6: unsent copies at a friend failing this long go elsewhere
+replace_after  = "168h"      # REPL-12: a friend silent this long is no longer room
 
 [replication.peer_limits]
 bjorn = "8M"                 # REPL-7: Björn is relayed through DERP; be gentle

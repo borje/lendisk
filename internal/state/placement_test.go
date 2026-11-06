@@ -26,7 +26,8 @@ func capture(t *testing.T, db *DB, bucket, key, op string) int64 {
 
 func friend(t *testing.T, db *DB, peer string) {
 	t.Helper()
-	if err := db.AddFriendship(context.Background(), Friendship{Peer: peer, Address: "tc" + peer, CreatedAt: time.Now()}); err != nil {
+	if err := db.AddFriendship(context.Background(), Friendship{Peer: peer, Address: "tc" + peer,
+		OwnNumber: 1 << 40, PeerNumber: 1 << 40, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -324,6 +325,10 @@ func TestHealingReuploadIsSentOnlyWhereTheHashIsNotHeld(t *testing.T) {
 	db := openTest(t)
 	for _, f := range []string{"B", "C", "D"} {
 		friend(t, db, f)
+	}
+	// Three copies: the object is placed at every friend.
+	if err := db.AddBucket(ctx, Bucket{Name: "laptop", Profile: "restic", Copies: 3, AccessKey: "AK", SecretKey: "s"}); err != nil {
+		t.Fatal(err)
 	}
 	s1 := capture(t, db, "laptop", "data/1", OpPut)
 	if err := db.RefusePlacement(ctx, "B", s1, "BadDigest"); err != nil {

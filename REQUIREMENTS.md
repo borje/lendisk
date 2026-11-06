@@ -1,6 +1,6 @@
 # lendisk — requirements
 
-Status: draft v0.11, 2026-11-04. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.11.1, 2026-11-06. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
@@ -15,7 +15,9 @@ contradictions in v0.10 found by a consistency review; v0.11 takes the
 product down to what v1 needs: quotas are numbers people set, with no
 negotiation, the local copy is always complete, an S3 service as the
 node's own store is post-v1, lock files stay local, and the identity
-key is a plain file. The design
+key is a plain file; v0.11.1 (2026-11-06) makes the `copies = 1`
+warning unconditional, in `bucket add` and `status` only, and not an
+alert (EP-6). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -408,9 +410,9 @@ double the surface for no change in the core problem.
   does not name the friends: copies are placed across the whole pool
   (REPL-12). `copies` defaults to 2 and can be changed later; a change
   places or removes copies to match (REPL-13). With `copies = 1`,
-  `bucket add`, `status` and the daily summary shall say that one lost
-  friend loses data and recommend 2; the nudge is suppressed when the
-  user sets `copies = 1` explicitly. When the pool has fewer than
+  `bucket add` and `status` shall say that one lost friend loses data
+  and recommend 2, however `copies` was set; it is not an alert. When
+  the pool has fewer than
   `copies` places, `bucket add` shall say so (OPS-2).
 - **EP-7** Tool profiles shall classify every key a tool writes into
   one of four classes, and say whether the tool is inside the

@@ -341,3 +341,30 @@ func TestAlertSettings(t *testing.T) {
 		}
 	}
 }
+
+// EP-6, D6 (#19): the [replication] section: copies for buckets created
+// without --copies (a TOML integer), and the placement thresholds.
+func TestReplicationSettings(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Replication.Copies.Int() != 2 || l.RerouteAfter() != time.Hour || l.ReplaceAfter() != 7*24*time.Hour {
+		t.Fatalf("defaults %+v", l.Replication)
+	}
+	p := writeFile(t, "[replication]\ncopies = 1\nreroute_after = \"30m\"\nreplace_after = \"72h\"\n")
+	l, err = load(t, []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Replication.Copies.Int() != 1 || l.RerouteAfter() != 30*time.Minute || l.ReplaceAfter() != 72*time.Hour {
+		t.Fatalf("from the file %+v", l.Replication)
+	}
+	for _, bad := range [][]string{{"--replication-copies", "0"}, {"--replication-copies", "two"},
+		{"--replication-reroute-after", "0"}, {"--replication-replace-after", "a week"}} {
+		if _, err := load(t, append([]string{"--config", none}, bad...), nil); err == nil {
+			t.Errorf("accepted %v", bad)
+		}
+	}
+}

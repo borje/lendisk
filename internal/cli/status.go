@@ -31,6 +31,8 @@ type Status struct {
 	Endpoint StatusEndpoint `json:"endpoint"`
 	Versions StatusVersions `json:"versions"`
 	Buckets  []StatusBucket `json:"buckets"`
+	// Pool is the friends that hold copies (#19).
+	Pool StatusPool `json:"pool"`
 	// Places are where replicas go: each friend, for now (#18).
 	Places []StatusPlace `json:"places"`
 	// Alerts are the pending alerts, oldest first (OPS-1, OPS-2, #13):
@@ -177,6 +179,29 @@ type StatusBucket struct {
 	// supply them as captured: gone, changed or rotted since capture, a
 	// directory, or too large for one PUT (#50). Each raised an alert.
 	Refused int64 `json:"refused"`
+	// BelowCopies counts the live objects that fewer than Copies places
+	// hold or will hold, and their bytes (REPL-4): the pool lacked room,
+	// a place refused them, or a friend gone past replace_after held them.
+	BelowCopies StatusBelow `json:"below_copies"`
+	// SingleCopy is true when copies is 1: each object is held by one
+	// friend, so losing that friend's disk loses the offsite copy (EP-6).
+	SingleCopy bool `json:"single_copy"`
+}
+
+// StatusPool is the pool of friends that hold copies (D6).
+type StatusPool struct {
+	// Friends counts the friends that are places for copies: with an
+	// address, not refusing this node, not gone past replace_after.
+	Friends int `json:"friends"`
+	// SingleFriend is true with exactly one: one lost disk loses every
+	// offsite copy (EP-6).
+	SingleFriend bool `json:"single_friend"`
+}
+
+// StatusBelow counts objects and bytes below a bucket's copies.
+type StatusBelow struct {
+	Objects int64 `json:"objects"`
+	Bytes   int64 `json:"bytes"`
 }
 
 // StatusQueue is a count of queue rows and their bytes. For a bucket it
@@ -267,11 +292,21 @@ func (a *app) statusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			for _, b := range bs {
-				q := queues[b.Name]
-				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
-					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name]})
+			below, err := db.BelowCopies(cmd.Context())
+			if err != nil {
+				return err
 			}
+			for _, b := range bs {
+				q, bc := queues[b.Name], below[b.Name]
+				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
+					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
+					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1})
+			}
+			db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
+			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
+				return err
+			}
+			st.Pool.SingleFriend = st.Pool.Friends == 1
 			if st.Places, err = places(cmd.Context(), db, a.now()); err != nil {
 				return err
 			}
@@ -309,7 +344,17 @@ func (a *app) statusCmd() *cobra.Command {
 				if b.Refused > 0 {
 					fmt.Fprintf(a.out, ", %d not replicated (the store's copy changed or cannot be sent; see the log)", b.Refused)
 				}
+				if b.BelowCopies.Objects > 0 {
+					fmt.Fprintf(a.out, ", %d objects, %d bytes at fewer than %d places", b.BelowCopies.Objects,
+						b.BelowCopies.Bytes, b.Copies)
+				}
 				fmt.Fprintln(a.out)
+				if b.SingleCopy {
+					fmt.Fprintf(a.out, "    %s\n", singleCopyLine)
+				}
+			}
+			if st.Pool.SingleFriend {
+				fmt.Fprintln(a.out, singleFriendLine)
 			}
 			if len(st.Places) > 0 {
 				fmt.Fprintf(a.out, "Places:  %d\n", len(st.Places))

@@ -152,7 +152,7 @@ func TestSameSecondReRaiseIsDeliveredOnItsOwn(t *testing.T) {
 func TestRefusedAtPlaces(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t)
-	if err := db.AddFriendship(ctx, Friendship{Peer: "B", Address: "tcB", CreatedAt: time.Now()}); err != nil {
+	if err := db.AddFriendship(ctx, Friendship{Peer: "B", Address: "tcB", OwnNumber: 1 << 40, PeerNumber: 1 << 40, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	var seqs []int64

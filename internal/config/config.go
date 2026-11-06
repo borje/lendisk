@@ -53,7 +53,9 @@ type Config struct {
 	Endpoint Endpoint `toml:"endpoint"`
 	Tunnel   Tunnel   `toml:"tunnel"`
 	Alerts   Alerts   `toml:"alerts"`
-	Log      Log      `toml:"log"`
+	// Replication is [replication] (D6, §3.4).
+	Replication Replication `toml:"replication"`
+	Log         Log         `toml:"log"`
 }
 
 // Store is the [store] section: one store for the node's own buckets and
@@ -162,6 +164,36 @@ type Alerts struct {
 	UnreachableAfter string `toml:"unreachable_after" default:"24h" help:"alert when a friend has not answered for this long and has been retried for at least an hour (OPS-2), such as 24h or 90m"`
 }
 
+// Replication is the [replication] section: pooled placement (D6,
+// §3.4, EP-6).
+type Replication struct {
+	Copies       Number `toml:"copies" default:"2" help:"how many friends hold each object of a bucket created without --copies (EP-6); 1 means one lost friend loses data, and bucket add and status say so"`
+	RerouteAfter string `toml:"reroute_after" default:"1h" help:"move the unsent copies at a friend that has failed this long to another friend with room (D6, REPL-1), such as 1h or 90m"`
+	ReplaceAfter string `toml:"replace_after" default:"168h" help:"a friend failing this long since its last answer is no longer room for copies (REPL-12, REPL-13), such as 168h"`
+}
+
+// Number is an integer setting kept as text, so the flag and variable
+// work like every other setting and the file may give it as a number.
+type Number string
+
+// UnmarshalText accepts a TOML integer or string.
+func (n *Number) UnmarshalText(b []byte) error { *n = Number(b); return nil }
+
+// Int is the number, which Validate checked.
+func (n Number) Int() int { i, _ := strconv.Atoi(string(n)); return i }
+
+// RerouteAfter is replication.reroute_after, which Validate checked.
+func (c *Config) RerouteAfter() time.Duration {
+	d, _ := time.ParseDuration(c.Replication.RerouteAfter)
+	return d
+}
+
+// ReplaceAfter is replication.replace_after, which Validate checked.
+func (c *Config) ReplaceAfter() time.Duration {
+	d, _ := time.ParseDuration(c.Replication.ReplaceAfter)
+	return d
+}
+
 // UnreachableAfter is alerts.unreachable_after, which Validate checked.
 func (c *Config) UnreachableAfter() time.Duration {
 	d, _ := time.ParseDuration(c.Alerts.UnreachableAfter)
@@ -209,6 +241,17 @@ func (c *Config) Validate() error {
 	}
 	if d, err := time.ParseDuration(c.Alerts.UnreachableAfter); err != nil || d <= 0 {
 		errs = append(errs, fmt.Errorf("alerts.unreachable_after = %q: want a positive duration such as 24h or 90m", c.Alerts.UnreachableAfter))
+	}
+	if n, err := strconv.Atoi(string(c.Replication.Copies)); err != nil || n < 1 {
+		errs = append(errs, fmt.Errorf("replication.copies = %q: want a whole number, at least 1", c.Replication.Copies))
+	}
+	for _, d := range []struct{ key, v string }{
+		{"replication.reroute_after", c.Replication.RerouteAfter},
+		{"replication.replace_after", c.Replication.ReplaceAfter},
+	} {
+		if v, err := time.ParseDuration(d.v); err != nil || v <= 0 {
+			errs = append(errs, fmt.Errorf("%s = %q: want a positive duration such as 1h or 168h", d.key, d.v))
+		}
 	}
 	if c.Alerts.Webhook != "" {
 		// Never echo the URL: its path or query may be a secret.

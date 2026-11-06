@@ -216,4 +216,55 @@ var migrations = []Migration{
 		-- Refusals, which the alert evaluator counts every minute.
 		CREATE INDEX placement_refused ON placement (place) WHERE state = 'refused';`,
 	},
+	{
+		Version: 12, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Pooled placement (D6, REPL-1, REPL-12, #19). placement.state
+		-- gains 'dropped': an unsent copy at a full or gone friend with no
+		-- other friend with room, taken out of its FIFO as a deficit.
+		-- What a placement row adds to its place's use while queued or
+		-- acked: a put its size plus the 4 KiB per object the lender counts
+		-- (0 when the place already holds those bytes), a delete minus what
+		-- the place held of the key. NULL counts as 0.
+		ALTER TABLE placement ADD COLUMN size INTEGER;
+		-- The borrower's count of what each place holds or will hold (D6
+		-- step 1): the sum of its queued and acked rows' size, kept by the
+		-- triggers below, so placing an object reads one row per place.
+		CREATE TABLE place_use (
+			place TEXT PRIMARY KEY,
+			bytes INTEGER NOT NULL
+		);
+		UPDATE placement SET size = (SELECT q.size FROM queue q WHERE q.seq = placement.seq) + 4096
+			WHERE op = 'put';
+		UPDATE placement SET size = -coalesce((SELECT sum(a.size) FROM placement a
+			WHERE a.place = placement.place AND a.bucket = placement.bucket AND a.key = placement.key
+			AND a.op = 'put' AND a.state = 'acked' AND a.seq < placement.seq
+			AND a.seq > coalesce((SELECT max(d.seq) FROM placement d WHERE d.place = a.place
+				AND d.bucket = a.bucket AND d.key = a.key AND d.op = 'delete' AND d.seq < placement.seq), 0)), 0)
+			WHERE op = 'delete';
+		INSERT INTO place_use (place, bytes)
+			SELECT place, coalesce(sum(size), 0) FROM placement WHERE state IN ('queued', 'acked') GROUP BY place;
+		CREATE TRIGGER place_use_insert AFTER INSERT ON placement
+		WHEN NEW.state IN ('queued', 'acked') BEGIN
+			INSERT OR IGNORE INTO place_use (place, bytes) VALUES (NEW.place, 0);
+			UPDATE place_use SET bytes = bytes + coalesce(NEW.size, 0) WHERE place = NEW.place;
+		END;
+		CREATE TRIGGER place_use_update AFTER UPDATE OF place, state, size ON placement BEGIN
+			UPDATE place_use SET bytes = bytes - coalesce(OLD.size, 0)
+				WHERE place = OLD.place AND OLD.state IN ('queued', 'acked');
+			INSERT OR IGNORE INTO place_use (place, bytes) VALUES (NEW.place, 0);
+			UPDATE place_use SET bytes = bytes + coalesce(NEW.size, 0)
+				WHERE place = NEW.place AND NEW.state IN ('queued', 'acked');
+		END;
+		CREATE TRIGGER place_use_delete AFTER DELETE ON placement
+		WHEN OLD.state IN ('queued', 'acked') BEGIN
+			UPDATE place_use SET bytes = bytes - coalesce(OLD.size, 0) WHERE place = OLD.place;
+		END;
+		-- The metadata barrier (REPL-1) looks for a bucket's queued rows
+		-- before a sequence; status counts each object's places.
+		CREATE INDEX placement_barrier ON placement (bucket, seq) WHERE state = 'queued';
+		CREATE INDEX placement_seq ON placement (seq);
+		-- A bucket's metadata, for what is not yet sent to a place (D6).
+		CREATE INDEX queue_metadata ON queue (bucket, key, seq) WHERE class IN ('metadata', 'snapshot');`,
+	},
 }

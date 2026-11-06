@@ -57,6 +57,7 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 			defer db.Close()
 			db.Clock = a.clock
+			db.RerouteAfter, db.ReplaceAfter = cfg.RerouteAfter(), cfg.ReplaceAfter()
 			if prev, ok, err := db.GetNode(ctx, "id"); err != nil {
 				return err
 			} else if ok && prev != nodeID {

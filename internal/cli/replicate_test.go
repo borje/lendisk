@@ -312,7 +312,7 @@ func TestStatusShowsStoreRefusalsAgainstTheBucket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", CreatedAt: time.Now()}); err != nil {
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", OwnNumber: 1 << 30, PeerNumber: 1 << 30, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	var seqs []int64
@@ -359,7 +359,7 @@ func TestStatusShowsAnUnreadableStoreAsTheCause(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", CreatedAt: time.Now()}); err != nil {
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", OwnNumber: 1 << 30, PeerNumber: 1 << 30, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	cause := "the store cannot be read: opening laptop/data/1: too many open files"

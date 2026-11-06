@@ -52,11 +52,11 @@ func (a *app) bucketCmd() *cobra.Command {
 		Short: "Create a bucket and print the lines to configure a backup tool",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.runBucketAdd(cmd.Context(), args[0], profile, copies)
+			return a.runBucketAdd(cmd.Context(), args[0], profile, copies, cmd.Flags().Changed("copies"))
 		},
 	}
 	add.Flags().StringVar(&profile, "profile", "", "backup tool: "+strings.Join(profiles, ", ")+" (required)")
-	add.Flags().IntVar(&copies, "copies", 2, "how many friends hold each object")
+	add.Flags().IntVar(&copies, "copies", 0, "how many friends hold each object (default replication.copies, 2)")
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List buckets",
@@ -118,14 +118,14 @@ func (a *app) openState(ctx context.Context) (*config.Loaded, *state.DB, error) 
 	return cfg, db, nil
 }
 
-func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int) error {
+func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int, explicit bool) error {
 	if err := validBucketName(name); err != nil {
 		return usageError{err}
 	}
 	if !contains(profiles, profile) {
 		return usageError{fmt.Errorf("--profile must be one of %s", strings.Join(profiles, ", "))}
 	}
-	if copies < 1 {
+	if explicit && copies < 1 {
 		return usageError{errors.New("--copies must be at least 1")}
 	}
 	cfg, db, err := a.openState(ctx)
@@ -133,6 +133,9 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 		return err
 	}
 	defer db.Close()
+	if !explicit {
+		copies = cfg.Replication.Copies.Int()
+	}
 	if cfg.Role == "lender" {
 		return errors.New("a lender-only node has no buckets of its own; set role = \"full\" first")
 	}
@@ -161,10 +164,30 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 		db.DeleteBucket(ctx, name)
 		return err
 	}
-	fmt.Fprintf(a.out, "Created bucket %s (profile %s, copies %d).\n\n", name, profile, copies)
+	fmt.Fprintf(a.out, "Created bucket %s (profile %s, copies %d).\n", name, profile, copies)
+	if copies == 1 {
+		fmt.Fprintln(a.out, singleCopyWarning)
+	}
+	db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
+	if places, err := db.PoolSize(ctx); err != nil {
+		return err
+	} else if places < copies {
+		fmt.Fprintf(a.out, "Your pool has %d places, fewer than copies %d: objects are held at fewer places until more friends join (`lendisk invite --quota <size>`).\n",
+			places, copies)
+	}
+	fmt.Fprintln(a.out)
 	printToolLines(a.out, cfg, b)
 	return nil
 }
+
+// What bucket add and status say of a bucket at copies 1, however
+// copies was set, and status of a pool of one friend (EP-6). Neither is
+// an alert.
+const (
+	singleCopyWarning = "Warning: copies = 1. Each object is held by one friend only, so if that friend's disk is lost, this bucket has no offsite copy left. Add a second friend, or recreate the bucket with --copies 2."
+	singleCopyLine    = "! one copy: losing that friend's disk loses the offsite copy; 2 is recommended"
+	singleFriendLine  = "Friends (1: one lost disk loses every offsite copy)"
+)
 
 // printToolLines prints the lines for loopback and, for each
 // [[endpoint.listen]] address, for another machine (EP-17).
