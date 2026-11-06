@@ -22,6 +22,8 @@ type Store struct {
 
 // OpenBackend opens the posix store on dir. AbsolutePaths is required:
 // without it posix.New changes the process's working directory (D15).
+// DataIntegrityEtag stays off: resolve's landed tells a PutObject's ETag
+// from a multipart one by the '-' (#62).
 func OpenBackend(dir string) (*Store, error) {
 	m := meta.XattrMeta{}
 	p, err := posix.New(dir, m, posix.PosixOpts{AbsolutePaths: true})

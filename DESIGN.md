@@ -1215,7 +1215,10 @@ upstream bucket is Q-V.
     and a retried completion of its upload is refused. `ResolveStranded`
     retries it every round but warns of it once per row while the daemon
     runs; `status` counts it among the bucket's pending writes
-    (`queue.pending`). Restoring the attributes settles it.
+    (`queue.pending`). Restoring the attributes settles it, and so does
+    any later write of the key (a plain ETag, or another upload's ID).
+    The rule relies on posix's `DataIntegrityEtag` being off: with it, a
+    `PutObject`'s ETag contains `-` too.
   - *Startup.* Before the gateway serves anything, `ResolvePending`
     settles every pending row with `HeadObject`: a put is done if the
     object carries the row's token (or upload ID), and is otherwise removed;
@@ -1230,7 +1233,9 @@ upstream bucket is Q-V.
     removing it (the state database refused the write, or a multipart
     hash failed) is remembered by the decorator as stranded, and
     `ResolveStranded` settles it against the store as startup would,
-    every minute (`Gateway.ResolveEvery`) until it succeeds, so a
+    every minute (`Gateway.ResolveEvery`) until it succeeds (a row whose
+    upload ID cannot be read waits for its attributes or a later write of
+    the key), so a
     failed request does not leave its row pending until the next start.
     The list is in memory; after a crash startup settles every pending
     row anyway.

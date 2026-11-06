@@ -227,8 +227,10 @@ func (d *Decorator) landed(ctx context.Context, e state.Entry) (bool, error) {
 		// No upload ID: a PutObject's object (a plain MD5 ETag) replaced
 		// the upload's, or the object lost its attributes. An ETag never
 		// stands in for the ID: an upload of the same parts gives it too.
+		// A plain ETag has no '-' only while posix's DataIntegrityEtag is
+		// off (OpenBackend); with it a PutObject's ETag contains one.
 		if etag := strings.Trim(deref(head.ETag), `"`); etag == "" || strings.Contains(etag, "-") {
-			return false, fmt.Errorf("%w: %s/%s: the object has no upload ID (ETag %q); its extended attributes may have been lost",
+			return false, fmt.Errorf("%w: %s/%s: the object has no upload ID (ETag %q); its extended attributes may have been lost: restore them, or write the key again",
 				errUploadUnreadable, e.Bucket, e.Key, etag)
 		}
 		return false, nil
