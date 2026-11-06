@@ -44,4 +44,44 @@ var migrations = []Migration{
 			used_at    INTEGER           -- unix seconds; NULL while unused
 		);`,
 	},
+	{
+		Version: 4, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The replication queue (REPL-1 to REPL-3): one row per captured
+		-- write or delete of an own bucket's key (EP-2, EP-3), in write
+		-- sequence. A row is pending while the backend call is in flight
+		-- and done once it succeeded; startup resolves pending rows.
+		CREATE TABLE queue (
+			seq        INTEGER PRIMARY KEY AUTOINCREMENT, -- write sequence
+			bucket     TEXT NOT NULL,
+			key        TEXT NOT NULL,
+			op         TEXT NOT NULL,    -- put | delete
+			class      TEXT NOT NULL,    -- snapshot | metadata | data (EP-7)
+			state      TEXT NOT NULL,    -- pending | done
+			size       INTEGER,          -- put: bytes
+			sha256     TEXT,             -- put: hex; multipart: <hex>-<parts>
+			token      TEXT,             -- PutObject: its lendisk-capture metadata
+			etag       TEXT,             -- multipart: the ETag it completes with
+			upload_id  TEXT,             -- multipart: the upload it completed
+			created_at INTEGER NOT NULL  -- unix seconds
+		);
+		CREATE INDEX queue_key ON queue (bucket, key, seq);
+		CREATE INDEX queue_pending ON queue (state) WHERE state = 'pending';
+		-- A multipart object's parts, in order (REPL-10, §3.3).
+		CREATE TABLE queue_part (
+			seq    INTEGER NOT NULL REFERENCES queue (seq) ON DELETE CASCADE,
+			number INTEGER NOT NULL,
+			size   INTEGER NOT NULL,
+			sha256 TEXT NOT NULL,
+			PRIMARY KEY (seq, number)
+		);
+		-- Parts of open multipart uploads, hashed as they were written.
+		CREATE TABLE upload_part (
+			upload_id TEXT NOT NULL,
+			number    INTEGER NOT NULL,
+			size      INTEGER NOT NULL,
+			sha256    TEXT NOT NULL,
+			PRIMARY KEY (upload_id, number)
+		);`,
+	},
 }

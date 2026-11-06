@@ -18,12 +18,19 @@ import (
 //   - CreateBucket asking for object lock, which posix would otherwise
 //     grant (D15);
 //   - the control API path, which belongs to the bridge on the tunnel and
-//     to nothing behind it.
+//     to nothing behind it;
+//   - a browser-form POST upload (a POST to a bucket that is not a
+//     multi-delete): it reaches the backend's PutObject, but no backup tool
+//     uses it and its policy-signed form is a second way in (Q-H, §3.3).
+//
+// Server-side copies are refused on own buckets by the decorator, which
+// knows the bucket map (Q-H).
 //
 // The borrower allow-list (NET-7, #15) grows here.
 func Gate() s3api.Option {
 	return s3api.WithMiddleware("/", func(c fiber.Ctx) error {
-		if msg := refuse(c.Method(), c.Path(), c.Get("X-Amz-Bucket-Object-Lock-Enabled")); msg != "" {
+		if msg := refuse(request{method: c.Method(), path: c.Path(), objectLock: c.Get("X-Amz-Bucket-Object-Lock-Enabled"),
+			multiDelete: c.Request().URI().QueryArgs().Has("delete")}); msg != "" {
 			return deny(c, msg)
 		}
 		return c.Next()
@@ -33,17 +40,32 @@ func Gate() s3api.Option {
 // ControlPrefix is the control API's path on the tunnel (§3.7).
 const ControlPrefix = "/_lendisk/"
 
+// request is what the gate looks at.
+type request struct {
+	method, path string
+	objectLock   string // the x-amz-bucket-object-lock-enabled header
+	multiDelete  bool   // the query has "delete"
+}
+
 // refuse returns why a request is refused, or "" to let it through.
-func refuse(method, path, objectLock string) string {
+func refuse(r request) string {
 	switch {
-	case method == http.MethodPatch:
+	case r.method == http.MethodPatch:
 		return "lendisk: the admin API is not served"
-	case strings.HasPrefix(path, ControlPrefix):
+	case strings.HasPrefix(r.path, ControlPrefix):
 		return "lendisk: control API not served here"
-	case method == http.MethodPut && strings.EqualFold(strings.TrimSpace(objectLock), "true"):
+	case r.method == http.MethodPut && strings.EqualFold(strings.TrimSpace(r.objectLock), "true"):
 		return "lendisk: object lock is not offered"
+	case r.method == http.MethodPost && !r.multiDelete && isBucketPath(r.path):
+		return "lendisk: browser-form uploads are not offered; use PUT"
 	}
 	return ""
+}
+
+// isBucketPath reports whether a path-style path names a bucket only.
+func isBucketPath(path string) bool {
+	p := strings.Trim(path, "/")
+	return p != "" && !strings.Contains(p, "/")
 }
 
 func deny(c fiber.Ctx, msg string) error {

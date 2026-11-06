@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -14,6 +15,7 @@ import (
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/version"
 )
@@ -59,6 +61,10 @@ func (a *app) serveCmd() *cobra.Command {
 			if err := a.checker().Check(cfg.StorePath(), floor); err != nil {
 				return err
 			}
+			profiles, err := profile.Load(filepath.Join(cfg.ConfigDir(), "profiles"))
+			if err != nil {
+				return err
+			}
 			tun, err := a.startTunnel(ctx, cfg, id, db, log)
 			if err != nil {
 				return err
@@ -71,7 +77,8 @@ func (a *app) serveCmd() *cobra.Command {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			errc := make(chan error, 2)
-			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Log: log}
+			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Log: log,
+				Profiles: profiles, AfterStore: a.afterStore}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
 			select {
