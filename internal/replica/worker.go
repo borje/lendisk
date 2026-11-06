@@ -78,6 +78,34 @@ type Worker struct {
 	// stat stats a bucket's directory in the store; nil means os.Stat.
 	// Tests set it to hang.
 	stat func(name string) (fs.FileInfo, error)
+
+	// flight guards sending: the row each sender has taken from its FIFO
+	// and not yet recorded the outcome of, which re-routing skips (a send
+	// that lands must find its row, §3.4). A sender takes its row and a
+	// re-routing pass reads the set under it, so neither misses the other.
+	flight  sync.Mutex
+	sending map[string]int64 // place -> seq
+}
+
+// next takes place's next queued row and marks it being sent.
+func (w *Worker) next(ctx context.Context, place string) (state.Placement, bool, error) {
+	w.flight.Lock()
+	defer w.flight.Unlock()
+	p, ok, err := w.DB.NextPlacement(ctx, place)
+	if ok && err == nil {
+		if w.sending == nil {
+			w.sending = map[string]int64{}
+		}
+		w.sending[place] = p.Seq
+	}
+	return p, ok, err
+}
+
+// done marks place's row as no longer being sent.
+func (w *Worker) done(place string) {
+	w.flight.Lock()
+	defer w.flight.Unlock()
+	delete(w.sending, place)
 }
 
 func (w *Worker) openFile(name string) (fs.File, error) {
@@ -215,7 +243,15 @@ func (w *Worker) Run(ctx context.Context) {
 // reroute_after, or full by their last answer, to friends with room
 // (§3.4), so the metadata barrier does not wait on them.
 func (w *Worker) reroute(ctx context.Context) {
-	moved, dropped, err := w.DB.Reroute(ctx)
+	w.flight.Lock()
+	moved, dropped, err := w.DB.Reroute(ctx, func(place string, seq int64) bool {
+		s, ok := w.sending[place]
+		return ok && s == seq
+	})
+	w.flight.Unlock()
+	if dropped > 0 {
+		w.alerted() // alert.KindCopiesDropped
+	}
 	switch {
 	case err != nil:
 		if ctx.Err() == nil {
@@ -273,8 +309,10 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		}
 		stale = c == state.ConditionStore
 	}
+	defer w.done(place)
 	for ctx.Err() == nil {
-		p, ok, err := w.DB.NextPlacement(ctx, place)
+		w.done(place) // the previous row's outcome is recorded
+		p, ok, err := w.next(ctx, place)
 		if err != nil {
 			if ctx.Err() == nil {
 				log.Error("replication: reading the queue failed", "err", err)
@@ -312,6 +350,12 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		err = w.send(ctx, place, r, p)
 		if ctx.Err() != nil {
 			return // stopping; the row stays queued
+		}
+		if err != nil && !errors.Is(err, errSuperseded) && !errors.Is(err, errLocal) &&
+			!errors.Is(err, ErrImmutable) && !errors.Is(err, ErrRejected) {
+			// Not sent, and the row stays queued: it may be re-routed
+			// while this sender waits to try again.
+			w.done(place)
 		}
 		prev := failing
 		failing = ""

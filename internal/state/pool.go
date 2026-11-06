@@ -67,7 +67,19 @@ func (p poolPlace) reroutable(db *DB, now time.Time) bool {
 	return p.unreachable(db, now) || p.full()
 }
 
-func poolPlaces(ctx context.Context, tx *sql.Tx) ([]poolPlace, error) {
+// droppable: its unsent data, with nowhere else to go, is dropped as a
+// deficit rather than wait: it is full (it would refuse the copies, and
+// they would hold the barrier and its later deletes for as long as it
+// stays full), or gone past replace_after.
+func (p poolPlace) droppable(db *DB, now time.Time) bool {
+	return p.full() || p.gone(db, now)
+}
+
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT f.peer_key,
 		min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)), coalesce(u.bytes, 0),
 		coalesce(c.condition, ''), coalesce(c.since, 0), c.last_ok
@@ -112,10 +124,12 @@ func unsentMetadata(ctx context.Context, tx *sql.Tx, bucket, place string) (int6
 // counts need bytes at a place, never one in exclude: friends with free
 // capacity for it, reachable ones first, each by largest free fraction
 // (free ÷ quota), ties by node ID. A friend gone past replace_after,
-// removed, or full by its last answer is not room. Fewer than n means
-// the pool lacks room: what fits is placed, and the deficit shows as
-// bytes below copies (§3.4).
-func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64, n int, exclude []string) ([]string, error) {
+// removed, or full by its last answer is not room; with reachableOnly,
+// neither is an unreachable one (re-routing, so rows do not move between
+// friends that both stopped answering). Fewer than n means the pool
+// lacks room: what fits is placed, and the deficit shows as bytes below
+// copies (§3.4).
+func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64, n int, exclude []string, reachableOnly bool) ([]string, error) {
 	if n <= 0 {
 		return nil, nil
 	}
@@ -131,7 +145,8 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 	}
 	var cs []cand
 	for _, p := range ps {
-		if slices.Contains(exclude, p.peer) || p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) {
+		if slices.Contains(exclude, p.peer) || p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) ||
+			reachableOnly && p.unreachable(db, now) {
 			continue
 		}
 		meta, err := unsentMetadata(ctx, tx, bucket, p.peer)
@@ -202,7 +217,7 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 	default:
 		if heal {
 			targets, err = column(ctx, tx, `SELECT p.place FROM placement p JOIN friendship f ON f.peer_key = p.place
-				WHERE coalesce(f.address, '') != '' AND p.seq = (SELECT max(l.seq) FROM queue l
+				WHERE coalesce(f.address, '') != '' AND p.state != 'dropped' AND p.seq = (SELECT max(l.seq) FROM queue l
 					WHERE l.bucket = ?1 AND l.key = ?2 AND l.seq < ?3 AND l.state = 'done')
 				ORDER BY p.place`, bucket, key, seq)
 			if err != nil {
@@ -215,7 +230,7 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 			return err
 		}
 		var more []string
-		more, err = db.choose(ctx, tx, bucket, size+ObjectOverhead, copies-len(targets), targets)
+		more, err = db.choose(ctx, tx, bucket, size+ObjectOverhead, copies-len(targets), targets, false)
 		targets = append(targets, more...)
 	}
 	if err != nil {
@@ -294,15 +309,17 @@ func column(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]string, e
 // placement row left, each acked at every place it is placed at. Rows
 // refused for good are not queued, so a friend that refuses everything
 // cannot stall the barrier (#20 review): the object is below copies,
-// which status shows. A queued put a later done write of the key
-// replaced will be cancelled, not sent, so it does not hold it either.
+// which status shows. A queued put that a done write of the key before
+// the metadata replaced will be cancelled, not sent, so it does not hold
+// it either; one replaced only after the metadata still does, as the
+// metadata was written while it was the key's bytes.
 func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 	var held bool
 	err := db.QueryRowContext(ctx, `SELECT q.class IN ('metadata', 'snapshot') AND EXISTS (
 		SELECT 1 FROM placement p JOIN queue d ON d.seq = p.seq
 		WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND p.op = 'put' AND d.class = 'data'
 		AND NOT EXISTS (SELECT 1 FROM queue l
-			WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.state = 'done'))
+			WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.seq < q.seq AND l.state = 'done'))
 		FROM queue q WHERE q.seq = ?`, seq).Scan(&held)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -312,16 +329,18 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 
 // Reroute moves the unsent data rows of every friend that is failing
 // for longer than reroute_after, or whose last answer was 507, to
-// another friend with room by D6's choice, never to one that has or had
-// a row of the object (§3.4). The row keeps its sequence, so it takes its
-// place in the new FIFO before later rows. Moving an unsent row moves no
-// bytes; should the old place's send still be in flight and land, it
-// holds an unrecorded extra copy. With no friend with room the row
-// waits, unless its place is gone past replace_after: then it is
-// dropped, a deficit status shows as bytes below copies, so it cannot
-// hold the metadata barrier for good. Re-placement (#26) restores the
-// copies once there is room.
-func (db *DB) Reroute(ctx context.Context) (moved, dropped int64, err error) {
+// another reachable friend with room by D6's choice, never to one that
+// has or had a row of the object (§3.4). The row keeps its sequence, so
+// it takes its place in the new FIFO before later rows. A row for which
+// sending(place, seq) is true is skipped: its send may land, and the
+// place's row must be there to record it, or no delete would reach the
+// copy. With no friend with room the row waits, unless its place is full
+// or gone past replace_after: then it is dropped (state dropped), a
+// deficit status shows as bytes below copies and alert.KindCopiesDropped
+// raises, so it cannot hold the metadata barrier, or a full friend's
+// later deletes, for good. Re-placement (#26) restores the copies once
+// there is room.
+func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64) bool) (moved, dropped int64, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, 0, err
@@ -361,24 +380,31 @@ func (db *DB) Reroute(ctx context.Context) (moved, dropped int64, err error) {
 			return 0, 0, err
 		}
 		for _, r := range rs {
+			if sending != nil && sending(p.peer, r.seq) {
+				continue
+			}
 			holders, err := column(ctx, tx, `SELECT place FROM placement WHERE seq = ?`, r.seq)
 			if err != nil {
 				return 0, 0, err
 			}
-			to, err := db.choose(ctx, tx, r.bucket, r.size+ObjectOverhead, 1, holders)
+			to, err := db.choose(ctx, tx, r.bucket, r.size+ObjectOverhead, 1, holders, true)
 			if err != nil {
 				return 0, 0, err
 			}
-			if len(to) == 0 && !p.gone(db, now) {
+			if len(to) == 0 {
+				if !p.droppable(db, now) {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = 'dropped'
+					WHERE place = ? AND seq = ? AND state = 'queued'`, p.peer, r.seq); err != nil {
+					return 0, 0, err
+				}
+				dropped++
 				continue
 			}
 			if _, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`,
 				p.peer, r.seq); err != nil {
 				return 0, 0, err
-			}
-			if len(to) == 0 {
-				dropped++
-				continue
 			}
 			if err := db.insertPlacement(ctx, tx, r.seq, to[0], false); err != nil {
 				return 0, 0, err
@@ -390,12 +416,28 @@ func (db *DB) Reroute(ctx context.Context) (moved, dropped int64, err error) {
 }
 
 // PoolSize is how many places the pool has for copies: friends with an
-// address that do not refuse this node (OPS-2, EP-6).
+// address that do not refuse this node and are not gone past
+// replace_after (OPS-2, EP-6).
 func (db *DB) PoolSize(ctx context.Context) (int, error) {
-	var n int
-	err := db.QueryRowContext(ctx, `SELECT count(*) FROM friendship f LEFT JOIN place c ON c.place = f.peer_key
-		WHERE coalesce(f.address, '') != '' AND coalesce(c.condition, '') != 'removed'`).Scan(&n)
-	return n, err
+	ps, err := poolPlaces(ctx, db)
+	if err != nil {
+		return 0, err
+	}
+	now, n := db.now(), 0
+	for _, p := range ps {
+		if p.cond != ConditionRemoved && !p.gone(db, now) {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// DroppedBelowCopies returns, per bucket, the live objects below copies
+// with a copy dropped at a full or gone friend (Reroute): data held at
+// fewer places for want of room (alert.KindCopiesDropped). Writing the
+// key again, or re-placement (#26), clears it.
+func (db *DB) DroppedBelowCopies(ctx context.Context) (map[string]BelowStat, error) {
+	return db.below(ctx, `AND EXISTS (SELECT 1 FROM placement p WHERE p.seq = q.seq AND p.state = 'dropped')`)
 }
 
 // PlaceUse returns the borrower's count of what each place holds or
@@ -431,12 +473,16 @@ type BelowStat struct {
 // for, refusals, and copies dropped at a friend gone past replace_after
 // (REPL-4). Buckets with none are absent.
 func (db *DB) BelowCopies(ctx context.Context) (map[string]BelowStat, error) {
+	return db.below(ctx, "")
+}
+
+func (db *DB) below(ctx context.Context, and string) (map[string]BelowStat, error) {
 	rows, err := db.QueryContext(ctx, `SELECT q.bucket, count(*), coalesce(sum(q.size), 0) FROM queue q
 		WHERE q.state = 'done' AND q.op = 'put'
 		AND NOT EXISTS (SELECT 1 FROM queue l
 			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
 		AND (SELECT count(*) FROM placement p WHERE p.seq = q.seq AND p.state IN ('queued', 'acked'))
-			< coalesce((SELECT copies FROM buckets WHERE name = q.bucket), ?)
+			< coalesce((SELECT copies FROM buckets WHERE name = q.bucket), ?) `+and+`
 		GROUP BY q.bucket`, DefaultCopies)
 	if err != nil {
 		return nil, err

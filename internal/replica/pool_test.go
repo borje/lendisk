@@ -216,3 +216,46 @@ func TestWorkerReroutesFromAnUnreachableFriend(t *testing.T) {
 		t.Fatalf("data/1 placed at %v", places)
 	}
 }
+
+// §3.4 (#19 review): a row its sender is sending is not re-routed: when
+// the send lands, the place's row records the copy, and a later delete
+// reaches that place, so no copy is left that nothing deletes.
+func TestARowBeingSentIsNotRerouted(t *testing.T) {
+	fx := newFixture(t, "B", "C", "D")
+	fx.bucket("repo", 2)
+	fx.db.RerouteAfter = time.Millisecond
+	fx.w.RerouteEvery = 5 * time.Millisecond
+	hold := make(chan struct{})
+	fx.places["C"].hold = hold
+	d := fx.put("repo", "data/1", "data", "pack") // B and C: ties by node ID
+	fx.run()
+	waitFor(t, "C's send in flight", func() bool {
+		p := fx.places["C"]
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.inFlight == 1
+	})
+	// C looks unreachable while its send is in flight.
+	if err := fx.db.SetPlaceCondition(t.Context(), "C", state.ConditionRetrying, "dial: timeout",
+		time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // many reroute passes
+	close(hold)
+	fx.drained("C")
+	fx.drained("B")
+	if !fx.holds("C", "repo", "data/1") {
+		t.Fatal("C's send did not land")
+	}
+	var state string
+	if err := fx.db.QueryRow(`SELECT state FROM placement WHERE place = 'C' AND seq = ?`, d).Scan(&state); err != nil || state != "acked" {
+		t.Fatalf("C's row of data/1: %q %v", state, err)
+	}
+	fx.remove("repo", "data/1")
+	for _, n := range []string{"B", "C", "D"} {
+		fx.drained(n)
+	}
+	if fx.holds("C", "repo", "data/1") {
+		t.Fatal("C keeps a copy of data/1 that no delete reached")
+	}
+}

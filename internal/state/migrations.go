@@ -217,10 +217,15 @@ var migrations = []Migration{
 		CREATE INDEX placement_refused ON placement (place) WHERE state = 'refused';`,
 	},
 	{
-		// Numbered 13: #28 takes 12.
+		// Schema 13 in DESIGN: #28 takes 12 and merges first. Version 12
+		// here only until this branch is rebased onto #28, as versions
+		// must have no gaps; the rebase makes it 13.
 		Version: 12, Compat: 1, Release: "0.1",
 		SQL: `
-		-- Pooled placement (D6, REPL-1, REPL-12, #19). copies_explicit is 1
+		-- Pooled placement (D6, REPL-1, REPL-12, #19). placement.state
+		-- gains 'dropped': an unsent copy at a full or gone friend with no
+		-- other friend with room, taken out of its FIFO as a deficit.
+		-- copies_explicit is 1
 		-- when the user gave copies (bucket add --copies), which silences
 		-- the copies = 1 nudge (EP-6); NULL when copies is the default.
 		ALTER TABLE buckets ADD COLUMN copies_explicit INTEGER;

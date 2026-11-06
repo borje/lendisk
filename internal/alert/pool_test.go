@@ -47,3 +47,69 @@ func TestPoolWithFewerPlacesThanCopiesIsAlerted(t *testing.T) {
 		t.Fatalf("alerts after D joined %v", as)
 	}
 }
+
+// OPS-2 (#19 review): a friend gone past replace_after is not a place
+// in the pool, so a copies-2 bucket whose only other friend is gone
+// raises pool_too_small.
+func TestAGoneFriendIsNotAPlaceInThePool(t *testing.T) {
+	db := openDB(t)
+	if err := db.AddBucket(t.Context(), state.Bucket{Name: "laptop", Profile: "restic", Copies: 2,
+		AccessKey: "AK", SecretKey: "s", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	addFriend(t, db, "B")
+	addFriend(t, db, "C")
+	now := time.Now()
+	if err := db.SetPlaceCondition(t.Context(), "C", state.ConditionOK, "", now.Add(-9*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPlaceCondition(t.Context(), "C", state.ConditionRetrying, "dial: no route", now.Add(-8*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	s := &Service{DB: db, Log: quiet}
+	if err := s.evaluate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if a, ok := active(t, db)[KindPoolTooSmall+":laptop"]; !ok || !strings.Contains(a.Message, "1 place") {
+		t.Fatalf("alerts %v", active(t, db))
+	}
+}
+
+// OPS-2, REPL-4 (#19 review): copies dropped at a friend that is full
+// or gone, with no other friend with room, raise copies_dropped for the
+// bucket: its data is held at fewer places than copies.
+func TestDroppedCopiesAreAlerted(t *testing.T) {
+	ctx := t.Context()
+	db := openDB(t)
+	if err := db.AddBucket(ctx, state.Bucket{Name: "laptop", Profile: "restic", Copies: 2,
+		AccessKey: "AK", SecretKey: "s", CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	addFriend(t, db, "B")
+	addFriend(t, db, "C")
+	seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "data/1", Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FinishPut(ctx, seqs[0], 100, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AckPlacement(ctx, "B", seqs[0], "h", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPlaceCondition(ctx, "C", state.ConditionQuota, "507", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, dropped, err := db.Reroute(ctx, nil); err != nil || dropped != 1 {
+		t.Fatalf("dropped %d %v", dropped, err)
+	}
+	s := &Service{DB: db, Log: quiet}
+	if err := s.evaluate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	as := active(t, db)
+	a, ok := as[KindCopiesDropped+":laptop"]
+	if !ok || !strings.Contains(a.Message, "1 object") || len(as) != 1 {
+		t.Fatalf("alerts %v", as)
+	}
+}

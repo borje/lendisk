@@ -30,6 +30,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -67,10 +68,17 @@ const (
 	// (OPS-2, #19), which re-placement cannot fix: the pool needs a new
 	// friendship. The subject is the bucket.
 	KindPoolTooSmall = "pool_too_small"
+	// KindCopiesDropped: unsent copies of a bucket's objects were dropped
+	// at a friend that is full or gone past replace_after, with no other
+	// friend with room (state.DB.Reroute, #19): data held at fewer places
+	// than copies until written again or re-placed (#26). The subject is
+	// the bucket.
+	KindCopiesDropped = "copies_dropped"
 )
 
 // kinds are the alert kinds the evaluator owns.
-var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused, KindPoolTooSmall}
+var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
+	KindPoolTooSmall, KindCopiesDropped}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -308,7 +316,24 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 			b.Name, b.Copies, countPlaces(pool))
 		out = append(out, alertOf(KindPoolTooSmall, b.Name, msg))
 	}
+	dropped, err := s.DB.DroppedBelowCopies(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range slices.Sorted(maps.Keys(dropped)) {
+		d := dropped[b]
+		msg := fmt.Sprintf("bucket %s has %s (%d bytes) at fewer places than its copies: a friend that is full or no longer answers held them, and no other friend has room; add room or a friend (lendisk invite)",
+			b, countObjects(d.Objects), d.Bytes)
+		out = append(out, alertOf(KindCopiesDropped, b, msg))
+	}
 	return out, nil
+}
+
+func countObjects(n int64) string {
+	if n == 1 {
+		return "1 object"
+	}
+	return fmt.Sprintf("%d objects", n)
 }
 
 func countPlaces(n int) string {

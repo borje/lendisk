@@ -261,7 +261,7 @@ func TestRerouteMovesUnsentDataFromAnUnreachableFriend(t *testing.T) {
 	p.ack("C", d1) // C acknowledged data/1 before it went away
 	reroute := func() (int64, int64) {
 		t.Helper()
-		moved, dropped, err := p.db.Reroute(ctx)
+		moved, dropped, err := p.db.Reroute(ctx, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -363,10 +363,15 @@ func TestMetadataBarrier(t *testing.T) {
 	if !p.held(dm) {
 		t.Fatal("metadata delete not held with data/2 queued")
 	}
-	// data/2 is deleted: its queued rows will be cancelled.
+	// data/2 is deleted: its queued rows will be cancelled, so metadata
+	// written after the delete is not held by them. The snapshot written
+	// before the delete still is (#19 review).
 	p.del("laptop", "data/2", "data")
-	if p.held(s) {
-		t.Fatal("a superseded put holds the barrier")
+	if s2 := p.put("laptop", "snapshots/2", "snapshot", 0.1); p.held(s2) {
+		t.Fatal("a put superseded before the metadata holds it")
+	}
+	if !p.held(s) {
+		t.Fatal("a delete written after the snapshot released it")
 	}
 }
 
@@ -534,4 +539,102 @@ func TestPlaceUseFollowsTheRows(t *testing.T) {
 	if use() != 0 {
 		t.Fatalf("use %d after a refusal and a cancel", use())
 	}
+}
+
+// REPL-1 AC, LEND-2 (#19 review): a friend whose last answer was 507,
+// with no other friend room for its unsent copies, does not hold the
+// metadata barrier: the copies are dropped as a deficit, shown below
+// copies, and its FIFO moves on to the metadata and the deletes behind
+// them; the other friend's metadata flows too.
+func TestAFullFriendWithNowhereElseDoesNotHoldTheBarrier(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 2)
+	d0 := p.put("laptop", "data/0", "data", 1)
+	p.ack("B", d0)
+	p.ack("C", d0)
+	d1 := p.put("laptop", "data/1", "data", 1)
+	p.wantPlaces("data/1", d1, "B", "C")
+	m := p.put("laptop", "index/1", "metadata", 0.5)
+	x := p.del("laptop", "data/0", "data")
+	p.ack("C", d1)
+	p.condition("B", ConditionQuota, p.now, p.now.Add(-time.Minute))
+	if !p.held(m) {
+		t.Fatal("index/1 not held while data/1 waits at B")
+	}
+	moved, dropped, err := p.db.Reroute(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if moved != 0 || dropped != 1 {
+		t.Fatalf("moved %d dropped %d: B's copy of data/1 has nowhere else to go", moved, dropped)
+	}
+	if p.held(m) {
+		t.Fatal("index/1 still held by a full friend's unsent copy")
+	}
+	var fifo []int64
+	rows, err := p.db.Query(`SELECT seq FROM placement WHERE place = 'B' AND state = 'queued' ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var s int64
+		rows.Scan(&s)
+		fifo = append(fifo, s)
+	}
+	rows.Close()
+	if !slices.Equal(fifo, []int64{m, x}) {
+		t.Fatalf("B's FIFO %v, want index/1 %d then the delete %d", fifo, m, x)
+	}
+	below, err := p.db.BelowCopies(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := below["laptop"]; b.Objects != 1 {
+		t.Fatalf("below copies %+v, want data/1", b)
+	}
+	// Fifty days on, nothing is left to hold anything.
+	p.now = p.now.Add(50 * 24 * time.Hour)
+	if moved, dropped, err := p.db.Reroute(ctx, nil); err != nil || moved != 0 || dropped != 0 {
+		t.Fatalf("moved %d dropped %d %v", moved, dropped, err)
+	}
+	if p.held(m) {
+		t.Fatal("index/1 held after fifty days")
+	}
+}
+
+// REPL-1 (#19 review): a queued data put superseded only by a write
+// after the metadata still holds that metadata: the metadata was
+// written while the put was the key's bytes.
+func TestASupersedingWriteAfterTheMetadataDoesNotReleaseIt(t *testing.T) {
+	p := newPool(t)
+	p.friend("B", 10)
+	p.bucket("laptop", 1)
+	p.put("laptop", "data/1", "data", 1)
+	m := p.put("laptop", "index/1", "metadata", 0.5)
+	p.del("laptop", "data/1", "data")
+	if !p.held(m) {
+		t.Fatal("index/1 released by a delete of data/1 written after it")
+	}
+}
+
+// §3.4 (#19 review): unsent data moves only to a reachable friend, so
+// rows do not ping-pong between friends that both stopped answering.
+func TestRerouteMovesOnlyToAReachableFriend(t *testing.T) {
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.friend("D", 0.5) // reachable, but no room
+	p.bucket("laptop", 1)
+	d := p.put("laptop", "data/1", "data", 1)
+	p.wantPlaces("data/1", d, "B")
+	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	p.condition("C", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	moved, dropped, err := p.db.Reroute(context.Background(), nil)
+	if err != nil || moved != 0 || dropped != 0 {
+		t.Fatalf("moved %d dropped %d %v: C is unreachable too", moved, dropped, err)
+	}
+	p.wantPlaces("data/1", d, "B")
 }
