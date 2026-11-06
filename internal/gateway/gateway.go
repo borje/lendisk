@@ -33,7 +33,6 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"time"
 
 	"github.com/versity/versitygw/embedgw"
@@ -42,24 +41,13 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/version"
 )
 
 const versitygwModule = "github.com/versity/versitygw"
 
 // Version is the linked versitygw module version, for `status` (EP-12).
-func Version() string {
-	if bi, ok := debug.ReadBuildInfo(); ok {
-		for _, d := range bi.Deps {
-			if d.Path == versitygwModule {
-				if d.Replace != nil {
-					return d.Replace.Version
-				}
-				return d.Version
-			}
-		}
-	}
-	return "unknown"
-}
+func Version() string { return version.Module(versitygwModule) }
 
 // maxSocketPath is the longest unix socket path Linux binds (sun_path is
 // 108 bytes including the terminating NUL).
@@ -81,6 +69,8 @@ type Gateway struct {
 	// compiled-in ones.
 	Profiles profile.Set
 	Log      *slog.Logger
+	// Clock is the IAM's clock; nil means time.Now.
+	Clock func() time.Time
 
 	// AfterStore is the decorator's crash-window hook. Tests only.
 	AfterStore func()
@@ -135,7 +125,7 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		MaxConnections:    250000,
 		MaxRequests:       100000,
 		MultipartMaxParts: 10000,
-		IAMService:        &IAM{DB: g.DB, Self: g.Self, Log: g.Log},
+		IAMService:        &IAM{DB: g.DB, Self: g.Self, Log: g.Log, Clock: g.Clock},
 		Quiet:             true,
 		S3Options:         []s3api.Option{Gate()},
 		// Deliberately empty: AdminPorts, WebuiPorts, WebsitePorts, metrics

@@ -20,8 +20,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	"path"
-	"strings"
 	"time"
 
 	"github.com/versity/versitygw/s3err"
@@ -71,23 +69,13 @@ func New(socket string, log *slog.Logger) *Bridge {
 // LoopbackHandler serves the S3 endpoint for tools on this host (EP-1).
 func (b *Bridge) LoopbackHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if isControlPath(r.URL.Path) {
+		if gateway.IsControlPath(r.URL.Path) {
 			writeError(w, s3err.APIError{Code: "AccessDenied",
 				Description: "lendisk: control API not served here", HTTPStatusCode: http.StatusForbidden})
 			return
 		}
 		b.proxy.ServeHTTP(w, r)
 	})
-}
-
-// isControlPath reports whether p names the control API once cleaned:
-// /_lendisk itself, or anything under it however spelled (//_lendisk/x,
-// /b/../_lendisk/x). The request is not rewritten; this only decides
-// whether to refuse it (#53).
-func isControlPath(p string) bool {
-	c := path.Clean("/" + p)
-	prefix := strings.TrimSuffix(gateway.ControlPrefix, "/")
-	return c == prefix || strings.HasPrefix(c, prefix+"/")
 }
 
 // Serve accepts connections on ln with h until ctx is cancelled.

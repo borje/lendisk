@@ -360,12 +360,21 @@ func assertNotIn(t *testing.T, n *node, needles ...string) {
 	}
 }
 
+// filesHolding lists the files under n's directories whose contents
+// hold needle, and the files and directories whose names do.
 func filesHolding(n *node, needle string) []string {
 	var found []string
 	root := filepath.Dir(filepath.Dir(n.config))
 	filepath.WalkDir(root, func(p string, de fs.DirEntry, err error) error {
-		if err != nil || de.IsDir() {
+		if err != nil {
 			return err
+		}
+		if p != root && strings.Contains(de.Name(), needle) {
+			found = append(found, p)
+			return nil
+		}
+		if de.IsDir() {
+			return nil
 		}
 		if b, _ := os.ReadFile(p); bytes.Contains(b, []byte(needle)) {
 			found = append(found, p)

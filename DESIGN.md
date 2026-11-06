@@ -1415,7 +1415,9 @@ upstream bucket is Q-V.
   `statfs` magic number. `serve` repeats the check at start. Post-v1, on `s3`, it
   would run the copy probe (D15) and warn when the endpoint is not on
   the local network. `status` reports the pinned versitygw and tailcat
-  versions.
+  versions, read from the binary's build information
+  (`version.Module`; `versions.versitygw` and `versions.tailcat` in
+  `status --json`).
 - **EP-13** Throughput is versitygw's chunk-signature verification plus
   the backend's writes; on `posix` with NVMe this is file I/O. Measured
   with G-3.
@@ -1449,11 +1451,17 @@ upstream bucket is Q-V.
   `delete`), `class` (`snapshot`, `metadata`, `data`), `state`
   (`pending`, `done`), and for a put `size` and `sha256`; `token`,
   `etag` and `upload_id` serve EP-3. `sha256` is always the
-  whole-object SHA-256. Rows are never removed, by capture or by the
-  worker (#18), which consumes `placement` rows instead; exactly-once
-  capture (EP-3) still compares with the key's latest done row. `status`
-  shows each bucket's queue (`queue.objects`, `queue.bytes`,
-  `queue.pending` in `status --json`).
+  whole-object SHA-256. Done rows are never removed, by capture or by
+  the worker (#18), which consumes `placement` rows instead; capture
+  removes only pending rows, of a failed request or of an identical
+  re-upload (`FinishPut`'s duplicate), and exactly-once capture (EP-3)
+  still compares with the key's latest done row. `status` shows each
+  bucket's capture count: `buckets[].queue.objects` and `.bytes` in
+  `status --json` count every done row the bucket ever captured, puts
+  and deletes, and the bytes of its puts, not what is still to send;
+  `.pending` counts writes in flight to the store. The backlog, what
+  waits to be sent, is per place: `places[].queue` (below). The field
+  names stay, as `status --json` never renames.
 - **Placement until #19 (schema 7).** `FinishPut` and `FinishDelete`
   place the row they complete in the same transaction
   (`state.placeTx`). The placer is trivial until pooled placement (#19):
@@ -2666,7 +2674,12 @@ design and disappear with it.
      `ErrRemoved`, `ErrImmutable`, `ErrRejected`), and a `500` or `503`
      as none of them, through a real tailcat tunnel with minio-go
      v7.4.1 (`TestFriendRefusalsAreDistinct`). minio-go parses the
-     error document of a `PUT` whatever the status.
+     error document of a `PUT` whatever the status. Since #53 not every
+     403 means removed: only an `AccessDenied` whose message names
+     `state.NoRelationship` and an `InvalidAccessKeyId` map to
+     `ErrRemoved`; any other 403 (`RequestTimeTooSkewed`, a bad
+     signature) is retried and reported as what it is
+     (`replica.classify`).
   4. *Resolved:* the limiter and the timetable hold to within one part.
      At 4 MiB/s each 5 MiB part took 1.236 to 1.255 s at both targets
      and a 20 MiB download 4.99 to 5.00 s; `SetLimit` from 2 to 8 MiB/s

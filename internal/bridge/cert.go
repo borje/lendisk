@@ -9,8 +9,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
-
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -60,8 +60,9 @@ func Fingerprint(der []byte) string {
 // byte, before the certificate, so a crash between leaves a pair that
 // does not load and is regenerated. A reused key is checked as a
 // tls = "files" key is: one others can read, or another user owns, is
-// refused (SEC-3, #53).
-func ensureCert(dir string, ips []net.IP, names []string) (*tls.Certificate, bool, error) {
+// refused (SEC-3, #53). now dates the certificate and random is its
+// randomness.
+func ensureCert(dir string, ips []net.IP, names []string, now time.Time, random io.Reader) (*tls.Certificate, bool, error) {
 	certFile, keyFile := filepath.Join(dir, CertFile), filepath.Join(dir, KeyFile)
 	if old, err := ReadCert(dir); err == nil && sameSANs(old, ips, names) {
 		if pair, err := tls.LoadX509KeyPair(certFile, keyFile); err == nil {
@@ -71,15 +72,14 @@ func ensureCert(dir string, ips []net.IP, names []string) (*tls.Certificate, boo
 			return &pair, false, nil
 		}
 	}
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), random)
 	if err != nil {
 		return nil, false, err
 	}
-	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
+	serial, err := rand.Int(random, new(big.Int).Lsh(big.NewInt(1), 127))
 	if err != nil {
 		return nil, false, err
 	}
-	now := time.Now()
 	cn := "lendisk endpoint"
 	if len(names) > 0 {
 		cn += " " + names[0]
@@ -98,7 +98,7 @@ func ensureCert(dir string, ips []net.IP, names []string) (*tls.Certificate, boo
 		IPAddresses:           ips,
 		DNSNames:              names,
 	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(random, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		return nil, false, err
 	}

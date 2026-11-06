@@ -23,7 +23,11 @@ import (
 	"tailscale.com/wgengine/filter"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/version"
 )
+
+// Version is the linked tailcat module version, for `status` (EP-12).
+func Version() string { return version.Module("github.com/tailscale/tailcat") }
 
 // Tailcat is the Transport over tailcat (D5): a tailcat Server on the
 // identity's key, with no pre-shared key and the saved region, serving

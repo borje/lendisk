@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"io"
@@ -162,14 +163,14 @@ func TestGeneratedCertificate(t *testing.T) {
 func TestReusedGeneratedKeyIsChecked(t *testing.T) {
 	dir := t.TempDir()
 	ips := []net.IP{net.ParseIP("127.0.0.1")}
-	if _, made, err := ensureCert(dir, ips, nil); err != nil || !made {
+	if _, made, err := ensureCert(dir, ips, nil, time.Now(), rand.Reader); err != nil || !made {
 		t.Fatalf("first: made %v, %v", made, err)
 	}
-	if _, made, err := ensureCert(dir, ips, nil); err != nil || made {
+	if _, made, err := ensureCert(dir, ips, nil, time.Now(), rand.Reader); err != nil || made {
 		t.Fatalf("reuse: made %v, %v", made, err)
 	}
 	os.Chmod(filepath.Join(dir, KeyFile), 0o644)
-	if _, _, err := ensureCert(dir, ips, nil); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+	if _, _, err := ensureCert(dir, ips, nil, time.Now(), rand.Reader); err == nil || !strings.Contains(err.Error(), "chmod 600") {
 		t.Fatalf("readable key reused: %v", err)
 	}
 }
@@ -191,7 +192,7 @@ func TestPlaintextListener(t *testing.T) {
 // when the key is readable by anyone but the service user.
 func TestUserCertificate(t *testing.T) {
 	src := t.TempDir()
-	if _, _, err := ensureCert(src, []net.IP{net.ParseIP("127.0.0.1")}, nil); err != nil {
+	if _, _, err := ensureCert(src, []net.IP{net.ParseIP("127.0.0.1")}, nil, time.Now(), rand.Reader); err != nil {
 		t.Fatal(err)
 	}
 	certFile, keyFile := filepath.Join(src, CertFile), filepath.Join(src, KeyFile)

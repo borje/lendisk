@@ -104,7 +104,7 @@ func TestBadPhrases(t *testing.T) {
 	}
 }
 
-func TestSaveLoad(t *testing.T) {
+func TestKeySavedPrivateLoadedBackNeverOverwritten(t *testing.T) {
 	dir := t.TempDir()
 	id, _ := FromPhrase(vector)
 	if err := id.Save(dir); err != nil {

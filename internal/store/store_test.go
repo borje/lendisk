@@ -81,7 +81,7 @@ func TestNoXattrRefused(t *testing.T) {
 	}
 }
 
-func TestBucketDir(t *testing.T) {
+func TestBucketDirRefusesNamesThatLeaveTheStore(t *testing.T) {
 	if d, err := BucketDir("/s", "laptop"); err != nil || d != "/s/laptop" {
 		t.Fatalf("%s %v", d, err)
 	}

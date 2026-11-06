@@ -103,7 +103,7 @@ func (a *app) runInit(ctx context.Context, restore bool) error {
 	if err := db.SetNode(ctx, "id", nodeID); err != nil {
 		return err
 	}
-	if err := db.SetNode(ctx, "initialised_at", time.Now().UTC().Format(time.RFC3339)); err != nil {
+	if err := db.SetNode(ctx, "initialised_at", a.now().UTC().Format(time.RFC3339)); err != nil {
 		return err
 	}
 	a.chooseRegion(ctx, cfg, db, log)
