@@ -61,6 +61,9 @@ type Decorator struct {
 	keys     keyLocks // one captured request per key at a time
 	mu       sync.Mutex
 	stranded map[int64]bool // rows to settle while running (strand)
+	// unmatched holds the rows already reported as unmatchable to the
+	// store (errUploadUnreadable), so each is warned of once per run.
+	unmatched map[int64]bool
 
 	// completing holds the claim on each upload being completed (under
 	// mu), so a retry can wait for its outcome rather than for the key.

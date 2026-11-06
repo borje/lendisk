@@ -42,8 +42,7 @@ func (d *Decorator) ResolvePending(ctx context.Context) (done, dropped int, err 
 	for _, e := range pending {
 		ok, err := d.resolve(ctx, e, nil)
 		if errors.Is(err, errUploadUnreadable) && ctx.Err() == nil {
-			d.Log.Warn("capture: a completed upload's row cannot be matched to the object in the store; leaving it pending and retrying while serving",
-				"seq", e.Seq, "bucket", e.Bucket, "key", e.Key, "upload", e.Upload, "err", err)
+			d.unmatchable(e, err)
 			d.strand(e.Seq)
 			continue
 		}
@@ -99,6 +98,25 @@ func (d *Decorator) strand(seqs ...int64) {
 	}
 }
 
+// unmatchable reports a completion's row that cannot be matched to the
+// object in the store (errUploadUnreadable), once per row while the
+// daemon runs: it is retried every round and may never settle (#62).
+// Status counts it among the bucket's pending writes.
+func (d *Decorator) unmatchable(e state.Entry, err error) {
+	d.mu.Lock()
+	seen := d.unmatched[e.Seq]
+	if d.unmatched == nil {
+		d.unmatched = map[int64]bool{}
+	}
+	d.unmatched[e.Seq] = true
+	d.mu.Unlock()
+	if seen {
+		return
+	}
+	d.Log.Warn("capture: a completed upload's row cannot be matched to the object in the store; leaving it pending and retrying while serving, reported once",
+		"seq", e.Seq, "bucket", e.Bucket, "key", e.Key, "upload", e.Upload, "err", err)
+}
+
 // ResolveStranded settles the stranded rows (EP-3) as ResolvePending
 // settles a crash's. A row that cannot be settled yet stays stranded for
 // the next call.
@@ -114,6 +132,10 @@ func (d *Decorator) ResolveStranded(ctx context.Context) {
 				continue
 			}
 		}
+		if errors.Is(err, errUploadUnreadable) && ctx.Err() == nil {
+			d.unmatchable(e, err)
+			continue
+		}
 		if err != nil {
 			if ctx.Err() == nil {
 				d.Log.Warn("capture: settling a stranded queue row failed; retrying later",
@@ -123,6 +145,7 @@ func (d *Decorator) ResolveStranded(ctx context.Context) {
 		}
 		d.mu.Lock()
 		delete(d.stranded, seq)
+		delete(d.unmatched, seq)
 		d.mu.Unlock()
 	}
 }
@@ -175,11 +198,13 @@ func (d *Decorator) resolveLoop(ctx context.Context, every time.Duration) {
 
 // landed reports whether a pending row's backend call took effect. A
 // completion's row is matched by the upload ID posix records on the
-// object. If the object carries none but has the row's ETag (the
-// attribute was lost, as when a store is copied without extended
-// attributes), it is taken as landed and logged: the object holds the
-// bytes the row's parts give. An attribute that cannot be read is an
-// error wrapping errUploadUnreadable: the row is undecided.
+// object, never by ETag alone: an upload of the same parts gives the same
+// ETag (#59, #62). An object with no upload ID and a plain (PutObject)
+// ETag replaced the upload's, which did not take effect here. An
+// attribute that cannot be read, or an object with no upload ID whose
+// ETag is a multipart one or missing (its attributes were lost, as when
+// a store is copied without extended attributes), is an error wrapping
+// errUploadUnreadable: the row is undecided.
 func (d *Decorator) landed(ctx context.Context, e state.Entry) (bool, error) {
 	head, err := d.Backend.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &e.Bucket, Key: &e.Key})
 	if notFound(err) {
@@ -199,10 +224,12 @@ func (d *Decorator) landed(ctx context.Context, e state.Entry) (bool, error) {
 		if err != nil || id != "" {
 			return id == e.Upload, err
 		}
-		if e.ETag != "" && strings.Trim(deref(head.ETag), `"`) == strings.Trim(e.ETag, `"`) {
-			d.Log.Warn("capture: a stored object has a completed upload's ETag but no upload ID; taking it as that upload's",
-				"seq", e.Seq, "bucket", e.Bucket, "key", e.Key, "upload", e.Upload, "etag", e.ETag)
-			return true, nil
+		// No upload ID: a PutObject's object (a plain MD5 ETag) replaced
+		// the upload's, or the object lost its attributes. An ETag never
+		// stands in for the ID: an upload of the same parts gives it too.
+		if etag := strings.Trim(deref(head.ETag), `"`); etag == "" || strings.Contains(etag, "-") {
+			return false, fmt.Errorf("%w: %s/%s: the object has no upload ID (ETag %q); its extended attributes may have been lost",
+				errUploadUnreadable, e.Bucket, e.Key, etag)
 		}
 		return false, nil
 	default:

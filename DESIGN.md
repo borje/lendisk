@@ -1199,13 +1199,23 @@ upstream bucket is Q-V.
     the same storer and bucket paths posix writes it with. The gateway
     hands the `Store` to the decorator as `Decorator.Uploads`, apart from
     the backend it wraps, so a wrapper between the decorator and posix
-    (quota #16, tombstones #17) cannot hide it (#62). An object with no
-    attribute but the row's ETag (the attribute was lost, as when a store
-    is copied without extended attributes) holds the bytes the row's
-    parts give: it counts as landed and is logged. An attribute that
-    cannot be read (an I/O error, or a value that does not parse) leaves
-    the row undecided: it is logged and stays pending and stranded, and
-    is never dropped for it.
+    (quota #16, tombstones #17) cannot hide it (#62). The ETag never
+    stands in for a missing attribute. versitygw v1.10.0's
+    `CompleteMultipartUpload` writes `mp-metadata` with the ETag, so an
+    object without one is either a `PutObject`'s (a plain MD5 ETag:
+    the upload did not take effect, the row is removed) or one whose
+    attributes were lost outside versitygw, as when a store is copied
+    without extended attributes (a multipart `-N` ETag, or none, since
+    posix keeps the ETag in `user.etag` too). Taking the latter as landed
+    by ETag would let a retry of a never-landed upload of the same parts
+    be answered from the store, and posix would then assemble it with no
+    row (#62). So it is treated like an attribute that cannot be read (an
+    I/O error, or a value that does not parse): the row is undecided, it
+    is logged and stays pending and stranded, is never dropped for it,
+    and a retried completion of its upload is refused. `ResolveStranded`
+    retries it every round but warns of it once per row while the daemon
+    runs; `status` counts it among the bucket's pending writes
+    (`queue.pending`). Restoring the attributes settles it.
   - *Startup.* Before the gateway serves anything, `ResolvePending`
     settles every pending row with `HeadObject`: a put is done if the
     object carries the row's token (or upload ID), and is otherwise removed;
@@ -1316,7 +1326,13 @@ upstream bucket is Q-V.
     and is answered from the store; one that claimed the upload first
     keeps the resolver off the row until the next round (#62). So a
     retried completion waits at most for another request's store call or
-    a `HEAD` and an attribute read, never for a hash. (A retried
+    a `HEAD` and an attribute read, never for the hash of its own upload.
+    It can wait for another upload's hash: a retry of an older upload of
+    the key, superseded by a newer one that is being hashed, claims its
+    own upload and then waits for the key's lock behind that hash, as
+    any write of the key does; it then finds its row not landed, removes
+    it, and goes to the store as a first completion, where posix answers
+    `NoSuchUpload` if the upload was consumed. (A retried
     `PutObject` writes the key, so it does wait for the key's lock, as
     any later write of the key does.)
     So no completion stores an object without a row. The claim, the
