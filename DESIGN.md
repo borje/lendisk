@@ -1807,20 +1807,37 @@ upstream bucket is Q-V.
   restarted server has forgotten it while the client's session looks
   valid, so its dials time out. `Tailcat.Dial` keeps one client per
   friend, shared by every caller (replication now, the control API
-  calls of #24 and #28 later), and counts its open connections. A
+  calls of #24 and #28 later), and counts its open connections and
+  when one last moved bytes (a read or write through `tunnelConn`). A
   failed dial does not drop the client, since the caller's own context
   may have ended or the friend hiccupped: the transport checks the
   client with a dial of its own, bounded by 10 s, at most one at a
-  time. Only if that check fails too is the client closed and dropped;
-  the next dial builds a new one, which pings first (#52). Closing it
-  then cuts no working connection: the check proves the server no
-  longer takes this client's dials, and tailcat's server keeps one
-  WireGuard session per client key, so a live old client would fight
-  its successor for that session (measured: a second client of the
-  same key to the same server stalls the first one's connections).
-  When the friend's address changes, the old client takes no new dials
-  but stays up until its last connection closes; clients on different
-  relays coexist.
+  time. A failed check closes and drops the client only once its open
+  connections have moved no bytes for 30 s (`quietFor`); until then it
+  waits out the rest of the 30 s and checks again (#58). A relay
+  restart or Wi-Fi drop of 15 s thus leaves a multi-GB PUT running,
+  whose TCP resumes; the price is that after a friend's restart a
+  client with an open connection is replaced up to about 40 s later
+  than a client with none, and a write that only fills the send buffer
+  of a dead connection counts as bytes moved, which delays the close
+  by one more round. The next dial after the close builds a new client,
+  which pings first (#52), and not before the old one has finished
+  closing.
+
+  Two clients of one key never run at one relay: tailcat's server
+  keeps one WireGuard session per client key, so a live old client
+  would fight its successor for that session (measured: a second
+  client of the same key to the same server stalls the first one's
+  connections). The client is keyed by the friend and its relay
+  (`relayOf`: a public region's ID, or the DERP servers' host and
+  port; tailcat strips region and node names from an address), not by
+  the address string, so an address that changes but keeps the relay
+  (a re-encoded region, a #51 re-redeem) reuses the client. When the
+  address moves to another relay, the old client takes no new dials
+  and its check stops, but it stays up until its last connection
+  closes, since clients on different relays coexist; if the address
+  comes back to its relay first, that client is put back in service
+  rather than a second one built.
 - **Dialling a friend.** The replica client's HTTP transport uses the
   tailcat `Client.Dial` for that peer as its dial function, so
   replication traffic enters the tunnel from inside the process. No
