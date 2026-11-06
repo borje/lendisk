@@ -91,6 +91,9 @@ type Gateway struct {
 	ReconcileEvery time.Duration
 
 	lending *Lending // once Run has built it; tests only
+	// lendingHook, if set, adjusts Lending before anything is served.
+	// Tests only.
+	lendingHook func(*Lending)
 
 	noCapture bool // tests: the decorator passes everything through
 }
@@ -163,6 +166,9 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	}
 	lend := &Lending{Next: dec, DB: g.DB, Uploads: be, StoreDir: g.StoreDir, Floor: g.Floor, Statfs: g.Statfs, Log: g.Log}
 	g.lending = lend
+	if g.lendingHook != nil {
+		g.lendingHook(lend)
+	}
 	if g.DB != nil {
 		every := g.ReconcileEvery
 		if every <= 0 {

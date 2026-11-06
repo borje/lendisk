@@ -47,6 +47,10 @@ type harness struct {
 	statfs func(dir string) (store.Space, error)
 	floor  *config.Floor
 	gw     *Gateway // the last one served
+	// lending, if set, adjusts the gateway's Lending before it serves.
+	lending func(*Lending)
+	// reconcileEvery is the gateway's ReconcileEvery.
+	reconcileEvery time.Duration
 }
 
 func newHarness(t *testing.T, buckets map[string]string) *harness {
@@ -86,8 +90,10 @@ func newHarnessIn(t *testing.T, dir string, buckets map[string]string) *harness 
 func (h *harness) serve(noCapture bool) (stop func()) {
 	h.t.Helper()
 	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: quiet,
-		ResolveEvery: 20 * time.Millisecond, noCapture: noCapture, Statfs: h.statfs, Floor: h.floor}
+		ResolveEvery: 20 * time.Millisecond, noCapture: noCapture, Statfs: h.statfs, Floor: h.floor,
+		ReconcileEvery: h.reconcileEvery}
 	h.gw = g
+	g.lendingHook = h.lending
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan struct{})
 	errc := make(chan error, 1)

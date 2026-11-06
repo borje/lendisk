@@ -42,6 +42,7 @@ type LentUpload struct {
 	UploadID, Peer, Sealed, Key string
 	SHA256                      string // hex
 	CreatedAt                   time.Time
+	Counted                     int64 // part bytes counted in lent_usage
 }
 
 // AddLentUpload records an upload a borrower began.
@@ -56,13 +57,26 @@ func (db *DB) AddLentUpload(ctx context.Context, u LentUpload) error {
 func (db *DB) GetLentUpload(ctx context.Context, uploadID string) (LentUpload, error) {
 	u := LentUpload{UploadID: uploadID}
 	var created int64
-	err := db.QueryRowContext(ctx, `SELECT peer_key, sealed, key, sha256, created_at FROM lent_upload WHERE upload_id = ?`,
-		uploadID).Scan(&u.Peer, &u.Sealed, &u.Key, &u.SHA256, &created)
+	err := db.QueryRowContext(ctx, `SELECT peer_key, sealed, key, sha256, created_at, counted FROM lent_upload WHERE upload_id = ?`,
+		uploadID).Scan(&u.Peer, &u.Sealed, &u.Key, &u.SHA256, &created, &u.Counted)
 	if errors.Is(err, sql.ErrNoRows) {
 		return LentUpload{}, ErrNotFound
 	}
 	u.CreatedAt = time.Unix(created, 0)
 	return u, err
+}
+
+// SetLentUploadCounted records the part bytes counted for an upload.
+func (db *DB) SetLentUploadCounted(ctx context.Context, uploadID string, n int64) error {
+	_, err := db.ExecContext(ctx, `UPDATE lent_upload SET counted = ? WHERE upload_id = ?`, n, uploadID)
+	return err
+}
+
+// DropLentUploadsBefore forgets peer's uploads begun before cutoff
+// (abandoned, LEND-1).
+func (db *DB) DropLentUploadsBefore(ctx context.Context, peer string, cutoff time.Time) error {
+	_, err := db.ExecContext(ctx, `DELETE FROM lent_upload WHERE peer_key = ? AND created_at < ?`, peer, cutoff.Unix())
+	return err
 }
 
 // DropLentUpload forgets a completed or aborted upload.

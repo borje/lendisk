@@ -613,9 +613,6 @@ type hashReader struct {
 	r io.Reader
 	h hash.Hash
 	n int64
-	// atEOF, if set, may fail the read that ends the stream, so the
-	// store does not publish it (LEND-4).
-	atEOF func(*hashReader) error
 }
 
 func (h *hashReader) Read(p []byte) (int, error) {
@@ -623,11 +620,6 @@ func (h *hashReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		h.h.Write(p[:n])
 		h.n += int64(n)
-	}
-	if err == io.EOF && h.atEOF != nil {
-		if e := h.atEOF(h); e != nil {
-			return n, e
-		}
 	}
 	return n, err
 }

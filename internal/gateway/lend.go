@@ -74,8 +74,20 @@ type Lending struct {
 	Floor    *config.Floor
 	Statfs   func(dir string) (store.Space, error)
 	Log      *slog.Logger
+	// Stall and MinProgress bound a borrower's body: a write whose body
+	// brings fewer than MinProgress bytes in any Stall period ends
+	// (defaults DefaultStall, DefaultMinProgress). AbandonAfter is how
+	// old a borrower's multipart upload may grow before the reconcile
+	// aborts it (default DefaultAbandonAfter).
+	Stall        time.Duration
+	MinProgress  int64
+	AbandonAfter time.Duration
+	// beforeComplete, if set, runs just before a borrower's upload is
+	// completed in the store. Tests only.
+	beforeComplete func()
 
 	keys     keyLocks // one multipart create, completion or delete per borrower's key at a time
+	uploads  keyLocks // one accounting step per borrower's upload at a time
 	mu       sync.Mutex
 	peers    map[string]*borrowerUse
 	reserved int64 // admitted bytes of every borrower's writes in flight
@@ -208,7 +220,7 @@ func (l *Lending) GetBucketAcl(ctx context.Context, in *s3.GetBucketAclInput) ([
 // CreateBucket creates a borrower's bucket under its store name, private
 // and owned by the borrower's account alone, and records it in the
 // mapping table (PEER-2, PEER-8). The name sent must be a sealed name.
-// A new bucket is admitted like a write (admitBucket). A retry finds
+// A new bucket is admitted like a write (createBucketLent). A retry finds
 // the bucket already its own and records it.
 func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, acl []byte) error {
 	peer, ok := borrower(ctx)
@@ -219,9 +231,6 @@ func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, ac
 		return errNotSealed
 	}
 	sealed, stored := *in.Bucket, LentName(peer, *in.Bucket)
-	if err := l.admitBucket(ctx, peer.String(), sealed); err != nil {
-		return err
-	}
 	own, err := json.Marshal(auth.ACL{Owner: peer.String()})
 	if err != nil {
 		return errInternal
@@ -229,14 +238,16 @@ func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, ac
 	c := *in
 	c.Bucket = &stored
 	c.ObjectOwnership = types.ObjectOwnershipBucketOwnerEnforced
-	err = l.Next.CreateBucket(ctx, &c, own)
-	if err != nil && !isCode(err, "BucketAlreadyOwnedByYou") {
+	return l.createBucketLent(ctx, peer.String(), sealed, func() error {
+		err := l.Next.CreateBucket(ctx, &c, own)
+		if err != nil && !isCode(err, "BucketAlreadyOwnedByYou") {
+			return err
+		}
+		if rerr := l.DB.AddLentBucket(context.Background(), peer.String(), sealed, l.now()); rerr != nil {
+			return errInternal
+		}
 		return err
-	}
-	if rerr := l.DB.AddLentBucket(context.Background(), peer.String(), sealed, l.now()); rerr != nil {
-		return errInternal
-	}
-	return err
+	})
 }
 
 func (l *Lending) now() time.Time {
@@ -419,7 +430,7 @@ func (l *Lending) AbortMultipartUpload(ctx context.Context, in *s3.AbortMultipar
 	c := *in
 	c.Bucket = b
 	if peer, ok := borrower(ctx); ok {
-		return l.abortLent(ctx, peer.String(), &c)
+		return l.abortLent(ctx, peer.String(), deref(in.Bucket), &c)
 	}
 	return l.Next.AbortMultipartUpload(ctx, &c)
 }
@@ -440,6 +451,9 @@ func (l *Lending) ListParts(ctx context.Context, in *s3.ListPartsInput) (s3respo
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.ListPartsResult{}, err
+	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return s3response.ListPartsResult{}, kerr
 	}
 	c := *in
 	c.Bucket = b
@@ -487,6 +501,9 @@ func (l *Lending) HeadObject(ctx context.Context, in *s3.HeadObjectInput) (*s3.H
 	if err != nil {
 		return nil, err
 	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return nil, kerr
+	}
 	c := *in
 	c.Bucket = b
 	return l.Next.HeadObject(ctx, &c)
@@ -496,6 +513,9 @@ func (l *Lending) GetObject(ctx context.Context, in *s3.GetObjectInput) (*s3.Get
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return nil, err
+	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return nil, kerr
 	}
 	c := *in
 	c.Bucket = b
@@ -507,6 +527,9 @@ func (l *Lending) GetObjectAcl(ctx context.Context, in *s3.GetObjectAclInput) (*
 	if err != nil {
 		return nil, err
 	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return nil, kerr
+	}
 	c := *in
 	c.Bucket = b
 	return l.Next.GetObjectAcl(ctx, &c)
@@ -516,6 +539,9 @@ func (l *Lending) GetObjectAttributes(ctx context.Context, in *s3.GetObjectAttri
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.GetObjectAttributesResponse{}, err
+	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return s3response.GetObjectAttributesResponse{}, kerr
 	}
 	c := *in
 	c.Bucket = b
@@ -605,6 +631,9 @@ func (l *Lending) RestoreObject(ctx context.Context, in *s3.RestoreObjectInput) 
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return err
+	}
+	if kerr := borrowerKey(ctx, in.Key); kerr != nil {
+		return kerr
 	}
 	c := *in
 	c.Bucket = b

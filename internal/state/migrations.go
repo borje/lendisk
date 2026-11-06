@@ -162,7 +162,8 @@ var migrations = []Migration{
 		Version: 10, Compat: 1, Release: "0.1",
 		SQL: `
 		-- What each borrower stores here (LEND-1, SEC-5): bytes of its
-		-- objects and of the parts of its uploads in progress (later plus
+		-- objects and of the parts of its open uploads, 4 KiB for each object,
+		-- bucket and open upload (later plus
 		-- tombstones), moved by every completed write and delete, and set
 		-- from a listing of its buckets when reconciled.
 		CREATE TABLE lent_usage (
@@ -171,14 +172,16 @@ var migrations = []Migration{
 			reconciled_at INTEGER           -- unix seconds; NULL until reconciled
 		);
 		-- A borrower's multipart upload in progress (LEND-4): the hash it
-		-- declared when it began, checked when it completes.
+		-- declared when it began, checked when it completes, and the part
+		-- bytes counted for it in lent_usage (LEND-1).
 		CREATE TABLE lent_upload (
 			upload_id  TEXT PRIMARY KEY,
 			peer_key   TEXT NOT NULL,    -- the borrower's node ID
 			sealed     TEXT NOT NULL,    -- the bucket's sealed name
 			key        TEXT NOT NULL,
 			sha256     TEXT NOT NULL,    -- hex, x-amz-meta-lendisk-sha256
-			created_at INTEGER NOT NULL  -- unix seconds
+			created_at INTEGER NOT NULL, -- unix seconds
+			counted    INTEGER NOT NULL DEFAULT 0 -- part bytes counted
 		);`,
 	},
 }

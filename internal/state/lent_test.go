@@ -101,3 +101,31 @@ func TestLentUploadKeepsTheDeclaredHash(t *testing.T) {
 		t.Fatalf("dropped upload: %v", err)
 	}
 }
+
+// LEND-1: an upload keeps the part bytes counted for it; rows of one
+// borrower older than a cutoff are dropped, others kept.
+func TestLentUploadCountedAndAbandonedRowsDropped(t *testing.T) {
+	ctx := context.Background()
+	db := openPeers(t)
+	old, recent := time.Unix(1_800_000_000, 0), time.Unix(1_800_900_000, 0)
+	for _, u := range []LentUpload{{UploadID: "old", Peer: "bob", CreatedAt: old}, {UploadID: "new", Peer: "bob", CreatedAt: recent},
+		{UploadID: "carol", Peer: "carol", CreatedAt: old}} {
+		if err := db.AddLentUpload(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.SetLentUploadCounted(ctx, "new", 77); err != nil {
+		t.Fatal(err)
+	}
+	if u, _ := db.GetLentUpload(ctx, "new"); u.Counted != 77 {
+		t.Fatalf("counted %d", u.Counted)
+	}
+	if err := db.DropLentUploadsBefore(ctx, "bob", old.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for id, want := range map[string]bool{"old": false, "new": true, "carol": true} {
+		if _, err := db.GetLentUpload(ctx, id); (err == nil) != want {
+			t.Errorf("%s: %v", id, err)
+		}
+	}
+}

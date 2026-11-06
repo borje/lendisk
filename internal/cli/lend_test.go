@@ -36,7 +36,8 @@ func hashMeta(body []byte) map[string]string {
 func sha256Hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
 
 // The lender's policy seen by the borrower's own replica client through
-// the tunnel (#16): A lends B 1K.
+// the tunnel (#16): A lends B 13000 bytes, room for its bucket, one
+// 600-byte object and one small one, with their overheads (4 KiB each).
 //
 //   - LEND-1, LEND-2, Q-I.5: once B's objects fill the quota, the next is
 //     refused with 507 QuotaExceeded, which B's client takes as "paused
@@ -50,7 +51,7 @@ func TestLenderPolicyAsTheBorrowerSeesIt(t *testing.T) {
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
-	s := a.invite("--quota", "1K")
+	s := a.invite("--quota", "13000")
 	if code, _, errOut := b.run("\n", "", "peer", "add", s); code != 0 {
 		t.Fatalf("peer add: %d %s", code, errOut)
 	}

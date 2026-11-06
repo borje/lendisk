@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
@@ -24,6 +26,9 @@ import (
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/store"
 )
+
+// ov is what each object, bucket and open upload costs besides its bytes.
+const ov = int64(itemOverhead)
 
 // hashMeta is the metadata a borrower sends with an object (REPL-10).
 func hashMeta(body []byte) map[string]string { return map[string]string{"lendisk-sha256": sum(body)} }
@@ -44,10 +49,11 @@ type lent struct {
 	c      *s3.Client
 	bucket *string
 	dir    string // the bucket's directory in the lender's store
+	store  string // the bucket's store name
 }
 
 // lendTo serves a lender to one borrower with the given quota, the
-// borrower's bucket created.
+// borrower's bucket created (one overhead of the quota).
 func lendTo(t *testing.T, quota int64, setup func(h *harness)) *lent {
 	t.Helper()
 	h := newHarness(t, nil)
@@ -59,12 +65,16 @@ func lendTo(t *testing.T, quota int64, setup func(h *harness)) *lent {
 	}
 	h.serve(false)
 	l := &lent{h: h, id: b, c: h.pairClient(b), bucket: aws.String(b.SealedName("laptop"))}
-	l.dir = filepath.Join(h.store, LentName(b.NodeID(), *l.bucket))
+	l.store = LentName(b.NodeID(), *l.bucket)
+	l.dir = filepath.Join(h.store, l.store)
 	if _, err := l.c.CreateBucket(context.Background(), &s3.CreateBucketInput{Bucket: l.bucket}); err != nil {
 		t.Fatal(err)
 	}
 	return l
 }
+
+func (l *lent) peer() string      { return l.id.NodeID().String() }
+func (l *lent) lending() *Lending { return l.h.gw.lending }
 
 func (l *lent) put(key string, body []byte, meta map[string]string) error {
 	_, err := l.c.PutObject(context.Background(), &s3.PutObjectInput{Bucket: l.bucket, Key: aws.String(key),
@@ -72,13 +82,27 @@ func (l *lent) put(key string, body []byte, meta map[string]string) error {
 	return err
 }
 
+// putDirect puts through Lending's borrower path without HTTP.
+func (l *lent) putDirect(key string, body io.Reader, size int64, meta map[string]string) error {
+	_, err := l.lending().putLent(context.Background(), l.peer(), s3response.PutObjectInput{Bucket: &l.store,
+		Key: aws.String(key), ContentLength: &size, Body: body, Metadata: meta})
+	return err
+}
+
 func (l *lent) usage() int64 {
 	l.h.t.Helper()
-	n, _, err := l.h.db.LentUsage(context.Background(), l.id.NodeID().String())
+	n, _, err := l.h.db.LentUsage(context.Background(), l.peer())
 	if err != nil {
 		l.h.t.Fatal(err)
 	}
 	return n
+}
+
+func (l *lent) wantUsage(want int64) {
+	l.h.t.Helper()
+	if n := l.usage(); n != want {
+		l.h.t.Fatalf("counter %d, want %d (%d overheads + %d)", n, want, want/ov, want%ov)
+	}
 }
 
 func (l *lent) stored(key string) ([]byte, bool) {
@@ -86,28 +110,46 @@ func (l *lent) stored(key string) ([]byte, bool) {
 	return b, err == nil
 }
 
-// mpu uploads parts of body under key with the declared hash and
-// returns the completion's error.
+func (l *lent) create(key string, meta map[string]string) (*string, error) {
+	up, err := l.c.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{Bucket: l.bucket,
+		Key: aws.String(key), Metadata: meta})
+	if err != nil {
+		return nil, err
+	}
+	return up.UploadId, nil
+}
+
+func (l *lent) part(key string, id *string, n int32, body []byte) (types.CompletedPart, error) {
+	out, err := l.c.UploadPart(context.Background(), &s3.UploadPartInput{Bucket: l.bucket, Key: aws.String(key), UploadId: id,
+		PartNumber: &n, Body: bytes.NewReader(body)})
+	if err != nil {
+		return types.CompletedPart{}, err
+	}
+	return types.CompletedPart{PartNumber: &n, ETag: out.ETag}, nil
+}
+
+func (l *lent) complete(key string, id *string, parts ...types.CompletedPart) error {
+	_, err := l.c.CompleteMultipartUpload(context.Background(), &s3.CompleteMultipartUploadInput{Bucket: l.bucket,
+		Key: aws.String(key), UploadId: id, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}})
+	return err
+}
+
+// mpu uploads parts under key with the declared hash and returns the
+// completion's error.
 func (l *lent) mpu(key string, declared string, parts ...[]byte) error {
-	ctx := context.Background()
-	up, err := l.c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: l.bucket, Key: aws.String(key),
-		Metadata: map[string]string{"lendisk-sha256": declared}})
+	id, err := l.create(key, map[string]string{"lendisk-sha256": declared})
 	if err != nil {
 		return err
 	}
 	var done []types.CompletedPart
 	for i, p := range parts {
-		n := int32(i + 1)
-		out, err := l.c.UploadPart(ctx, &s3.UploadPartInput{Bucket: l.bucket, Key: aws.String(key), UploadId: up.UploadId,
-			PartNumber: &n, Body: bytes.NewReader(p)})
+		cp, err := l.part(key, id, int32(i+1), p)
 		if err != nil {
 			return err
 		}
-		done = append(done, types.CompletedPart{PartNumber: &n, ETag: out.ETag})
+		done = append(done, cp)
 	}
-	_, err = l.c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: l.bucket, Key: aws.String(key),
-		UploadId: up.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: done}})
-	return err
+	return l.complete(key, id, done...)
 }
 
 // LEND-1, LEND-2, Q-I.5: once a borrower's objects fill the friendship's
@@ -116,15 +158,13 @@ func (l *lent) mpu(key string, declared string, parts ...[]byte) error {
 // stored, and the counter holds what was stored. A retried create of a
 // bucket it has is not refused.
 func TestOverQuotaRefusedWith507(t *testing.T) {
-	l := lendTo(t, 100, nil)
+	l := lendTo(t, 3*ov+100, nil)
 	ctx := context.Background()
 	first := bytes.Repeat([]byte("a"), 60)
 	if err := l.put("data/one", first, hashMeta(first)); err != nil {
 		t.Fatal(err)
 	}
-	if n := l.usage(); n != 60 {
-		t.Fatalf("counter %d after a 60-byte put", n)
-	}
+	l.wantUsage(2*ov + 60)
 	second := bytes.Repeat([]byte("b"), 60)
 	err := l.put("data/two", second, hashMeta(second))
 	if code(err) != "QuotaExceeded" || status(err) != 507 {
@@ -133,17 +173,12 @@ func TestOverQuotaRefusedWith507(t *testing.T) {
 	if _, ok := l.stored("data/two"); ok {
 		t.Fatal("the refused object is stored")
 	}
-	// What still fits is accepted.
 	small := bytes.Repeat([]byte("c"), 40)
 	if err := l.put("data/three", small, hashMeta(small)); err != nil {
 		t.Fatalf("a put that fits: %v", err)
 	}
-	if n := l.usage(); n != 100 {
-		t.Fatalf("counter %d, want 100", n)
-	}
-	_, err = l.c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: l.bucket, Key: aws.String("data/four"),
-		Metadata: hashMeta(small)})
-	if code(err) != "QuotaExceeded" || status(err) != 507 {
+	l.wantUsage(3*ov + 100)
+	if _, err := l.create("data/four", hashMeta(small)); code(err) != "QuotaExceeded" || status(err) != 507 {
 		t.Fatalf("multipart create over quota: %v", err)
 	}
 	other := aws.String(l.id.SealedName("desktop"))
@@ -156,13 +191,10 @@ func TestOverQuotaRefusedWith507(t *testing.T) {
 	if _, err := l.c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: l.bucket}); err != nil && code(err) != "BucketAlreadyOwnedByYou" {
 		t.Fatalf("retried create of the borrower's bucket: %v", err)
 	}
-	// A delete frees its bytes.
 	if _, err := l.c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: l.bucket, Key: aws.String("data/one")}); err != nil {
 		t.Fatal(err)
 	}
-	if n := l.usage(); n != 40 {
-		t.Fatalf("counter %d after deleting 60 bytes, want 40", n)
-	}
+	l.wantUsage(2*ov + 40)
 	if err := l.put("data/two", second, hashMeta(second)); err != nil {
 		t.Fatalf("put after a delete: %v", err)
 	}
@@ -177,22 +209,98 @@ func TestQuotaErrorIsLendisksOwn507(t *testing.T) {
 	}
 }
 
+// LEND-1, SEC-5: every object, bucket and open upload costs a fixed
+// overhead besides its bytes, so empty objects, buckets and uploads
+// cannot be made without end; the reconcile counts them the same way.
+func TestEveryItemCostsItsOverhead(t *testing.T) {
+	l := lendTo(t, 4*ov-1, nil)
+	ctx := context.Background()
+	for _, k := range []string{"e1", "e2"} {
+		if err := l.put(k, nil, hashMeta(nil)); err != nil {
+			t.Fatalf("empty %s: %v", k, err)
+		}
+	}
+	l.wantUsage(3 * ov)
+	if err := l.put("e3", nil, hashMeta(nil)); code(err) != "QuotaExceeded" {
+		t.Fatalf("a third empty object: %v", err)
+	}
+	if _, err := l.create("mp", hashMeta(nil)); code(err) != "QuotaExceeded" {
+		t.Fatalf("an upload: %v", err)
+	}
+	if _, err := l.c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(l.id.SealedName("other"))}); code(err) != "QuotaExceeded" {
+		t.Fatalf("a bucket: %v", err)
+	}
+	if err := l.h.db.SetLentUsage(ctx, l.peer(), 1, time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.lending().reconcile(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	l.wantUsage(3 * ov)
+}
+
+// blockingStatfs reports space and, once armed, blocks the next caller
+// until released.
+type blockingStatfs struct {
+	free    atomic.Uint64
+	armed   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingStatfs(free uint64) *blockingStatfs {
+	b := &blockingStatfs{entered: make(chan struct{}), release: make(chan struct{})}
+	b.free.Store(free)
+	return b
+}
+
+func (b *blockingStatfs) statfs(string) (store.Space, error) {
+	if b.armed.CompareAndSwap(true, false) {
+		close(b.entered)
+		<-b.release
+	}
+	return store.Space{Total: 1 << 40, Free: b.free.Load()}, nil
+}
+
+// LEND-1, SEC-5: the quota is checked against the count as it is when
+// the write is admitted, not as it was read before: of two 60-byte puts
+// with room for one, a put admitted after the other completed is
+// refused.
+func TestQuotaCheckedAgainstTheCurrentCount(t *testing.T) {
+	bs := newBlockingStatfs(1 << 40)
+	l := lendTo(t, ov+(60+ov)+30, func(h *harness) { h.statfs = bs.statfs })
+	a, b := bytes.Repeat([]byte("a"), 60), bytes.Repeat([]byte("b"), 60)
+	bs.armed.Store(true)
+	late := make(chan error, 1)
+	go func() { late <- l.put("data/b", b, hashMeta(b)) }()
+	within(t, "the late put admitting", bs.entered)
+	if err := l.put("data/a", a, hashMeta(a)); err != nil {
+		t.Fatal(err)
+	}
+	close(bs.release)
+	if err := within(t, "the late put", late); code(err) != "QuotaExceeded" {
+		t.Fatalf("the late put: %v", err)
+	}
+	l.wantUsage(2*ov + 60)
+}
+
 // LEND-2, SEC-5: below the free-space floor (default 5% of the
 // filesystem) a put, a multipart create and a new bucket are refused
 // with the quota error, whatever the quota; a put that would take free
 // space below the floor is refused too.
 func TestBelowTheFloorRefusedWithTheQuotaError(t *testing.T) {
+	const total, floor = 1_000_000, 50_000 // the default floor is 5%
 	var free atomic.Uint64
-	free.Store(1000)
+	free.Store(total)
 	l := lendTo(t, 1<<30, func(h *harness) {
-		h.statfs = func(string) (store.Space, error) { return store.Space{Total: 1000, Free: free.Load()}, nil }
+		h.statfs = func(string) (store.Space, error) { return store.Space{Total: total, Free: free.Load()}, nil }
 	})
 	ctx := context.Background()
 	body := []byte("pack")
 	if err := l.put("data/fits", body, hashMeta(body)); err != nil {
 		t.Fatal(err)
 	}
-	free.Store(60) // the default floor is 50 of 1000
+	free.Store(uint64(floor + ov + 10))
 	if err := l.put("data/small", body, hashMeta(body)); err != nil {
 		t.Fatalf("a put that stays above the floor: %v", err)
 	}
@@ -200,12 +308,11 @@ func TestBelowTheFloorRefusedWithTheQuotaError(t *testing.T) {
 	if err := l.put("data/big", big, hashMeta(big)); code(err) != "QuotaExceeded" || status(err) != 507 {
 		t.Fatalf("a put that would cross the floor: %v", err)
 	}
-	free.Store(40)
+	free.Store(40_000)
 	if err := l.put("data/more", body, hashMeta(body)); code(err) != "QuotaExceeded" {
 		t.Fatalf("put below the floor: %v", err)
 	}
-	if _, err := l.c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: l.bucket, Key: aws.String("data/mp"),
-		Metadata: hashMeta(body)}); code(err) != "QuotaExceeded" {
+	if _, err := l.create("data/mp", hashMeta(body)); code(err) != "QuotaExceeded" {
 		t.Fatalf("multipart create below the floor: %v", err)
 	}
 	if _, err := l.c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(l.id.SealedName("desktop"))}); code(err) != "QuotaExceeded" {
@@ -216,7 +323,7 @@ func TestBelowTheFloorRefusedWithTheQuotaError(t *testing.T) {
 			t.Errorf("%s stored below the floor", k)
 		}
 	}
-	free.Store(1000)
+	free.Store(total)
 	if err := l.put("data/more", body, hashMeta(body)); err != nil {
 		t.Fatalf("put once space is back: %v", err)
 	}
@@ -225,16 +332,55 @@ func TestBelowTheFloorRefusedWithTheQuotaError(t *testing.T) {
 // LEND-2: a configured floor in bytes replaces the default.
 func TestConfiguredFloorApplies(t *testing.T) {
 	var free atomic.Uint64
-	free.Store(1000)
+	free.Store(1_000_000)
 	l := lendTo(t, 1<<30, func(h *harness) {
-		h.statfs = func(string) (store.Space, error) { return store.Space{Total: 1000, Free: free.Load()}, nil }
-		h.floor = &config.Floor{Bytes: 600}
+		h.statfs = func(string) (store.Space, error) { return store.Space{Total: 1_000_000, Free: free.Load()}, nil }
+		h.floor = &config.Floor{Bytes: 600_000}
 	})
-	free.Store(500)
+	free.Store(500_000)
 	body := []byte("pack")
 	if err := l.put("data/x", body, hashMeta(body)); code(err) != "QuotaExceeded" {
-		t.Fatalf("put below a 600-byte floor: %v", err)
+		t.Fatalf("put below a 600 kB floor: %v", err)
 	}
+}
+
+// LEND-2: completing an upload needs room for the object again while
+// its parts still exist (posix copies them into place), so it is
+// refused with the quota error when that would cross the floor, and
+// goes through once there is room.
+func TestCompletionReservesItsCopyAgainstTheFloor(t *testing.T) {
+	const total, floor = 1 << 30, 1 << 30 / 20
+	var free atomic.Uint64
+	free.Store(total)
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.statfs = func(string) (store.Space, error) { return store.Space{Total: total, Free: free.Load()}, nil }
+	})
+	p1, p2 := bytes.Repeat([]byte("1"), 5<<20), []byte("tail")
+	whole := append(append([]byte{}, p1...), p2...)
+	id, err := l.create("data/big", hashMeta(whole))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1, err := l.part("data/big", id, 1, p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := l.part("data/big", id, 2, p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	free.Store(floor + 1<<20) // room for small writes, not for a 5 MiB copy
+	if err := l.complete("data/big", id, c1, c2); code(err) != "QuotaExceeded" {
+		t.Fatalf("completion below the floor: %v", err)
+	}
+	if _, ok := l.stored("data/big"); ok {
+		t.Fatal("completed below the floor")
+	}
+	free.Store(total)
+	if err := l.complete("data/big", id, c1, c2); err != nil {
+		t.Fatalf("completion with room: %v", err)
+	}
+	l.wantUsage(2*ov + int64(len(whole)))
 }
 
 // LEND-4, REPL-10: a borrower's put without x-amz-meta-lendisk-sha256,
@@ -251,17 +397,37 @@ func TestPutWithoutTheHashRefused(t *testing.T) {
 			t.Errorf("%s: stored", name)
 		}
 	}
-	if _, err := l.c.CreateMultipartUpload(context.Background(), &s3.CreateMultipartUploadInput{Bucket: l.bucket,
-		Key: aws.String("data/mp")}); status(err) != 400 {
+	if _, err := l.create("data/mp", nil); status(err) != 400 {
 		t.Fatalf("multipart create without the hash: %v", err)
 	}
-	if n := l.usage(); n != 0 {
-		t.Fatalf("counter %d", n)
+	l.wantUsage(ov)
+}
+
+// LEND-4: a hash sent in upper case is the same hash: the put is
+// accepted, and so is a retry of it in either case.
+func TestUpperCaseHashIsTheSameHash(t *testing.T) {
+	l := lendTo(t, 1<<30, nil)
+	body := []byte("pack")
+	upper := map[string]string{"lendisk-sha256": strings.ToUpper(sum(body))}
+	if err := l.put("data/x", body, upper); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.put("data/x", body, upper); err != nil {
+		t.Fatalf("retried in upper case: %v", err)
+	}
+	if err := l.put("data/x", body, hashMeta(body)); err != nil {
+		t.Fatalf("retried in lower case: %v", err)
+	}
+	if err := l.mpu("data/y", strings.ToUpper(sum(body)), body); err != nil {
+		t.Fatalf("multipart with an upper-case hash: %v", err)
+	}
+	if err := l.put("data/y", body, hashMeta(body)); err != nil {
+		t.Fatalf("a put over it in lower case: %v", err)
 	}
 }
 
-// LEND-4: a body whose SHA-256 is not the one declared is removed and
-// refused with BadDigest; the counter does not move.
+// LEND-4: a body whose SHA-256 is not the one declared is refused with
+// BadDigest and not kept; the counter does not move.
 func TestMismatchedBodyRemovedAndRefused(t *testing.T) {
 	l := lendTo(t, 1<<30, nil)
 	body := []byte("the bytes sent")
@@ -272,8 +438,59 @@ func TestMismatchedBodyRemovedAndRefused(t *testing.T) {
 	if _, ok := l.stored("data/x"); ok {
 		t.Fatal("the mismatched object is kept")
 	}
-	if n := l.usage(); n != 0 {
-		t.Fatalf("counter %d", n)
+	l.wantUsage(ov)
+}
+
+// SEC-5: a body longer than its Content-Length is refused and nothing is
+// stored, whatever its hash.
+func TestBodyLongerThanItsLengthRefused(t *testing.T) {
+	l := lendTo(t, 1<<30, nil)
+	body := []byte("abcdef")
+	if err := l.putDirect("data/x", bytes.NewReader(body), 3, hashMeta(body)); !isCode(err, "InvalidRequest") {
+		t.Fatalf("a long body: %v", err)
+	}
+	if _, ok := l.stored("data/x"); ok {
+		t.Fatal("stored")
+	}
+	l.wantUsage(ov)
+}
+
+// ignoringReads stores whatever a body gave, ignoring its read error: a
+// backend that would publish an object lendisk's reader refused.
+type ignoringReads struct{ *Store }
+
+func (b ignoringReads) PutObject(ctx context.Context, in s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
+	data, _ := io.ReadAll(in.Body)
+	n := int64(len(data))
+	in.Body, in.ContentLength = bytes.NewReader(data), &n
+	return b.Store.PutObject(ctx, in)
+}
+
+// LEND-4: should the store publish a body lendisk refused at its end,
+// the object is removed and the put refused.
+func TestPublishedMismatchIsRemoved(t *testing.T) {
+	h := newHarness(t, nil)
+	ctx := context.Background()
+	be, err := OpenBackend(h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateBucket(ctx, be, "lent-x", "owner"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.db.AddFriendship(ctx, state.Friendship{Peer: "peer", CreatedAt: time.Now(), OwnNumber: 1 << 30, PeerNumber: 1 << 30}); err != nil {
+		t.Fatal(err)
+	}
+	l := &Lending{Next: ignoringReads{be}, DB: h.db, Uploads: be, StoreDir: h.store, Log: quiet}
+	body := []byte("bytes")
+	n := int64(len(body))
+	_, err = l.putLent(ctx, "peer", s3response.PutObjectInput{Bucket: aws.String("lent-x"), Key: aws.String("k"),
+		ContentLength: &n, Body: bytes.NewReader(body), Metadata: hashMeta([]byte("other"))})
+	if !isCode(err, "BadDigest") {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(h.store, "lent-x", "k")); !os.IsNotExist(err) {
+		t.Fatal("the published mismatch is kept")
 	}
 }
 
@@ -310,10 +527,7 @@ func TestChangedKeyRefusedSameHashAccepted(t *testing.T) {
 		before.Sys().(*syscall.Stat_t).Ino != after.Sys().(*syscall.Stat_t).Ino || !after.ModTime().Equal(before.ModTime()) {
 		t.Fatalf("the stored object changed: %q", data)
 	}
-	if n := l.usage(); n != int64(len(orig)) {
-		t.Fatalf("counter %d", n)
-	}
-	// A multipart upload is held to the same rules.
+	l.wantUsage(2*ov + int64(len(orig)))
 	if err := l.mpu("snapshots/a", sum(changed), changed); code(err) != "PreconditionFailed" {
 		t.Fatalf("multipart over a changed key: %v", err)
 	}
@@ -328,6 +542,10 @@ type stalledReader struct {
 	r       io.Reader
 }
 
+func newStalledReader(b []byte) *stalledReader {
+	return &stalledReader{reading: make(chan struct{}), release: make(chan struct{}), r: bytes.NewReader(b)}
+}
+
 func (s *stalledReader) Read(p []byte) (int, error) {
 	s.once.Do(func() { close(s.reading) })
 	<-s.release
@@ -339,17 +557,10 @@ func (s *stalledReader) Read(p []byte) (int, error) {
 // put, once it ends, cannot replace it with other bytes.
 func TestStalledPutDoesNotBlockTheKey(t *testing.T) {
 	l := lendTo(t, 1<<30, nil)
-	peer := l.id.NodeID().String()
-	bucket := LentName(l.id.NodeID(), *l.bucket)
 	stale := []byte("stale")
-	s := &stalledReader{reading: make(chan struct{}), release: make(chan struct{}), r: bytes.NewReader(stale)}
-	n := int64(len(stale))
+	s := newStalledReader(stale)
 	done := make(chan error, 1)
-	go func() {
-		_, err := l.h.gw.lending.putLent(context.Background(), peer, s3response.PutObjectInput{Bucket: &bucket,
-			Key: aws.String("data/x"), ContentLength: &n, Body: s, Metadata: hashMeta(stale)})
-		done <- err
-	}()
+	go func() { done <- l.putDirect("data/x", s, int64(len(stale)), hashMeta(stale)) }()
 	within(t, "the stalled put reading", s.reading)
 	fresh := []byte("fresh")
 	retried := make(chan error, 1)
@@ -358,14 +569,106 @@ func TestStalledPutDoesNotBlockTheKey(t *testing.T) {
 		t.Fatalf("retry: %v", err)
 	}
 	close(s.release)
-	if err := within(t, "the stalled put", done); !isCode(err, "PreconditionFailed") {
+	if err := within(t, "the stalled put", done); !preconditionFailed(err) {
 		t.Fatalf("the stalled put ended with %v", err)
 	}
 	if data, _ := l.stored("data/x"); !bytes.Equal(data, fresh) {
 		t.Fatalf("stored %q", data)
 	}
-	if u := l.usage(); u != int64(len(fresh)) {
-		t.Fatalf("counter %d", u)
+	l.wantUsage(2*ov + int64(len(fresh)))
+}
+
+// tricklingReader gives one byte every gap.
+type tricklingReader struct {
+	gap  time.Duration
+	left int
+}
+
+func (r *tricklingReader) Read(p []byte) (int, error) {
+	if r.left == 0 {
+		return 0, io.EOF
+	}
+	time.Sleep(r.gap)
+	r.left--
+	p[0] = 'x'
+	return 1, nil
+}
+
+// SEC-5: a borrower's body that brings less than the minimum in a stall
+// period ends the write, whether it stops or trickles, so it holds no
+// reservation of quota or floor for long. Nothing is stored.
+func TestStalledOrTricklingBodyEnds(t *testing.T) {
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.lending = func(l *Lending) { l.Stall, l.MinProgress = 300*time.Millisecond, 1000 }
+	})
+	stopped := newStalledReader(nil)
+	t.Cleanup(func() { close(stopped.release) })
+	for name, body := range map[string]io.Reader{"stopped": stopped, "trickling": &tricklingReader{gap: 20 * time.Millisecond, left: 100}} {
+		start := time.Now()
+		done := make(chan error, 1)
+		go func() { done <- l.putDirect("data/"+name, body, 100, hashMeta(bytes.Repeat([]byte("x"), 100))) }()
+		if err := within(t, name, done); !isCode(err, "RequestTimeout") {
+			t.Errorf("%s: %v", name, err)
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Errorf("%s ended after %v", name, d)
+		}
+		if _, ok := l.stored("data/" + name); ok {
+			t.Errorf("%s stored", name)
+		}
+	}
+	l.wantUsage(ov)
+}
+
+// LEND-1: a reconcile while a put's body is stalled does not wait for it
+// and still corrects a counter that drifted.
+func TestReconcileWhileAPutIsStalled(t *testing.T) {
+	l := lendTo(t, 1<<30, nil)
+	ctx := context.Background()
+	body := bytes.Repeat([]byte("z"), 300)
+	if err := l.put("data/a", body, hashMeta(body)); err != nil {
+		t.Fatal(err)
+	}
+	s := newStalledReader([]byte("stalled"))
+	done := make(chan error, 1)
+	go func() { done <- l.putDirect("data/s", s, 7, hashMeta([]byte("stalled"))) }()
+	t.Cleanup(func() { close(s.release); <-done })
+	within(t, "the stalled put reading", s.reading)
+	l.lending().count(l.peer(), 99_999) // drift
+	reconciled := make(chan error, 1)
+	go func() { reconciled <- l.lending().reconcile(ctx, 0) }()
+	if err := within(t, "the reconcile", reconciled); err != nil {
+		t.Fatal(err)
+	}
+	l.wantUsage(2*ov + 300)
+}
+
+// SEC-5: a borrower's delete or multipart create naming a reserved or
+// malformed key is refused, and what lendisk keeps under .lendisk/ is
+// not touched.
+func TestDeleteAndMultipartRefuseBadKeys(t *testing.T) {
+	l := lendTo(t, 1<<30, nil)
+	ctx := context.Background()
+	tomb := filepath.Join(l.dir, ".lendisk", "tomb", "x")
+	if err := os.MkdirAll(filepath.Dir(tomb), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tomb, []byte("kept"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{".lendisk/tomb/x", "a/../b", ".lendisk"} {
+		if _, err := l.c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: l.bucket, Key: aws.String(k)}); status(err) != 400 {
+			t.Errorf("delete %q: %v", k, err)
+		}
+	}
+	if _, err := os.Stat(tomb); err != nil {
+		t.Fatalf("the tomb copy: %v", err)
+	}
+	if _, err := l.create(".lendisk/tomb/y", hashMeta(nil)); status(err) != 400 {
+		t.Fatalf("multipart create under .lendisk: %v", err)
+	}
+	if _, err := l.c.HeadObject(ctx, &s3.HeadObjectInput{Bucket: l.bucket, Key: aws.String(".lendisk/tomb/x")}); status(err) != 400 {
+		t.Fatalf("head under .lendisk: %v", err)
 	}
 }
 
@@ -384,72 +687,128 @@ func TestMultipartVerifiedAsAWhole(t *testing.T) {
 	if data, ok := l.stored("data/good"); !ok || !bytes.Equal(data, whole) {
 		t.Fatal("the completed object is not stored")
 	}
-	if n := l.usage(); n != int64(len(whole)) {
-		t.Fatalf("counter %d, want %d", n, len(whole))
-	}
+	l.wantUsage(2*ov + int64(len(whole)))
 	if err := l.mpu("data/bad", sum([]byte("something else")), p1, p2); code(err) != "BadDigest" {
 		t.Fatalf("mismatched multipart: %v", err)
 	}
 	if _, ok := l.stored("data/bad"); ok {
 		t.Fatal("the mismatched multipart object is kept")
 	}
-	if n := l.usage(); n != int64(len(whole)) {
-		t.Fatalf("counter %d after a refused completion", n)
-	}
-	// The same object again is accepted and changes nothing.
+	l.wantUsage(2*ov + int64(len(whole)))
 	if err := l.mpu("data/good", sum(whole), p1, p2); err != nil {
 		t.Fatalf("same multipart again: %v", err)
 	}
-	if n := l.usage(); n != int64(len(whole)) {
-		t.Fatalf("counter %d after a repeated upload", n)
-	}
-	up, err := l.c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: l.bucket, Key: aws.String("data/aborted"),
-		Metadata: hashMeta(p2)})
+	l.wantUsage(2*ov + int64(len(whole)))
+	id, err := l.create("data/aborted", hashMeta(p2))
 	if err != nil {
 		t.Fatal(err)
 	}
-	one := int32(1)
-	if _, err := l.c.UploadPart(ctx, &s3.UploadPartInput{Bucket: l.bucket, Key: aws.String("data/aborted"), UploadId: up.UploadId,
-		PartNumber: &one, Body: bytes.NewReader(p2)}); err != nil {
-		t.Fatal(err)
+	for range 2 { // a part sent again replaces the first; it is counted once
+		if _, err := l.part("data/aborted", id, 1, p2); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// A part sent again replaces the first; it is counted once.
-	if _, err := l.c.UploadPart(ctx, &s3.UploadPartInput{Bucket: l.bucket, Key: aws.String("data/aborted"), UploadId: up.UploadId,
-		PartNumber: &one, Body: bytes.NewReader(p2)}); err != nil {
-		t.Fatal(err)
-	}
-	if n := l.usage(); n != int64(len(whole)+len(p2)) {
-		t.Fatalf("counter %d with a part stored", n)
-	}
+	l.wantUsage(3*ov + int64(len(whole)+len(p2)))
 	if _, err := l.c.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: l.bucket, Key: aws.String("data/aborted"),
-		UploadId: up.UploadId}); err != nil {
+		UploadId: id}); err != nil {
 		t.Fatal(err)
 	}
-	if n := l.usage(); n != int64(len(whole)) {
-		t.Fatalf("counter %d after the abort", n)
+	l.wantUsage(2*ov + int64(len(whole)))
+}
+
+// LEND-1, SEC-5: re-sends of one part racing each other are counted
+// once: the counter equals what is stored, and the next put over quota
+// is refused.
+func TestRacingPartResendsCountedOnce(t *testing.T) {
+	l := lendTo(t, 3*ov+1500, nil)
+	id, err := l.create("data/mp", hashMeta(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := bytes.Repeat([]byte("p"), 1000)
+	if _, err := l.part("data/mp", id, 1, part); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() { l.part("data/mp", id, 1, part) })
+	}
+	wg.Wait()
+	l.wantUsage(2*ov + 1000)
+	over := bytes.Repeat([]byte("o"), 600)
+	if err := l.put("data/over", over, hashMeta(over)); code(err) != "QuotaExceeded" {
+		t.Fatalf("a put over quota after the re-sends: %v", err)
 	}
 }
 
 // LEND-1, SEC-5: a part that would take the borrower over quota is
 // refused with the quota error.
 func TestPartOverQuotaRefused(t *testing.T) {
-	l := lendTo(t, 100, nil)
-	ctx := context.Background()
-	up, err := l.c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: l.bucket, Key: aws.String("data/mp"),
-		Metadata: hashMeta([]byte("x"))})
+	l := lendTo(t, 2*ov+100, nil)
+	id, err := l.create("data/mp", hashMeta([]byte("x")))
 	if err != nil {
 		t.Fatal(err)
 	}
-	one := int32(1)
-	if _, err := l.c.UploadPart(ctx, &s3.UploadPartInput{Bucket: l.bucket, Key: aws.String("data/mp"), UploadId: up.UploadId,
-		PartNumber: &one, Body: bytes.NewReader(bytes.Repeat([]byte("p"), 101))}); code(err) != "QuotaExceeded" {
+	if _, err := l.part("data/mp", id, 1, bytes.Repeat([]byte("p"), 101)); code(err) != "QuotaExceeded" {
 		t.Fatalf("part over quota: %v", err)
 	}
 }
 
-// SEC-5: a borrower's key is a plain relative path: no dot segments, no
-// empty segments, no leading or trailing slash, no control characters,
-// and nothing under lendisk's or versitygw's own directories.
+// LEND-4: a completion is stored only if the key is still absent: a put
+// of the key that lands while the upload is being checked wins, and the
+// completion is refused as a changed key.
+func TestCompletionRefusedWhenAPutLandsFirst(t *testing.T) {
+	var putFirst func()
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.lending = func(l *Lending) { l.beforeComplete = func() { putFirst() } }
+	})
+	mp, other := []byte("from the upload"), []byte("from a put")
+	putFirst = func() {
+		if err := l.putDirect("data/k", bytes.NewReader(other), int64(len(other)), hashMeta(other)); err != nil {
+			t.Errorf("the put: %v", err)
+		}
+	}
+	if err := l.mpu("data/k", sum(mp), mp); code(err) != "PreconditionFailed" {
+		t.Fatalf("the completion: %v", err)
+	}
+	if data, _ := l.stored("data/k"); !bytes.Equal(data, other) {
+		t.Fatalf("stored %q", data)
+	}
+}
+
+// LEND-4: an upload completed in the store but never verified (a crash
+// came between) is verified when its completion is retried: a mismatch
+// is removed and refused.
+func TestRetriedCompletionVerifiedAfterACrash(t *testing.T) {
+	l := lendTo(t, 1<<30, nil)
+	ctx := context.Background()
+	declared, sent := []byte("declared"), []byte("sent instead")
+	id, err := l.create("data/k", hashMeta(declared))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp, err := l.part("data/k", id, 1, sent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be, err := OpenBackend(l.h.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := &s3.CompleteMultipartUploadInput{Bucket: &l.store, Key: aws.String("data/k"), UploadId: id,
+		MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{cp}}}
+	if _, _, err := be.CompleteMultipartUpload(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.complete("data/k", id, cp); code(err) != "BadDigest" {
+		t.Fatalf("the retried completion: %v", err)
+	}
+	if _, ok := l.stored("data/k"); ok {
+		t.Fatal("the unverified object is kept")
+	}
+}
+
+// SEC-5: the borrower's keys are plain relative paths.
 func TestBorrowerKeysValidated(t *testing.T) {
 	for _, k := range []string{"config", "data/ab/abcdef", "keys/1", "index/x.y", "p0123-abc_def", "kopia.repository",
 		"xn0_1", ".hidden/x", "a/.b"} {
@@ -474,8 +833,8 @@ func TestBorrowerKeysValidated(t *testing.T) {
 }
 
 // LEND-1: the counter is reconciled against a listing of the borrower's
-// buckets, objects and parts of uploads in progress, and the reconcile
-// time recorded; a counter that drifted is set right.
+// buckets, objects and uploads in progress with their parts, and the
+// reconcile time recorded; a counter that drifted is set right.
 func TestCounterReconciledAgainstAListing(t *testing.T) {
 	l := lendTo(t, 1<<30, nil)
 	ctx := context.Background()
@@ -483,38 +842,93 @@ func TestCounterReconciledAgainstAListing(t *testing.T) {
 	if err := l.put("data/a", body, hashMeta(body)); err != nil {
 		t.Fatal(err)
 	}
-	up, err := l.c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: l.bucket, Key: aws.String("data/mp"),
-		Metadata: hashMeta(body)})
+	id, err := l.create("data/mp", hashMeta(body))
 	if err != nil {
 		t.Fatal(err)
 	}
-	one := int32(1)
-	if _, err := l.c.UploadPart(ctx, &s3.UploadPartInput{Bucket: l.bucket, Key: aws.String("data/mp"), UploadId: up.UploadId,
-		PartNumber: &one, Body: bytes.NewReader(body[:50])}); err != nil {
+	if _, err := l.part("data/mp", id, 1, body[:50]); err != nil {
 		t.Fatal(err)
 	}
-	peer := l.id.NodeID().String()
 	old := time.Now().Add(-48 * time.Hour)
-	if err := l.h.db.SetLentUsage(ctx, peer, 99_999, old); err != nil {
+	if err := l.h.db.SetLentUsage(ctx, l.peer(), 99_999, old); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.h.gw.lending.reconcile(ctx, 24*time.Hour); err != nil {
+	if err := l.lending().reconcile(ctx, 24*time.Hour); err != nil {
 		t.Fatal(err)
 	}
-	n, at, err := l.h.db.LentUsage(ctx, peer)
-	if err != nil || n != 350 || !at.After(old) {
-		t.Fatalf("reconciled to %d at %v (%v); want 350 now", n, at, err)
+	n, at, err := l.h.db.LentUsage(ctx, l.peer())
+	if want := 3*ov + 350; err != nil || n != want || !at.After(old) {
+		t.Fatalf("reconciled to %d at %v (%v); want %d now", n, at, err, want)
 	}
-	// Not due again for a day.
-	if err := l.h.db.AddLentUsage(ctx, peer, 5); err != nil {
+}
+
+// LEND-1: an upload left open longer than the abandon period is aborted
+// by the reconcile, its row dropped and its bytes freed.
+func TestAbandonedUploadsAborted(t *testing.T) {
+	var now atomic.Int64
+	now.Store(time.Now().Unix())
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.lending = func(l *Lending) { l.Now = func() time.Time { return time.Unix(now.Load(), 0) } }
+	})
+	ctx := context.Background()
+	id, err := l.create("data/mp", hashMeta(nil))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := l.h.gw.lending.reconcile(ctx, 24*time.Hour); err != nil {
+	if _, err := l.part("data/mp", id, 1, []byte("part")); err != nil {
 		t.Fatal(err)
 	}
-	if n, _, _ := l.h.db.LentUsage(ctx, peer); n != 355 {
-		t.Fatalf("reconciled again within a day: %d", n)
+	if err := l.lending().reconcile(ctx, 0); err != nil {
+		t.Fatal(err)
 	}
+	l.wantUsage(2*ov + 4)
+	now.Add(int64(8 * 24 * time.Hour / time.Second))
+	if err := l.lending().reconcile(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	l.wantUsage(ov)
+	if _, err := l.h.db.GetLentUpload(ctx, *id); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("the upload's row: %v", err)
+	}
+	ups, err := l.lending().Next.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{Bucket: &l.store,
+		KeyMarker: aws.String(""), UploadIdMarker: aws.String(""), MaxUploads: aws.Int32(100)})
+	if err != nil || len(ups.Uploads) != 0 {
+		t.Fatalf("uploads left: %+v %v", ups.Uploads, err)
+	}
+}
+
+// LEND-1: the reconcile loop runs at start and then on schedule, each
+// borrower once a day.
+func TestReconcileLoopRunsAtStartAndThenDaily(t *testing.T) {
+	var now atomic.Int64
+	t0 := time.Now().Add(time.Hour).Truncate(time.Second)
+	now.Store(t0.Unix())
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.reconcileEvery = 10 * time.Millisecond
+		h.lending = func(l *Lending) { l.Now = func() time.Time { return time.Unix(now.Load(), 0) } }
+	})
+	reconciledAt := func(want time.Time) {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			_, at, err := l.h.db.LentUsage(context.Background(), l.peer())
+			if err == nil && at.Equal(want) {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("reconciled at %v, want %v", at, want)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	reconciledAt(t0)
+	now.Store(t0.Add(time.Hour).Unix())
+	time.Sleep(100 * time.Millisecond) // several runs: not due yet
+	if _, at, _ := l.h.db.LentUsage(context.Background(), l.peer()); !at.Equal(t0) {
+		t.Fatalf("reconciled again within the day, at %v", at)
+	}
+	now.Store(t0.Add(25 * time.Hour).Unix())
+	reconciledAt(t0.Add(25 * time.Hour))
 }
 
 // EP-3 (#62): with the lending layer and its quota in place, the gateway
@@ -544,3 +958,5 @@ func TestStartupSettlesAPendingCompletionWithQuotaInPlace(t *testing.T) {
 	h.settled()
 	assertOneDoneRow(t, h, be, "big", body)
 }
+
+var _ backend.Backend = ignoringReads{}
