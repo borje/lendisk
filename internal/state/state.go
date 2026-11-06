@@ -44,6 +44,11 @@ type DB struct {
 	// Clock stamps the rows the queue writes (created_at, acked_at); nil
 	// means time.Now. Tests set it.
 	Clock func() time.Time
+	// RerouteAfter and ReplaceAfter are replication.reroute_after and
+	// replication.replace_after (D6, §3.4): how long a friend may fail
+	// before its unsent data goes elsewhere, and before it is no longer
+	// room at all. Zero means 1 hour and 7 days.
+	RerouteAfter, ReplaceAfter time.Duration
 }
 
 func (db *DB) now() time.Time {

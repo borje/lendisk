@@ -22,7 +22,11 @@ import (
 
 // Worker drains every place's FIFO (REPL-1, REPL-3): one sender per
 // friend, each sending its queued placement rows in write-sequence
-// order, one object at a time, the places in parallel. An object is read
+// order, one object at a time, the places in parallel. A metadata row
+// at the head of a FIFO waits until every earlier data object of its
+// bucket is acknowledged wherever it is placed (the barrier,
+// state.DB.Held), and unsent data at a friend that stopped answering is
+// re-routed (state.DB.Reroute). An object is read
 // from the store as it is sent, once per place, with its capture hash
 // (REPL-10); the place's acknowledgement records the hash. The queue is
 // lendisk.db, so a restart continues at the first unacknowledged row.
@@ -44,6 +48,9 @@ type Worker struct {
 	// MinBackoff and MaxBackoff bound the retry delay after an error
 	// worth retrying (defaults 1 s and 5 minutes).
 	MinBackoff, MaxBackoff time.Duration
+	// RerouteEvery is how often unsent data at friends that stopped
+	// answering is re-routed (state.DB.Reroute, §3.4; default 1 minute).
+	RerouteEvery time.Duration
 	// PauseRetry is how long a place paused for quota or removed waits
 	// before trying again (default an hour, LEND-2).
 	PauseRetry time.Duration
@@ -151,7 +158,12 @@ func (w *Worker) Run(ctx context.Context) {
 	if friendships == nil {
 		friendships = w.DB.Friendships
 	}
+	var rerouted time.Time
 	for {
+		if now := w.now(); now.Sub(rerouted) >= orDefault(w.RerouteEvery, time.Minute) {
+			rerouted = now
+			w.reroute(ctx)
+		}
 		fs, err := friendships(ctx)
 		if err != nil {
 			// Keep the senders as they are: a failed read says nothing
@@ -196,6 +208,22 @@ func (w *Worker) Run(ctx context.Context) {
 		if !sleep(ctx, 5*poll) {
 			return
 		}
+	}
+}
+
+// reroute moves unsent data from friends failing for longer than
+// reroute_after, or full by their last answer, to friends with room
+// (§3.4), so the metadata barrier does not wait on them.
+func (w *Worker) reroute(ctx context.Context) {
+	moved, dropped, err := w.DB.Reroute(ctx)
+	switch {
+	case err != nil:
+		if ctx.Err() == nil {
+			w.Log.Error("replication: re-routing unsent data failed", "err", err)
+		}
+	case moved > 0 || dropped > 0:
+		w.Log.Info("replication: re-routed unsent data from friends that stopped answering or are full",
+			"moved", moved, "dropped_below_copies", dropped)
 	}
 }
 
@@ -268,6 +296,18 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			failing = ""
 			sleep(ctx, poll)
 			continue
+		}
+		if p.Class == "metadata" || p.Class == "snapshot" {
+			// The barrier (REPL-1): not before every earlier data object
+			// of the bucket is acknowledged wherever it is placed.
+			held, err := w.DB.Held(ctx, p.Seq)
+			if err != nil || held {
+				if err != nil && ctx.Err() == nil {
+					log.Error("replication: reading the metadata barrier failed", "err", err)
+				}
+				sleep(ctx, poll)
+				continue
+			}
 		}
 		err = w.send(ctx, place, r, p)
 		if ctx.Err() != nil {

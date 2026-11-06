@@ -63,10 +63,14 @@ const (
 	// key with another hash (EP-11) or rejects bytes that match their
 	// capture hash (#57); the subject is the place.
 	KindPlaceRefused = "place_refused"
+	// KindPoolTooSmall: a bucket's copies exceed the places in the pool
+	// (OPS-2, #19), which re-placement cannot fix: the pool needs a new
+	// friendship. The subject is the bucket.
+	KindPoolTooSmall = "pool_too_small"
 )
 
 // kinds are the alert kinds the evaluator owns.
-var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused}
+var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused, KindPoolTooSmall}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -288,7 +292,30 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 			p, objects(places[p]))
 		out = append(out, alertOf(KindPlaceRefused, p, msg))
 	}
+	bs, err := s.DB.Buckets(ctx)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := s.DB.PoolSize(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range bs {
+		if b.Copies <= pool {
+			continue
+		}
+		msg := fmt.Sprintf("bucket %s keeps %d copies of each object, but the pool has only %s: objects are held at fewer places until another friend joins (lendisk invite)",
+			b.Name, b.Copies, countPlaces(pool))
+		out = append(out, alertOf(KindPoolTooSmall, b.Name, msg))
+	}
 	return out, nil
+}
+
+func countPlaces(n int) string {
+	if n == 1 {
+		return "1 place"
+	}
+	return fmt.Sprintf("%d places", n)
 }
 
 func sortedKeys(m map[string]int64) []string {

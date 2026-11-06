@@ -9,12 +9,15 @@ import (
 
 // Bucket is one of the node's own buckets.
 type Bucket struct {
-	Name      string
-	Profile   string
-	Copies    int
-	AccessKey string
-	SecretKey string
-	CreatedAt time.Time
+	Name    string
+	Profile string
+	Copies  int
+	// CopiesExplicit is true when the user gave copies; a copies of 1
+	// that came from the default gets a nudge (EP-6).
+	CopiesExplicit bool
+	AccessKey      string
+	SecretKey      string
+	CreatedAt      time.Time
 }
 
 // ErrNotFound means no row matched.
@@ -29,8 +32,8 @@ func (db *DB) AddBucket(ctx context.Context, b Bucket) error {
 		return ErrExists
 	}
 	_, err := db.ExecContext(ctx, `INSERT INTO buckets
-		(name, profile, copies, access_key, secret_key, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		b.Name, b.Profile, b.Copies, b.AccessKey, b.SecretKey, b.CreatedAt.UTC().Format(time.RFC3339))
+		(name, profile, copies, access_key, secret_key, created_at, copies_explicit) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		b.Name, b.Profile, b.Copies, b.AccessKey, b.SecretKey, b.CreatedAt.UTC().Format(time.RFC3339), b.CopiesExplicit)
 	return err
 }
 
@@ -40,12 +43,12 @@ func (db *DB) DeleteBucket(ctx context.Context, name string) error {
 	return err
 }
 
-const bucketCols = `name, profile, copies, access_key, secret_key, created_at`
+const bucketCols = `name, profile, copies, access_key, secret_key, created_at, coalesce(copies_explicit, 0)`
 
 func scanBucket(row interface{ Scan(...any) error }) (Bucket, error) {
 	var b Bucket
 	var created string
-	err := row.Scan(&b.Name, &b.Profile, &b.Copies, &b.AccessKey, &b.SecretKey, &created)
+	err := row.Scan(&b.Name, &b.Profile, &b.Copies, &b.AccessKey, &b.SecretKey, &created, &b.CopiesExplicit)
 	if errors.Is(err, sql.ErrNoRows) {
 		return b, ErrNotFound
 	}

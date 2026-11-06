@@ -56,52 +56,22 @@ type Placement struct {
 	Place       string
 	Bucket, Key string
 	Op          string // OpPut or OpDelete
+	Class       string // the key's class (EP-7): metadata rows wait for the barrier (Held)
 	Size        int64
 	SHA256      string // the capture's whole-object SHA-256 (REPL-10)
 	State       string
 	CreatedAt   time.Time // when the write was captured
 }
 
-// placeTx places a completed queue row. Placement is trivial until
-// pooled placement (#19): every friend gets every row. A healing
-// re-upload (heal, #61) is acked at once, without sending, at a place
-// that acknowledged the very row it heals (the key's previous done row,
-// a put of the same hash) and has nothing of the key queued:
-// exactly-once holds for honest places while another place keeps
-// refusing. An older acknowledgement of the hash is not enough: a row of
-// other bytes sent since may have landed with its answer lost and then
-// been cancelled as superseded, which leaves no row behind.
-func placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool, now time.Time) error {
-	_, err := tx.ExecContext(ctx, `WITH c AS (
-		SELECT q.seq, f.peer_key AS place, q.bucket, q.key, q.op, q.sha256,
-			?2 AND q.op = 'put'
-			AND EXISTS (SELECT 1 FROM placement a
-				WHERE a.place = f.peer_key AND a.state = 'acked' AND a.sha256 = q.sha256
-				AND a.seq = (SELECT max(l.seq) FROM queue l
-					WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq < q.seq AND l.state = 'done'))
-			AND NOT EXISTS (SELECT 1 FROM placement w
-				WHERE w.place = f.peer_key AND w.bucket = q.bucket AND w.key = q.key
-				AND w.state = 'queued' AND w.seq < q.seq) AS held
-		FROM queue q, friendship f
-		WHERE q.seq = ?1 AND q.state = 'done' AND coalesce(f.address, '') != '')
-	INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at)
-		SELECT seq, place, bucket, key, op,
-			CASE WHEN held THEN 'acked' ELSE 'queued' END,
-			CASE WHEN held THEN sha256 END,
-			CASE WHEN held THEN ?3 END
-		FROM c`, seq, heal, now.Unix())
-	return err
-}
-
 // NextPlacement returns the head of place's FIFO: its queued row with
 // the lowest sequence. ok is false when the FIFO is empty.
 func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok bool, err error) {
 	var created int64
-	err = db.QueryRowContext(ctx, `SELECT p.seq, p.place, p.bucket, p.key, p.op, coalesce(q.size, 0),
+	err = db.QueryRowContext(ctx, `SELECT p.seq, p.place, p.bucket, p.key, p.op, q.class, coalesce(q.size, 0),
 		coalesce(q.sha256, ''), p.state, q.created_at
 		FROM placement p JOIN queue q ON q.seq = p.seq
 		WHERE p.place = ? AND p.state = 'queued' ORDER BY p.seq LIMIT 1`, place).
-		Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Size, &p.SHA256, &p.State, &created)
+		Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Class, &p.Size, &p.SHA256, &p.State, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, false, nil
 	}

@@ -36,6 +36,12 @@ type place struct {
 	hold                  chan struct{}
 	inFlight, maxInFlight int
 	bytesRead             int64
+	// world, if set, is held while a put stores, and check is then
+	// called: an invariant across places (REPL-1 AC).
+	world *sync.Mutex
+	check func()
+	// delay is how long each put takes.
+	delay time.Duration
 }
 
 func newPlace(name string) *place { return &place{name: name, objs: map[string][]byte{}} }
@@ -59,6 +65,12 @@ func (p *place) Put(ctx context.Context, o Object) error {
 	b, err := io.ReadAll(o.Body)
 	if err != nil {
 		return err
+	}
+	time.Sleep(p.delay)
+	if p.world != nil {
+		p.world.Lock()
+		defer p.world.Unlock()
+		defer p.check() // after p.mu is released
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -117,7 +129,8 @@ func newFixture(t *testing.T, friends ...string) *fixture {
 	t.Cleanup(func() { db.Close() })
 	fx := &fixture{t: t, db: db, store: t.TempDir(), places: map[string]*place{}}
 	for _, f := range friends {
-		if err := db.AddFriendship(t.Context(), state.Friendship{Peer: f, Address: "tc" + f, CreatedAt: time.Now()}); err != nil {
+		if err := db.AddFriendship(t.Context(), state.Friendship{Peer: f, Address: "tc" + f,
+			OwnNumber: 1 << 40, PeerNumber: 1 << 40, CreatedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		fx.places[f] = newPlace(f)
@@ -980,7 +993,7 @@ func TestHungStoreReadDoesNotHangTheRealClient(t *testing.T) {
 	self := newID(t)
 	friend, peer := tunnelLender(t, self, &recorder{})
 	place := peer.String()
-	if err := fx.db.AddFriendship(t.Context(), state.Friendship{Peer: place, Address: "tc", CreatedAt: time.Now()}); err != nil {
+	if err := fx.db.AddFriendship(t.Context(), state.Friendship{Peer: place, Address: "tc", OwnNumber: 1 << 40, PeerNumber: 1 << 40, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	fx.w.Connect = func(state.Friendship) (Replica, error) { return friend, nil }
@@ -1165,7 +1178,7 @@ func TestTruncatedStoreReadIsTheStoresFault(t *testing.T) {
 	self := newID(t)
 	friend, peer := tunnelLender(t, self, &recorder{})
 	place := peer.String()
-	if err := fx.db.AddFriendship(t.Context(), state.Friendship{Peer: place, Address: "tc", CreatedAt: time.Now()}); err != nil {
+	if err := fx.db.AddFriendship(t.Context(), state.Friendship{Peer: place, Address: "tc", OwnNumber: 1 << 40, PeerNumber: 1 << 40, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	fx.w.Connect = func(state.Friendship) (Replica, error) { return friend, nil }

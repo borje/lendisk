@@ -28,7 +28,7 @@ import (
 func TestConcurrentCapturesAndAcksSeeNoErrors(t *testing.T) {
 	h := newHarness(t, map[string]string{"laptop": "restic"})
 	ctx := context.Background()
-	if err := h.db.AddFriendship(ctx, state.Friendship{Peer: "friend", Address: "tcfriend", CreatedAt: time.Now()}); err != nil {
+	if err := h.db.AddFriendship(ctx, state.Friendship{Peer: "friend", Address: "tcfriend", OwnNumber: 1 << 30, PeerNumber: 1 << 30, CreatedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	h.serve(false)

@@ -1410,6 +1410,16 @@ upstream bucket is Q-V.
   its own, and it cannot create buckets. `bucket add` writes the row
   and then creates the bucket directly through the posix backend, so it
   needs no running daemon; `bucket show` prints the lines again.
+  `--copies N` sets the bucket's `copies`; without it the bucket gets
+  `replication.copies` (default 2). *Decision (#19):* EP-6's nudge
+  needs a `copies = 1` the user did not set explicitly, and the only
+  such source is that setting: `buckets.copies_explicit` (schema 13)
+  records whether `--copies` was given, and a bucket at `copies` 1
+  without it gets the nudge ("one lost friend loses data; 2 is
+  recommended") in `bucket add` and `status` (`buckets[].copies_nudge`
+  in `status --json`). `bucket add` also says when the pool has fewer
+  places than `copies` (OPS-2), as does the `pool_too_small` alert
+  (§3.8). The daily summary's nudge comes with the summary.
 - **EP-7** Profiles are TOML files compiled into the binary
   (`internal/profile/profiles/<name>.toml`) and overridable in
   `<config>/profiles/`: a file there replaces the compiled-in profile
@@ -1463,12 +1473,59 @@ upstream bucket is Q-V.
 
 ### 3.4 Replication
 
-- **REPL-12, placement at capture.** When the decorator completes a
-  queue row (EP-3), the placer runs D6's choice for it in the same
-  SQLite transaction: a metadata key gets a `placement` row per friend
-  (and per overflow target already holding data of the bucket), a data
-  key gets `copies` rows. Each `placement` row in state `queued` is an
-  entry in that place's FIFO.
+- **REPL-12, placement at capture (#19).** When the decorator completes a
+  queue row (EP-3), `FinishPut` or `FinishDelete` places it in the same
+  SQLite transaction (`state.DB.placeTx`, `internal/state/pool.go`):
+  - a metadata or snapshot key (the queue row's `class`, EP-7) gets a
+    `placement` row at every friend with an address (and, once overflow
+    targets exist, every one already holding data of the bucket);
+  - a data key gets rows at `copies` friends (the bucket's row;
+    `state.DefaultCopies`, 2, for a bucket with none) by D6's choice
+    (`state.DB.choose`): candidates are friends with an address and
+    free capacity for the object; reachable ones first, then by largest
+    free fraction (free ÷ quota), ties by node ID. Free capacity is the
+    friendship's quota less the borrower's count of the place's use
+    (below) less the bucket's live metadata with no row at that place
+    (a friend added later, which re-placement, #26, fills). A friend
+    that is `removed`, whose last answer was `507` (condition `quota`,
+    below), or that is gone past `replace_after` is not a candidate;
+  - a delete goes to every friend whose latest row of the key is a put,
+    in any state (REPL-2): every place that holds or will hold it, and
+    one that refused it, which may hold older bytes;
+  - a healing re-upload of a data key (*Healing*, below) goes where the
+    row it heals was placed, topped up to `copies` by the choice.
+
+  With fewer candidates than `copies`, what fits is placed: the deficit
+  is not stored, it is the object's count of `queued` and `acked` rows
+  below `copies`, which `status` shows (`state.DB.BelowCopies`,
+  `buckets[].below_copies` in `status --json`: live objects and bytes,
+  the key's latest done write a put). Each `placement` row in state
+  `queued` is an entry in that place's FIFO.
+  *Reachability* until the probe (#65) is the place's condition: a
+  friend is unreachable once it has been `retrying` or `removed` for
+  `replication.reroute_after` (1 hour; a shorter failure is a blip),
+  and gone once, in addition, `replication.replace_after` (7 days) has
+  passed since its last acknowledgement (`last_ok`, or the failure's
+  start if it never answered). An unreachable friend with room is still
+  chosen when the reachable ones are not enough; a gone one is not.
+  *The borrower's count* (`place_use`, schema 13) is the sum over a
+  place's `queued` and `acked` rows of `placement.size`: a put's bytes
+  plus `state.ObjectOverhead` (4 KiB, the lender's per-object overhead,
+  LEND-1), or 0 when the place's latest row of the key acknowledged the
+  same hash (a healing re-upload, which the lender stores nothing for);
+  a delete minus what the place acknowledged of the key since its last
+  delete there. SQLite triggers on `placement` keep it as rows are
+  inserted, acknowledged, refused, re-queued, cancelled and moved, so
+  placing an object reads one row per friend. A row acknowledged after
+  its delete was placed (a send in flight) stays counted: the count
+  errs towards less room. Tombstones (#17) will change what a delete
+  frees. *Correction from the lender's answers:* the lender's only
+  answer about room so far is `507` (LEND-2; the control API's `quota`
+  call is not built): a place whose last answer was `507` counts as
+  full, gets no new data and has its unsent data re-routed (below),
+  until it acknowledges a row again. Each backup run queues metadata at
+  every friend, so a full friend learns of freed room within a
+  `PauseRetry` (an hour) of the next run.
 - **REPL-1 to REPL-3** The queue is a SQLite table with one FIFO
   sequence per place, ordered by the bucket's write sequence. The
   worker uploads one object at a time per place in sequence order,
@@ -1493,11 +1550,9 @@ upstream bucket is Q-V.
   `.pending` counts writes in flight to the store. The backlog, what
   waits to be sent, is per place: `places[].queue` (below). The field
   names stay, as `status --json` never renames.
-- **Placement until #19 (schema 7).** `FinishPut` and `FinishDelete`
-  place the row they complete in the same transaction
-  (`state.placeTx`). The placer is trivial until pooled placement (#19):
-  every friend with an address gets a `queued` row for every put and
-  delete. Table `placement`: `seq` (the queue row), `place` (the
+- **The placement table (schema 7).** `FinishPut` and `FinishDelete`
+  place the row they complete in the same transaction (above). Table
+  `placement`: `seq` (the queue row), `place` (the
   friend's node ID), `bucket`, `key` and `op` copied from the queue row
   so the index outlives it, `state` (`queued`, `acked`, `refused`),
   and on acknowledgement `sha256` and `acked_at`: acked put rows are
@@ -1513,7 +1568,8 @@ upstream bucket is Q-V.
   *Healing (#57):* a refusal is healed by writing the same bytes again.
   `FinishPut` drops an identical re-upload as a retry (EP-3) only while
   the key's last done row is refused nowhere; when it is refused at
-  some place, the re-upload is queued and placed at every friend, but
+  some place, the re-upload is queued and placed again (where the
+  healed row was, for a data key; at every friend for metadata), but
   sent only where the object is known to be held (#61): at a place
   that acknowledged the very row being healed (the key's previous done
   row, a put of the same hash) and has nothing of the key queued, the
@@ -1555,15 +1611,35 @@ upstream bucket is Q-V.
   placed at, which is `copies` places or, where D6 recorded a deficit,
   fewer. A deficit therefore lowers the copies but does not stop the
   pool: places with room keep receiving data and metadata. The bucket's
-  watermark (REPL-11) still requires `copies`. Because the place's FIFO
+  watermark (REPL-11) still requires `copies`. The sender checks it
+  (`state.DB.Held`) when a metadata or snapshot row, put or delete,
+  is the head of its FIFO, and polls every second while it holds; the
+  check reads the bucket's queued rows before `m` (index
+  `placement_barrier`). *Decision (#19, from the #20 review):* only
+  `queued` rows hold the barrier. A row refused for good (by the place,
+  `BadDigest` or `412`, or for the store) is not queued, so one hostile
+  friend that refuses everything cannot stall metadata for the others;
+  the object is then below `copies` and shows so. A queued put that a
+  later done write of the key replaced does not hold it either: it will
+  be cancelled, not sent. Because the place's FIFO
   waits behind a held metadata row, a lagging data copy holds back
   every place's metadata, so data rows are re-routed early: a `queued`
   data row at a friend unreachable for longer than
-  `replication.reroute_after` (1 hour) is given to another *friend*
-  with room by D6's choice, never to an overflow target while the
+  `replication.reroute_after` (1 hour), or whose last answer was `507`,
+  is given to another *friend* with room by D6's choice
+  (`state.DB.Reroute`, which the worker runs every minute,
+  `Worker.RerouteEvery`), never to one that has or had a row of the
+  object, and never to an overflow target while the
   unreachable friend still has room (REPL-12); with no such friend it
   waits, the lag shows in `status`, and `replace_after` applies.
-  Re-routing an unsent row moves no bytes.
+  The moved row keeps its sequence, so it takes its turn in the new
+  place's FIFO ahead of later rows. Re-routing an unsent row moves no
+  bytes; should a send to the old place still be in flight and land,
+  that place keeps an unrecorded extra copy. *Decision (#19):* once the
+  friend is gone past `replace_after` and no friend has room, the row
+  is dropped rather than left to hold the barrier for good: the object
+  is below `copies`, and re-placement (#26) places the copy when there
+  is room.
   Restic and Kopia write packs, then indexes, then the snapshot or
   manifest, so the barrier costs one round of acknowledgements per
   backup run, not per object.
@@ -1861,8 +1937,10 @@ capture decorator, so nothing stands between that and posix (#62).
   `lending.max_total` bounds the sum of the node's own numbers;
   `peer quota` refuses a value that would exceed it (LEND-8). The
   borrower side keeps its own count of what it has stored at each
-  place, for D6's free fraction, and corrects it from the lender's
-  `quota` answer.
+  place, for D6's free fraction (`place_use`, §3.4), and corrects it
+  from the lender's answers: for now a `507`, which makes the place
+  full until it acknowledges again; the control API's `quota` answer
+  (LEND-7) will reconcile the count itself.
 - **LEND-2** `Lending` refuses a borrower's `PutObject`,
   `CreateMultipartUpload`, `UploadPart` and `CreateBucket` of a new
   bucket with S3 error code `QuotaExceeded`, HTTP 507, when the counter
@@ -2230,7 +2308,10 @@ capture decorator, so nothing stands between that and posix (#62).
     again;
   - `place_refused`, subject the place: rows it refused for good
     (EP-11, a `BadDigest` for bytes that match, #57), until written
-    again.
+    again;
+  - `pool_too_small`, subject the bucket: its `copies` exceed the
+    places in the pool, friends with an address that do not refuse this
+    node (`state.DB.PoolSize`, #19).
   Later tickets add a kind to `alert.kinds` and its condition to the
   evaluator. Each raise is delivered at least once to each configured
   channel: success is recorded in `hook_at` or `webhook_at` against

@@ -177,6 +177,19 @@ type StatusBucket struct {
 	// supply them as captured: gone, changed or rotted since capture, a
 	// directory, or too large for one PUT (#50). Each raised an alert.
 	Refused int64 `json:"refused"`
+	// BelowCopies counts the live objects that fewer than Copies places
+	// hold or will hold, and their bytes (REPL-4): the pool lacked room,
+	// a place refused them, or a friend gone past replace_after held them.
+	BelowCopies StatusBelow `json:"below_copies"`
+	// CopiesNudge is true for copies 1 the user did not choose with
+	// --copies: one lost friend loses data (EP-6).
+	CopiesNudge bool `json:"copies_nudge,omitempty"`
+}
+
+// StatusBelow counts objects and bytes below a bucket's copies.
+type StatusBelow struct {
+	Objects int64 `json:"objects"`
+	Bytes   int64 `json:"bytes"`
 }
 
 // StatusQueue is a count of queue rows and their bytes. For a bucket it
@@ -267,10 +280,15 @@ func (a *app) statusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			below, err := db.BelowCopies(cmd.Context())
+			if err != nil {
+				return err
+			}
 			for _, b := range bs {
-				q := queues[b.Name]
+				q, bc := queues[b.Name], below[b.Name]
 				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
-					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name]})
+					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
+					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, CopiesNudge: nudgeCopies(b)})
 			}
 			if st.Places, err = places(cmd.Context(), db, a.now()); err != nil {
 				return err
@@ -308,6 +326,13 @@ func (a *app) statusCmd() *cobra.Command {
 				}
 				if b.Refused > 0 {
 					fmt.Fprintf(a.out, ", %d not replicated (the store's copy changed or cannot be sent; see the log)", b.Refused)
+				}
+				if b.BelowCopies.Objects > 0 {
+					fmt.Fprintf(a.out, ", %d objects, %d bytes at fewer than %d places", b.BelowCopies.Objects,
+						b.BelowCopies.Bytes, b.Copies)
+				}
+				if b.CopiesNudge {
+					fmt.Fprintf(a.out, "; %s", copiesNudge)
 				}
 				fmt.Fprintln(a.out)
 			}
