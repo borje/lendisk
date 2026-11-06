@@ -7,6 +7,8 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/bridge"
+	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
@@ -31,6 +33,33 @@ type Status struct {
 // in the lender-only profile, which has no endpoint (PEER-9).
 type StatusEndpoint struct {
 	S3 string `json:"s3"`
+	// Listen is every non-loopback listener (EP-17), one per address.
+	Listen []StatusListener `json:"listen"`
+}
+
+// StatusListener is one [[endpoint.listen]] address (EP-17).
+type StatusListener struct {
+	// URL is the endpoint for backup tools; empty for an interface that
+	// has no address now.
+	URL       string `json:"url"`
+	Interface string `json:"interface,omitempty"`
+	TLS       string `json:"tls"`       // generate, files or off
+	Plaintext bool   `json:"plaintext"` // TLS is off
+}
+
+// lanListeners resolves the [[endpoint.listen]] entries for status.
+func lanListeners(cfg *config.Loaded) []StatusListener {
+	out := []StatusListener{}
+	for _, e := range cfg.Endpoint.Listen {
+		addrs := bridge.Resolve([]config.Listen{e}, nil)
+		if len(addrs) == 0 {
+			out = append(out, StatusListener{Interface: e.Interface, TLS: e.TLS, Plaintext: e.TLS == "off"})
+		}
+		for _, a := range addrs {
+			out = append(out, StatusListener{URL: a.URL(), Interface: e.Interface, TLS: e.TLS, Plaintext: a.Plaintext()})
+		}
+	}
+	return out
 }
 
 // StatusVersions are the linked components' versions (EP-12).
@@ -58,6 +87,18 @@ type StatusNode struct {
 type StatusPaths struct {
 	Config string `json:"config"`
 	Data   string `json:"data"`
+}
+
+func listenerLine(l StatusListener) string {
+	what := cmp.Or(l.URL, l.Interface+" (no address now)")
+	switch {
+	case l.Plaintext:
+		return what + " (plaintext)"
+	case l.TLS == "generate":
+		return what + " (TLS, generated certificate)"
+	default:
+		return what + " (TLS, your certificate)"
+	}
 }
 
 // StatusSchema is the current `status --json` schema number.
@@ -92,6 +133,7 @@ func (a *app) statusCmd() *cobra.Command {
 			if cfg.Role == "full" {
 				st.Endpoint.S3 = "http://" + cfg.Endpoint.Loopback
 			}
+			st.Endpoint.Listen = lanListeners(cfg)
 			db, err := state.Open(cmd.Context(), cfg.DataDir, log)
 			if err != nil {
 				return err
@@ -116,6 +158,9 @@ func (a *app) statusCmd() *cobra.Command {
 			fmt.Fprintf(a.out, "Data:    %s\n", st.Paths.Data)
 			if st.Endpoint.S3 != "" {
 				fmt.Fprintf(a.out, "S3:      %s\n", st.Endpoint.S3)
+			}
+			for _, l := range st.Endpoint.Listen {
+				fmt.Fprintf(a.out, "LAN:     %s\n", listenerLine(l))
 			}
 			fmt.Fprintf(a.out, "Buckets: %d\n", len(st.Buckets))
 			for _, b := range st.Buckets {

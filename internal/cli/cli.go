@@ -86,6 +86,7 @@ func (a *app) rootCmd() *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
+	root.AddCommand(a.endpointCmd())
 	return root
 }
 
@@ -101,6 +102,12 @@ func (a *app) load(w io.Writer) (*config.Loaded, *slog.Logger, error) {
 	}
 	for _, k := range cfg.Unknown {
 		log.Warn("config key not used by this version", "key", k, "file", cfg.Path)
+	}
+	for _, l := range cfg.Endpoint.Listen {
+		if l.TLS == "off" { // EP-17
+			log.Warn("endpoint.listen with tls = \"off\": request metadata and object contents cross the network unencrypted; only restic and Kopia buckets are protected by the backup tool's own encryption",
+				"listen", l.String())
+		}
 	}
 	return cfg, log, nil
 }

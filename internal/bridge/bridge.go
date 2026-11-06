@@ -1,6 +1,6 @@
 // Package bridge owns every TCP listener in front of the gateway's internal
-// socket (§3.7): the loopback S3 endpoint now (EP-1), the LAN listeners
-// (EP-17) and the tunnel port later. It proxies each request, unbuffered,
+// socket (§3.7): the loopback S3 endpoint (EP-1), the LAN listeners and
+// their TLS certificate (EP-17, SEC-3), and the tunnel port later. It proxies each request, unbuffered,
 // to gw.sock with the Host header and every signed header unchanged, so
 // the client's SigV4 signature still verifies there (Q-G). lendisk never
 // computes a signature.
