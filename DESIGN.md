@@ -1161,19 +1161,68 @@ upstream bucket is Q-V.
     a delete is done if the key is gone. A `PutObject` that reached the
     store but not its row is hashed by reading the object once: the
     only read capture makes of a stored object, and only after a crash.
+  - *While running.* A row whose request ended without completing or
+    removing it (the state database refused the write, or a multipart
+    hash failed) is remembered by the decorator as stranded, and
+    `ResolveStranded` settles it against the store as startup would,
+    every minute (`Gateway.ResolveEvery`) until it succeeds, so a
+    failed request does not leave its row pending until the next start.
+    The list is in memory; after a crash startup settles every pending
+    row anyway.
+  - *Concurrent requests.* Capture writes `lendisk.db` from many
+    requests at once, alongside the replication worker. Write
+    transactions begin `IMMEDIATE` (`_txlock=immediate` in the modernc
+    DSN), so `FinishPut`, which reads the key's latest done row and then
+    writes, holds the write lock from its start and cannot fail with
+    `SQLITE_BUSY_SNAPSHOT` when another connection commits in between
+    (#47); writers wait for the lock up to `busy_timeout`, 30 s, which is
+    a queue of millisecond transactions, never a held lock, since no
+    transaction does I/O other than SQLite's own.
+  - *Same-key ordering.* `seq` is assigned when the row is written,
+    before the store call, so two overlapping writes to one key could
+    reach the store in the other order and leave the key's last done row
+    describing an object that is not on disk (#48). The decorator
+    therefore holds a per-key lock (`keyLocks`, a map of mutexes that
+    exist only while held or awaited) from before a captured request
+    writes its row until the row is done or removed: writes and deletes
+    of one key are applied in `seq` order, and the key's last done row
+    always describes the object on disk. Different keys never wait for
+    each other. `DeleteObjects` takes the locks of all its captured keys
+    in sorted order, so two of them cannot deadlock. restic and Kopia
+    never write one key concurrently, so the lock costs them one
+    uncontended mutex per request. `ResolveStranded` settles a row only
+    if its key's lock is free, and otherwise leaves it for the next
+    round.
   - *Multipart.* There is no single stream to hash, and clients upload
     parts in parallel, so parts are not hashed. The completion writes a
     pending row with the ETag the completion will give the object, the
     store assembles it, and the decorator then reads the finished object
-    once and records its whole-object SHA-256 and size. If the key
-    already holds another object by then (a later write won the race),
-    the row is dropped, since that write has its own. The read is
-    usually served from the page cache, but completing a large upload
-    takes as long as hashing it (decided 2026-11-06: one canonical hash
-    for every object is worth the second read, and replication may then
-    use any part size). A failed read leaves the row pending; a retried
-    completion or the next start finishes it. A retried completion of an
-    upload already done is passed to the store but not queued again.
+    once and records its whole-object SHA-256 and size (decided
+    2026-11-06: one canonical hash for every object is worth the second
+    read, and replication may then use any part size). If the key holds
+    another object by then (it changed outside lendisk), the row is
+    dropped.
+    *The completion answers before the hash finishes* (decided
+    2026-11-06, #49). On a Pi a multi-GB object can take longer to hash
+    than a client's read timeout (the AWS CLI's is 60 s), and a client
+    that times out retries the completion and may report the upload as
+    failed. So the client gets its answer as soon as the store has
+    assembled the object, and the hash runs in the background, still
+    holding the key's lock (same-key ordering above), so a later write of
+    the key waits for it. Nothing is lost by answering first: the pending
+    row was written before the store call, so if the process dies before
+    the hash is recorded, startup finds the object carrying the row's
+    ETag and hashes it (*Startup*); a graceful stop cancels the hash
+    with the same result. A failed read leaves the row stranded for
+    `ResolveStranded`. A `FinishPut` that answers `ErrNotFound` (the row
+    was settled elsewhere) counts as success.
+    *Retried completions.* A completion of an upload that already has a
+    queue row is a client's retry. posix answers it, without changing
+    anything, from the object being assembled or finished, so the
+    decorator passes it to the store without queueing or hashing it, and
+    without waiting for the key's lock, which the first completion may
+    hold while it hashes. A retry that arrives before the first has
+    written its row waits for the key's lock, then finds the row.
   - *Exactly once.* A put whose hash equals the key's latest done row,
     a put, is not queued again (`FinishPut` drops it): this is the
     client's retry after a crash it saw as a failure, and an identical
@@ -1410,8 +1459,13 @@ upstream bucket is Q-V.
   capture replaced or deleted (`state.Superseded`) is cancelled, since
   the store no longer holds its bytes; deletes are always sent, and a
   key or bucket the friend lacks counts as deleted. A put reads
-  `<store>/<bucket>/<key>` from the `posix` store as it sends it; a size
-  other than the row's means a later write is in flight and waits. On
+  `<store>/<bucket>/<key>` from the `posix` store as it sends it. A size
+  other than the row's, or a missing file, while a later capture of the
+  key exists (`state.LaterCapture`) means that write is in flight: the
+  row waits, and is cancelled as superseded once that capture is done
+  (or sent, if it was dropped). With no later capture, the object
+  changed outside lendisk, and the row is `refused` like a `BadDigest`,
+  so it cannot stall the FIFO (#48). On
   acknowledgement the row becomes `acked` with its hash and the place
   `ok`. Nothing is acknowledged before the place answers, so a restart
   of either side sends the head row again whole; the friend stores the

@@ -66,7 +66,13 @@ func open(ctx context.Context, dataDir string, ms []Migration, log *slog.Logger)
 	if err := os.Chmod(path, 0o600); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
+	// Write transactions begin IMMEDIATE: they take the write lock at
+	// BEGIN, waiting up to busy_timeout for it, so a transaction that
+	// reads and then writes cannot fail with SQLITE_BUSY_SNAPSHOT when
+	// another connection commits in between (#47). Every write
+	// transaction is short (no I/O but SQLite's own inside one), so the
+	// timeout is a queue of writers, not a held lock.
+	dsn := "file:" + path + "?_txlock=immediate&_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
 	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

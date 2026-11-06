@@ -64,6 +64,10 @@ func orDefault(d, def time.Duration) time.Duration {
 // bytes in the store.
 var errSuperseded = errors.New("superseded by a later write of the key")
 
+// errChanged: the store's object is not the one the row captured (its
+// size differs, or it is gone).
+var errChanged = errors.New("the store's object is not the captured one")
+
 // Run replicates until ctx ends.
 func (w *Worker) Run(ctx context.Context) {
 	type sender struct {
@@ -198,6 +202,11 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		case errors.Is(err, ErrRejected) && !w.rewriting(ctx, p):
 			w.refuse(log, place, p, row, err, "the store's copy no longer matches the hash taken at capture; not replicated")
 			condition(state.ConditionOK, "")
+		case errors.Is(err, errChanged) && !w.rewriting(ctx, p):
+			// No later capture of the key will supersede the row, so
+			// waiting would stall the FIFO for good (#48).
+			w.refuse(log, place, p, row, err, "the store's object changed outside lendisk since capture; not replicated")
+			condition(state.ConditionOK, "")
 		case errors.Is(err, ErrQuota):
 			log.Warn("replication paused for quota: the friend refuses new objects; retrying later", append(row, "err", err, "retry_in", pause)...)
 			condition(state.ConditionQuota, err.Error())
@@ -250,6 +259,9 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		return fmt.Errorf("key %q does not name a file in the store", p.Key)
 	}
 	f, err := os.Open(filepath.Join(w.StoreDir, p.Bucket, name))
+	if errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: it is gone", errChanged)
+	}
 	if err != nil {
 		return fmt.Errorf("reading the object from the store: %w", err)
 	}
@@ -259,8 +271,9 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		return err
 	}
 	if fi.Size() != p.Size {
-		// A later write is under way; its capture will supersede this row.
-		return fmt.Errorf("the store holds %d bytes, the capture %d", fi.Size(), p.Size)
+		// Usually a later write under way, whose capture will supersede
+		// this row; drain tells the two apart.
+		return fmt.Errorf("%w: the store holds %d bytes, the capture %d", errChanged, fi.Size(), p.Size)
 	}
 	var body io.Reader = f
 	if w.OnRead != nil {

@@ -79,7 +79,8 @@ func newHarnessIn(t *testing.T, dir string, buckets map[string]string) *harness 
 // serve runs the gateway until stop is called or the test ends.
 func (h *harness) serve(noCapture bool) (stop func()) {
 	h.t.Helper()
-	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: quiet, noCapture: noCapture}
+	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: quiet,
+		ResolveEvery: 20 * time.Millisecond, noCapture: noCapture}
 	ctx, cancel := context.WithCancel(context.Background())
 	ready := make(chan struct{})
 	errc := make(chan error, 1)
@@ -116,6 +117,19 @@ func (h *harness) entries(bucket string) []state.Entry {
 		h.t.Fatal(err)
 	}
 	return es
+}
+
+// settled waits until no queue row is pending: a completed upload's row
+// is finished in the background after the client's answer.
+func (h *harness) settled() {
+	h.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for p, _ := h.db.PendingCaptures(context.Background()); len(p) != 0; p, _ = h.db.PendingCaptures(context.Background()) {
+		if time.Now().After(deadline) {
+			h.t.Fatalf("still pending: %+v", p)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 func sum(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }
@@ -217,6 +231,7 @@ func TestCaptureWritesAndDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	h.settled()
 	type row struct{ key, op, class, sha string }
 	var rows []row
 	for _, e := range h.entries("laptop") {

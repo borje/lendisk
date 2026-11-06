@@ -7,7 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/versity/versitygw/s3err"
@@ -34,33 +37,99 @@ func (d *Decorator) ResolvePending(ctx context.Context) (done, dropped int, err 
 		return 0, 0, err
 	}
 	for _, e := range pending {
-		landed, err := d.landed(ctx, e)
+		ok, err := d.resolve(ctx, e)
 		if err != nil {
 			return done, dropped, fmt.Errorf("resolving queue row %d (%s/%s): %w", e.Seq, e.Bucket, e.Key, err)
 		}
-		if !landed {
-			if err := d.DB.DropCaptures(ctx, e.Seq); err != nil {
-				return done, dropped, err
-			}
+		if ok {
+			done++
+		} else {
 			dropped++
-			continue
 		}
-		switch {
-		case e.Op == state.OpDelete:
-			err = d.DB.FinishDelete(ctx, e.Seq)
-		default:
-			var size int64
-			var sum string
-			if size, sum, err = d.hashStored(ctx, e.Bucket, e.Key); err == nil {
-				_, err = d.DB.FinishPut(ctx, e.Seq, size, sum)
-			}
-		}
-		if err != nil {
-			return done, dropped, fmt.Errorf("resolving queue row %d (%s/%s): %w", e.Seq, e.Bucket, e.Key, err)
-		}
-		done++
 	}
 	return done, dropped, nil
+}
+
+// resolve settles one pending row against the store, as ResolvePending
+// does; done is false when the row was removed.
+func (d *Decorator) resolve(ctx context.Context, e state.Entry) (done bool, err error) {
+	landed, err := d.landed(ctx, e)
+	if err != nil {
+		return false, err
+	}
+	if !landed {
+		return false, d.DB.DropCaptures(ctx, e.Seq)
+	}
+	if e.Op == state.OpDelete {
+		return true, d.DB.FinishDelete(ctx, e.Seq)
+	}
+	size, sum, err := d.hashStored(ctx, e.Bucket, e.Key)
+	if err == nil {
+		_, err = d.DB.FinishPut(ctx, e.Seq, size, sum)
+	}
+	return true, err
+}
+
+// strand records rows whose request has ended without completing or
+// removing them (the state database refused the write, or a multipart
+// hash failed). ResolveStranded settles them while the gateway runs,
+// rather than leaving them pending until the next start.
+func (d *Decorator) strand(seqs ...int64) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stranded == nil {
+		d.stranded = map[int64]bool{}
+	}
+	for _, s := range seqs {
+		d.stranded[s] = true
+	}
+}
+
+// ResolveStranded settles the stranded rows (EP-3) as ResolvePending
+// settles a crash's. A row that cannot be settled yet stays stranded for
+// the next call.
+func (d *Decorator) ResolveStranded(ctx context.Context) {
+	d.mu.Lock()
+	seqs := slices.Sorted(maps.Keys(d.stranded))
+	d.mu.Unlock()
+	for _, seq := range seqs {
+		e, ok, err := d.DB.PendingCapture(ctx, seq)
+		if err == nil && ok {
+			// A request writing the key now would race the read of the
+			// store: leave the row for the next call.
+			unlock, free := d.keys.tryLock(e.Bucket, e.Key)
+			if !free {
+				continue
+			}
+			if e, ok, err = d.DB.PendingCapture(ctx, seq); err == nil && ok {
+				_, err = d.resolve(ctx, e)
+			}
+			unlock()
+		}
+		if err != nil {
+			if ctx.Err() == nil {
+				d.Log.Warn("capture: settling a stranded queue row failed; retrying later", "seq", seq, "err", err)
+			}
+			continue
+		}
+		d.mu.Lock()
+		delete(d.stranded, seq)
+		d.mu.Unlock()
+	}
+}
+
+// resolveLoop calls ResolveStranded every interval until ctx ends.
+func (d *Decorator) resolveLoop(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			d.ResolveStranded(ctx)
+		}
+	}
 }
 
 // landed reports whether a pending row's backend call took effect.

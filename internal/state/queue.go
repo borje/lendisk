@@ -193,6 +193,16 @@ func (db *DB) PendingCaptures(ctx context.Context) ([]Entry, error) {
 	return db.entries(ctx, `state = 'pending'`)
 }
 
+// PendingCapture returns row seq if it is still pending; ok is false if
+// it is done or gone.
+func (db *DB) PendingCapture(ctx context.Context, seq int64) (e Entry, ok bool, err error) {
+	es, err := db.entries(ctx, `seq = ? AND state = 'pending'`, seq)
+	if err != nil || len(es) == 0 {
+		return Entry{}, false, err
+	}
+	return es[0], true, nil
+}
+
 // QueueEntries lists a bucket's rows in sequence order.
 func (db *DB) QueueEntries(ctx context.Context, bucket string) ([]Entry, error) {
 	return db.entries(ctx, `bucket = ?`, bucket)
