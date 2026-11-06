@@ -80,7 +80,7 @@ func (a *app) serveCmd() *cobra.Command {
 			defer cancel()
 			errc := make(chan error, 4)
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
-				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock}
+				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
 			select {

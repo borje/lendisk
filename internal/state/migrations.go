@@ -158,4 +158,27 @@ var migrations = []Migration{
 		-- bucket. NULL when the place itself refused (EP-11).
 		ALTER TABLE placement ADD COLUMN cause TEXT;`,
 	},
+	{
+		Version: 10, Compat: 1, Release: "0.1",
+		SQL: `
+		-- What each borrower stores here (LEND-1, SEC-5): bytes of its
+		-- objects and of the parts of its uploads in progress (later plus
+		-- tombstones), moved by every completed write and delete, and set
+		-- from a listing of its buckets when reconciled.
+		CREATE TABLE lent_usage (
+			peer_key      TEXT PRIMARY KEY, -- the borrower's node ID
+			bytes         INTEGER NOT NULL,
+			reconciled_at INTEGER           -- unix seconds; NULL until reconciled
+		);
+		-- A borrower's multipart upload in progress (LEND-4): the hash it
+		-- declared when it began, checked when it completes.
+		CREATE TABLE lent_upload (
+			upload_id  TEXT PRIMARY KEY,
+			peer_key   TEXT NOT NULL,    -- the borrower's node ID
+			sealed     TEXT NOT NULL,    -- the bucket's sealed name
+			key        TEXT NOT NULL,
+			sha256     TEXT NOT NULL,    -- hex, x-amz-meta-lendisk-sha256
+			created_at INTEGER NOT NULL  -- unix seconds
+		);`,
+	},
 }

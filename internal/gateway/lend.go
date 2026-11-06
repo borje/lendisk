@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -14,8 +16,10 @@ import (
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 
+	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/store"
 )
 
 // LentPrefix begins the store name of every bucket a borrower keeps here.
@@ -51,12 +55,30 @@ func borrowerOf(access string) (identity.NodeID, bool) {
 // passing a borrower's sealed name through unmapped. For a borrower,
 // calls that would weaken the ownership wall (ACLs, policies, ownership
 // controls, bucket owner), copies (their source names a bucket in a
-// string) and DeleteBucket are refused; the NET-7 allow-list in the gate
+// string), DeleteBucket and DeleteObjects are refused; the NET-7 allow-list in the gate
 // (#15) narrows the rest.
+//
+// For a borrower it also enforces quota, the free-space floor, object
+// integrity and key names on every write (quota.go: LEND-1, LEND-2,
+// LEND-4, SEC-5).
 type Lending struct {
 	Next backend.Backend
 	DB   *state.DB
 	Now  func() time.Time
+	// Uploads reads which upload assembled a stored object (#62), to
+	// tell a retried completion.
+	Uploads UploadIDs
+	// StoreDir, Floor and Statfs give the free-space floor (LEND-2): a
+	// nil Floor is DefaultFloor, a nil Statfs the real filesystem's.
+	StoreDir string
+	Floor    *config.Floor
+	Statfs   func(dir string) (store.Space, error)
+	Log      *slog.Logger
+
+	keys     keyLocks // one multipart create, completion or delete per borrower's key at a time
+	mu       sync.Mutex
+	peers    map[string]*borrowerUse
+	reserved int64 // admitted bytes of every borrower's writes in flight
 }
 
 var (
@@ -186,7 +208,8 @@ func (l *Lending) GetBucketAcl(ctx context.Context, in *s3.GetBucketAclInput) ([
 // CreateBucket creates a borrower's bucket under its store name, private
 // and owned by the borrower's account alone, and records it in the
 // mapping table (PEER-2, PEER-8). The name sent must be a sealed name.
-// A retry finds the bucket already its own and records it.
+// A new bucket is admitted like a write (admitBucket). A retry finds
+// the bucket already its own and records it.
 func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, acl []byte) error {
 	peer, ok := borrower(ctx)
 	if !ok {
@@ -196,6 +219,9 @@ func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, ac
 		return errNotSealed
 	}
 	sealed, stored := *in.Bucket, LentName(peer, *in.Bucket)
+	if err := l.admitBucket(ctx, peer.String(), sealed); err != nil {
+		return err
+	}
 	own, err := json.Marshal(auth.ACL{Owner: peer.String()})
 	if err != nil {
 		return errInternal
@@ -233,7 +259,8 @@ func (l *Lending) PutBucketAcl(ctx context.Context, bucket string, data []byte) 
 }
 
 // DeleteBucket is refused to a borrower: its row in the mapping table and
-// the quota count go with it, which is not built (#15, #16).
+// its bytes in the quota count would have to go with it, which is not
+// built (#15).
 func (l *Lending) DeleteBucket(ctx context.Context, bucket string) error {
 	if refused(ctx) {
 		return errNotForBorrower
@@ -354,8 +381,14 @@ func (l *Lending) CreateMultipartUpload(ctx context.Context, in s3response.Creat
 	if err != nil {
 		return s3response.InitiateMultipartUploadResult{}, err
 	}
+	sealed := deref(in.Bucket)
 	in.Bucket = b
-	res, err := l.Next.CreateMultipartUpload(ctx, in)
+	var res s3response.InitiateMultipartUploadResult
+	if peer, ok := borrower(ctx); ok {
+		res, err = l.createUploadLent(ctx, peer.String(), sealed, in)
+	} else {
+		res, err = l.Next.CreateMultipartUpload(ctx, in)
+	}
 	res.Bucket = sealedOf(ctx, res.Bucket)
 	return res, err
 }
@@ -367,7 +400,13 @@ func (l *Lending) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMu
 	}
 	c := *in
 	c.Bucket = b
-	res, ver, err := l.Next.CompleteMultipartUpload(ctx, &c)
+	var res s3response.CompleteMultipartUploadResult
+	var ver string
+	if peer, ok := borrower(ctx); ok {
+		res, ver, err = l.completeLent(ctx, peer.String(), deref(in.Bucket), &c)
+	} else {
+		res, ver, err = l.Next.CompleteMultipartUpload(ctx, &c)
+	}
 	res.Bucket = sealedPtr(ctx, res.Bucket)
 	return res, ver, err
 }
@@ -379,6 +418,9 @@ func (l *Lending) AbortMultipartUpload(ctx context.Context, in *s3.AbortMultipar
 	}
 	c := *in
 	c.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		return l.abortLent(ctx, peer.String(), &c)
+	}
 	return l.Next.AbortMultipartUpload(ctx, &c)
 }
 
@@ -413,6 +455,9 @@ func (l *Lending) UploadPart(ctx context.Context, in *s3.UploadPartInput) (*s3.U
 	}
 	c := *in
 	c.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		return l.uploadPartLent(ctx, peer.String(), deref(in.Bucket), &c)
+	}
 	return l.Next.UploadPart(ctx, &c)
 }
 
@@ -431,6 +476,9 @@ func (l *Lending) PutObject(ctx context.Context, in s3response.PutObjectInput) (
 		return s3response.PutObjectOutput{}, err
 	}
 	in.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		return l.putLent(ctx, peer.String(), in)
+	}
 	return l.Next.PutObject(ctx, in)
 }
 
@@ -513,10 +561,18 @@ func (l *Lending) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput) (*
 	}
 	c := *in
 	c.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		return l.deleteLent(ctx, peer.String(), &c)
+	}
 	return l.Next.DeleteObject(ctx, &c)
 }
 
+// DeleteObjects is refused to a borrower (NET-7): each delete is one
+// DeleteObject, so the counter and, later, tombstones see each.
 func (l *Lending) DeleteObjects(ctx context.Context, in *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
+	if refused(ctx) {
+		return s3response.DeleteResult{}, errNotForBorrower
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.DeleteResult{}, err

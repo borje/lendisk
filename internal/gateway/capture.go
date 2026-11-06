@@ -29,9 +29,10 @@ const MetaCapture = "lendisk-capture"
 
 // Decorator wraps the store's backend (D4). It captures every successful
 // write and delete of an own bucket's key into the replication queue
-// (EP-2, EP-3), classified by the bucket's tool profile (EP-7); quota
-// (#16) and tombstones (#17) are added as further overriding methods.
-// Buckets that are not the node's own (lent-*) pass through.
+// (EP-2, EP-3), classified by the bucket's tool profile (EP-7);
+// tombstones (#17) are added as further overriding methods. Buckets that
+// are not the node's own (lent-*) pass through: a borrower's writes are
+// policed above, by Lending (quota.go).
 //
 // Capture is a pending row written before the backend call, marked done
 // with the SHA-256 taken from the request stream as it passes (REPL-10),
@@ -612,6 +613,9 @@ type hashReader struct {
 	r io.Reader
 	h hash.Hash
 	n int64
+	// atEOF, if set, may fail the read that ends the stream, so the
+	// store does not publish it (LEND-4).
+	atEOF func(*hashReader) error
 }
 
 func (h *hashReader) Read(p []byte) (int, error) {
@@ -619,6 +623,11 @@ func (h *hashReader) Read(p []byte) (int, error) {
 	if n > 0 {
 		h.h.Write(p[:n])
 		h.n += int64(n)
+	}
+	if err == io.EOF && h.atEOF != nil {
+		if e := h.atEOF(h); e != nil {
+			return n, e
+		}
 	}
 	return n, err
 }

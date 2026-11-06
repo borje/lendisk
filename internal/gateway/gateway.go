@@ -3,7 +3,9 @@
 // store, with lendisk's gate in front of its routing, lendisk's IAM service
 // for credentials and lendisk's decorator around the backend. The
 // decorator's outer layer (Lending) maps a borrower's sealed bucket names
-// to its lent-<id16>-<sealed> buckets (PEER-8, SEC-16); its inner layer
+// to its lent-<id16>-<sealed> buckets (PEER-8, SEC-16) and enforces quota,
+// the free-space floor, object hashes and key names on a borrower's
+// writes (LEND-1, LEND-2, LEND-4, SEC-5); its inner layer
 // captures every write and delete of an own bucket into the replication
 // queue (EP-2, EP-3, EP-7, REPL-3, REPL-10). A friend's node ID is an
 // account whose secret is derived per pair (NET-7a).
@@ -38,9 +40,11 @@ import (
 	"github.com/versity/versitygw/embedgw"
 	"github.com/versity/versitygw/s3api"
 
+	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/store"
 	"github.com/borje/lendisk/internal/version"
 )
 
@@ -77,6 +81,16 @@ type Gateway struct {
 	// ResolveEvery is how often rows a failed request left pending are
 	// settled while serving (default a minute).
 	ResolveEvery time.Duration
+	// Floor is the store's free-space floor for borrowers' writes
+	// (LEND-2); nil is DefaultFloor. Statfs reads the store's
+	// filesystem; nil is the real one. Tests set it.
+	Floor  *config.Floor
+	Statfs func(dir string) (store.Space, error)
+	// ReconcileEvery is how often borrowers' usage counters are checked
+	// for their daily reconcile (default an hour).
+	ReconcileEvery time.Duration
+
+	lending *Lending // once Run has built it; tests only
 
 	noCapture bool // tests: the decorator passes everything through
 }
@@ -147,8 +161,19 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		go func() { defer close(resolved); dec.resolveLoop(rctx, every) }()
 		defer func() { cancel(); <-resolved }()
 	}
+	lend := &Lending{Next: dec, DB: g.DB, Uploads: be, StoreDir: g.StoreDir, Floor: g.Floor, Statfs: g.Statfs, Log: g.Log}
+	g.lending = lend
+	if g.DB != nil {
+		every := g.ReconcileEvery
+		if every <= 0 {
+			every = time.Hour
+		}
+		rctx, cancel := context.WithCancel(ctx)
+		reconciled := make(chan struct{})
+		go func() { defer close(reconciled); lend.reconcileLoop(rctx, every) }()
+		defer func() { cancel(); <-reconciled }()
+	}
 	errc := make(chan error, 1)
-	lend := &Lending{Next: dec, DB: g.DB}
 	go func() { errc <- embedgw.RunVersityGW(ctx, lend, cfg) }()
 	// waitForSocket drains errc whenever it returns early, so versitygw
 	// never outlives Run (only one may run per process).
