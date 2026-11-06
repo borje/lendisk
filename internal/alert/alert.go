@@ -443,7 +443,9 @@ func CheckCommand(command string) error {
 
 func executable(path string) bool {
 	fi, err := os.Stat(path)
-	return err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0
+	// Access checks execute permission for the daemon's own user, not
+	// just that some execute bit is set.
+	return err == nil && fi.Mode().IsRegular() && syscall.Access(path, 0x1 /* X_OK */) == nil
 }
 
 // waitDelay is how long RunCommand waits for the hook's output pipes

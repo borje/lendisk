@@ -159,7 +159,7 @@ type Tunnel struct {
 type Alerts struct {
 	Command          string `toml:"command" help:"absolute path of one executable program, run for each alert with a JSON object on stdin, without a shell or arguments (put arguments in a small script); its output is logged when it fails (OPS-3); empty for none"`
 	Webhook          string `toml:"webhook" help:"http or https URL each alert's JSON is POSTed to, redirects not followed (OPS-3); may hold a secret, never logged in full; empty for none"`
-	UnreachableAfter string `toml:"unreachable_after" default:"24h" help:"alert when a friend has not answered for this long (OPS-2), such as 24h or 90m"`
+	UnreachableAfter string `toml:"unreachable_after" default:"24h" help:"alert when a friend has not answered for this long and has been retried for at least an hour (OPS-2), such as 24h or 90m"`
 }
 
 // UnreachableAfter is alerts.unreachable_after, which Validate checked.

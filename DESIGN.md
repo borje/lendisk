@@ -2191,9 +2191,9 @@ capture decorator, so nothing stands between that and posix (#62).
     and `now − since ≥ alert.Service.MinRetrying` (1 hour), and
     `now − last_ok ≥ alerts.unreachable_after` (24h), using `since`
     when `last_ok` is unset (it never answered). A friend that went off
-    at t0, tried next by a backup at t0+20h, is alerted at t0+24h (at
-    t0+21h at the earliest, when the hour of retrying is what is
-    missing). The hour keeps a nightly backup that meets a one-minute
+    at t0, tried next by a backup at t0+20h, is alerted at t0+24h; one
+    tried next at t0+23h30m is alerted at t0+24h30m, when it has been
+    retrying for the hour. The hour keeps a nightly backup that meets a one-minute
     blip 24h after the last answer from alerting at once, since
     reachability is learned only from replication attempts. So a friend
     with nothing queued is not judged until the periodic reachability

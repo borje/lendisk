@@ -70,7 +70,7 @@ bjorn = "8M"                 # REPL-7: Björn is relayed through DERP; be gentle
 #   #!/bin/sh
 #   exec curl -fsS -H 'Title: lendisk alert' --data-binary @- https://ntfy.sh/your-topic
 # command = "/etc/lendisk/hooks/ntfy.sh"
-webhook = "https://hc-ping.com/your-uuid" # OPS-3: healthchecks.io style
+# webhook = "https://hc-ping.com/your-uuid" # OPS-3: healthchecks.io style
 unreachable_after = "24h"                 # OPS-2: the default
 
 [log]

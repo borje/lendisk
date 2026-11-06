@@ -49,7 +49,7 @@ upload_limit = "50M"
 schedule     = "always"
 
 [alerts]
-webhook = "https://hc-ping.com/your-uuid"
+# webhook = "https://hc-ping.com/your-uuid"
 
 [log]
 level = "info"
