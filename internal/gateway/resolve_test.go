@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -130,6 +131,8 @@ func TestRetryWhileTheResolverHashesAStrandedUploadDoesNotWait(t *testing.T) {
 		t.Fatalf("the retry waited for the key's lock %q while the resolver hashed", name)
 	case <-resolved:
 		t.Fatal("the resolver finished before its hash was released")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the retried completion did not answer")
 	}
 	close(be.release)
 	within(t, "the resolver", resolved)
@@ -205,9 +208,11 @@ func TestUnreadableUploadIDLeavesTheRowPendingAndReported(t *testing.T) {
 	if !strings.Contains(logs.String(), "cannot be matched") {
 		t.Fatalf("not reported; log:\n%s", logs)
 	}
+	// Retried every round, but reported once per row while the daemon runs.
 	d.ResolveStranded(ctx)
-	if len(d.stranded) != 1 || !strings.Contains(logs.String(), "settling a stranded queue row failed") {
-		t.Fatalf("stranded %v; log:\n%s", d.stranded, logs)
+	d.ResolveStranded(ctx)
+	if len(d.stranded) != 1 || strings.Count(logs.String(), "level=WARN") != 1 {
+		t.Fatalf("stranded %v; want one warning, log:\n%s", d.stranded, logs)
 	}
 	if err := syscall.Setxattr(path, attr, good, 0); err != nil {
 		t.Fatal(err)
@@ -231,26 +236,121 @@ func TestNoUploadIDSourceIsReportedNotADrop(t *testing.T) {
 	}
 }
 
-// EP-3 (#62): an object that lost its upload-ID attribute but has the
-// row's ETag holds the bytes the row's parts give: the row is settled
-// done and the missing attribute logged, not silently dropped.
-func TestMissingUploadIDWithTheRowsETagIsSettledAndReported(t *testing.T) {
-	h, d, _, store, _, body, logs := strandedUpload(t)
+// stripXattrs removes every user.* attribute from path, as copying a
+// store without extended attributes does.
+func stripXattrs(t *testing.T, path string) {
+	t.Helper()
+	buf := make([]byte, 64<<10)
+	n, err := syscall.Listxattr(path, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range strings.Split(string(buf[:n]), "\x00") {
+		if strings.HasPrefix(name, "user.") {
+			if err := syscall.Removexattr(path, name); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// assertLeftAndReported runs startup and checks that it left the
+// upload's row pending and stranded (neither done nor dropped) and
+// logged that the object has no upload ID.
+func assertLeftAndReported(t *testing.T, h *harness, d *Decorator, logs *logBuffer) {
+	t.Helper()
 	ctx := context.Background()
+	d.stranded = nil // as after a restart
+	if done, dropped, err := d.ResolvePending(ctx); err != nil || done != 0 || dropped != 0 {
+		t.Fatalf("startup settled %d done, %d dropped (%v); want the row left", done, dropped, err)
+	}
+	if p, _ := h.db.PendingCaptures(ctx); len(p) != 1 || !d.stranded[p[0].Seq] {
+		t.Fatalf("pending %+v, stranded %v; want the row pending and stranded", p, d.stranded)
+	}
+	if !strings.Contains(logs.String(), "cannot be matched") || !strings.Contains(logs.String(), "no upload ID") {
+		t.Fatalf("not reported; log:\n%s", logs)
+	}
+}
+
+// EP-3 (#62): a landed upload's object whose attributes are all gone
+// (a store copied without extended attributes: no upload ID, and posix
+// reports no ETag) is reported and its row kept pending, never dropped
+// silently.
+func TestObjectWithNoAttributesKeepsTheUploadsRowAndReportsIt(t *testing.T) {
+	h, d, _, _, _, _, logs := strandedUpload(t)
+	stripXattrs(t, objectPath(h, "big"))
+	assertLeftAndReported(t, h, d, logs)
+}
+
+// EP-3 (#62): a multipart object that lost only its upload ID is not
+// taken as the row's upload by its ETag, which an upload of the same
+// parts would also give: the row is reported and kept pending.
+func TestMissingUploadIDIsReportedNotSettledByETag(t *testing.T) {
+	h, d, _, store, _, _, logs := strandedUpload(t)
 	if err := syscall.Removexattr(objectPath(h, "big"), "user."+mpMetaAttr); err != nil {
 		t.Fatal(err)
 	}
 	if id, err := store.UploadID("files", "big"); err != nil || id != "" {
 		t.Fatalf("upload ID %q (%v) after removing it", id, err)
 	}
+	assertLeftAndReported(t, h, d, logs)
+}
+
+// EP-3 (#62): a retried completion of an upload that never landed, with
+// the same parts as the landed object that lost its upload ID, is not
+// answered from the store by the matching ETag: posix would assemble it
+// with no row describing it.
+func TestRetryOfAnUnlandedUploadIsNotAnsweredByAMatchingETag(t *testing.T) {
+	h, d, _, store, _, _, _ := strandedUpload(t)
+	ctx := context.Background()
+	d.ResolveStranded(ctx)                         // the landed upload's row is done
+	_, second, _ := twoPartUpload(t, store, "big") // the same part as the landed upload
+	etag, err := backend.ComputeMultipartETagFromPartETags(*second.UploadId, second.MultipartUpload.Parts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if es := h.entries("files"); len(es) != 1 || strings.Trim(es[0].ETag, `"`) != strings.Trim(etag, `"`) {
+		t.Fatalf("queue %+v; want one row with the second upload's ETag %s", es, etag)
+	}
+	seqs, err := h.db.BeginCaptures(ctx, []state.Capture{{Bucket: "files", Key: "big", Op: state.OpPut,
+		Class: "data", ETag: etag, UploadID: *second.UploadId}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.strand(seqs[0]) // its first completion never reached the store
+	if err := syscall.Removexattr(objectPath(h, "big"), "user."+mpMetaAttr); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := d.CompleteMultipartUpload(ctx, second); err == nil {
+		t.Error("the retry was answered")
+	}
+	if id, _ := store.UploadID("files", "big"); id == *second.UploadId {
+		t.Fatal("the store assembled the retried upload without a row")
+	}
+	if p, _ := h.db.PendingCaptures(ctx); len(p) != 1 {
+		t.Fatalf("pending %+v; want the retried upload's row kept", p)
+	}
+}
+
+// EP-3 (#62): a stranded upload's key overwritten since by a PutObject
+// (no upload ID, a plain ETag) did not take the upload: the row is
+// removed.
+func TestStrandedUploadOverwrittenByAPutIsDropped(t *testing.T) {
+	h, d, _, store, _, _, _ := strandedUpload(t)
+	ctx := context.Background()
+	data := []byte("replaced")
+	n := int64(len(data))
+	if _, err := store.PutObject(ctx, s3response.PutObjectInput{Bucket: aws.String("files"),
+		Key: aws.String("big"), ContentLength: &n, Body: bytes.NewReader(data)}); err != nil {
+		t.Fatal(err)
+	}
 	d.stranded = nil
-	if done, dropped, err := d.ResolvePending(ctx); err != nil || done != 1 || dropped != 0 {
-		t.Fatalf("startup settled %d done, %d dropped (%v); want the row done", done, dropped, err)
+	if done, dropped, err := d.ResolvePending(ctx); err != nil || done != 0 || dropped != 1 {
+		t.Fatalf("startup settled %d done, %d dropped (%v); want the row dropped", done, dropped, err)
 	}
-	if !strings.Contains(logs.String(), "no upload ID") {
-		t.Fatalf("not reported; log:\n%s", logs)
+	if p, _ := h.db.PendingCaptures(ctx); len(p) != 0 {
+		t.Fatalf("pending %+v", p)
 	}
-	assertOneDoneRow(t, h, store, "big", body)
 }
 
 // EP-3 (#62): hashing a stored object stops when its context ends,
