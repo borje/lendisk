@@ -715,8 +715,9 @@ func reroutePass(t *testing.T, p *pool) (moved, dropped int64) {
 }
 
 // §3.4 (#19 final review): a re-routing pass over 3000 waiting rows in
-// a bucket of 1200 metadata objects takes well under a second, so it
-// never keeps captures waiting on the write lock past busy_timeout.
+// a bucket of 1200 metadata objects is fast (tens of milliseconds;
+// passLimit, 2 s or 5 s under the race detector, keeps CI stable), so
+// it never keeps captures waiting on the write lock past busy_timeout.
 // Only a few rows find room; the rest wait at the unreachable friend.
 func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
 	p := newPool(t)
@@ -899,4 +900,53 @@ func TestRerouteChoosesTheLargestFreeFractionExactly(t *testing.T) {
 		}
 		p.wantPlaces("data/1", s, "C")
 	}
+}
+
+// §3.4 (#19 review of fb6ed1f): an object waiting at two unreachable
+// friends with one friend with room moves there once: its other copy
+// stays queued, and the next pass does not fail.
+func TestRerouteMovesAnObjectToAFriendOnce(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("A", 10)
+	p.friend("B", 10)
+	p.bucket("x", 2)
+	s := p.put("x", "data/1", "data", 1)
+	p.wantPlaces("data/1", s, "A", "B")
+	p.friend("X", 10) // joins after: the only friend with room
+	p.condition("A", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	for pass := range 2 {
+		moved, dropped, err := p.db.Reroute(ctx, nil, nil)
+		if err != nil {
+			t.Fatalf("pass %d: %v", pass, err)
+		}
+		if want := int64(1 - pass); moved != want || dropped != 0 {
+			t.Fatalf("pass %d: moved %d dropped %d, want %d moved", pass, moved, dropped, want)
+		}
+	}
+	p.wantPlaces("data/1", s, "B", "X")
+}
+
+// D6 (#19 review of fb6ed1f): a quota past what room arithmetic holds
+// (hundredths of a byte in 64 bits) counts as MaxQuota, never wraps:
+// such a friend is the emptiest, for placement and for re-routing.
+func TestAHugeQuotaDoesNotOverflow(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("S", 10)
+	p.bucket("x", 1)
+	s := p.put("x", "data/1", "data", 1)
+	p.wantPlaces("data/1", s, "S")
+	if err := p.db.AddFriendship(ctx, Friendship{Peer: "H", Address: "tcH", OwnNumber: 1 << 62, PeerNumber: 1 << 62,
+		CreatedAt: p.now}); err != nil {
+		t.Fatal(err)
+	}
+	d := p.put("x", "data/2", "data", 1)
+	p.wantPlaces("data/2", d, "H")
+	p.condition("S", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	if moved, _, err := p.db.Reroute(ctx, nil, nil); err != nil || moved != 1 {
+		t.Fatalf("moved %d %v", moved, err)
+	}
+	p.wantPlaces("data/1", s, "H")
 }

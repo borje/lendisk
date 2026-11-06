@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/bits"
 	"slices"
 	"strconv"
@@ -53,15 +54,33 @@ func liveMetadata(ctx context.Context, q querier) (int64, error) {
 // reserve's percentage of the quota is exact and fractions that should
 // tie do tie.
 
+// MaxQuota is the most bytes room arithmetic counts: a friendship quota,
+// use or size above it counts as MaxQuota (32 PiB), so room in
+// hundredths of a byte, and the products byFraction compares, never
+// overflow.
+const MaxQuota = 1 << 55
+
+// capped is n within [-MaxQuota, MaxQuota].
+func capped(n int64) int64 { return min(max(n, -MaxQuota), MaxQuota) }
+
 // freeRoom is the room for data, in hundredths of a byte, at a friend of
-// quota bytes holding use and with unsent bytes of a bucket's metadata
-// still to come, less the metadata reserve: the larger of
-// MetadataReserveFactor times live (liveMetadata) and
-// MetadataReservePercent of the quota. Metadata placement ignores the
-// reserve: metadata may use it.
+// quota bytes holding use and with unsent more bytes to come (a bucket's
+// metadata not yet sent there, and what a pass moved there), less the
+// metadata reserve: the larger of MetadataReserveFactor times live
+// (liveMetadata) and MetadataReservePercent of the quota. Metadata
+// placement ignores the reserve: metadata may use it. Every input counts
+// at most MaxQuota, and a deficit of more than MaxQuota counts as
+// MaxQuota: |result| stays within 200 × MaxQuota.
 func freeRoom(quota, use, unsent, live int64) int64 {
-	return 100*(quota-use-unsent) - max(100*MetadataReserveFactor*live, MetadataReservePercent*quota)
+	quota = capped(quota)
+	d := max(quota-capped(use)-capped(unsent), -MaxQuota)
+	reserve := max(100*MetadataReserveFactor*min(capped(live), MaxQuota/MetadataReserveFactor), MetadataReservePercent*quota)
+	return 100*d - reserve
 }
+
+// fits reports whether an object that counts need bytes fits in free
+// hundredths of a byte.
+func fits(free, need int64) bool { return free >= 100*capped(need) }
 
 // byFraction orders candidates by largest free fraction (free ÷ quota,
 // free in hundredths of a byte, quota above 0), compared exactly, then by
@@ -224,10 +243,10 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 			return nil, err
 		}
 		free := freeRoom(p.quota, p.use, meta, live)
-		if free < 100*need {
+		if !fits(free, need) {
 			continue
 		}
-		cs = append(cs, cand{p.peer, !p.unreachable(db, now), free, p.quota})
+		cs = append(cs, cand{p.peer, !p.unreachable(db, now), free, capped(p.quota)})
 	}
 	slices.SortStableFunc(cs, func(a, b cand) int {
 		if a.reachable != b.reachable {
@@ -411,10 +430,14 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 // metadata reserve), with what the pass's moves of every bucket take
 // from it, and each bucket's unsent metadata there taken off when a row
 // of that bucket looks at it, so moves of several buckets fill a friend
-// once. It applies the moves in short write transactions, each under lock when lock is set. A row is applied only
-// if it is still queued there and sending(place, seq) is false under the
-// lock: its send may land, and the place's row must be there to record
-// it, or no delete would reach the copy.
+// once. A row never goes to a friend that holds the object, nor to one
+// this pass already sent another copy of it to. It applies the moves in
+// short write transactions, each under lock when lock is set. A row is
+// applied only if it is still queued there and sending(place, seq) is
+// false under the lock: its send may land, and the place's row must be
+// there to record it, or no delete would reach the copy. A batch that
+// fails is rolled back and the pass goes on with the next: the errors
+// are returned together with what the other batches did.
 func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64) bool, lock sync.Locker) (moved, dropped int64, err error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
@@ -426,21 +449,20 @@ func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64)
 		return 0, 0, err
 	}
 	// The friends that could take a copy, in node ID order: reachable,
-	// with room before any bucket's unsent metadata (base, in hundredths
-	// of a byte) less what this pass's moves took. A friend without room
+	// with room less what this pass's moves took. A friend without room
 	// for one more object leaves the list.
 	type target struct {
-		peer        string
-		quota, base int64
-		taken       int64 // bytes this pass moved there
+		peer       string
+		quota, use int64
+		taken      int64 // bytes this pass moved there
 	}
 	var targets []*target
 	for _, p := range ps {
 		if p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) || p.unreachable(db, now) {
 			continue
 		}
-		if base := freeRoom(p.quota, p.use, 0, live); base >= 100*ObjectOverhead {
-			targets = append(targets, &target{peer: p.peer, quota: p.quota, base: base})
+		if fits(freeRoom(p.quota, p.use, 0, live), ObjectOverhead) {
+			targets = append(targets, &target{peer: p.peer, quota: capped(p.quota), use: p.use})
 		}
 	}
 	unsent := map[[2]string]int64{} // bucket, place -> unsentMetadata
@@ -454,8 +476,9 @@ func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64)
 			}
 			unsent[k] = meta
 		}
-		return t.base - 100*(meta+t.taken), nil
+		return freeRoom(t.quota, t.use, capped(meta)+capped(t.taken), live), nil
 	}
+	sentTo := map[int64][]string{} // seq -> friends this pass moved a copy of it to
 	var ops []rerouteOp
 	for _, p := range ps {
 		if !p.reroutable(db, now) {
@@ -473,14 +496,14 @@ func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64)
 			var to *target
 			var toFree int64
 			for _, t := range targets {
-				if slices.Contains(r.holders, t.peer) {
+				if slices.Contains(r.holders, t.peer) || slices.Contains(sentTo[r.seq], t.peer) {
 					continue
 				}
 				free, err := room(t, r.bucket)
 				if err != nil {
 					return 0, 0, err
 				}
-				if free < 100*r.need {
+				if !fits(free, r.need) {
 					continue
 				}
 				if to == nil || byFraction(t.peer, free, t.quota, to.peer, toFree, to.quota) < 0 {
@@ -489,26 +512,28 @@ func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64)
 			}
 			switch {
 			case to != nil:
-				to.taken += r.need
-				if to.base-100*to.taken < 100*ObjectOverhead {
+				to.taken = capped(to.taken + r.need)
+				if !fits(freeRoom(to.quota, to.use, to.taken, live), ObjectOverhead) {
 					targets = slices.DeleteFunc(targets, func(t *target) bool { return t == to })
 				}
+				sentTo[r.seq] = append(sentTo[r.seq], to.peer)
 				ops = append(ops, rerouteOp{from: p.peer, seq: r.seq, to: to.peer})
 			case gone || full && r.barrier:
 				ops = append(ops, rerouteOp{from: p.peer, seq: r.seq})
 			}
 		}
 	}
-	for len(ops) > 0 {
+	var errs []error
+	for len(ops) > 0 && ctx.Err() == nil {
 		n := min(len(ops), 64)
-		m, d, err := db.applyReroute(ctx, ops[:n], sending, lock)
-		moved, dropped = moved+m, dropped+d
-		if err != nil {
-			return moved, dropped, err
+		if m, d, err := db.applyReroute(ctx, ops[:n], sending, lock); err != nil {
+			errs = append(errs, fmt.Errorf("re-routing rows %d to %d: %w", ops[0].seq, ops[n-1].seq, err))
+		} else {
+			moved, dropped = moved+m, dropped+d
 		}
 		ops = ops[n:]
 	}
-	return moved, dropped, nil
+	return moved, dropped, errors.Join(append(errs, ctx.Err())...)
 }
 
 // rerouteOp moves row seq from one place to another, or drops it there

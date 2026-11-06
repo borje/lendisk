@@ -1489,7 +1489,9 @@ upstream bucket is Q-V.
     free fraction (free ÷ quota), compared exactly, ties by node ID
     (`state.byFraction`, a total order; room is counted in hundredths
     of a byte, so the reserve's 1% of a quota is exact and equal
-    fractions tie). Free capacity is the
+    fractions tie; a quota, use or size above `state.MaxQuota`, 32
+    PiB, counts as 32 PiB, so that arithmetic never overflows 64
+    bits). Free capacity is the
     friendship's quota less the borrower's count of the place's use
     (below) less the bucket's live metadata with no row at that place
     (a friend added later, which re-placement, #26, fills) less the
@@ -1695,12 +1697,17 @@ upstream bucket is Q-V.
   of several buckets fill a friend once. Friends are scanned in node ID
   order and compared exactly, so the choice does not depend on the
   order of a map; a friend with no room for one more object leaves the
-  candidates, so the remaining rows cost nothing.
+  candidates, so the remaining rows cost nothing. A row never goes
+  to a friend that holds the object, nor to one this pass already gave
+  another copy of it (an object waiting at two unreachable friends, with
+  one friend with room, moves there once; its other copy waits).
   It then applies the moves in write transactions of at most 64 rows,
   each under the worker's lock, re-checking that each row is still
   queued and not being sent, so captures never wait behind a long pass
   (3000 waiting rows in a bucket of 1200 metadata objects take tens of
-  milliseconds). With no reachable friend with room the row waits at
+  milliseconds). A batch that fails is rolled back and the pass goes on
+  with the next, returning the errors with what the others did, so one
+  bad row cannot stop re-routing for the node. With no reachable friend with room the row waits at
   its friend, and the lag shows in `status`. *Decision (#19,
   review):* the row is dropped instead of waiting (state `dropped`:
   out of the FIFO, not counted in `place_use`) when its friend is gone
