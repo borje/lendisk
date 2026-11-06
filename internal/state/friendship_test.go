@@ -43,19 +43,114 @@ func TestRedeemInviteOnceOnly(t *testing.T) {
 		stored.PeerRetention != 60*24*time.Hour || !stored.CreatedAt.Equal(now) {
 		t.Fatalf("stored %+v", stored)
 	}
-	if r, _ := db.PeerRole(ctx, "ik", now); r != RoleNone {
-		t.Fatalf("used invite key still has role %q", r)
-	}
 
-	// Replay, as the same friend or another node.
-	for _, peer := range []string{"bob", "carol"} {
-		f.Peer = peer
-		if _, err := db.RedeemInvite(ctx, "ik", f, now); !errors.Is(err, ErrInviteSpent) {
-			t.Fatalf("replay as %s: %v", peer, err)
-		}
+	// Replay by another node.
+	f.Peer = "carol"
+	if _, err := db.RedeemInvite(ctx, "ik", f, now); !errors.Is(err, ErrInviteSpent) {
+		t.Fatalf("replay as carol: %v", err)
 	}
 	if _, err := db.GetFriendship(ctx, "carol"); !errors.Is(err, ErrNotFound) {
 		t.Fatal("a replayed invite created a friendship")
+	}
+}
+
+// PEER-2 retry (#51): the node that redeemed an invite may redeem it
+// again until it expires, and gets the same terms; its reported number
+// and retention are applied. The invite key keeps the invite role for
+// that retry only while the friendship stands, and loses it at expiry.
+func TestRedeemRetryBySameFriendAnswersSameTerms(t *testing.T) {
+	ctx := context.Background()
+	db := openPeers(t)
+	now := time.Unix(1_800_000_000, 0)
+	exp := now.Add(time.Hour)
+	if err := db.AddInvite(ctx, Invite{Key: "ik", Number: 80 << 30, Retention: 30 * 24 * time.Hour, ExpiresAt: exp}); err != nil {
+		t.Fatal(err)
+	}
+	f := Friendship{Peer: "bob", Address: "tcbob", PeerNumber: 100 << 30, PeerRetention: 60 * 24 * time.Hour}
+	first, err := db.RedeemInvite(ctx, "ik", f, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := db.PeerRole(ctx, "ik", now); r != RoleInvite {
+		t.Fatalf("redeemed invite key has role %q; the redeemer cannot retry", r)
+	}
+	again, err := db.RedeemInvite(ctx, "ik", f, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("retry by the redeemer: %v", err)
+	}
+	if again.OwnNumber != first.OwnNumber || again.OwnRetention != first.OwnRetention || !again.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("retry answered %+v, first %+v", again, first)
+	}
+	// A retry carrying another number is the last report: applied.
+	f.PeerNumber = 50 << 30
+	if got, err := db.RedeemInvite(ctx, "ik", f, now.Add(2*time.Minute)); err != nil || got.PeerNumber != 50<<30 {
+		t.Fatalf("retry with a new number: %+v, %v", got, err)
+	}
+	if fs, _ := db.Friendships(ctx); len(fs) != 1 || fs[0].PeerNumber != 50<<30 {
+		t.Fatalf("friendships after retries %+v", fs)
+	}
+	// Another node is still refused.
+	if _, err := db.RedeemInvite(ctx, "ik", Friendship{Peer: "carol", PeerNumber: 1, PeerRetention: time.Hour}, now); !errors.Is(err, ErrInviteSpent) {
+		t.Fatalf("replay as carol: %v", err)
+	}
+	// Expired: refused, and the key has no role.
+	if _, err := db.RedeemInvite(ctx, "ik", f, exp); !errors.Is(err, ErrInviteSpent) {
+		t.Fatalf("retry after expiry: %v", err)
+	}
+	if r, _ := db.PeerRole(ctx, "ik", exp); r != RoleNone {
+		t.Fatalf("expired invite key has role %q", r)
+	}
+	// Without the friendship the used key admits nothing.
+	if _, err := db.ExecContext(ctx, `DELETE FROM friendship`); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := db.PeerRole(ctx, "ik", now); r != RoleNone {
+		t.Fatalf("used invite key of a removed friend has role %q", r)
+	}
+	if _, err := db.RedeemInvite(ctx, "ik", f, now); !errors.Is(err, ErrInviteSpent) {
+		t.Fatalf("retry after the friendship went: %v", err)
+	}
+}
+
+// PEER-2 (#51): the invited node records its terms before it calls
+// redeem, and finishing stores the friendship and drops that record in
+// one step.
+func TestPendingRedeemKeepsTermsUntilFinished(t *testing.T) {
+	ctx := context.Background()
+	db := openPeers(t)
+	now := time.Unix(1_800_000_000, 0)
+	if _, err := db.PendingRedeemOf(ctx, "ik"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("no pending redeem yet: %v", err)
+	}
+	p := PendingRedeem{InviteKey: "ik", Peer: "alice", Number: 100 << 30, Retention: 60 * 24 * time.Hour, StartedAt: now}
+	if err := db.StartRedeem(ctx, p); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.PendingRedeemOf(ctx, "ik")
+	if err != nil || got != p {
+		t.Fatalf("pending %+v, %v; want %+v", got, err, p)
+	}
+	if r, _ := db.PeerRole(ctx, "alice", now); r != RoleNone {
+		t.Fatalf("a pending redeem admits the inviter as %q", r)
+	}
+	f := Friendship{Peer: "alice", Address: "tcalice", OwnNumber: p.Number, PeerNumber: 80 << 30, OwnRetention: p.Retention, CreatedAt: now}
+	if err := db.FinishRedeem(ctx, "ik", f); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PendingRedeemOf(ctx, "ik"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("pending redeem after finishing: %v", err)
+	}
+	if _, err := db.GetFriendship(ctx, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	// Abandoning drops the record.
+	p.InviteKey = "ik2"
+	db.StartRedeem(ctx, p)
+	if err := db.AbandonRedeem(ctx, "ik2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.PendingRedeemOf(ctx, "ik2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("abandoned redeem: %v", err)
 	}
 }
 

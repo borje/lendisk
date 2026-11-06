@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -128,6 +129,92 @@ func TestInviteAndRedeemMakeFriends(t *testing.T) {
 	}
 	if len(a.peers()) != 1 || len(c.peers()) != 0 {
 		t.Fatal("a replay made a friendship")
+	}
+}
+
+// lostAnswer delivers the request, then drops the answer.
+type lostAnswer struct{ next http.RoundTripper }
+
+func (l lostAnswer) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := l.next.RoundTrip(r)
+	if err == nil {
+		resp.Body.Close()
+	}
+	return nil, errors.New("connection reset by peer")
+}
+
+// assertHealed checks that A and B hold one friendship with each other,
+// with B's number as B first gave it.
+func assertHealed(t *testing.T, a, b *node, bNumber int64) {
+	t.Helper()
+	ap, bp := a.peers(), b.peers()
+	if len(ap) != 1 || ap[0].ID != b.status().Node.ID || ap[0].PeerNumber != bNumber || ap[0].OwnNumber != 80<<30 {
+		t.Fatalf("A's peers %+v", ap)
+	}
+	if len(bp) != 1 || bp[0].ID != a.status().Node.ID || bp[0].OwnNumber != bNumber || bp[0].PeerNumber != 80<<30 {
+		t.Fatalf("B's peers %+v", bp)
+	}
+}
+
+// PEER-2, #51: A commits the friendship but B never sees the answer.
+// Running the same peer add again repeats B's terms without asking and
+// both sides end with the friendship. Another node is still refused.
+func TestLostRedeemAnswerHealsOnRerun(t *testing.T) {
+	a, b, c := friendNode(t), friendNode(t), friendNode(t)
+	stop := a.serveLogged()
+	defer stop()
+	s := a.invite("--quota", "80G")
+
+	b.redeemTransport = func(rt http.RoundTripper) http.RoundTripper { return lostAnswer{rt} }
+	code, _, errOut := b.run("100G\n", "", "peer", "add", s)
+	if code == 0 || !strings.Contains(errOut, "run the same `lendisk peer add` again") {
+		t.Fatalf("lost answer: %d %s", code, errOut)
+	}
+	if len(a.peers()) != 1 || len(b.peers()) != 0 {
+		t.Fatal("the dropped answer did not leave a one-sided friendship")
+	}
+
+	b.redeemTransport = nil
+	code, out, errOut := b.run("", "", "peer", "add", s) // no number typed: not asked
+	if code != 0 {
+		t.Fatalf("re-run: %d %s", code, errOut)
+	}
+	if !strings.Contains(out, "Resuming") || strings.Contains(out, "What you lend them") {
+		t.Fatalf("re-run said:\n%s", out)
+	}
+	assertHealed(t, a, b, 100<<30)
+
+	c.dialTimeout = 10 * time.Second
+	if code, _, errOut := c.run("\n", "", "peer", "add", s); code == 0 || !strings.Contains(errOut, "already used or has expired") {
+		t.Fatalf("replay by another node: %d %s", code, errOut)
+	}
+	if len(a.peers()) != 1 || len(c.peers()) != 0 {
+		t.Fatal("a replay made a friendship")
+	}
+}
+
+// PEER-2, #51: B crashes after A's answer and before writing its row;
+// running peer add again heals the same way.
+func TestCrashBeforeFriendshipWriteHealsOnRerun(t *testing.T) {
+	a, b := friendNode(t), friendNode(t)
+	stop := a.serveLogged()
+	defer stop()
+	s := a.invite("--quota", "80G")
+
+	b.beforeFriendship = func() error { return errors.New("killed") }
+	if code, _, errOut := b.run("50G\n", "", "peer", "add", s); code == 0 {
+		t.Fatalf("crash: %d %s", code, errOut)
+	}
+	if len(a.peers()) != 1 || len(b.peers()) != 0 {
+		t.Fatal("the crash did not leave a one-sided friendship")
+	}
+	b.beforeFriendship = nil
+	if code, _, errOut := b.run("", "", "peer", "add", s); code != 0 {
+		t.Fatalf("re-run: %d %s", code, errOut)
+	}
+	assertHealed(t, a, b, 50<<30)
+	if code, _, errOut := b.run("", "", "peer", "add", s); code == 0 || !strings.Contains(errOut, "already friends") {
+		t.Fatalf("third run: %d %s", code, errOut)
 	}
 }
 

@@ -171,24 +171,42 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 		return err
 	}
 
-	fmt.Fprintf(a.out, "Invite from node %s.\n", them)
-	fmt.Fprintf(a.out, "They lend you %s and keep what you delete for %s.\n", formatSize(inv.Number), formatDays(inv.Retention))
-	fmt.Fprintf(a.out, "What you lend them [%s]: ", formatSize(inv.Number))
-	line, err := a.readLine()
-	if err != nil {
-		return fmt.Errorf("no number given; nothing was done: %w", err)
-	}
-	number := inv.Number
-	if line != "" {
-		if number, err = parseNumber(line); err != nil {
-			return usageError{err}
-		}
-	}
-
 	ik, err := inv.Key()
 	if err != nil {
 		return err
 	}
+	ikID := ik.NodeID().String()
+
+	fmt.Fprintf(a.out, "Invite from node %s.\n", them)
+	fmt.Fprintf(a.out, "They lend you %s and keep what you delete for %s.\n", formatSize(inv.Number), formatDays(inv.Retention))
+	// A redeem started before repeats its terms (#51): the inviting
+	// node may have stored them already.
+	number := inv.Number
+	pending, err := db.PendingRedeemOf(ctx, ikID)
+	switch {
+	case err == nil:
+		number, ret = pending.Number, pending.Retention
+		fmt.Fprintf(a.out, "Resuming the redeem started %s: you lend them %s and keep what they delete for %s.\n",
+			pending.StartedAt.UTC().Format(time.RFC3339), formatSize(number), formatDays(ret))
+	case errors.Is(err, state.ErrNotFound):
+		fmt.Fprintf(a.out, "What you lend them [%s]: ", formatSize(inv.Number))
+		line, err := a.readLine()
+		if err != nil {
+			return fmt.Errorf("no number given; nothing was done: %w", err)
+		}
+		if line != "" {
+			if number, err = parseNumber(line); err != nil {
+				return usageError{err}
+			}
+		}
+		if err := db.StartRedeem(ctx, state.PendingRedeem{InviteKey: ikID, Peer: them.String(),
+			Number: number, Retention: ret, StartedAt: a.now()}); err != nil {
+			return err
+		}
+	default:
+		return err
+	}
+
 	dl, err := transport.NewDialer(ik, log)
 	if err != nil {
 		return err
@@ -200,22 +218,37 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 	}
 	cctx, cancel := context.WithTimeout(ctx, a.redeemTimeout())
 	defer cancel()
-	cl := &control.Client{HTTP: &http.Client{Transport: &http.Transport{
+	var rt http.RoundTripper = &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return dl.Dial(ctx, them, inv.Address)
 		},
-	}}}
+	}
+	if a.redeemTransport != nil {
+		rt = a.redeemTransport(rt)
+	}
+	cl := &control.Client{HTTP: &http.Client{Transport: rt}}
 	resp, err := cl.Redeem(cctx, control.RedeemRequest{Address: addr, Number: number,
 		RetentionSeconds: int64(ret / time.Second), Proof: proof})
 	var ce *control.CallError
 	switch {
 	case errors.As(err, &ce):
+		if ce.Status < http.StatusInternalServerError {
+			// Refused for good: a re-run starts afresh.
+			if err := db.AbandonRedeem(ctx, ikID); err != nil {
+				log.Warn("dropping the refused redeem failed", "err", err)
+			}
+		}
 		return fmt.Errorf("node %s refused the invite: %s", them, ce.Message)
 	case err != nil && cctx.Err() != nil:
-		return fmt.Errorf("cannot reach node %s: it is offline or not running `lendisk serve`, or the invite was already used or has expired; nothing was done", them)
+		return fmt.Errorf("cannot reach node %s: it is offline or not running `lendisk serve`, or the invite was already used or has expired; run the same `lendisk peer add` again to retry", them)
 	case err != nil:
-		return fmt.Errorf("redeeming the invite at node %s: %w", them, err)
+		return fmt.Errorf("redeeming the invite at node %s: %w; run the same `lendisk peer add` again to finish", them, err)
+	}
+	if a.beforeFriendship != nil {
+		if err := a.beforeFriendship(); err != nil {
+			return err
+		}
 	}
 	f := state.Friendship{
 		Peer: them.String(), Address: inv.Address,
@@ -223,8 +256,8 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 		OwnRetention: ret, PeerRetention: time.Duration(resp.RetentionSeconds) * time.Second,
 		CreatedAt: a.now(),
 	}
-	if err := db.AddFriendship(ctx, f); err != nil {
-		return fmt.Errorf("node %s stored the friendship but this node could not: %w", them, err)
+	if err := db.FinishRedeem(ctx, ikID, f); err != nil {
+		return fmt.Errorf("node %s stored the friendship but this node could not: %w; run the same `lendisk peer add` again to finish", them, err)
 	}
 	fmt.Fprintf(a.out, "Now friends with %s. Quota: %s each way.\n", them, formatSize(f.Quota()))
 	return nil

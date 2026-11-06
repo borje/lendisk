@@ -80,9 +80,11 @@ func (s *Server) method(w http.ResponseWriter, r *http.Request, m string) bool {
 
 // redeem is the invite handshake (PEER-2). The caller is the invite key;
 // the redeeming node's own key is the one its address names, proven by
-// RedeemProof. The invite is marked used in the transaction that stores
-// the friendship, and the invite key's connection is closed after the
-// answer (SEC-13).
+// RedeemProof. The invite is marked used by that key in the transaction
+// that stores the friendship, and the invite key's connection is closed
+// after the answer (SEC-13). Until the invite expires the same proven
+// key may redeem it again and gets the same terms, since it may have
+// lost the answer (#51); any other key is refused (state.RedeemInvite).
 func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 	w.Header().Set("Connection", "close")
 	if c.Role != state.RoleInvite {

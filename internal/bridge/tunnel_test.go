@@ -186,7 +186,7 @@ func TestInviteKeyMayOnlyRedeem(t *testing.T) {
 // PEER-2 and the identity rule: the friend's key is the one its address
 // names, proven by key agreement; a forged proof or another node's
 // address is refused, and the friend is never the connection's invite
-// key. A replay on the same connection is refused.
+// key. A replay by another proven key is refused.
 func TestRedeemBindsProvenKey(t *testing.T) {
 	d := transporttest.Start(t)
 	l := startLender(t)
@@ -226,9 +226,49 @@ func TestRedeemBindsProvenKey(t *testing.T) {
 	if l.changed.Load() != 1 {
 		t.Fatalf("Changed called %d times", l.changed.Load())
 	}
-	// Replay: the invite key now has no role, so the middleware refuses.
-	if _, err := c.Redeem(t.Context(), control.RedeemRequest{Address: bobAddr, Number: 1, RetentionSeconds: 1, Proof: proof}); !errors.As(err, &ce) || ce.Status != http.StatusForbidden {
-		t.Fatalf("replayed redeem: %v", err)
+	// Replay by Mallory, proving her own address: refused.
+	mallProof, _ := control.RedeemProof(mallory, l.self.NodeID(), ik.NodeID())
+	_, err = c.Redeem(t.Context(), control.RedeemRequest{Address: transport.AddressOf(mallory, d.Region), Number: 1 << 30, RetentionSeconds: 3600, Proof: mallProof})
+	if !errors.As(err, &ce) || ce.Status != http.StatusConflict || !strings.Contains(ce.Message, "already used") {
+		t.Fatalf("replayed redeem by another key: %v", err)
+	}
+	if _, err := l.db.GetFriendship(t.Context(), mallory.NodeID().String()); !errors.Is(err, state.ErrNotFound) {
+		t.Fatal("a replay made a friendship")
+	}
+}
+
+// PEER-2 retry (#51): Bob lost the answer; redeeming again over the
+// invite key, with the same proof, answers the same terms. The used
+// invite key still reaches nothing but redeem (SEC-13).
+func TestRedeemRetryBySameKeyAnswersSameTerms(t *testing.T) {
+	d := transporttest.Start(t)
+	l := startLender(t)
+	ik, bob := newID(t), newID(t)
+	l.addInvite(t, ik)
+	c := l.tun.client(ik)
+	req := control.RedeemRequest{Address: transport.AddressOf(bob, d.Region), Number: 100 << 30, RetentionSeconds: 3600}
+	req.Proof, _ = control.RedeemProof(bob, l.self.NodeID(), ik.NodeID())
+	first, err := c.Redeem(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := c.Redeem(t.Context(), req)
+	if err != nil {
+		t.Fatalf("retry by the redeeming key: %v", err)
+	}
+	if again != first {
+		t.Fatalf("retry answered %+v, first %+v", again, first)
+	}
+	if fs, _ := l.db.Friendships(t.Context()); len(fs) != 1 {
+		t.Fatalf("friendships after a retry: %+v", fs)
+	}
+	for _, r := range everyRequest {
+		if r.path == control.RedeemPath {
+			continue
+		}
+		if got := status(t, c, r.method, r.path); got != http.StatusForbidden {
+			t.Errorf("%s %s with a used invite key: %d, want 403", r.method, r.path, got)
+		}
 	}
 }
 

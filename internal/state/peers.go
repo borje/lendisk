@@ -9,9 +9,11 @@ import (
 type Role string
 
 const (
-	RoleNone   Role = ""       // unknown: refused
-	RolePeer   Role = "peer"   // a friendship row
-	RoleInvite Role = "invite" // an unexpired, unused invite key
+	RoleNone Role = ""     // unknown: refused
+	RolePeer Role = "peer" // a friendship row
+	// RoleInvite is an unexpired invite key, unused or used by a node
+	// that is still a friend, so that node can retry redeem (#51).
+	RoleInvite Role = "invite"
 )
 
 // PeerRole looks a tunnel key (a node ID in display form) up in the
@@ -21,7 +23,8 @@ func (db *DB) PeerRole(ctx context.Context, key string, now time.Time) (Role, er
 	var peer, invite bool
 	err := db.QueryRowContext(ctx, `SELECT
 		EXISTS (SELECT 1 FROM friendship WHERE peer_key = ?1),
-		EXISTS (SELECT 1 FROM invite WHERE invite_key = ?1 AND used_at IS NULL AND expires_at > ?2)`,
+		EXISTS (SELECT 1 FROM invite WHERE invite_key = ?1 AND expires_at > ?2
+			AND (used_at IS NULL OR redeemed_by IN (SELECT peer_key FROM friendship)))`,
 		key, now.Unix()).Scan(&peer, &invite)
 	switch {
 	case err != nil:
