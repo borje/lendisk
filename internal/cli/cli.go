@@ -230,7 +230,7 @@ func ensureDir(dir string) error {
 // data directory.
 func ownEntry(name string) bool {
 	switch name {
-	case "lendisk.toml", "identity.key", "endpoint.crt", "endpoint.key", "profiles", "store", "run":
+	case "lendisk.toml", "identity.key", "endpoint.crt", "endpoint.key", "profiles", "store", "run", "locks":
 		return true
 	}
 	return strings.HasPrefix(name, "lendisk.db")

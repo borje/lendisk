@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -618,5 +620,81 @@ func TestConcurrentPeerAddSaysInProgress(t *testing.T) {
 	}
 	if len(a.peers()) != 0 {
 		t.Fatal("the losing peer add redeemed")
+	}
+}
+
+// heldAtPrompt is a stdin that holds the peer add reading it at its
+// number prompt: reached is closed when it asks, and release ends it.
+type heldAtPrompt struct {
+	reached, release chan struct{}
+	once             sync.Once
+}
+
+func (h *heldAtPrompt) Read([]byte) (int, error) {
+	h.once.Do(func() { close(h.reached) })
+	<-h.release
+	return 0, io.EOF
+}
+
+// countDials counts the redeem calls a node's peer add makes.
+type countDials struct {
+	rt http.RoundTripper
+	n  *atomic.Int32
+}
+
+func (c countDials) RoundTrip(r *http.Request) (*http.Response, error) {
+	c.n.Add(1)
+	return c.rt.RoundTrip(r)
+}
+
+// #64: while one peer add of an invite runs, a second of the same
+// invite, which finds its redeem record and would resume at once,
+// refuses without dialling with the same invite key (#52).
+func TestSecondPeerAddOfInviteRefusesWithoutDialling(t *testing.T) {
+	a, b := friendNode(t), friendNode(t)
+	stop := a.serveLogged()
+	defer stop()
+	s := a.invite("--quota", "80G")
+	inv, _ := invite.Parse(s)
+	key, _ := inv.Key()
+	them, _ := transport.KeyOf(inv.Address)
+	var dials atomic.Int32
+	b.redeemTransport = func(rt http.RoundTripper) http.RoundTripper { return countDials{rt, &dials} }
+
+	first := &heldAtPrompt{reached: make(chan struct{}), release: make(chan struct{})}
+	b.stdin = first
+	done := make(chan int)
+	go func() {
+		code, _, _ := b.run("", "", "peer", "add", s)
+		done <- code
+	}()
+	<-first.reached
+	b.stdin = nil
+	// The first run's record, as if it had gone on to dial.
+	if err := openDB(t, b).StartRedeem(t.Context(), state.PendingRedeem{InviteKey: key.NodeID().String(), Peer: them.String(),
+		Number: 1 << 30, Retention: time.Hour, StartedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	code, _, errOut := b.run("", "", "peer", "add", s)
+	close(first.release)
+	<-done
+	if code == 0 || !strings.Contains(errOut, "a redeem of this invite is already in progress") {
+		t.Fatalf("second peer add: %d %s", code, errOut)
+	}
+	if n := dials.Load(); n != 0 {
+		t.Fatalf("the second peer add dialled %d times", n)
+	}
+	if len(a.peers()) != 0 {
+		t.Fatal("the second peer add redeemed")
+	}
+
+	// The lock goes with the first run: the same invite now redeems.
+	b.redeemTransport = nil
+	if code, _, errOut := b.run("", "", "peer", "add", s); code != 0 {
+		t.Fatalf("peer add after the first ended: %d %s", code, errOut)
+	}
+	if len(a.peers()) != 1 {
+		t.Fatal("no friendship after the first peer add ended")
 	}
 }
