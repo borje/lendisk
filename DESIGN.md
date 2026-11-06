@@ -928,26 +928,45 @@ upstream bucket is Q-V.
   `copies`, profile, created at). Placement (REPL-12) and the buckets'
   own S3 credentials (SEC-3) are not in it. *Envelope*: `ldm1` ‖
   24-byte nonce ‖ XChaCha20-Poly1305 (`golang.org/x/crypto`) of the
-  JSON, with `ldm1` ‖ the node's 32 key bytes as additional data,
+  JSON padded with spaces to a multiple of 4 KiB, with `ldm1` ‖ the
+  node's 32 key bytes as additional data,
   under `identity.ManifestKey` =
   `HKDF-SHA256(private key, info="lendisk-manifest-v1")`. The fourth
   byte versions the envelope and `format` the plaintext; `Open`
-  refuses a version it does not know, and checks the node ID inside.
-  *Version*: the daemon's `manifest.Pusher` builds the content from
+  refuses a version it does not know, strips the padding, and checks
+  the node ID inside. The padding keeps the size from telling a lender
+  how many friends and buckets the node has, beyond which 4 KiB step
+  their entries reach. *Version*: the daemon's `manifest.Pusher` builds the content from
   `lendisk.db` at start, every 15 s and when `redeem` commits a
   friendship, and hashes it (SHA-256 of the JSON); a new hash counts
   `seq` up (`node` keys `manifest_seq`, `manifest_hash`,
   `manifest_updated_at`), so a change made by another process
-  (`bucket add`, `peer quota`) is pushed within 15 s. *Push*: each
-  friend whose acknowledged `seq` differs from the current one gets
-  the sealed manifest by `PUT /_lendisk/manifest`, all friends at
-  once, 30 s each; the lender answers with the size and SHA-256 it
-  stored, which the pusher checks. The table `manifest_push`
-  (migration 12) keeps per friend the `seq` acknowledged, when, and
-  the last attempt and its failure, so a friend that missed a push
-  (it was offline, or this node was) gets it at the first round it
-  answers, and `status` shows each friend still lacking the current
-  version (`manifest.pending`). Both profiles push: a lender-only node
+  (`bucket add`, `peer quota`) is pushed within 15 s. `seq` never goes
+  back: a recovered node continues from the version it fetched
+  (`state.ContinueManifest`, ID-5), so its next manifest is above every
+  copy its friends hold. *Push*: a friend is due the sealed manifest
+  when it has not acknowledged the current `seq` (differs, not below:
+  any other copy is stale), or last acknowledged it 24 h ago or more,
+  since it may have lost its store and only a push puts the manifest
+  back. It gets it by `PUT /_lendisk/manifest`, 30 s at most; the
+  lender answers with the size and SHA-256 it stored, which the pusher
+  checks. Each friend's push runs on its own and the round does not
+  wait for it, nor start a second one to a friend still in flight, so a
+  hung friend holds up no other. After failed pushes in a row a friend
+  is due again only 1 min after the last, doubling per failure to at
+  most 1 h. The table `manifest_push`
+  (migration 12) keeps per friend the `seq` acknowledged, when, the
+  last attempt, its failure and the failures in a row, so a friend
+  that missed a push (it was offline, or this node was) gets it at the
+  first round after its backoff in which it answers. Committing a
+  friendship, new or again (the inviter's side of a redeem by a friend
+  it kept, #51/#56), drops that friend's row, so it is pushed to at
+  once: a friend that redeems again has usually lost its disk. The
+  inviter's daemon is kicked by its control API's redeem; the invited
+  side commits in `peer add`, another process, so its daemon pushes at
+  its next poll. `status` shows each friend not known to hold the
+  current version (`manifest.pending`): never acknowledged, or the last
+  push, the daily one included, failed. Both profiles push: a lender-only node
   is rebuilt from its manifest too. *Lender*: the call is open to the
   `peer` role only (SEC-11, SEC-13) and keyed by the connection's key,
   so a friend stores and reads its own manifest and no other; no
@@ -957,7 +976,10 @@ upstream bucket is Q-V.
   the lender keep one small file and nothing else; it is not counted
   against the quota. `manifest.Store` writes it to
   `<store>/.lendisk/manifests/<node ID>`, 0600 in 0700 directories,
-  through a synced temporary file renamed over the old one. It is a
+  through a synced temporary file (`.put-*`) renamed over the old one;
+  `serve` sweeps temporary files an hour old at start, left by a crash.
+  A former friend's manifest stays until ending the friendship removes
+  it with its replica (#25). It is a
   file, not an object in a `lendisk-manifests` bucket as planned: a
   name beginning with a dot is no valid bucket name, so versitygw
   serves it to no account at all (no borrower, no bucket key, not the
@@ -978,8 +1000,11 @@ upstream bucket is Q-V.
   (SEC-14). `recover` derives the key
   from the phrase, dials the lender, fetches the manifest over the
   control API (`GET /_lendisk/manifest`, `manifest.Fetch`: no bucket,
-  no S3 credential and no `lendisk.db` needed), sets its `seq` as the
-  node's manifest version so later changes count on from it, then
+  no S3 credential and no `lendisk.db` needed), passes the highest
+  `seq` it fetched to `state.ContinueManifest` before the daemon first
+  runs, so the version never goes back and later changes count on from
+  it (#29 must do this; until then nothing sets it and a fresh node
+  counts from 1), then
   derives the per-pair S3 credentials (§3.7) for every lender listed,
   and re-derives its dial key for each friend the manifest lists (§3.1
   ID-1), which the friend still admits.

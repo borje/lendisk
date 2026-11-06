@@ -20,6 +20,7 @@
 package manifest
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -43,7 +44,8 @@ const Format = 1
 // magicPrefix begins every envelope; the fourth byte is the envelope
 // version. Envelope v1: "ldm1" ‖ 24-byte nonce ‖ XChaCha20-Poly1305
 // ciphertext of the JSON manifest, with "ldm1" ‖ the node's 32 key
-// bytes as additional data.
+// bytes as additional data. The JSON is padded with spaces to a multiple
+// of padTo bytes.
 const (
 	magicPrefix = "ldm"
 	envelopeV1  = magicPrefix + "1"
@@ -170,6 +172,7 @@ func Seal(self *identity.Identity, m *Manifest, random io.Reader) ([]byte, error
 	if err != nil {
 		return nil, err
 	}
+	plain = pad(plain)
 	aead, err := chacha20poly1305.NewX(self.ManifestKey())
 	if err != nil {
 		return nil, err
@@ -202,7 +205,7 @@ func Open(self *identity.Identity, blob []byte) (*Manifest, error) {
 		return nil, errors.New("the manifest does not open with this identity: it is another node's, or damaged")
 	}
 	var m Manifest
-	if err := json.Unmarshal(plain, &m); err != nil {
+	if err := json.Unmarshal(bytes.TrimRight(plain, " "), &m); err != nil {
 		return nil, fmt.Errorf("the manifest is malformed: %w", err)
 	}
 	if m.Format != Format {
@@ -212,6 +215,19 @@ func Open(self *identity.Identity, blob []byte) (*Manifest, error) {
 		return nil, errors.New("the manifest names another node")
 	}
 	return &m, nil
+}
+
+// padTo quantises the plaintext's size, so the envelope's size tells a
+// lender little (how many friends and buckets, roughly): JSON is padded
+// with spaces, which it ignores after the value, to a multiple of it.
+const padTo = 4096
+
+func pad(plain []byte) []byte {
+	n := (len(plain) + padTo - 1) / padTo * padTo
+	if n == 0 {
+		n = padTo
+	}
+	return append(plain, bytes.Repeat([]byte{' '}, n-len(plain))...)
 }
 
 // additional binds an envelope to its version and its owner.

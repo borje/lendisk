@@ -51,7 +51,9 @@ type StatusManifest struct {
 	UpdatedAt string `json:"updated_at,omitempty"` // RFC 3339, UTC
 	// Friends is how many friends should hold it.
 	Friends int `json:"friends"`
-	// Pending are the friends that do not hold this version yet.
+	// Pending are the friends not known to hold this version: never
+	// acknowledged it, or the last push to them (the daily one too)
+	// failed.
 	Pending []StatusManifestPending `json:"pending"`
 }
 
@@ -84,7 +86,9 @@ func manifestStatus(ctx context.Context, db *state.DB) (StatusManifest, error) {
 		out.UpdatedAt = v.UpdatedAt.UTC().Format(time.RFC3339)
 	}
 	for _, f := range fs {
-		if p := pushes[f.Peer]; p.Seq != v.Seq || v.Seq == 0 {
+		// A failed push, the daily re-push included, means the friend
+		// may not hold it: it may have lost its store (ID-4).
+		if p := pushes[f.Peer]; p.Seq != v.Seq || v.Seq == 0 || p.Error != "" {
 			out.Pending = append(out.Pending, StatusManifestPending{Peer: f.Peer, Held: p.Seq, Error: p.Error})
 		}
 	}

@@ -8,9 +8,12 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
@@ -202,6 +205,117 @@ func TestStoreKeepsManifestsPrivately(t *testing.T) {
 	}
 	if got, _ := st.Get(a.NodeID()); !bytes.Equal(got, b) {
 		t.Fatal("a refused put changed the stored manifest")
+	}
+}
+
+// ID-4 (#28 review): the envelope's size says little: the plaintext is
+// padded to a multiple of 4 KiB, so a node with no friend and one with
+// a few send manifests of one size, and padding is gone once opened.
+func TestSealedSizeIsQuantised(t *testing.T) {
+	a := newID(t)
+	size := func(friends int) int {
+		m := &Manifest{Seq: 1, Content: Content{Friends: []Friend{}, Buckets: []Bucket{}, Overflow: []Overflow{}}}
+		for range friends {
+			m.Friends = append(m.Friends, Friend{ID: newID(t).NodeID().String(), Address: "tc" + strings.Repeat("x", 120)})
+		}
+		b, err := Seal(a, m, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := Open(a, b)
+		if err != nil || len(got.Friends) != friends {
+			t.Fatalf("open after padding: %v", err)
+		}
+		if (len(b)-minEnvelope)%padTo != 0 {
+			t.Fatalf("%d friends: envelope of %d bytes is not header plus a multiple of %d", friends, len(b), padTo)
+		}
+		return len(b)
+	}
+	if s0, s3 := size(0), size(3); s0 != s3 {
+		t.Fatalf("0 friends sealed to %d bytes, 3 to %d", s0, s3)
+	}
+	if s0, s40 := size(0), size(40); s40 <= s0 {
+		t.Fatalf("40 friends sealed to %d bytes, no more than 0 (%d)", s40, s0)
+	}
+}
+
+// sealRaw seals plain under self's key with the given additional data,
+// as Seal would but with the binding chosen by the test.
+func sealRaw(t *testing.T, self *identity.Identity, plain, ad []byte) []byte {
+	t.Helper()
+	aead, err := chacha20poly1305.NewX(self.ManifestKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := append([]byte(envelopeV1), make([]byte, aead.NonceSize())...)
+	return aead.Seal(head, head[len(envelopeV1):], plain, ad)
+}
+
+// ID-4 (#28 review): an envelope is bound to its version and its owner's
+// node ID by its additional data: one sealed under the owner's key with
+// any other binding does not open.
+func TestEnvelopeBoundToVersionAndNode(t *testing.T) {
+	a := newID(t)
+	plain, _ := json.Marshal(Manifest{Format: Format, Node: a.NodeID().String(), Seq: 1})
+	if _, err := Open(a, sealRaw(t, a, plain, additional(a))); err != nil {
+		t.Fatalf("the hand-sealed envelope does not open with the right binding: %v", err)
+	}
+	other := newID(t).NodeID()
+	id := a.NodeID()
+	for name, ad := range map[string][]byte{
+		"no node":      []byte(envelopeV1),
+		"another node": append([]byte(envelopeV1), other[:]...),
+		"no version":   id[:],
+		"version 2":    append([]byte(magicPrefix+"2"), id[:]...),
+	} {
+		if _, err := Open(a, sealRaw(t, a, plain, ad)); err == nil {
+			t.Errorf("an envelope bound to %s opened", name)
+		}
+	}
+}
+
+// ID-4 (#28 review): a manifest that names another node does not open,
+// though sealed under this node's key with its binding.
+func TestManifestNamingAnotherNodeRefused(t *testing.T) {
+	a := newID(t)
+	plain, _ := json.Marshal(Manifest{Format: Format, Node: newID(t).NodeID().String(), Seq: 1})
+	if _, err := Open(a, sealRaw(t, a, plain, additional(a))); err == nil {
+		t.Fatal("a manifest naming another node opened")
+	}
+}
+
+// ID-4 (#28 review): temporary files a crashed Put left are swept when
+// they are an hour old; a fresh one, being written now, and the
+// manifests stay.
+func TestStoreSweepsOldTemporaryFiles(t *testing.T) {
+	st := &Store{Dir: Dir(t.TempDir())}
+	a := newID(t)
+	if err := st.Put(a.NodeID(), blobFor(t, a)); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for name, age := range map[string]time.Duration{".put-old": 61 * time.Minute, ".put-new": time.Minute} {
+		p := filepath.Join(st.Dir, name)
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, now.Add(-age), now.Add(-age)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.Sweep(now); err != nil {
+		t.Fatal(err)
+	}
+	var left []string
+	ents, _ := os.ReadDir(st.Dir)
+	for _, e := range ents {
+		left = append(left, e.Name())
+	}
+	if want := []string{".put-new", a.NodeID().String()}; !slices.Equal(left, want) {
+		t.Fatalf("left %v, want %v", left, want)
+	}
+	if err := (&Store{Dir: Dir(t.TempDir())}).Sweep(now); err != nil {
+		t.Fatalf("sweeping a store with no manifests yet: %v", err)
 	}
 }
 

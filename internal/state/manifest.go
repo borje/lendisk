@@ -101,13 +101,49 @@ type ManifestPush struct {
 	DeliveredAt time.Time // zero if never
 	TriedAt     time.Time
 	Error       string
+	Failures    int64 // failed attempts since the last success
+}
+
+// ContinueManifest makes the version count on from seq, the version of
+// a manifest fetched from a friend: if seq is above the current
+// version, it becomes the current one with no hash, so the next
+// NoteManifest counts seq+1 whatever the content. The version thus never
+// goes back, and a recovered node's next manifest is above every copy
+// its friends hold (ID-5). `recover` (#29) must call it with the fetched
+// manifest's seq before the daemon first runs.
+func (db *DB) ContinueManifest(ctx context.Context, seq int64) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	v, err := manifestVersion(ctx, tx)
+	if err != nil || seq <= v.Seq {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO node (key, value) VALUES (?, ?)
+		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, manifestSeqKey, strconv.FormatInt(seq, 10)); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM node WHERE key = ?`, manifestHashKey); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// forgetManifestPush drops what peer acknowledged, when a friendship
+// with it is committed (new or again): it may have lost its store, so
+// it is pushed to as if it held nothing.
+func forgetManifestPush(ctx context.Context, x execer, peer string) error {
+	_, err := x.ExecContext(ctx, `DELETE FROM manifest_push WHERE peer_key = ?`, peer)
+	return err
 }
 
 // ManifestDelivered records that peer acknowledged version seq.
 func (db *DB) ManifestDelivered(ctx context.Context, peer string, seq int64, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO manifest_push (peer_key, seq, delivered_at, tried_at, error)
-		VALUES (?1, ?2, ?3, ?3, NULL)
-		ON CONFLICT (peer_key) DO UPDATE SET seq = ?2, delivered_at = ?3, tried_at = ?3, error = NULL`,
+	_, err := db.ExecContext(ctx, `INSERT INTO manifest_push (peer_key, seq, delivered_at, tried_at, error, failures)
+		VALUES (?1, ?2, ?3, ?3, NULL, 0)
+		ON CONFLICT (peer_key) DO UPDATE SET seq = ?2, delivered_at = ?3, tried_at = ?3, error = NULL, failures = 0`,
 		peer, seq, now.Unix())
 	return err
 }
@@ -115,8 +151,8 @@ func (db *DB) ManifestDelivered(ctx context.Context, peer string, seq int64, now
 // ManifestPushFailed records a failed push to peer, keeping the version
 // it acknowledged before.
 func (db *DB) ManifestPushFailed(ctx context.Context, peer, msg string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO manifest_push (peer_key, tried_at, error) VALUES (?1, ?2, ?3)
-		ON CONFLICT (peer_key) DO UPDATE SET tried_at = ?2, error = ?3`,
+	_, err := db.ExecContext(ctx, `INSERT INTO manifest_push (peer_key, tried_at, error, failures) VALUES (?1, ?2, ?3, 1)
+		ON CONFLICT (peer_key) DO UPDATE SET tried_at = ?2, error = ?3, failures = failures + 1`,
 		peer, now.Unix(), msg)
 	return err
 }
@@ -124,7 +160,7 @@ func (db *DB) ManifestPushFailed(ctx context.Context, peer, msg string, now time
 // ManifestPushes reads every friend's delivery, by node ID. Rows of
 // former friends are kept and harmless.
 func (db *DB) ManifestPushes(ctx context.Context) (map[string]ManifestPush, error) {
-	rows, err := db.QueryContext(ctx, `SELECT peer_key, seq, delivered_at, tried_at, error FROM manifest_push`)
+	rows, err := db.QueryContext(ctx, `SELECT peer_key, seq, delivered_at, tried_at, error, failures FROM manifest_push`)
 	if err != nil {
 		return nil, err
 	}
@@ -133,12 +169,12 @@ func (db *DB) ManifestPushes(ctx context.Context) (map[string]ManifestPush, erro
 	for rows.Next() {
 		var peer string
 		var seq, delivered sql.NullInt64
-		var tried int64
+		var tried, failures int64
 		var msg sql.NullString
-		if err := rows.Scan(&peer, &seq, &delivered, &tried, &msg); err != nil {
+		if err := rows.Scan(&peer, &seq, &delivered, &tried, &msg, &failures); err != nil {
 			return nil, err
 		}
-		p := ManifestPush{Seq: seq.Int64, TriedAt: time.Unix(tried, 0), Error: msg.String}
+		p := ManifestPush{Seq: seq.Int64, TriedAt: time.Unix(tried, 0), Error: msg.String, Failures: failures}
 		if delivered.Valid {
 			p.DeliveredAt = time.Unix(delivered.Int64, 0)
 		}

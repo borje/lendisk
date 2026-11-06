@@ -6,6 +6,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
@@ -75,6 +77,40 @@ func (s *Store) Get(peer identity.NodeID) ([]byte, error) {
 		return nil, control.ErrNoManifest
 	}
 	return b, err
+}
+
+// sweepAge is how old a temporary file must be before Sweep removes
+// it: far longer than any Put takes, so none in progress is touched.
+const sweepAge = time.Hour
+
+// Sweep removes the temporary files a Put that crashed left, those an
+// hour old or more at now; `serve` calls it at start. A Dir not created
+// yet is no error. Manifests of former friends stay: removing them is
+// ending the friendship's job (#25).
+func (s *Store) Sweep(now time.Time) error {
+	ents, err := os.ReadDir(s.Dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if !strings.HasPrefix(e.Name(), ".put-") {
+			continue
+		}
+		fi, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if now.Sub(fi.ModTime()) >= sweepAge {
+			if err := os.Remove(filepath.Join(s.Dir, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ensureDir creates Dir and its parent at 0700, and keeps them 0700.

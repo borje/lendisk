@@ -72,6 +72,12 @@ func newPushRig(t *testing.T) *pushRig {
 	return r
 }
 
+// round makes one round and waits for the pushes it started.
+func (r *pushRig) round(ctx context.Context) {
+	r.p.Round(ctx)
+	r.p.Wait()
+}
+
 func (r *pushRig) addBucket(name string) {
 	r.t.Helper()
 	if err := r.db.AddBucket(r.t.Context(), state.Bucket{Name: name, Profile: "restic", Copies: 2, AccessKey: "AK" + name,
@@ -97,7 +103,7 @@ func TestPushOncePerVersionToEveryFriend(t *testing.T) {
 	r := newPushRig(t)
 	ctx := t.Context()
 	r.addBucket("laptop")
-	r.p.Round(ctx)
+	r.round(ctx)
 	if r.lenders.count(r.b) != 1 || r.lenders.count(r.c) != 1 {
 		t.Fatalf("first round: B got %d, C got %d", r.lenders.count(r.b), r.lenders.count(r.c))
 	}
@@ -113,13 +119,13 @@ func TestPushOncePerVersionToEveryFriend(t *testing.T) {
 	}
 
 	r.now = r.now.Add(time.Minute)
-	r.p.Round(ctx)
+	r.round(ctx)
 	if r.lenders.count(r.b) != 1 {
 		t.Fatal("an unchanged manifest was pushed again")
 	}
 
 	r.addBucket("desktop")
-	r.p.Round(ctx)
+	r.round(ctx)
 	if r.lenders.count(r.b) != 2 || r.lenders.count(r.c) != 2 {
 		t.Fatal("a change was not pushed to every friend")
 	}
@@ -134,11 +140,11 @@ func TestPushOncePerVersionToEveryFriend(t *testing.T) {
 func TestMissedPushIsMadeWhenFriendReturns(t *testing.T) {
 	r := newPushRig(t)
 	ctx := t.Context()
-	r.p.Round(ctx)
+	r.round(ctx)
 	r.lenders.setOffline(r.c, true)
 	r.addBucket("laptop")
 	r.now = r.now.Add(time.Minute)
-	r.p.Round(ctx)
+	r.round(ctx)
 	if d := r.delivered(r.c); d.Seq != 1 || d.Error == "" || !d.TriedAt.Equal(r.now) {
 		t.Fatalf("C's delivery after the miss %+v", d)
 	}
@@ -147,7 +153,7 @@ func TestMissedPushIsMadeWhenFriendReturns(t *testing.T) {
 	}
 	r.lenders.setOffline(r.c, false)
 	r.now = r.now.Add(time.Minute)
-	r.p.Round(ctx)
+	r.round(ctx)
 	if d := r.delivered(r.c); d.Seq != 2 || d.Error != "" {
 		t.Fatalf("C's delivery after its return %+v", d)
 	}

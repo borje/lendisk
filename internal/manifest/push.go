@@ -23,11 +23,15 @@ type DialFunc func(ctx context.Context, peer identity.NodeID, addr string) (net.
 
 // Pusher keeps every friend holding the node's current manifest (ID-4).
 // Each round builds the manifest from lendisk.db, counts its version up
-// when the content changed, and pushes it to every friend that has not
-// acknowledged that version, all at once; what each acknowledged, and
-// the last failure, is recorded in lendisk.db. A friend that missed a
-// push (offline, or this node was) gets it at the first round it
-// answers. Rounds run at start, every Poll, and on Kick.
+// when the content changed, and starts a push to every friend that is
+// due: it has not acknowledged that version, or last did a day
+// (Refresh) ago or more, since it may have lost its store. A friend
+// whose last push failed is due again only after a backoff (MinBackoff
+// doubling per failure in a row, at most MaxBackoff). Each friend's
+// push runs on its own; the round does not wait for it, and starts no
+// second push to a friend while one is in flight, so one hung friend
+// holds up no other. What each acknowledged, and the last failure, is
+// recorded in lendisk.db. Rounds run at start, every Poll, and on Kick.
 type Pusher struct {
 	DB   *state.DB
 	Self *identity.Identity
@@ -45,13 +49,55 @@ type Pusher struct {
 	Poll time.Duration
 	// Timeout bounds one push (default 30 s).
 	Timeout time.Duration
-	Log     *slog.Logger
+	// Refresh is how long after a delivery the same version is pushed
+	// again (default 24 h).
+	Refresh time.Duration
+	// MinBackoff and MaxBackoff bound the wait after failed pushes in
+	// a row (defaults 1 min and 1 h).
+	MinBackoff, MaxBackoff time.Duration
+	Log                    *slog.Logger
 
-	once sync.Once
-	kick chan struct{}
+	once     sync.Once
+	kick     chan struct{}
+	mu       sync.Mutex
+	inflight map[string]bool
+	wg       sync.WaitGroup
 }
 
-func (p *Pusher) init() { p.once.Do(func() { p.kick = make(chan struct{}, 1) }) }
+func (p *Pusher) init() {
+	p.once.Do(func() {
+		p.kick = make(chan struct{}, 1)
+		p.inflight = map[string]bool{}
+	})
+}
+
+func or(d, def time.Duration) time.Duration {
+	if d <= 0 {
+		return def
+	}
+	return d
+}
+
+// Wait waits for every push in flight to finish.
+func (p *Pusher) Wait() { p.wg.Wait() }
+
+// due reports whether a friend with delivery d is due a push of version
+// seq at now.
+func (p *Pusher) due(d state.ManifestPush, seq int64, now time.Time) bool {
+	if d.Error != "" && d.Failures > 0 {
+		wait, ceil := or(p.MinBackoff, time.Minute), or(p.MaxBackoff, time.Hour)
+		for i := int64(1); i < d.Failures && wait < ceil; i++ {
+			wait *= 2
+		}
+		if now.Sub(d.TriedAt) < min(wait, ceil) {
+			return false
+		}
+	}
+	// "Differs", not "below": the version only rises (ContinueManifest
+	// after recovery, ID-5), so a friend holding another one holds a
+	// stale copy either way.
+	return d.Seq != seq || d.DeliveredAt.IsZero() || now.Sub(d.DeliveredAt) >= or(p.Refresh, 24*time.Hour)
+}
 
 func (p *Pusher) now() time.Time {
 	if p.Now == nil {
@@ -79,6 +125,7 @@ func (p *Pusher) Run(ctx context.Context) {
 	}
 	tick := time.NewTicker(poll)
 	defer tick.Stop()
+	defer p.Wait() // the pushes in flight end with ctx
 	for {
 		p.Round(ctx)
 		select {
@@ -90,9 +137,11 @@ func (p *Pusher) Run(ctx context.Context) {
 	}
 }
 
-// Round makes one round: build, version, push to every friend lacking
-// the current version, record.
+// Round makes one round: build, version, and start a push to every
+// friend due one and not being pushed to already. It does not wait for
+// the pushes (Wait does).
 func (p *Pusher) Round(ctx context.Context) {
+	p.init()
 	c, err := Build(ctx, p.DB, p.Self)
 	if err != nil {
 		p.logErr(ctx, "manifest: reading state failed", err)
@@ -113,14 +162,15 @@ func (p *Pusher) Round(ctx context.Context) {
 		p.logErr(ctx, "manifest: reading friendships failed", err)
 		return
 	}
+	now := p.now()
 	var todo []state.Friendship
+	p.mu.Lock()
 	for _, f := range fs {
-		// Not "below": a node rebuilt without its version history
-		// counts again from 1, and its friends must still get it.
-		if pushes[f.Peer].Seq != v.Seq {
+		if !p.inflight[f.Peer] && p.due(pushes[f.Peer], v.Seq, now) {
 			todo = append(todo, f)
 		}
 	}
+	p.mu.Unlock()
 	if len(todo) == 0 {
 		return
 	}
@@ -129,15 +179,19 @@ func (p *Pusher) Round(ctx context.Context) {
 		p.logErr(ctx, "manifest: sealing failed", err)
 		return
 	}
-	timeout := p.Timeout
-	if timeout <= 0 {
-		timeout = 30 * time.Second
-	}
-	var wg sync.WaitGroup
+	timeout := or(p.Timeout, 30*time.Second)
 	for _, f := range todo {
-		wg.Add(1)
+		p.mu.Lock()
+		p.inflight[f.Peer] = true
+		p.mu.Unlock()
+		p.wg.Add(1)
 		go func() {
-			defer wg.Done()
+			defer func() {
+				p.mu.Lock()
+				delete(p.inflight, f.Peer)
+				p.mu.Unlock()
+				p.wg.Done()
+			}()
 			pctx, cancel := context.WithTimeout(ctx, timeout)
 			err := p.push(pctx, f, blob)
 			cancel()
@@ -160,7 +214,6 @@ func (p *Pusher) Round(ctx context.Context) {
 			p.Log.Info("manifest delivered", "peer", f.Peer, "version", v.Seq, "size", len(blob))
 		}()
 	}
-	wg.Wait()
 }
 
 func (p *Pusher) push(ctx context.Context, f state.Friendship, blob []byte) error {

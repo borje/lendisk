@@ -93,6 +93,10 @@ func (db *DB) RedeemInvite(ctx context.Context, key string, f Friendship, now ti
 			WHERE invite_key = ? AND used_at IS NULL`, now.Unix(), f.Peer, key); err != nil {
 			return Friendship{}, err
 		}
+		// A friend redeeming again may have lost its store (ID-4).
+		if err := forgetManifestPush(ctx, tx, f.Peer); err != nil {
+			return Friendship{}, err
+		}
 		return got, tx.Commit()
 	case !errors.Is(err, ErrNotFound):
 		return Friendship{}, err
@@ -279,7 +283,7 @@ func addFriendship(ctx context.Context, x interface {
 	} else if n == 0 {
 		return ErrExists
 	}
-	return nil
+	return forgetManifestPush(ctx, x, f.Peer)
 }
 
 const friendshipCols = `peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention, dial_key`

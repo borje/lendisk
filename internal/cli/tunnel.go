@@ -76,6 +76,12 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		<-ctx.Done()
 		ln.Close()
 	}()
+	// Friends' manifests live in the store, not lendisk.db (ID-4); a Put
+	// that crashed may have left a temporary file.
+	manifests := &manifest.Store{Dir: manifest.Dir(cfg.StorePath())}
+	if err := manifests.Sweep(a.now()); err != nil {
+		log.Warn("sweeping leftover manifest files failed", "dir", manifests.Dir, "err", err)
+	}
 	ctl := &control.Server{DB: db, Self: id, Log: log,
 		Changed: func() {
 			adm.Clear()
@@ -83,8 +89,7 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 				changed()
 			}
 		},
-		// Friends' manifests live in the store, not lendisk.db (ID-4).
-		Manifests: &manifest.Store{Dir: manifest.Dir(cfg.StorePath())}}
+		Manifests: manifests}
 	s3 := &bridge.Late{}
 	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, log), log)
 	go purgeInvites(ctx, db, adm, a.now, log)

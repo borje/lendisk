@@ -18,6 +18,7 @@ import (
 
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 )
 
@@ -46,6 +47,79 @@ func (n *node) delivered(after int64) int64 {
 	}).Version
 }
 
+// ID-4 (#28 review): a friend whose last push failed, the daily one
+// included, is not shown as holding the manifest: it may have lost it.
+func TestStatusCountsAFailedRepushAsNotHeld(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(t)
+	db := openDB(t, n)
+	ctx := t.Context()
+	now := time.Now()
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: "bob", Address: "tcbob", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	v, err := db.NoteManifest(ctx, "h", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ManifestDelivered(ctx, "bob", v.Seq, now); err != nil {
+		t.Fatal(err)
+	}
+	if m := n.status().Manifest; len(m.Pending) != 0 {
+		t.Fatalf("delivered, yet pending: %+v", m)
+	}
+	if err := db.ManifestPushFailed(ctx, "bob", "offline", now.Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	m := n.status().Manifest
+	if len(m.Pending) != 1 || m.Pending[0].Peer != "bob" || m.Pending[0].Held != v.Seq || m.Pending[0].Error != "offline" {
+		t.Fatalf("a failed re-push shows as held: %+v", m)
+	}
+	if _, out, _ := n.run("", "", "status"); !strings.Contains(out, "not yet at 1 of 1 friends") {
+		t.Fatalf("status text:\n%s", out)
+	}
+}
+
+// ID-4 (#28 review): a redeem makes the inviting node's daemon push its
+// manifest at once (the control API's Changed kicks the pusher), not at
+// its next poll: with an hour between rounds, it tries the new friend
+// within seconds.
+func TestRedeemPushesManifestAtOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	an, bn := newNode(t), newNode(t)
+	bn.regions = an.regions
+	for _, n := range []*node{an, bn} {
+		p, _ := identity.NewPhrase()
+		if code, _, e := n.run(p+"\n", "", "init", "--restore"); code != 0 {
+			t.Fatal(e)
+		}
+	}
+	slow := envManifestPoll + "=1h"
+	a, b := newProcNode(t, an, slow), newProcNode(t, bn, slow)
+	b.start()
+	a.start()
+	bn.waitManifest("built", 30*time.Second, func(m StatusManifest) bool { return m.Version > 0 })
+	befriend(t, bn, an) // A redeems B's invite at B's daemon
+	aKey := an.identity().NodeID().String()
+	db := openDB(t, bn)
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		ps, err := db.ManifestPushes(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := ps[aKey]; ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("B did not push to its new friend after the redeem")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 // ID-4 end to end (#28), A borrowing from B through real daemons:
 //
 //   - A's manifest reaches B at the first round after the friendship,
@@ -57,6 +131,8 @@ func (n *node) delivered(after int64) int64 {
 //   - B loses lendisk.db and restarts: the manifest file is unchanged.
 //     B knows A again only once they are friends again (SEC-10), here
 //     through a new invite that A answers with the stored terms (#51).
+//   - B lost its store too: being befriended again makes A push the
+//     same version again.
 //   - With A's machine gone, a fresh machine with nothing but A's phrase
 //     fetches it from B and opens it: every bucket with its sealed name
 //     and copies, B with its address, A's own address.
@@ -166,9 +242,35 @@ func TestManifestOnLenderSurvivesItsDatabaseLoss(t *testing.T) {
 	if len(bn.peers()) != 0 {
 		t.Fatal("B still has friends after losing its database")
 	}
+	// B lost its store too: A must push again, though its version did
+	// not change, once they are friends again (#28 review).
+	if err := os.RemoveAll(manifest.Dir(filepath.Join(bn.data, "store"))); err != nil {
+		t.Fatal(err)
+	}
 	befriend(t, an, bn) // A answers with the friendship it kept (#51)
 	if ps := bn.peers(); len(ps) != 1 || ps[0].ID != aKey {
 		t.Fatalf("B's friends after the new invite: %+v", ps)
+	}
+	// A's tunnel client to B, refused by the B that had lost lendisk.db,
+	// does not recover within minutes (a transport matter outside #28);
+	// a restart gives A a fresh one. Without the delivery dropped by the
+	// new redeem, the restarted A would still not push: its version did
+	// not change and B acknowledged it moments ago.
+	a.p.kill()
+	a.start()
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		if held, err = os.ReadFile(file); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			ps, _ := openDB(t, an).ManifestPushes(t.Context())
+			t.Fatalf("A did not push its manifest again to B, which lost it: %+v", ps[bKey])
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if m, err := manifest.Open(aID, held); err != nil || m.Seq != v {
+		t.Fatalf("pushed again: %+v %v, want version %d", m, err, v)
 	}
 
 	// A's machine is gone; a fresh one has nothing but the phrase.
@@ -195,7 +297,7 @@ func TestManifestOnLenderSurvivesItsDatabaseLoss(t *testing.T) {
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return dl.Dial(ctx, them, bAddr) },
 	}}
 	var m *manifest.Manifest
-	deadline := time.Now().Add(90 * time.Second) // B's admission may still remember refusing A (DeniedFor)
+	deadline = time.Now().Add(90 * time.Second) // B's admission may still remember refusing A (DeniedFor)
 	for {
 		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 		m, err = manifest.Fetch(ctx, id, bAddr, dl.Dial)
@@ -239,6 +341,6 @@ func TestManifestOnLenderSurvivesItsDatabaseLoss(t *testing.T) {
 		t.Fatalf("friends %+v", m.Friends)
 	}
 	if got, _ := os.ReadFile(file); !bytes.Equal(got, held) {
-		t.Fatal("the manifest fetched is not the one B held before losing its database")
+		t.Fatal("the manifest fetched is not the one B holds")
 	}
 }
