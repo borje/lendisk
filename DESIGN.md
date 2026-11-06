@@ -964,28 +964,48 @@ upstream bucket is Q-V.
   the invite key's 32 bytes, keyed with
   `HKDF-SHA256(X25519(own key, other key), info="lendisk-redeem-v1")`,
   which either side computes and no one else can (ID-1: no
-  signature). The inviting node refuses a missing or wrong proof, its
-  own address, or a peer that is already a friend; it then marks the
-  invite used by the proven key (`invite.redeemed_by`, migration 8)
-  and inserts the friendship row in one transaction, answers with its
-  own number and retention, and closes the connection (`Connection:
-  close`). The invited node writes its row only after that answer.
+  signature). The inviting node refuses a missing or wrong proof or
+  its own address; it then marks the invite used by the proven key
+  (`invite.redeemed_by`, migration 8) and inserts the friendship row
+  in one transaction, answers with its own number and retention, and
+  closes the connection (`Connection: close`). The invited node writes
+  its row only after that answer.
   The answer can be lost, or the invited node can stop before writing
-  its row, after the inviting node committed (#51). So the invited
-  node first records the terms it offers in `pending_redeem` (keyed
-  by the invite key's node ID) and writes its friendship row and
-  deletes that record in one transaction (`state.DB.FinishRedeem`);
-  running `peer add` with the same invite again finds the record,
-  repeats its number and retention without asking, and redeems again.
-  The retry goes over the invite key, which admission still admits
-  (SEC-10): a used invite answers `redeem` again, until it expires,
-  for the key it was redeemed by while that friendship stands, with
-  the stored terms; the request's address, number and retention are
-  applied as the friend's latest report. A redeem from any other
-  proven key finds the invite used (`409`), and an expired invite is
-  refused, so the PEER-2 AC holds. A refusal (`4xx`) drops the
-  `pending_redeem` record; a timeout, a lost answer or a `5xx` keeps
-  it and tells the user to run the same `peer add` again. Both rows
+  its row, after the inviting node committed (#51, #56). So the
+  invited node first records the terms it offers in `pending_redeem`
+  (keyed by the invite key's node ID, with the inviter's ID) and
+  writes its friendship row and deletes every record with that
+  inviter in one transaction (`state.DB.FinishRedeem`). Running
+  `peer add` with the same invite again finds the record, repeats its
+  number and retention without asking, and redeems again; a record
+  with the same inviter from another invite is named on stdout (its
+  invite key's node ID and start time) and settled by this redeem. If
+  the record of this invite appears while `peer add` asks for the
+  number, another `peer add` of it is running, and this one stops with
+  "a redeem of this invite is already in progress".
+  A proven key that is already a friend is answered, not refused: any
+  unexpired invite, used by it, unused or used by another, answers
+  `redeem` with the stored friendship's terms, the request's address,
+  number and retention applied as the friend's latest report, and an
+  unused invite is marked used by it (`state.DB.RedeemInvite`). The
+  proof binds the invite key of this connection, so a proof seen
+  elsewhere does not carry over; `redeem` is served to the `invite`
+  role only, never over a friend's own key. An expired invite's key
+  is no longer admitted (SEC-10), so a re-run after expiry cannot
+  reach the inviting node. When an invite-key redeem times out or is
+  refused (`4xx`) and a `pending_redeem` record with that inviter
+  existed before this run, `peer add` keeps the records and says that
+  the invite has expired or cannot be reached, that the inviting node
+  may already count this node as a friend, and to ask it for a new
+  invite; redeeming that one heals through the friend answer above.
+  The invited node never dials with its own key here: a second
+  process holding the daemon's key on the relay stalls both (#52).
+  Every other proven key finds a used invite used (`409`) and an
+  expired one not admitted, so the PEER-2 AC holds: a replay never
+  makes a friendship. Without an earlier record, a refusal (`4xx`)
+  drops the invite's `pending_redeem` record; a
+  timeout, a lost answer or a `5xx` keeps it and tells the user to
+  run the same `peer add` again. Both rows
   hold peer key, address, own number, the other's number as last
   reported and each side's retention (migration 5), and each
   becomes an account in the other's `IAMService`: each is the other's
@@ -2213,8 +2233,10 @@ upstream bucket is Q-V.
   closed; the borrower reconnects with its own key. A used invite key
   keeps the `invite` role until expiry while its redeemer is a friend,
   so the redeemer can retry a redeem whose answer it lost (§3.2,
-  PEER-2); in that role it still reaches `redeem` alone, and `redeem`
-  answers only the key the invite was redeemed by.
+  PEER-2); in that role it still reaches `redeem` alone. Over any
+  unexpired invite, `redeem` answers a proven key that is already a
+  friend with that friendship's terms (§3.2, #56); every other key
+  finds a used invite used.
 - **SEC-14** `DisablePresharedKey` is set and `Key` is the identity's
   WireGuard key (ID-1), so the `tc…` address is a function of the
   public key and the bootstrap region only. The address embeds the

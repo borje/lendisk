@@ -154,8 +154,7 @@ func TestPendingRedeemKeepsTermsUntilFinished(t *testing.T) {
 	}
 }
 
-// An expired invite is refused; one redeemed by a node that is already a
-// friend stays unused.
+// An expired invite is refused, and a friendship row is not added twice.
 func TestRedeemExpiredOrExistingRefused(t *testing.T) {
 	ctx := context.Background()
 	db := openPeers(t)
@@ -170,12 +169,91 @@ func TestRedeemExpiredOrExistingRefused(t *testing.T) {
 	if err := db.AddFriendship(ctx, Friendship{Peer: "bob", OwnNumber: 1, PeerNumber: 1, CreatedAt: now}); !errors.Is(err, ErrExists) {
 		t.Fatalf("second friendship row: %v", err)
 	}
-	db.AddInvite(ctx, Invite{Key: "new", Number: 1, Retention: time.Hour, ExpiresAt: now.Add(time.Hour)})
-	if _, err := db.RedeemInvite(ctx, "new", Friendship{Peer: "bob", PeerNumber: 1, PeerRetention: time.Hour}, now); !errors.Is(err, ErrExists) {
-		t.Fatalf("redeem by an existing friend: %v", err)
+}
+
+// PEER-2 (#56): a friend that lost the answer may redeem any live
+// invite, a new one or one another node used, and gets the friendship
+// it already has, with its report applied; a new invite is spent by it.
+// An expired invite is still refused, and no one else gains anything.
+func TestRedeemByFriendAnswersItsFriendship(t *testing.T) {
+	ctx := context.Background()
+	db := openPeers(t)
+	now := time.Unix(1_800_000_000, 0)
+	for _, inv := range []Invite{
+		{Key: "first", Number: 80 << 30, Retention: 30 * 24 * time.Hour, ExpiresAt: now.Add(time.Hour)},
+		{Key: "new", Number: 60 << 30, Retention: time.Hour, ExpiresAt: now.Add(time.Hour)},
+		{Key: "carols", Number: 1 << 30, Retention: time.Hour, ExpiresAt: now.Add(time.Hour)},
+		{Key: "old", Number: 1 << 30, Retention: time.Hour, ExpiresAt: now},
+	} {
+		if err := db.AddInvite(ctx, inv); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if r, _ := db.PeerRole(ctx, "new", now); r != RoleInvite {
-		t.Fatal("a refused redemption used the invite")
+	bob := Friendship{Peer: "bob", Address: "tcbob", PeerNumber: 100 << 30, PeerRetention: 60 * 24 * time.Hour}
+	first, err := db.RedeemInvite(ctx, "first", bob, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RedeemInvite(ctx, "carols", Friendship{Peer: "carol", PeerNumber: 1, PeerRetention: time.Hour}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	bob.Address, bob.PeerNumber = "tcbob2", 90<<30
+	for _, key := range []string{"new", "carols"} {
+		got, err := db.RedeemInvite(ctx, key, bob, now.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("friend redeeming %s: %v", key, err)
+		}
+		if got.OwnNumber != first.OwnNumber || got.OwnRetention != first.OwnRetention || !got.CreatedAt.Equal(first.CreatedAt) ||
+			got.Address != "tcbob2" || got.PeerNumber != 90<<30 {
+			t.Fatalf("friend redeeming %s got %+v, first %+v", key, got, first)
+		}
+	}
+	// The new invite is spent by bob: dave is refused it.
+	if _, err := db.RedeemInvite(ctx, "new", Friendship{Peer: "dave", PeerNumber: 1, PeerRetention: time.Hour}, now); !errors.Is(err, ErrInviteSpent) {
+		t.Fatalf("dave with the invite bob healed with: %v", err)
+	}
+	var by string
+	db.QueryRow(`SELECT redeemed_by FROM invite WHERE invite_key = 'carols'`).Scan(&by)
+	if by != "carol" {
+		t.Fatalf("carol's invite now redeemed by %q", by)
+	}
+	if _, err := db.RedeemInvite(ctx, "old", bob, now); !errors.Is(err, ErrInviteSpent) {
+		t.Fatalf("friend with an expired invite: %v", err)
+	}
+	if fs, _ := db.Friendships(ctx); len(fs) != 2 {
+		t.Fatalf("friendships %+v", fs)
+	}
+}
+
+// PEER-2 (#56): the invited node lists every pending redeem with one
+// inviter, and finishing any of them drops them all.
+func TestFinishRedeemDropsEveryPendingWithThePeer(t *testing.T) {
+	ctx := context.Background()
+	db := openPeers(t)
+	now := time.Unix(1_800_000_000, 0)
+	for i, p := range []PendingRedeem{
+		{InviteKey: "ik1", Peer: "alice", Number: 1, Retention: time.Hour},
+		{InviteKey: "ik2", Peer: "alice", Number: 2, Retention: time.Hour},
+		{InviteKey: "ik3", Peer: "carol", Number: 3, Retention: time.Hour},
+	} {
+		p.StartedAt = now.Add(time.Duration(i) * time.Minute)
+		if err := db.StartRedeem(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ps, err := db.PendingRedeemsWith(ctx, "alice")
+	if err != nil || len(ps) != 2 || ps[0].InviteKey != "ik1" || ps[1].InviteKey != "ik2" {
+		t.Fatalf("pending with alice: %+v, %v", ps, err)
+	}
+	if err := db.FinishRedeem(ctx, "ik2", Friendship{Peer: "alice", OwnNumber: 2, PeerNumber: 1, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if ps, _ := db.PendingRedeemsWith(ctx, "alice"); len(ps) != 0 {
+		t.Fatalf("pending with alice after finishing: %+v", ps)
+	}
+	if _, err := db.PendingRedeemOf(ctx, "ik3"); err != nil {
+		t.Fatalf("carol's pending redeem: %v", err)
 	}
 }
 

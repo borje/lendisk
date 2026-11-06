@@ -179,6 +179,18 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 
 	fmt.Fprintf(a.out, "Invite from node %s.\n", them)
 	fmt.Fprintf(a.out, "They lend you %s and keep what you delete for %s.\n", formatSize(inv.Number), formatDays(inv.Retention))
+	// A redeem with them started before, from any invite, means they
+	// may hold the friendship already (#56).
+	earlier, err := db.PendingRedeemsWith(ctx, them.String())
+	if err != nil {
+		return err
+	}
+	for _, p := range earlier {
+		if p.InviteKey != ikID {
+			fmt.Fprintf(a.out, "An unfinished redeem with this node, started %s from another invite (invite key %s), is settled by this one.\n",
+				p.StartedAt.UTC().Format(time.RFC3339), p.InviteKey)
+		}
+	}
 	// A redeem started before repeats its terms (#51): the inviting
 	// node may have stored them already.
 	number := inv.Number
@@ -199,39 +211,33 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 				return usageError{err}
 			}
 		}
-		if err := db.StartRedeem(ctx, state.PendingRedeem{InviteKey: ikID, Peer: them.String(),
-			Number: number, Retention: ret, StartedAt: a.now()}); err != nil {
+		err = db.StartRedeem(ctx, state.PendingRedeem{InviteKey: ikID, Peer: them.String(),
+			Number: number, Retention: ret, StartedAt: a.now()})
+		if errors.Is(err, state.ErrExists) {
+			return errors.New("a redeem of this invite is already in progress (another `lendisk peer add` started it while this one asked); let it finish, then check `lendisk peer list`")
+		} else if err != nil {
 			return err
 		}
 	default:
 		return err
 	}
 
-	dl, err := transport.NewDialer(ik, log)
-	if err != nil {
-		return err
-	}
-	defer dl.Close()
-	proof, err := control.RedeemProof(id, them, ik.NodeID())
-	if err != nil {
-		return err
-	}
-	cctx, cancel := context.WithTimeout(ctx, a.redeemTimeout())
-	defer cancel()
-	var rt http.RoundTripper = &http.Transport{
-		DisableKeepAlives: true,
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dl.Dial(ctx, them, inv.Address)
-		},
-	}
-	if a.redeemTransport != nil {
-		rt = a.redeemTransport(rt)
-	}
-	cl := &control.Client{HTTP: &http.Client{Transport: rt}}
-	resp, err := cl.Redeem(cctx, control.RedeemRequest{Address: addr, Number: number,
-		RetentionSeconds: int64(ret / time.Second), Proof: proof})
+	req := control.RedeemRequest{Address: addr, Number: number, RetentionSeconds: int64(ret / time.Second)}
+	resp, timedOut, err := a.redeem(ctx, log, ik, id, them, inv.Address, req)
 	var ce *control.CallError
 	switch {
+	case err != nil && len(earlier) > 0 && (timedOut || errors.As(err, &ce) && ce.Status < http.StatusInternalServerError):
+		// An earlier redeem with them may have been stored there while
+		// this invite can no longer be redeemed, its key no longer
+		// admitted once it expired (#56). Its record is kept: the redeem
+		// of a new invite settles it.
+		why := "it did not answer"
+		if ce != nil {
+			why = "it refused: " + ce.Message
+		}
+		return fmt.Errorf("this invite has expired or node %s cannot be reached (%s). An earlier redeem with that node, started %s, did not finish, "+
+			"so it may already count you as a friend. Ask them for a new invite and run `lendisk peer add` with it: that settles this one. If they were only offline and the invite is still valid, running the same `lendisk peer add` again also works",
+			them, why, earlier[0].StartedAt.UTC().Format(time.RFC3339))
 	case errors.As(err, &ce):
 		if ce.Status < http.StatusInternalServerError {
 			// Refused for good: a re-run starts afresh.
@@ -240,7 +246,7 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 			}
 		}
 		return fmt.Errorf("node %s refused the invite: %s", them, ce.Message)
-	case err != nil && cctx.Err() != nil:
+	case err != nil && timedOut:
 		return fmt.Errorf("cannot reach node %s: it is offline or not running `lendisk serve`, or the invite was already used or has expired; run the same `lendisk peer add` again to retry", them)
 	case err != nil:
 		return fmt.Errorf("redeeming the invite at node %s: %w; run the same `lendisk peer add` again to finish", them, err)
@@ -259,8 +265,41 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 	if err := db.FinishRedeem(ctx, ikID, f); err != nil {
 		return fmt.Errorf("node %s stored the friendship but this node could not: %w; run the same `lendisk peer add` again to finish", them, err)
 	}
+	if resp.Number != inv.Number || f.PeerRetention != inv.Retention {
+		fmt.Fprintf(a.out, "They already held this friendship: they lend you %s and keep what you delete for %s.\n",
+			formatSize(resp.Number), formatDays(f.PeerRetention))
+	}
 	fmt.Fprintf(a.out, "Now friends with %s. Quota: %s each way.\n", them, formatSize(f.Quota()))
 	return nil
+}
+
+// redeem calls redeem at them, dialling with the invite key; the proof
+// by self binds that key. timedOut reports that the call ran out of
+// time.
+func (a *app) redeem(ctx context.Context, log *slog.Logger, key, self *identity.Identity, them identity.NodeID,
+	address string, req control.RedeemRequest) (resp control.RedeemResponse, timedOut bool, err error) {
+	dl, err := transport.NewDialer(key, log)
+	if err != nil {
+		return resp, false, err
+	}
+	defer dl.Close()
+	if req.Proof, err = control.RedeemProof(self, them, key.NodeID()); err != nil {
+		return resp, false, err
+	}
+	cctx, cancel := context.WithTimeout(ctx, a.redeemTimeout())
+	defer cancel()
+	var rt http.RoundTripper = &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dl.Dial(ctx, them, address)
+		},
+	}
+	if a.redeemTransport != nil {
+		rt = a.redeemTransport(rt)
+	}
+	cl := &control.Client{HTTP: &http.Client{Transport: rt}}
+	resp, err = cl.Redeem(cctx, req)
+	return resp, err != nil && cctx.Err() != nil, err
 }
 
 // PeerJSON is one friend in `peer list --json`.

@@ -55,13 +55,14 @@ func (db *DB) PurgeInvites(ctx context.Context, now time.Time) (int64, error) {
 // as a friendship, with the invite's number and retention as this
 // side's, in one transaction (PEER-2, SEC-13). It fails with
 // ErrInviteSpent when the invite is unknown, expired at now, or used by
-// another node, and with ErrExists when f's peer is already a friend;
-// either way nothing changes.
+// another node; nothing then changes.
 //
-// The node that redeemed an invite may redeem it again until it
-// expires, since it may have lost the answer (#51): while its
-// friendship stands, the retry returns the stored row with f's address,
-// number and retention applied as the friend's latest report.
+// The caller must have proven that f.Peer redeems (control.RedeemProof),
+// because a friend may redeem again, since it may have lost the answer
+// (#51, #56): when f's peer is already a friend, any unexpired invite,
+// used or not, returns the stored friendship with f's address, number
+// and retention applied as the friend's latest report, and an unused
+// invite is marked used by it.
 func (db *DB) RedeemInvite(ctx context.Context, key string, f Friendship, now time.Time) (Friendship, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -69,28 +70,25 @@ func (db *DB) RedeemInvite(ctx context.Context, key string, f Friendship, now ti
 	}
 	defer tx.Rollback()
 	var number, retention, usedAt sql.NullInt64
-	var by sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT number, retention, used_at, redeemed_by FROM invite
-		WHERE invite_key = ? AND expires_at > ?`, key, now.Unix()).Scan(&number, &retention, &usedAt, &by)
+	err = tx.QueryRowContext(ctx, `SELECT number, retention, used_at FROM invite
+		WHERE invite_key = ? AND expires_at > ?`, key, now.Unix()).Scan(&number, &retention, &usedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Friendship{}, ErrInviteSpent
 	} else if err != nil {
 		return Friendship{}, err
 	}
-	if usedAt.Valid {
-		if !by.Valid || by.String != f.Peer {
-			return Friendship{}, ErrInviteSpent
-		}
-		got, err := scanFriendship(tx.QueryRowContext(ctx, `UPDATE friendship
-			SET address = ?, peer_number = ?, peer_retention = ? WHERE peer_key = ?
-			RETURNING `+friendshipCols,
-			f.Address, f.PeerNumber, int64(f.PeerRetention/time.Second), f.Peer))
-		if errors.Is(err, ErrNotFound) {
-			return Friendship{}, ErrInviteSpent
-		} else if err != nil {
+	got, err := refreshFriendship(ctx, tx, f)
+	switch {
+	case err == nil:
+		if _, err := tx.ExecContext(ctx, `UPDATE invite SET used_at = ?, redeemed_by = ?
+			WHERE invite_key = ? AND used_at IS NULL`, now.Unix(), f.Peer, key); err != nil {
 			return Friendship{}, err
 		}
 		return got, tx.Commit()
+	case !errors.Is(err, ErrNotFound):
+		return Friendship{}, err
+	case usedAt.Valid:
+		return Friendship{}, ErrInviteSpent
 	}
 	// Conditional, so a concurrent redemption cannot use it twice.
 	res, err := tx.ExecContext(ctx, `UPDATE invite SET used_at = ?, redeemed_by = ?
@@ -110,6 +108,16 @@ func (db *DB) RedeemInvite(ctx context.Context, key string, f Friendship, now ti
 		return Friendship{}, err
 	}
 	return f, tx.Commit()
+}
+
+// refreshFriendship applies f's address, number and retention to the
+// friendship with f's peer as the friend's latest report and returns
+// the row; ErrNotFound if f's peer is not a friend.
+func refreshFriendship(ctx context.Context, tx *sql.Tx, f Friendship) (Friendship, error) {
+	return scanFriendship(tx.QueryRowContext(ctx, `UPDATE friendship
+		SET address = ?, peer_number = ?, peer_retention = ? WHERE peer_key = ?
+		RETURNING `+friendshipCols,
+		f.Address, f.PeerNumber, int64(f.PeerRetention/time.Second), f.Peer))
 }
 
 // PendingRedeem is a redeem the invited node started and has not
@@ -157,8 +165,32 @@ func (db *DB) PendingRedeemOf(ctx context.Context, key string) (PendingRedeem, e
 	return p, nil
 }
 
+// PendingRedeemsWith lists the pending redeems of invites from peer,
+// oldest first.
+func (db *DB) PendingRedeemsWith(ctx context.Context, peer string) ([]PendingRedeem, error) {
+	rows, err := db.QueryContext(ctx, `SELECT invite_key, peer_key, number, retention, started_at
+		FROM pending_redeem WHERE peer_key = ? ORDER BY started_at, invite_key`, peer)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ps []PendingRedeem
+	for rows.Next() {
+		var p PendingRedeem
+		var ret, started int64
+		if err := rows.Scan(&p.InviteKey, &p.Peer, &p.Number, &ret, &started); err != nil {
+			return nil, err
+		}
+		p.Retention = time.Duration(ret) * time.Second
+		p.StartedAt = time.Unix(started, 0)
+		ps = append(ps, p)
+	}
+	return ps, rows.Err()
+}
+
 // FinishRedeem stores f and drops the pending redeem of the invite with
-// key in one transaction; ErrExists if f's peer is a friend already.
+// key, and every other one with f's peer (#56), in one transaction;
+// ErrExists if f's peer is a friend already.
 func (db *DB) FinishRedeem(ctx context.Context, key string, f Friendship) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -168,7 +200,7 @@ func (db *DB) FinishRedeem(ctx context.Context, key string, f Friendship) error 
 	if err := addFriendship(ctx, tx, f); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM pending_redeem WHERE invite_key = ?`, key); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM pending_redeem WHERE invite_key = ? OR peer_key = ?`, key, f.Peer); err != nil {
 		return err
 	}
 	return tx.Commit()

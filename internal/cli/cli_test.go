@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -38,6 +39,8 @@ type node struct {
 	// every command (app's fields of those names).
 	redeemTransport  func(http.RoundTripper) http.RoundTripper
 	beforeFriendship func() error
+	// stdin, when set, is every command's stdin in place of run's.
+	stdin io.Reader
 }
 
 func newNode(t *testing.T) *node {
@@ -49,8 +52,12 @@ func newNode(t *testing.T) *node {
 // run executes the CLI with stdin and returns exit code, stdout, stderr.
 func (n *node) run(stdin string, phrase string, args ...string) (int, string, string) {
 	var out, errOut bytes.Buffer
+	var in io.Reader = strings.NewReader(stdin)
+	if n.stdin != nil {
+		in = n.stdin
+	}
 	a := &app{
-		in: bufio.NewReader(strings.NewReader(stdin)), out: &out, errOut: &errOut,
+		in: bufio.NewReader(in), out: &out, errOut: &errOut,
 		pick:      func(int, int) []int { return []int{0, 11, 23} },
 		newPhrase: func() (string, error) { return phrase, nil },
 		regions:   n.regions,
