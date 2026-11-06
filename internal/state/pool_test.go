@@ -643,13 +643,13 @@ func TestRerouteMovesOnlyToAReachableFriend(t *testing.T) {
 	p.wantPlaces("data/1", d, "B")
 }
 
-// §3.4 (#19 final review): a re-routing pass over 3000 waiting rows in
-// a bucket of 1200 metadata objects takes well under a second, so it
-// never keeps captures waiting on the write lock past busy_timeout.
-// Only a few rows find room; the rest wait.
-func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
+// manyWaiting fills p with friends B, C and D (room for about 20 more
+// objects), a bucket of 1200 metadata objects acknowledged everywhere,
+// and 3000 data rows acknowledged at C and queued at B, the friend to
+// re-route from; with barrier, a metadata row queued at C after them.
+func manyWaiting(t *testing.T, p *pool, barrier bool) {
+	t.Helper()
 	ctx := context.Background()
-	p := newPool(t)
 	p.friend("B", 1<<20)
 	p.friend("C", 1<<20)
 	p.friend("D", 40) // room for about 20 after the bucket's metadata and its reserve
@@ -658,7 +658,7 @@ func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{
+	qs := []string{
 		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
 		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
 			SELECT 'laptop', 'index/' || i, 'put', 'metadata', 'done', 100, 'h', ?1 FROM n`,
@@ -672,7 +672,14 @@ func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
 			SELECT seq, 'B', bucket, key, 'put', 'queued', 1048576 FROM queue WHERE class = 'data'`,
 		`INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
 			SELECT seq, 'C', bucket, key, 'put', 'acked', 'h', ?1, 1048576 FROM queue WHERE class = 'data'`,
-	} {
+	}
+	if barrier {
+		qs = append(qs, `INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
+			VALUES ('laptop', 'index/new', 'put', 'metadata', 'done', 100, 'h', ?1)`,
+			`INSERT INTO placement (seq, place, bucket, key, op, state, size)
+			SELECT seq, 'C', bucket, key, 'put', 'queued', 4196 FROM queue WHERE key = 'index/new'`)
+	}
+	for _, q := range qs {
 		if _, err := tx.ExecContext(ctx, q, p.now.Unix()); err != nil {
 			t.Fatal(err)
 		}
@@ -680,19 +687,22 @@ func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+}
+
+// reroutePass runs one pass and checks it took under passLimit (more
+// under the race detector) and filled D no further than its quota.
+func reroutePass(t *testing.T, p *pool) (moved, dropped int64) {
+	t.Helper()
+	ctx := context.Background()
 	start := time.Now()
 	moved, dropped, err := p.db.Reroute(ctx, nil, nil)
 	took := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("a pass over 3000 rows took %v, moved %d", took, moved)
-	if moved == 0 || moved > 40 || dropped != 0 {
-		t.Fatalf("moved %d dropped %d: D has room for a few", moved, dropped)
-	}
-	if took > 2*time.Second {
-		t.Fatalf("a pass took %v", took)
+	t.Logf("a pass over 3000 rows took %v, moved %d, dropped %d", took, moved, dropped)
+	if took > passLimit {
+		t.Fatalf("a pass took %v, over %v", took, passLimit)
 	}
 	use, err := p.db.PlaceUse(ctx)
 	if err != nil {
@@ -700,6 +710,33 @@ func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
 	}
 	if use["D"] > 40*unit {
 		t.Fatalf("D counts %d bytes, more than its quota", use["D"])
+	}
+	return moved, dropped
+}
+
+// §3.4 (#19 final review): a re-routing pass over 3000 waiting rows in
+// a bucket of 1200 metadata objects takes well under a second, so it
+// never keeps captures waiting on the write lock past busy_timeout.
+// Only a few rows find room; the rest wait at the unreachable friend.
+func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
+	p := newPool(t)
+	manyWaiting(t, p, false)
+	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	if moved, dropped := reroutePass(t, p); moved == 0 || moved > 40 || dropped != 0 {
+		t.Fatalf("moved %d dropped %d: D has room for a few", moved, dropped)
+	}
+}
+
+// §3.4 (#19 review of 3db283c): the same at a friend that has answered
+// 507 for reroute_after, where every row holds a metadata barrier: the
+// few that fit move, the rest are dropped, in one fast pass.
+func TestRerouteOfManyRowsAtAFullFriendIsFast(t *testing.T) {
+	p := newPool(t)
+	manyWaiting(t, p, true)
+	p.condition("B", ConditionQuota, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	moved, dropped := reroutePass(t, p)
+	if moved == 0 || moved > 40 || moved+dropped != 3000 {
+		t.Fatalf("moved %d dropped %d of 3000", moved, dropped)
 	}
 }
 
@@ -801,5 +838,65 @@ func TestDataLeavesRoomForAPrunesIndex(t *testing.T) {
 		if err != nil || !ok || nx.Op != OpDelete {
 			t.Fatalf("%s's head after the index: %+v %v %v, want the deletes", f, nx, ok, err)
 		}
+	}
+}
+
+// §3.4 (#19 review of 3db283c): one re-routing pass that moves rows of
+// several buckets to the same friend fills it once, not once per
+// bucket: what one bucket's rows take is gone for the others too.
+func TestRerouteOfSeveralBucketsDoesNotOverfillAFriend(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.bucket("x", 1)
+	p.bucket("y", 1)
+	for _, b := range []string{"x", "y"} {
+		for i := range 2 {
+			s := p.put(b, fmt.Sprintf("data/%d", i), "data", 1)
+			p.wantPlaces(b, s, "B")
+		}
+	}
+	p.friend("D", 2.5) // joins after: the only other room
+	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	moved, dropped, err := p.db.Reroute(ctx, nil, nil)
+	if err != nil || dropped != 0 {
+		t.Fatalf("dropped %d %v", dropped, err)
+	}
+	use, err := p.db.PlaceUse(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// D: 2.5 units less its 1% reserve takes two 1-unit objects.
+	if moved != 2 || use["D"] != 2*unit {
+		t.Fatalf("moved %d, D counts %d bytes (%.2f units), want 2 objects", moved, use["D"], float64(use["D"])/float64(unit))
+	}
+}
+
+// D6 (#19 review of 3db283c): re-routing picks the friend with the
+// largest free fraction, compared exactly, whatever order it looks at
+// the friends in: fractions a hair apart are not a tie.
+func TestRerouteChoosesTheLargestFreeFractionExactly(t *testing.T) {
+	ctx := context.Background()
+	for range 30 {
+		p := newPool(t)
+		p.friend("Z", 10)
+		p.bucket("x", 1)
+		s := p.put("x", "data/1", "data", 1)
+		p.wantPlaces("data/1", s, "Z")
+		for _, f := range []string{"A", "B", "C"} {
+			p.friend(f, 100)
+		}
+		// C is the emptiest; B and A have a few bytes more stored, each
+		// well under a millionth of the quota apart.
+		const k = 63
+		if _, err := p.db.Exec(`INSERT OR REPLACE INTO place_use (place, bytes) VALUES ('A', ?), ('B', ?), ('C', 0)`,
+			2*k, k); err != nil {
+			t.Fatal(err)
+		}
+		p.condition("Z", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+		if moved, _, err := p.db.Reroute(ctx, nil, nil); err != nil || moved != 1 {
+			t.Fatalf("moved %d %v", moved, err)
+		}
+		p.wantPlaces("data/1", s, "C")
 	}
 }

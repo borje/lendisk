@@ -1486,8 +1486,10 @@ upstream bucket is Q-V.
     `state.DefaultCopies`, 2, for a bucket with none) by D6's choice
     (`state.DB.choose`): candidates are friends with an address and
     free capacity for the object; reachable ones first, then by largest
-    free fraction (free ÷ quota), ties by node ID (fractions within one
-    part in a million tie). Free capacity is the
+    free fraction (free ÷ quota), compared exactly, ties by node ID
+    (`state.byFraction`, a total order; room is counted in hundredths
+    of a byte, so the reserve's 1% of a quota is exact and equal
+    fractions tie). Free capacity is the
     friendship's quota less the borrower's count of the place's use
     (below) less the bucket's live metadata with no row at that place
     (a friend added later, which re-placement, #26, fills) less the
@@ -1685,10 +1687,15 @@ upstream bucket is Q-V.
   under and a re-routing pass reads it under, so neither misses the
   other; a send that failed releases its row before the sender waits
   to retry. A pass reads without a transaction: the waiting rows of
-  each friend to re-route, with their holders, in one query; each
-  bucket's free room at each reachable friend, computed once and
-  lowered in memory as rows move (a friend with no room for one more
-  object leaves the candidates, so the remaining rows cost nothing).
+  each friend to re-route, with their holders, in one query; and, once,
+  each reachable friend's room before any bucket's metadata (quota less
+  use less the reserve). A row's room at a friend is that, less its
+  bucket's unsent metadata there (read once per bucket and friend),
+  less what the pass has already moved there for any bucket, so moves
+  of several buckets fill a friend once. Friends are scanned in node ID
+  order and compared exactly, so the choice does not depend on the
+  order of a map; a friend with no room for one more object leaves the
+  candidates, so the remaining rows cost nothing.
   It then applies the moves in write transactions of at most 64 rows,
   each under the worker's lock, re-checking that each row is still
   queued and not being sent, so captures never wait behind a long pass
