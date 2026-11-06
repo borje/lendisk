@@ -162,8 +162,12 @@ func TestRefusedObjectCountsAgainstTheBucket(t *testing.T) {
 	if err := db.AckPlacement(ctx, "C", s1, "h-data/1", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RefuseObject(ctx, s1, "gone"); err != nil {
-		t.Fatal(err)
+	if refused, err := db.RefuseObject(ctx, s1, "gone"); err != nil || !refused {
+		t.Fatal(refused, err)
+	}
+	// Another place's sender comes second: nothing left to refuse (#57).
+	if refused, err := db.RefuseObject(ctx, s1, "gone"); err != nil || refused {
+		t.Fatal(refused, err)
 	}
 	for _, place := range []string{"B", "C"} {
 		if p, _, _ := db.NextPlacement(ctx, place); p.Seq != s2 {
@@ -229,5 +233,113 @@ func TestPlaceStatsAndCondition(t *testing.T) {
 	cs, _ = db.PlaceConditions(ctx)
 	if c := cs["B"]; c.Condition != ConditionOK || !c.LastOK.Equal(now.Add(2*time.Hour)) {
 		t.Fatalf("condition %+v", c)
+	}
+}
+
+// REPL-1, REPL-3 (#57): an identical re-upload of an object whose last
+// done row was refused somewhere, by a place or because the store could
+// not supply it, is queued again and placed at every friend; once it is
+// done, the refusals of the older row no longer count. An ordinary
+// retry of an object refused nowhere is still dropped (EP-3).
+func TestIdenticalReuploadHealsARefusedObject(t *testing.T) {
+	ctx := context.Background()
+	for _, refuse := range []struct {
+		name string
+		fn   func(db *DB, seq int64) error
+	}{
+		{"place", func(db *DB, seq int64) error { return db.RefusePlacement(ctx, "B", seq, "BadDigest") }},
+		{"store", func(db *DB, seq int64) error {
+			_, err := db.RefuseObject(ctx, seq, "the store holds 0 bytes")
+			return err
+		}},
+	} {
+		t.Run(refuse.name, func(t *testing.T) {
+			db := openTest(t)
+			friend(t, db, "B")
+			friend(t, db, "C")
+			put := func() (int64, bool) {
+				t.Helper()
+				s, err := db.BeginCaptures(ctx, []Capture{{Bucket: "laptop", Key: "data/1", Op: OpPut, Class: "data"}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				dup, err := db.FinishPut(ctx, s[0], 6, "h-data/1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				return s[0], dup
+			}
+			s1, _ := put()
+			// Queued or acknowledged, an identical re-upload is a retry.
+			if _, dup := put(); !dup {
+				t.Fatal("a retry of a queued object was queued again")
+			}
+			if err := db.AckPlacement(ctx, "C", s1, "h-data/1", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if _, dup := put(); !dup {
+				t.Fatal("a retry of an acknowledged object was queued again")
+			}
+			if err := refuse.fn(db, s1); err != nil {
+				t.Fatal(err)
+			}
+			if st, _ := db.PlaceStats(ctx, time.Now()); st["B"].Refused+mustRefused(t, db)["laptop"] != 1 {
+				t.Fatalf("refusal not counted: %+v %v", st, mustRefused(t, db))
+			}
+			s2, dup := put()
+			if dup {
+				t.Fatal("the re-upload of a refused object was dropped")
+			}
+			for _, place := range []string{"B", "C"} {
+				if p, ok, _ := db.NextPlacement(ctx, place); !ok || p.Seq != s2 {
+					t.Fatalf("%s head %+v %v", place, p, ok)
+				}
+			}
+			st, _ := db.PlaceStats(ctx, time.Now())
+			if st["B"].Refused != 0 || mustRefused(t, db)["laptop"] != 0 {
+				t.Fatalf("a healed refusal still counts: %+v %v", st, mustRefused(t, db))
+			}
+			// The new row is refused nowhere: the next identical upload is a retry.
+			if _, dup := put(); !dup {
+				t.Fatal("a retry after healing was queued again")
+			}
+		})
+	}
+}
+
+func mustRefused(t *testing.T, db *DB) map[string]int64 {
+	t.Helper()
+	r, err := db.RefusedObjects(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// #57: a place's condition goes back to ok, without counting as an
+// acknowledgement, when its FIFO empties for another reason.
+func TestPlaceConditionResets(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	now := time.Unix(1_800_000_000, 0)
+	if err := db.SetPlaceCondition(ctx, "B", ConditionOK, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetPlaceCondition(ctx, "B", ConditionRetrying, "connection refused", now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ResetPlaceCondition(ctx, "B", now.Add(2*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c, _ := db.PlaceConditions(ctx)
+	if b := c["B"]; b.Condition != ConditionOK || b.Detail != "" || !b.Since.Equal(now.Add(2*time.Hour)) || !b.LastOK.Equal(now) {
+		t.Fatalf("condition %+v", b)
+	}
+	// A place never contacted gets no condition.
+	if err := db.ResetPlaceCondition(ctx, "C", now); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ := db.PlaceConditions(ctx); len(c) != 1 {
+		t.Fatalf("conditions %+v", c)
 	}
 }

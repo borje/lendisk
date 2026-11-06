@@ -40,15 +40,18 @@ type StatusPlace struct {
 	Place string `json:"place"` // the friend's node ID
 	Kind  string `json:"kind"`  // friend
 	// State is how the place answered last: ok, retrying, quota (paused
-	// for quota, LEND-2), removed (PEER-5); empty before its first answer.
+	// for quota, LEND-2), removed (PEER-5); store when it waits because
+	// this node's store cannot be read, Detail saying why (#57); empty
+	// before its first answer.
 	State  string `json:"state"`
 	Detail string `json:"detail,omitempty"`
 	// Queue is what waits to be sent there.
 	Queue StatusQueue `json:"queue"`
 	// LagSeconds is the age of the oldest object waiting (REPL-11).
 	LagSeconds int64 `json:"lag_seconds"`
-	// Refused counts objects the place refused for good (EP-11, LEND-4);
-	// objects the store could not supply count against their bucket.
+	// Refused counts objects the place refused for good (EP-11, LEND-4)
+	// and not written again since (#57); objects the store could not
+	// supply count against their bucket.
 	Refused int64 `json:"refused"`
 	// LastOK is when the place last acknowledged anything (RFC 3339).
 	LastOK string `json:"last_ok,omitempty"`
@@ -60,6 +63,7 @@ var placeStates = map[string]string{
 	state.ConditionRetrying: "retrying",
 	state.ConditionQuota:    "paused for quota",
 	state.ConditionRemoved:  "removed",
+	state.ConditionStore:    "waiting for this node's store",
 	"":                      "not contacted yet",
 }
 

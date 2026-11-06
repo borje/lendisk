@@ -2,14 +2,18 @@ package replica
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/borje/lendisk/internal/identity"
@@ -50,6 +54,16 @@ type Worker struct {
 	// friendships reads the friendships; nil means DB.Friendships. Tests
 	// set it to fail.
 	friendships func(context.Context) ([]state.Friendship, error)
+	// open opens a file in the store; nil means os.Open. Tests set it to
+	// inject open, stat and read failures.
+	open func(name string) (fs.File, error)
+}
+
+func (w *Worker) openFile(name string) (fs.File, error) {
+	if w.open != nil {
+		return w.open(name)
+	}
+	return os.Open(name)
 }
 
 func (w *Worker) now() time.Time {
@@ -70,15 +84,19 @@ func orDefault(d, def time.Duration) time.Duration {
 // bytes in the store.
 var errSuperseded = errors.New("superseded by a later write of the key")
 
-// errLocal: the store cannot supply the object the row captured (it is
-// gone, its size differs, it is a directory, it cannot be read, it is
+// errLocal: the store definitely cannot supply the object the row
+// captured (it is gone, its size differs, it is a directory, its bytes
+// no longer match the capture hash, its key escapes the bucket, it is
 // too large for one PUT). Unless a later capture of the key explains
-// it, retrying cannot help, so the row is refused against its bucket.
+// it, retrying cannot help, so the row is refused for every place,
+// against its bucket (#50, #57).
 var errLocal = errors.New("the store cannot supply the captured object")
 
-// errStore: the bucket's directory in the store cannot be read at all
-// (a disk not mounted): nothing about one object, so rows wait.
-var errStore = errors.New("the store is unreadable")
+// errStore: the store cannot be read now: the bucket's directory is
+// missing (a disk not mounted), or opening, stating or reading the
+// object failed in a way that may pass (EMFILE, EACCES, EIO…). Nothing
+// is refused; the row waits with backoff (#57).
+var errStore = errors.New("the store cannot be read")
 
 // Run replicates until ctx ends.
 func (w *Worker) Run(ctx context.Context) {
@@ -177,10 +195,15 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	pause := orDefault(w.PauseRetry, time.Hour)
 	backoff := minB
 	log := w.Log.With("place", place)
+	// stale: the place's recorded condition may not be ok, so an empty
+	// FIFO resets it (#57). True at start for a condition left by an
+	// earlier run.
+	stale := true
 	condition := func(c, detail string) {
 		if err := w.DB.SetPlaceCondition(context.Background(), place, c, detail, w.now()); err != nil {
 			log.Error("replication: recording the place's condition failed", "err", err)
 		}
+		stale = c != state.ConditionOK
 	}
 	for ctx.Err() == nil {
 		p, ok, err := w.DB.NextPlacement(ctx, place)
@@ -192,6 +215,16 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			continue
 		}
 		if !ok {
+			// Its rows went for another reason than its answer (refused
+			// for the store by another sender): nothing waits for it.
+			if stale {
+				if err := w.DB.ResetPlaceCondition(context.Background(), place, w.now()); err != nil {
+					log.Error("replication: resetting the place's condition failed", "err", err)
+				} else {
+					stale = false
+				}
+			}
+			backoff = minB
 			sleep(ctx, poll)
 			continue
 		}
@@ -223,7 +256,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		case errors.Is(err, ErrImmutable):
 			w.refuse(log, place, p, row, err, "immutability alert: the friend holds this key with another hash; not replicated")
 			condition(state.ConditionOK, "")
-		case errors.Is(err, ErrRejected) || errors.Is(err, errLocal):
+		case errors.Is(err, errLocal):
 			if w.rewriting(ctx, p) {
 				// A later write of the key is in flight; its capture will
 				// supersede this row once done (or it is dropped and the
@@ -235,16 +268,25 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			// Nothing will make the store supply the captured bytes, so
 			// waiting would stall every place's FIFO for good (#48, #50).
 			w.refuseObject(log, p, row, err)
-			if errors.Is(err, ErrRejected) {
-				condition(state.ConditionOK, "") // the place answered
-			}
+			backoff = minB
+		case errors.Is(err, ErrRejected):
+			// send re-hashed the store's copy and it matches the capture:
+			// the place is at fault, and only its copy is refused (#57).
+			w.refuse(log, place, p, row, err, "replication alert: the place rejects bytes that match their capture hash; not replicated there")
+			condition(state.ConditionOK, "") // the place answered
 			backoff = minB
 		case errors.Is(err, errStore):
-			level := slog.LevelDebug
+			// Retried for as long as it lasts, never refused: what may pass
+			// (EMFILE, EACCES, a disk dropping out) must not lose an
+			// object for good. Alerted on the first failure in a row and
+			// shown as the place's condition (#57).
+			attrs := append(row, "err", err, "retry_in", backoff)
 			if backoff == minB {
-				level = slog.LevelError
+				log.Error("replication alert: this node's store cannot be read; waiting", append(attrs, "alert", true)...)
+			} else {
+				log.Debug("replication: this node's store cannot be read; waiting", attrs...)
 			}
-			log.Log(ctx, level, "replication: the store cannot be read; waiting", append(row, "err", err, "retry_in", backoff)...)
+			condition(state.ConditionStore, err.Error())
 			sleep(ctx, backoff)
 			backoff = min(2*backoff, maxB)
 		case errors.Is(err, ErrQuota):
@@ -279,13 +321,19 @@ func (w *Worker) refuse(log *slog.Logger, place string, p state.Placement, row [
 
 // refuseObject takes a row whose object the store cannot supply out of
 // every place's FIFO, against its bucket, and raises its alert in the
-// log (alert delivery is #13).
+// log (alert delivery is #13), once: when another place's sender
+// refused it first, this one only logs at debug level.
 func (w *Worker) refuseObject(log *slog.Logger, p state.Placement, row []any, err error) {
+	refused, rerr := w.DB.RefuseObject(context.Background(), p.Seq, err.Error())
+	if rerr != nil {
+		log.Error("replication: recording a refusal failed", append(row, "err", rerr)...)
+	}
+	if !refused && rerr == nil {
+		log.Debug("replication: another place's sender refused the object first", append(row, "err", err)...)
+		return
+	}
 	log.Error("replication alert: the store cannot supply the object as captured; not replicated",
 		append(row, "sha256", p.SHA256, "alert", true, "err", err)...)
-	if err := w.DB.RefuseObject(context.Background(), p.Seq, err.Error()); err != nil {
-		log.Error("replication: recording a refusal failed", append(row, "err", err)...)
-	}
 }
 
 // rewriting reports whether a later write of the key is in flight or
@@ -305,15 +353,51 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	} else if sup {
 		return errSuperseded
 	}
+	body, done, err := w.openCaptured(p)
+	if err != nil {
+		return err
+	}
+	defer done()
+	lr := &localReader{r: body}
+	body = lr
+	if w.OnRead != nil {
+		body = &observed{r: body, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
+	}
+	err = r.Put(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Body: body})
+	if ctx.Err() != nil || err == nil {
+		return err
+	}
+	if rerr := lr.failed(); rerr != nil {
+		// The place did not fail: reading the store did.
+		return w.unreadable(p, "reading", rerr)
+	}
+	if errors.Is(err, ErrRejected) {
+		// The place says the bytes do not match the hash. Only the
+		// store's copy decides whose fault that is (#57): a friend must
+		// not be able to stop replication to the others.
+		if lerr := w.verify(ctx, p); lerr != nil {
+			return lerr
+		}
+		return fmt.Errorf("%w (the store's copy matches its capture hash)", err)
+	}
+	return err
+}
+
+// openCaptured opens the row's object in the store, checked against
+// the capture: a body of p.Size bytes and the function that closes it.
+// The error is errLocal only for what is definitely permanent (gone, a
+// directory or special file, another size, an escaping key, too large to
+// send), errStore for anything that may pass (#57).
+func (w *Worker) openCaptured(p state.Placement) (io.Reader, func(), error) {
 	name := filepath.FromSlash(p.Key)
 	if !filepath.IsLocal(name) {
-		return fmt.Errorf("%w: key %q does not name a file in the store", errLocal, p.Key)
+		return nil, nil, fmt.Errorf("%w: key %q does not name a file in the store", errLocal, p.Key)
 	}
 	if p.Size > MaxPutSize {
-		return fmt.Errorf("%w: %d bytes is more than one PUT carries (%d) and multipart replication is not built yet (#23)",
+		return nil, nil, fmt.Errorf("%w: %d bytes is more than one PUT carries (%d) and multipart replication is not built yet (#23)",
 			errLocal, p.Size, int64(MaxPutSize))
 	}
-	// local blames the object for err, unless the bucket's directory is
+	// local blames the object, unless the bucket's directory is
 	// unreadable too, which is the store's fault, not the object's.
 	local := func(format string, a ...any) error {
 		if err := w.storeReadable(p.Bucket); err != nil {
@@ -321,17 +405,17 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		}
 		return fmt.Errorf("%w: "+format, append([]any{errLocal}, a...)...)
 	}
-	f, err := os.Open(filepath.Join(w.StoreDir, p.Bucket, name))
-	if errors.Is(err, os.ErrNotExist) {
-		return local("it is gone")
+	f, err := w.openFile(filepath.Join(w.StoreDir, p.Bucket, name))
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		return nil, nil, local("it is gone")
 	}
 	if err != nil {
-		return local("%w", err)
+		return nil, nil, w.unreadable(p, "opening", err)
 	}
-	defer f.Close()
 	fi, err := f.Stat()
 	if err != nil {
-		return local("%w", err)
+		f.Close()
+		return nil, nil, w.unreadable(p, "stating", err)
 	}
 	var body io.Reader = f
 	switch {
@@ -340,23 +424,61 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		// directory: an empty object.
 		body = strings.NewReader("")
 	case !fi.Mode().IsRegular():
-		return local("the store holds a %s there, not an object file", fileKind(fi))
+		f.Close()
+		return nil, nil, local("the store holds a %s there, not an object file", fileKind(fi))
 	case fi.Size() != p.Size:
 		// Usually a later write under way, whose capture will supersede
 		// this row; drain tells the two apart.
-		return local("the store holds %d bytes, the capture %d", fi.Size(), p.Size)
+		f.Close()
+		return nil, nil, local("the store holds %d bytes, the capture %d", fi.Size(), p.Size)
 	}
-	lr := &localReader{r: body}
-	body = lr
-	if w.OnRead != nil {
-		body = &observed{r: body, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
+	return body, func() { f.Close() }, nil
+}
+
+// verify re-hashes the store's copy of the row's object: nil when it
+// matches the capture hash, errLocal when it does not (it rotted, or a
+// write outside lendisk changed it: VER-5), errStore when it cannot be
+// read now.
+func (w *Worker) verify(ctx context.Context, p state.Placement) error {
+	body, done, err := w.openCaptured(p)
+	if err != nil {
+		return err
 	}
-	err = r.Put(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Body: body})
-	if rerr := lr.failed(); err != nil && rerr != nil && ctx.Err() == nil {
-		// The place did not fail: reading the store did.
-		return local("reading it: %w", rerr)
+	defer done()
+	h := sha256.New()
+	if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: body}); err != nil {
+		if ctx.Err() != nil {
+			return err
+		}
+		return w.unreadable(p, "re-hashing", err)
 	}
-	return err
+	if got := hex.EncodeToString(h.Sum(nil)); got != p.SHA256 {
+		return fmt.Errorf("%w: the store's copy no longer matches its capture hash (it hashes to %s; bit rot, or changed outside lendisk)",
+			errLocal, got)
+	}
+	return nil
+}
+
+// unreadable is errStore for a failure that may pass: opening, stating
+// or reading the object failed for another reason than its absence.
+func (w *Worker) unreadable(p state.Placement, doing string, err error) error {
+	if serr := w.storeReadable(p.Bucket); serr != nil {
+		return serr
+	}
+	return fmt.Errorf("%w: %s %s/%s: %w", errStore, doing, p.Bucket, p.Key, err)
+}
+
+// ctxReader stops reading when ctx ends.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // storeReadable checks that bucket's directory is in the store, so a

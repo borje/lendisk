@@ -62,6 +62,9 @@ var (
 	// LEND-4); an immutability alert (EP-11).
 	ErrImmutable = errors.New("immutability alert")
 	// ErrRejected: the friend found the bytes do not match the hash
-	// (BadDigest, LEND-4): the local copy changed after capture.
+	// (BadDigest, LEND-4). The worker re-hashes the store's copy to
+	// tell whose fault it is: a copy that changed after capture is
+	// refused for every place, one that still matches only at this
+	// place (#57).
 	ErrRejected = errors.New("hash rejected by the place")
 )

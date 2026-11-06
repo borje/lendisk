@@ -12,6 +12,9 @@ import (
 // refusal that would repeat, out of the FIFO and shown in status: by
 // the place (EP-11, LEND-4), or, with cause 'store', because the node's
 // own store cannot supply the object as captured (RefuseObject, #50).
+// An identical re-upload of the key heals a refusal: FinishPut queues it
+// again, and a refusal a later done write replaced no longer counts
+// (#57).
 const (
 	PlacementQueued  = "queued"
 	PlacementAcked   = "acked"
@@ -24,7 +27,17 @@ const (
 	ConditionRetrying = "retrying" // an error worth retrying with backoff
 	ConditionQuota    = "quota"    // paused for quota (LEND-2)
 	ConditionRemoved  = "removed"  // the friend refuses this node (PEER-5)
+	// ConditionStore: the place waits because this node's own store
+	// cannot be read now (a disk not mounted, EMFILE, EIO; #57). Not the
+	// place's fault; the detail says what failed.
+	ConditionStore = "store"
 )
+
+// current keeps placement rows p whose queue row is the key's latest
+// done write: a refusal a later write or delete of the key replaced
+// (by healing it, #57) no longer counts.
+const current = `NOT EXISTS (SELECT 1 FROM queue l
+	WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.state = 'done')`
 
 // Placement is a placement row joined with its queue row: what the
 // worker sends to the place.
@@ -94,17 +107,24 @@ func (db *DB) RefusePlacement(ctx context.Context, place string, seq int64, deta
 // refused because the node's own store cannot supply the object as
 // captured (#50); RefusedObjects counts it against its bucket, and no
 // place's refusals include it. Rows already acknowledged stay so.
-func (db *DB) RefuseObject(ctx context.Context, seq int64, detail string) error {
-	_, err := db.ExecContext(ctx, `UPDATE placement SET state = 'refused', detail = ?, cause = 'store'
+// refused is false when no row was still queued: another place's sender
+// refused it first, and only one alert is raised (#57).
+func (db *DB) RefuseObject(ctx context.Context, seq int64, detail string) (refused bool, err error) {
+	r, err := db.ExecContext(ctx, `UPDATE placement SET state = 'refused', detail = ?, cause = 'store'
 		WHERE seq = ? AND state = 'queued'`, detail, seq)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n > 0, err
 }
 
 // RefusedObjects returns, per bucket, how many objects were refused
-// because the store could not supply them; buckets with none are absent.
+// because the store could not supply them and not written again since;
+// buckets with none are absent.
 func (db *DB) RefusedObjects(ctx context.Context) (map[string]int64, error) {
-	rows, err := db.QueryContext(ctx, `SELECT bucket, count(DISTINCT seq) FROM placement
-		WHERE state = 'refused' AND cause = 'store' GROUP BY bucket`)
+	rows, err := db.QueryContext(ctx, `SELECT bucket, count(DISTINCT seq) FROM placement p
+		WHERE state = 'refused' AND cause = 'store' AND `+current+` GROUP BY bucket`)
 	if err != nil {
 		return nil, err
 	}
@@ -160,7 +180,7 @@ type PlaceStat struct {
 	QueuedBytes int64         // bytes of queued puts
 	Lag         time.Duration // age of the oldest queued row; zero when none
 	Oldest      time.Time     // capture time of the oldest queued row
-	Refused     int64         // rows the place itself refused for good (not RefuseObject's)
+	Refused     int64         // rows the place itself refused for good (not RefuseObject's), not written again since
 }
 
 // PlaceStats returns each place's FIFO size and lag at now; places with
@@ -170,7 +190,7 @@ func (db *DB) PlaceStats(ctx context.Context, now time.Time) (map[string]PlaceSt
 		count(*) FILTER (WHERE p.state = 'queued'),
 		coalesce(sum(q.size) FILTER (WHERE p.state = 'queued' AND p.op = 'put'), 0),
 		min(q.created_at) FILTER (WHERE p.state = 'queued'),
-		count(*) FILTER (WHERE p.state = 'refused' AND p.cause IS NULL)
+		count(*) FILTER (WHERE p.state = 'refused' AND p.cause IS NULL AND `+current+`)
 		FROM placement p JOIN queue q ON q.seq = p.seq GROUP BY p.place`)
 	if err != nil {
 		return nil, err
@@ -211,6 +231,16 @@ func (db *DB) SetPlaceCondition(ctx context.Context, place, condition, detail st
 			condition = excluded.condition, detail = excluded.detail,
 			last_ok = coalesce(excluded.last_ok, place.last_ok)`,
 		place, condition, nullStr(detail), now.Unix())
+	return err
+}
+
+// ResetPlaceCondition sets place's condition back to ok at now, when
+// its FIFO emptied without an answer from it (its rows were refused for
+// the store, #57). LastOK is untouched: nothing was acknowledged. A
+// place with no condition yet gets none.
+func (db *DB) ResetPlaceCondition(ctx context.Context, place string, now time.Time) error {
+	_, err := db.ExecContext(ctx, `UPDATE place SET condition = 'ok', detail = NULL, since = ?
+		WHERE place = ? AND condition != 'ok'`, now.Unix(), place)
 	return err
 }
 
