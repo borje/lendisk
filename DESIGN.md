@@ -1475,13 +1475,17 @@ upstream bucket is Q-V.
   `FinishPut` drops an identical re-upload as a retry (EP-3) only while
   the key's last done row is refused nowhere; when it is refused at
   some place, the re-upload is queued and placed at every friend, but
-  sent only where the object is not already held (#61): at a place
-  whose latest acknowledged row for the key is a put of the same hash
-  (`state.AckedHash`) and that has nothing of the key queued, the new
-  row is `acked` at placement, without a send. A row of the key still
-  queued there may be in flight and could still replace what the place
-  holds, so then the new row is queued and the older one is cancelled
-  as superseded. So a friend that keeps refusing gets every re-upload,
+  sent only where the object is known to be held (#61): at a place
+  that acknowledged the very row being healed (the key's previous done
+  row, a put of the same hash) and has nothing of the key queued, the
+  new row is `acked` at placement, without a send (`placeTx`).
+  Everywhere else it is queued: an older acknowledgement of the same
+  hash is not enough, because a row of other bytes sent since may have
+  landed with its answer lost and then been cancelled as superseded,
+  which leaves no row behind. A row of the key still queued there may
+  be in flight and could still replace what the place holds, so then
+  the new row is queued and the older one is cancelled as superseded.
+  So a friend that keeps refusing gets every re-upload,
   and an honest friend that holds the hash gets none: exactly-once
   (EP-3) holds for it. A refusal counts in
   `status` (both kinds) only while its row is the key's latest done
@@ -1491,7 +1495,9 @@ upstream bucket is Q-V.
   refused only as too large for one PUT (cause `oversize`) are put back
   in their places' FIFOs by `state.RequeueOversize` when multipart
   replication lands: #23 calls it once, at the start of a worker that
-  can send them; a row a later write of the key replaced stays as it
+  can send them, with `replica.MaxPutSize`; it also re-queues rows
+  refused before #61 told the causes apart (cause `store`, size above
+  that limit). A row a later write of the key replaced stays as it
   is. A re-upload also heals them.
   Table `place` keeps each place's last answer:
   `condition` (`ok`, `retrying`, `quota`, `removed`, and `store` while
@@ -1674,10 +1680,17 @@ upstream bucket is Q-V.
   other outcome (an acknowledgement, a refusal, a network error at any
   backoff) is logged at error level with `alert=true` and starts its
   backoff at 1 s; the network's backoff never decides it (#61). A read
-  of the store that does not return while an object is sent is such a
-  failure: after `replica.Worker.StoreStall` (1 minute, half the
-  client's 2-minute stall timeout) the worker cancels the put itself,
-  so a hung disk shows as `store`, not as the friend's `retrying`.
+  of the store that does not return while an object is sent, or while
+  it is re-hashed after a `BadDigest`, is such a failure: the store is
+  read on a goroutine of its own and handed to the client through a
+  pipe, and when one read does not return within
+  `replica.Worker.StoreStall` (1 minute, half the client's 2-minute
+  stall timeout) the pipe is closed with that error, so the request
+  body fails at once. (Cancelling the put's context is not enough:
+  net/http does not return while the body's `Read` is blocked.) The
+  goroutine stuck in the read is left behind until the disk answers;
+  the sender goes on, and a hung disk shows as `store`, not as the
+  friend's `retrying`.
 - **The worker** (`replica.Worker`, started by `serve` in the full
   profile only). It re-reads the friendships every 5 s and runs one
   sender per friend with an address, restarted when the address

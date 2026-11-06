@@ -48,7 +48,7 @@ type Worker struct {
 	// before trying again (default an hour, LEND-2).
 	PauseRetry time.Duration
 	// StoreStall is how long one read of the store may take while an
-	// object is sent before the send is cancelled as the store's failure
+	// object is sent or re-hashed before it fails as the store's failure
 	// (default 1 minute: half a friend's stall timeout, so a hung disk is
 	// not blamed on the friend, #61).
 	StoreStall time.Duration
@@ -385,20 +385,20 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		return err
 	}
 	defer done()
-	// A store read that does not return cancels the put as the store's
-	// failure, before the client's stall timeout blames the place (#61).
-	pctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	lr := &localReader{r: body, stall: orDefault(w.StoreStall, time.Minute), cancel: cancel}
-	body = lr
+	// A store read that does not return ends the body with an error, so
+	// the put fails as the store's failure before the client's stall
+	// timeout blames the place (#61).
+	sr := w.storeReader(body)
+	defer sr.Close()
+	body = sr
 	if w.OnRead != nil {
 		body = &observed{r: body, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
 	}
-	err = r.Put(pctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Body: body})
+	err = r.Put(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Body: body})
 	if ctx.Err() != nil || err == nil {
 		return err
 	}
-	if rerr := lr.failed(); rerr != nil {
+	if rerr := sr.failed(); rerr != nil {
 		// The place did not fail: reading the store did.
 		return w.unreadable(p, "reading", rerr)
 	}
@@ -476,8 +476,10 @@ func (w *Worker) verify(ctx context.Context, p state.Placement) error {
 		return err
 	}
 	defer done()
+	sr := w.storeReader(body) // a hung re-hash is the store's failure too
+	defer sr.Close()
 	h := sha256.New()
-	if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: body}); err != nil {
+	if _, err := io.Copy(h, &ctxReader{ctx: ctx, r: sr}); err != nil {
 		if ctx.Err() != nil {
 			return err
 		}
@@ -533,31 +535,60 @@ func fileKind(fi os.FileInfo) string {
 	return "special file (" + fi.Mode().Type().String() + ")"
 }
 
-// localReader remembers a read error from the store, which the client
-// would otherwise report as its own failure. A read that does not return
-// within stall is such an error too: it calls cancel, which ends the put
-// (#61). The HTTP transport may still be reading when Put returns, hence
-// the lock.
-type localReader struct {
-	r      io.Reader
-	stall  time.Duration
-	cancel func()
-	mu     sync.Mutex
-	err    error
+// storeReader reads body from the store on its own goroutine and hands
+// the bytes on through a pipe, so a store read that does not return
+// within Worker.StoreStall ends the body with an error at once (#61).
+// Cancelling a put's context is not enough: net/http does not return
+// while the request body's Read is blocked. The goroutine stuck in such
+// a read is left behind until the disk answers; its bytes are dropped.
+func (w *Worker) storeReader(body io.Reader) *localReader {
+	stall := orDefault(w.StoreStall, time.Minute)
+	pr, pw := io.Pipe()
+	l := &localReader{pr: pr}
+	go func() {
+		buf := make([]byte, 32<<10)
+		for {
+			t := time.AfterFunc(stall, func() {
+				err := fmt.Errorf("a read did not return for %v", stall)
+				l.fail(err)
+				pw.CloseWithError(err)
+			})
+			n, err := body.Read(buf)
+			if !t.Stop() {
+				return // the stall ended the body
+			}
+			if n > 0 {
+				if _, werr := pw.Write(buf[:n]); werr != nil {
+					return // the reader closed: the put is over
+				}
+			}
+			if err == io.EOF {
+				pw.Close()
+				return
+			}
+			if err != nil {
+				l.fail(err)
+				pw.CloseWithError(err)
+				return
+			}
+		}
+	}()
+	return l
 }
 
-func (l *localReader) Read(p []byte) (int, error) {
-	t := time.AfterFunc(l.stall, func() {
-		l.fail(fmt.Errorf("a read did not return for %v", l.stall))
-		l.cancel()
-	})
-	n, err := l.r.Read(p)
-	t.Stop()
-	if err != nil && err != io.EOF {
-		l.fail(err)
-	}
-	return n, err
+// localReader is the body storeReader returns. It remembers a read
+// error from the store, a stall included, which the client would
+// otherwise report as its own failure. Close stops the reading
+// goroutine at its next write.
+type localReader struct {
+	pr  *io.PipeReader
+	mu  sync.Mutex
+	err error
 }
+
+func (l *localReader) Read(p []byte) (int, error) { return l.pr.Read(p) }
+
+func (l *localReader) Close() error { return l.pr.Close() }
 
 // fail keeps the first error: a hung read that fails once the file is
 // closed is still the hang.
