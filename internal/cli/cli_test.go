@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io/fs"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/transport"
 	"github.com/borje/lendisk/internal/transport/transporttest"
@@ -163,6 +165,46 @@ func TestInitWrongWordsWritesNothing(t *testing.T) {
 	}
 }
 
+// #53: init never chmods a directory the user keeps other things in,
+// such as $HOME when the config is ./lendisk.toml; it refuses instead.
+func TestInitRefusesSharedDirectory(t *testing.T) {
+	n := newNode(t)
+	home := filepath.Dir(n.config)
+	os.MkdirAll(home, 0o755)
+	os.Chmod(home, 0o755)
+	os.WriteFile(filepath.Join(home, ".bashrc"), []byte("x"), 0o644)
+	code, _, errOut := n.run("abandon\nabandon\nart\n", testPhrase, "init")
+	if code != 1 || !strings.Contains(errOut, "dedicated directory") || !strings.Contains(errOut, home) {
+		t.Fatalf("init in a shared directory: %d %s", code, errOut)
+	}
+	if fi, _ := os.Stat(home); fi.Mode().Perm() != 0o755 {
+		t.Fatalf("mode changed to %04o", fi.Mode().Perm())
+	}
+	if _, err := os.Stat(filepath.Join(home, "identity.key")); !os.IsNotExist(err) {
+		t.Fatal("key written into a shared directory")
+	}
+}
+
+// #53: an existing directory holding nothing but lendisk's own files,
+// such as a fresh compose bind mount or the example config, is
+// tightened to 0700.
+func TestInitTightensItsOwnDirectories(t *testing.T) {
+	n := newNode(t)
+	for _, d := range []string{filepath.Dir(n.config), n.data} {
+		os.MkdirAll(d, 0o755)
+		os.Chmod(d, 0o755)
+	}
+	os.WriteFile(n.config, []byte("[log]\nlevel = \"info\"\n"), 0o600)
+	if code, _, e := n.run("abandon\nabandon\nart\n", testPhrase, "init"); code != 0 {
+		t.Fatal(e)
+	}
+	for _, d := range []string{filepath.Dir(n.config), n.data} {
+		if fi, _ := os.Stat(d); fi.Mode().Perm() != 0o700 {
+			t.Errorf("%s mode %04o, want 0700", d, fi.Mode().Perm())
+		}
+	}
+}
+
 func TestRestoreOnSecondMachineGivesSameID(t *testing.T) {
 	// ID-1 AC through the CLI: a second machine restored from the phrase
 	// has the same node ID.
@@ -230,6 +272,33 @@ func TestServeLogsStructuredAndStops(t *testing.T) {
 	if !sawStart {
 		t.Fatalf("no start record:\n%s", out.String())
 	}
+}
+
+// #53: when the loopback endpoint cannot bind, serve stops the gateway
+// before it returns, so the database is never closed under it.
+func TestServeBindFailureStopsGateway(t *testing.T) {
+	n := newNode(t)
+	n.mustInit(t)
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer taken.Close()
+	var out, errOut bytes.Buffer
+	a := &app{in: bufio.NewReader(strings.NewReader("")), out: &out, errOut: &errOut, ctx: t.Context(), regions: n.regions}
+	code := a.run([]string{"serve", "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", taken.Addr().String()})
+	if code != 1 || !strings.Contains(errOut.String(), "S3 endpoint") {
+		t.Fatalf("serve exit %d: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "gateway serving") {
+		t.Fatalf("the gateway never started:\n%s", out.String())
+	}
+	if c, err := net.Dial("unix", gateway.SocketPath(n.data)); err == nil {
+		c.Close()
+		t.Fatal("the gateway still answers after serve returned")
+	}
+	// And a second daemon in this process starts cleanly.
+	n.serve(t).stop()
 }
 
 func TestUsageErrorExitCode(t *testing.T) {

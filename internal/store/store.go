@@ -40,10 +40,30 @@ func Prepare(dir string, floor config.Floor) error {
 	return DefaultChecker.Prepare(dir, floor)
 }
 
-// Prepare creates dir at mode 0700 if needed and checks it.
+// Prepare creates dir at mode 0700 if needed and checks it. Generic
+// buckets hold plaintext, so an existing directory that group or others
+// can reach is refused, unless it is empty, when it is set to 0700
+// (#53).
 func (c Checker) Prepare(dir string, floor config.Floor) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("store directory: %w", err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("store directory: %w", err)
+	}
+	if perm := fi.Mode().Perm(); perm&0o077 != 0 {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return fmt.Errorf("store directory: %w", err)
+		}
+		if len(entries) > 0 {
+			return fmt.Errorf("store directory %s has mode %04o, so other users can read the buckets in it, "+
+				"and generic buckets hold plaintext: run `chmod 700 %s`, or choose another store.path", dir, perm, dir)
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("store directory %s has mode %04o and cannot be set to 0700: %w", dir, perm, err)
+		}
 	}
 	return c.Check(dir, floor)
 }

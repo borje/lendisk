@@ -113,6 +113,12 @@ func (a *app) serveCmd() *cobra.Command {
 			if cfg.Role == "full" {
 				ln, err := net.Listen("tcp", cfg.Endpoint.Loopback)
 				if err != nil {
+					// Stop what already runs before the deferred
+					// db.Close, which must not race the gateway (#53).
+					cancel()
+					for i := 0; i < running; i++ {
+						<-errc
+					}
 					return fmt.Errorf("S3 endpoint: %w", err)
 				}
 				log.Info("S3 endpoint listening", "address", ln.Addr().String())

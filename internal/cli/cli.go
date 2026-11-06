@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -133,7 +134,13 @@ func (a *app) load(w io.Writer) (*config.Loaded, *slog.Logger, error) {
 	return cfg, log, nil
 }
 
-// ensureDir creates dir at mode 0700, or tightens an existing one to 0700.
+// ensureDir makes dir a private directory for lendisk's secrets (#53).
+// A missing one is created at 0700. An existing one that group or
+// others can reach is tightened to 0700 only when it holds nothing but
+// lendisk's own files (it is empty, or a bind mount holding
+// lendisk.toml); otherwise it is used for other things, such as $HOME
+// when the config is ./lendisk.toml, and lendisk refuses rather than
+// change its permissions.
 func ensureDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -142,12 +149,41 @@ func ensureDir(dir string) error {
 	if err != nil {
 		return err
 	}
-	if fi.Mode().Perm() != 0o700 {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			return fmt.Errorf("%s has mode %04o and cannot be set to 0700: %w", dir, fi.Mode().Perm(), err)
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	perm := fi.Mode().Perm()
+	if perm == 0o700 {
+		return nil
+	}
+	if perm&0o077 != 0 {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if !ownEntry(e.Name()) {
+				return fmt.Errorf("%s has mode %04o and holds files that are not lendisk's (%s): "+
+					"lendisk keeps secrets there and will not change the permissions of a directory used for other things; "+
+					"use a dedicated directory (--config, --data-dir), or run `chmod 700 %s` if it is meant to be private",
+					dir, perm, e.Name(), dir)
+			}
 		}
 	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return fmt.Errorf("%s has mode %04o and cannot be set to 0700: %w", dir, perm, err)
+	}
 	return nil
+}
+
+// ownEntry reports whether name is one lendisk keeps in its config or
+// data directory.
+func ownEntry(name string) bool {
+	switch name {
+	case "lendisk.toml", "identity.key", "endpoint.crt", "endpoint.key", "profiles", "store", "run":
+		return true
+	}
+	return strings.HasPrefix(name, "lendisk.db")
 }
 
 func randomPositions(n, k int) []int {

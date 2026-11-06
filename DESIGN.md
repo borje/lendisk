@@ -824,7 +824,20 @@ directory the user names, such as a USB disk), holding the node's own
 buckets and the `lent-*` buckets side by side, each lent bucket with a
 `.lendisk/tomb/` directory for its tombstones (§3.6); `lendisk.db`
 (SQLite) is in `<data>`; `<data>/run/` (mode 0700) holds the internal
-gateway socket `gw.sock`. Bucket naming: the node's own buckets keep their names. A borrower
+gateway socket `gw.sock`. `init` creates a missing `<config>` or
+`<data>` at 0700. An existing one with no group or other permission
+bits, such as the installer's `install -d -m 0700` in `examples/`, is
+kept private (its owner bits set to 0700); one that group or others can reach is set to 0700 only if it holds
+nothing but lendisk's own entries (`lendisk.toml`, `identity.key`,
+`endpoint.crt`, `endpoint.key`, `profiles`, `store`, `run`,
+`lendisk.db*`), as a fresh bind mount or the example config does, and
+otherwise `init` refuses, naming the directory and a foreign entry:
+it is used for other things, such as `$HOME` with `./lendisk.toml`,
+and lendisk does not change its permissions (`cli.ensureDir`, #53).
+The store directory gets the same treatment in `store.Prepare`
+(EP-12), stricter: generic buckets hold plaintext, so an existing
+store others can reach is set to 0700 only when it is empty, and
+otherwise refused with a `chmod 700` hint. Bucket naming: the node's own buckets keep their names. A borrower
 never sends a bucket's own name to a lender (SEC-16); it sends the
 bucket's **sealed name** `s<26>`, where `<26>` is the first 26
 characters, lowercase base32, of
@@ -1086,7 +1099,10 @@ upstream bucket is Q-V.
   header unchanged, as on every other listener (§3.7, Q-G). versitygw verifies the signature against the per-bucket
   credential exactly as on loopback; lendisk adds no check of its own
   and needs none, since the writer is trusted (§2). A request under
-  `/_lendisk/` is refused on a loopback or LAN listener. With `tls = "generate"`,
+  `/_lendisk/` is refused on a loopback or LAN listener, as are
+  `/_lendisk` itself and every path that cleans to one of them
+  (`//_lendisk/x`, `/b/../_lendisk/x`); the path is only tested
+  cleaned, never rewritten (#53). With `tls = "generate"`,
   lendisk creates one self-signed ECDSA P-256 certificate whose SANs are
   the addresses of every `generate` entry (interfaces resolved) and the
   host name, valid ten years, at
@@ -1095,7 +1111,8 @@ upstream bucket is Q-V.
   (`CA:TRUE`), so it is what a client trusts. It is regenerated when
   that SAN set changes, at start or when an interface's addresses
   change, and swapped into the running listeners; otherwise the
-  existing pair is reused. `lendisk endpoint cert` prints its path,
+  existing pair is reused, after the key passes the same mode and
+  owner check as a `tls = "files"` key (#53). `lendisk endpoint cert` prints its path,
   SHA-256 fingerprint (colon-separated hex, as `openssl x509
   -fingerprint -sha256`), names and expiry, and says to run `serve`
   when there is none yet. With `tls = "files"` the key must be owned
@@ -1485,8 +1502,21 @@ upstream bucket is Q-V.
   `List` is the control API call of §3.7 and `Undelete` is §3.6.
 - **Errors.** The client's S3 errors are mapped to the replica
   interface's: a `507 QuotaExceeded` from a friend's decorator becomes
-  "paused for quota" (LEND-2); a `403` after a removal becomes
-  "removed" (PEER-5, SEC-15); a `412` becomes an immutability alert
+  "paused for quota" (LEND-2); a `403` that says this node is not a
+  friend becomes "removed" (PEER-5, SEC-15): the tunnel middleware's
+  `AccessDenied` whose message is `state.NoRelationship`, or
+  versitygw's `InvalidAccessKeyId` (its IAM no longer resolves the
+  node-ID key). Other `403`s are retried like any other error and
+  reported as what they are: `RequestTimeTooSkewed` says the two
+  clocks differ by more than 15 minutes and to enable NTP, and
+  `SignatureDoesNotMatch` and the rest name their S3 code (#53). A
+  friend that removed this node normally refuses the tunnel
+  connection at admission (SEC-10) before any `403`, so until ending
+  a friendship tells the other side (#25) such a place shows as
+  `retrying` with a dial error, not `removed`; `removed` appears only
+  on a connection opened before the removal, which the middleware
+  still refuses request by request (SEC-11). A `412` becomes an
+  immutability alert
   (EP-11); anything else is a retry with backoff. A `BadDigest` (also
   `InvalidDigest`, `XAmzContentSHA256Mismatch`) means the bytes read
   from the store no longer match the capture hash (REPL-10), a local
@@ -1524,7 +1554,7 @@ upstream bucket is Q-V.
 - **The worker** (`replica.Worker`, started by `serve` in the full
   profile only). It re-reads the friendships every 5 s and runs one
   sender per friend with an address, restarted when the address
-  changes. A sender takes the head of its FIFO (`state.NextPlacement`),
+  changes; a failed read keeps the senders as they are (#53). A sender takes the head of its FIFO (`state.NextPlacement`),
   sends it and waits for the answer before the next row, polling every
   second when the FIFO is empty. A put whose key a later completed
   capture replaced or deleted (`state.Superseded`) is cancelled, since
@@ -1703,6 +1733,11 @@ upstream bucket is Q-V.
   that range, or without the header, is answered 400 with an error
   naming both versions and which side to upgrade, and the client
   refuses an answer whose header is outside the range the same way.
+  The tunnel middleware's refusals carry the header too, on the
+  control path and on S3, so every answer from a lendisk tunnel port
+  has it; `control.Client` treats an answer without it, success or
+  refusal, as an error: whatever answered is not a lendisk control
+  API (#53).
 - **The bridge.** `embedgw` takes listener addresses, not a
   `net.Listener` (D15), so versitygw is given one internal unix
   socket, `<data>/run/gw.sock`, and lendisk's bridge owns every
@@ -1862,7 +1897,10 @@ upstream bucket is Q-V.
   release are additive (new tables, nullable columns), so the previous
   minor keeps working; a breaking step may lock out only schemas two
   or more minors old, which a test enforces. The database is copied to
-  `lendisk.db.schema-<n>.bak` (`VACUUM INTO`) before migrating.
+  `lendisk.db.schema-<n>.bak` (`VACUUM INTO`) before migrating. The
+  copy holds bucket secrets, so lendisk creates it empty at 0600
+  first (`VACUUM INTO` accepts an empty file) and a failure to do so
+  stops the migration (#53).
 
 ### 3.9 Security
 
@@ -1886,8 +1924,8 @@ upstream bucket is Q-V.
   uses them and never passed to another. The endpoint's TLS key
   (EP-17), where TLS is on, is `<config>/endpoint.key` at mode 0600
   when generated; a user-supplied key stays at the path the config
-  names, and lendisk refuses to start if that file is readable by
-  anyone but the service user. It is not in the manifest: a recovered
+  names, and lendisk refuses to start if that file, or a generated key
+  it would reuse, is readable by anyone but the service user. It is not in the manifest: a recovered
   node generates a new certificate, and clients are given the new one.
 - **SEC-7** The hostile-peer test exercises every S3 operation through
   the tunnel bridge and every control API endpoint, from an allowed

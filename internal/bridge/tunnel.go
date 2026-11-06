@@ -35,6 +35,9 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Lo
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		isControl := strings.HasPrefix(r.URL.Path, control.Prefix)
 		refuse := func(code int, msg string) {
+			// Every refusal says what it speaks (NET-6), so the caller
+			// can tell lendisk refused it from something else answering.
+			w.Header().Set(control.ProtocolHeader, control.Protocol)
 			if isControl {
 				control.Error(w, code, msg)
 				return
@@ -71,7 +74,7 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Lo
 				refuse(http.StatusForbidden, "no pending invite for this key: it was already used or has expired; ask for a new one")
 				return
 			}
-			refuse(http.StatusForbidden, "no relationship with this node")
+			refuse(http.StatusForbidden, state.NoRelationship)
 			return
 		}
 		r = r.WithContext(control.WithCaller(r.Context(), control.Caller{Peer: peer, Role: role}))

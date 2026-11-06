@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 	"github.com/borje/lendisk/internal/transport/transporttest"
 )
@@ -173,15 +174,20 @@ func paths(rs []request) []string {
 
 // s3Error answers with an S3 error document.
 func s3Error(w http.ResponseWriter, status int, code string) {
+	s3ErrorMsg(w, status, code, "test")
+}
+
+func s3ErrorMsg(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Content-Type", "application/xml")
 	w.WriteHeader(status)
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>test</Message></Error>`, code)
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>%s</Message></Error>`, code, msg)
 }
 
 // Q-Y.3, LEND-2, PEER-5, EP-11, REPL-10: a friend's quota (507),
-// removal (403) and immutability (412) refusals, and a rejected hash,
-// reach the worker through the tunnel as distinct errors; anything else
-// is none of them and is retried.
+// removal (403 saying there is no relationship, or naming an unknown
+// access key) and immutability (412) refusals, and a rejected hash,
+// reach the worker through the tunnel as distinct errors; anything else,
+// other 403s included (#53), is none of them and is retried.
 func TestFriendRefusalsAreDistinct(t *testing.T) {
 	self := newID(t)
 	f, _ := tunnelLender(t, self, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -193,7 +199,15 @@ func TestFriendRefusalsAreDistinct(t *testing.T) {
 		case key == "quota":
 			s3Error(w, 507, "QuotaExceeded")
 		case key == "removed":
+			s3ErrorMsg(w, 403, "AccessDenied", "lendisk: "+state.NoRelationship)
+		case key == "unknown-key":
+			s3Error(w, 403, "InvalidAccessKeyId")
+		case key == "denied":
 			s3Error(w, 403, "AccessDenied")
+		case key == "bad-signature":
+			s3Error(w, 403, "SignatureDoesNotMatch")
+		case key == "skewed":
+			s3Error(w, 403, "RequestTimeTooSkewed")
 		case key == "immutable":
 			s3Error(w, 412, "PreconditionFailed")
 		case key == "rotted":
@@ -206,7 +220,8 @@ func TestFriendRefusalsAreDistinct(t *testing.T) {
 	}))
 	kinds := []error{ErrQuota, ErrRemoved, ErrImmutable, ErrRejected}
 	for key, want := range map[string]error{"quota": ErrQuota, "removed": ErrRemoved, "immutable": ErrImmutable,
-		"rotted": ErrRejected, "flaky": nil, "busy": nil} {
+		"rotted": ErrRejected, "flaky": nil, "busy": nil,
+		"unknown-key": ErrRemoved, "denied": nil, "bad-signature": nil, "skewed": nil} {
 		err := put(t, f, "laptop", "data/"+key, []byte("x"))
 		if err == nil {
 			t.Fatalf("%s: accepted", key)
@@ -215,6 +230,13 @@ func TestFriendRefusalsAreDistinct(t *testing.T) {
 			if errors.Is(err, k) != (k == want) {
 				t.Errorf("%s: %v; errors.Is(%v) = %v", key, err, k, errors.Is(err, k))
 			}
+		}
+		// A refusal for a skewed clock says so, and what to do.
+		if key == "skewed" && (!strings.Contains(err.Error(), "clock") || !strings.Contains(err.Error(), "NTP")) {
+			t.Errorf("skewed: %v", err)
+		}
+		if key == "bad-signature" && !strings.Contains(err.Error(), "SignatureDoesNotMatch") {
+			t.Errorf("bad-signature: %v", err)
 		}
 	}
 }

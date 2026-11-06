@@ -43,7 +43,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	c, ok := CallerFrom(r.Context())
 	if !ok || c.Role == state.RoleNone {
 		// The middleware never lets this through; refuse anyway.
-		Error(w, http.StatusForbidden, "no relationship with this node")
+		Error(w, http.StatusForbidden, state.NoRelationship)
 		return
 	}
 	if r.URL.Path == VersionPath {

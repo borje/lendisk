@@ -16,6 +16,11 @@ const (
 	RoleInvite Role = "invite"
 )
 
+// NoRelationship is the message of the tunnel's refusal of a key with
+// RoleNone. A borrower's replica client reads a 403 carrying it as
+// "removed by the friend" (PEER-5), so the two sides must agree on it.
+const NoRelationship = "no relationship with this node"
+
 // PeerRole looks a tunnel key (a node ID in display form) up in the
 // friendship and invite tables. Callers deciding admission must treat an
 // error like RoleNone: a database that cannot be read admits nobody.
