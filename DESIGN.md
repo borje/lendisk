@@ -1278,10 +1278,25 @@ upstream bucket is Q-V.
   `delete`), `class` (`snapshot`, `metadata`, `data`), `state`
   (`pending`, `done`), and for a put `size` and `sha256`; `token`,
   `etag` and `upload_id` serve EP-3. `sha256` is always the
-  whole-object SHA-256. Rows are never removed by capture; `placement`
-  (#19) and the worker (#18) consume them. `status` shows each
-  bucket's queue (`queue.objects`, `queue.bytes`, `queue.pending` in
-  `status --json`).
+  whole-object SHA-256. Rows are never removed, by capture or by the
+  worker (#18), which consumes `placement` rows instead; exactly-once
+  capture (EP-3) still compares with the key's latest done row. `status`
+  shows each bucket's queue (`queue.objects`, `queue.bytes`,
+  `queue.pending` in `status --json`).
+- **Placement until #19 (schema 7).** `FinishPut` and `FinishDelete`
+  place the row they complete in the same transaction
+  (`state.placeTx`). The placer is trivial until pooled placement (#19):
+  every friend with an address gets a `queued` row for every put and
+  delete. Table `placement`: `seq` (the queue row), `place` (the
+  friend's node ID), `bucket`, `key` and `op` copied from the queue row
+  so the index outlives it, `state` (`queued`, `acked`, `refused`),
+  and on acknowledgement `sha256` and `acked_at`: acked put rows are
+  the index of acknowledged hashes (REPL-10, `state.AckedHash`).
+  `refused` (with `detail`) is a refusal the place would repeat; the row
+  leaves the FIFO. Table `place` keeps each place's last answer:
+  `condition` (`ok`, `retrying`, `quota`, `removed`), `detail`, `since`
+  and `last_ok`, D6's last-reachable time. A friend added after a row
+  was placed gets no copy of it until re-placement (#26).
 - **REPL-1, the metadata barrier.** A metadata row at sequence `m` is
   eligible to send only when every data object before `m` has no
   `queued` placement row left: each is `acked` at every place it is
@@ -1340,13 +1355,25 @@ upstream bucket is Q-V.
   chunk, and over HTTPS it sends unsigned anyway) and `MaxRetries: 1`
   (minio-go retries only seekable bodies, and the limited reader is
   not one; the worker owns retries). `TrailingHeaders` stays off. The
-  clients are built in one package, which is the only code that
-  imports minio-go (D12). Pinned at **minio-go v7.4.1** (Q-Y).
+  clients are built in one package, `internal/replica`, which is the
+  only code that imports minio-go (D12). Pinned at **minio-go v7.4.1**
+  (Q-Y). In v7.4.1 `DisableContentSha256` is an option of each put
+  (`PutObjectOptions`, `PutObjectPartOptions`), not of the client, so
+  every put sets it. A friend's client (`replica.NewFriend`) sends
+  `Host: lendisk-friend:9000` (the dial ignores it; versitygw checks
+  the signature over it) and region `us-east-1`, so minio-go never asks
+  for a bucket's location. It creates the sealed bucket at the friend
+  before its first put to it (`BucketAlreadyOwnedByYou` is success).
+  The dial is bounded by 30 s, the wait for a response's headers by
+  2 minutes, and a body the transport takes no bytes from for 2 minutes
+  cancels the request (a friend switched off mid-transfer).
 - **Operations.** `Put` streams the object from the store through the
   decorator into `PutObject`, or for objects above the part size into
   the low-level multipart calls (`NewMultipartUpload`, `PutObjectPart`,
   `CompleteMultipartUpload`), with `x-amz-meta-lendisk-sha256` from the
-  queue row. The request checksum is SHA-256 (S3-3, Q-Y.2): a single
+  queue row. Until #23 every object is one `PutObject` (up to 5 GiB)
+  and an interrupted one is sent again whole; the multipart path and its
+  resume come with #23. The request checksum is SHA-256 (S3-3, Q-Y.2): a single
   PUT carries the queue row's hash as `x-amz-checksum-sha256`, at no
   extra read; a multipart upload is created with
   `x-amz-checksum-algorithm: SHA256` and each part carries its own
@@ -1365,7 +1392,33 @@ upstream bucket is Q-V.
   interface's: a `507 QuotaExceeded` from a friend's decorator becomes
   "paused for quota" (LEND-2); a `403` after a removal becomes
   "removed" (PEER-5, SEC-15); a `412` becomes an immutability alert
-  (EP-11); anything else is a retry with backoff.
+  (EP-11); anything else is a retry with backoff. A `BadDigest` (also
+  `InvalidDigest`, `XAmzContentSHA256Mismatch`) means the bytes read
+  from the store no longer match the capture hash (REPL-10): unless a
+  later capture of the key exists, which explains it, the row is
+  `refused` like a `412`, so a rotted object does not stop its place's
+  FIFO. A refused row is logged at error level with `alert=true` until
+  alert delivery (#13). A paused (`quota`) or `removed` place tries its
+  head row again after an hour (LEND-2); other errors back off from 1 s,
+  doubling to 5 minutes.
+- **The worker** (`replica.Worker`, started by `serve` in the full
+  profile only). It re-reads the friendships every 5 s and runs one
+  sender per friend with an address, restarted when the address
+  changes. A sender takes the head of its FIFO (`state.NextPlacement`),
+  sends it and waits for the answer before the next row, polling every
+  second when the FIFO is empty. A put whose key a later completed
+  capture replaced or deleted (`state.Superseded`) is cancelled, since
+  the store no longer holds its bytes; deletes are always sent, and a
+  key or bucket the friend lacks counts as deleted. A put reads
+  `<store>/<bucket>/<key>` from the `posix` store as it sends it; a size
+  other than the row's means a later write is in flight and waits. On
+  acknowledgement the row becomes `acked` with its hash and the place
+  `ok`. Nothing is acknowledged before the place answers, so a restart
+  of either side sends the head row again whole; the friend stores the
+  same bytes under the same key, and nothing is sent twice that was
+  acknowledged. `status` (and `places` in `status --json`) shows per
+  place its condition, queued objects and bytes, lag (age of the oldest
+  queued row) and refused rows.
 - **REPL-6** The upload ID and the number, ETag and checksum of each
   completed part are written to the queue row as parts complete. After
   a restart or an interruption the worker lists the parts of the open
@@ -1593,6 +1646,12 @@ upstream bucket is Q-V.
   `lendisk.db` on every lookup so a removed friend's next request is
   refused. The bridge refuses a request whose access key is not the
   tunnel peer key (SEC-12). The derived secret is never stored.
+- **A restarted friend.** tailcat admits a client as a WireGuard peer
+  at its first ping only (the "meow" handshake, `Client.up`), and a
+  restarted server has forgotten it while the client's session looks
+  valid, so its dials time out. `Tailcat.Dial` therefore drops and
+  closes a cached client when a dial through it fails; the next dial
+  builds a new one, which pings first.
 - **Dialling a friend.** The replica client's HTTP transport uses the
   tailcat `Client.Dial` for that peer as its dial function, so
   replication traffic enters the tunnel from inside the process. No
@@ -2186,6 +2245,11 @@ design and disappear with it.
   also run its own). Measure their RSS with Q-M against OPS-7.
   Fallback: dial lenders on demand and close a `Client` after an idle
   period, at the cost of a fresh hole punch per replication burst.
+  A serving node that dials a friend in its own region holds two DERP
+  connections with one key, its server's and its client's; derpserver
+  keeps both and sends to the last writer. #18's two-node test runs
+  both nodes on one relay, restarts each mid-transfer and passes, but
+  a relayed-only friendship under load is for G-1 to watch.
 - **Q-T (resolved)** REQUIREMENTS.md v0.9 made the two changes this
   design needed: EP-16 admits a store behind an S3 service the user
   names, with EP-12, EP-15, LEND-6, COMPAT-4 and scenarios 1 and 7
@@ -2209,7 +2273,7 @@ design and disappear with it.
 - **Q-X (gate, open, measured with G-3)** Listing time at 500k objects
   in one bucket on `posix`. Testable in a day. Object lock semantics
   were part of this gate until v0.12; object lock is no longer used.
-- **Q-Y (gate, open: items 3 and 5, and 1 and 2 at RustFS and B2)**
+- **Q-Y (gate, open: item 5, and 1 and 2 at RustFS and B2)**
   The replica client (D12, §3.4), against the pinned minio-go, before
   the worker is built on it. Pinned at **minio-go v7.4.1** (2026-10-12)
   with `golang.org/x/time` v0.16.0. Items 1, 2 and 4 were answered on
@@ -2243,8 +2307,13 @@ design and disappear with it.
      queue row's hash as a header. S3 has no whole-object SHA-256 for
      multipart. §3.4 and S3-3 are written to match. Tier-1 providers
      are left to their CI.
-  3. A friend's `507`, `403` and `412` reach the worker as
-     distinguishable errors through the tailcat transport (ticket 18).
+  3. *Resolved 2026-11-06 (#18):* a friend's `507 QuotaExceeded`,
+     `403 AccessDenied`, `412 PreconditionFailed` and `400 BadDigest`
+     reach the worker as four distinct errors (`replica.ErrQuota`,
+     `ErrRemoved`, `ErrImmutable`, `ErrRejected`), and a `500` or `503`
+     as none of them, through a real tailcat tunnel with minio-go
+     v7.4.1 (`TestFriendRefusalsAreDistinct`). minio-go parses the
+     error document of a `PUT` whatever the status.
   4. *Resolved:* the limiter and the timetable hold to within one part.
      At 4 MiB/s each 5 MiB part took 1.236 to 1.255 s at both targets
      and a 20 MiB download 4.99 to 5.00 s; `SetLimit` from 2 to 8 MiB/s

@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/replica"
 )
 
 const (
@@ -20,6 +22,15 @@ const (
 	// itself after the store accepted a captured request and before its
 	// queue row is completed: the window startup settles (EP-3).
 	envCrashAfterStore = "LENDISK_TEST_CRASH_AFTER_STORE"
+	// envReplFast=1 makes the replication worker poll and retry in
+	// milliseconds and give up on an absent friend in seconds.
+	envReplFast = "LENDISK_TEST_REPL_FAST"
+	// envSendDelay is a pause after each read of an object being sent to
+	// a friend (a Go duration), so a test can act mid-transfer.
+	envSendDelay = "LENDISK_TEST_SEND_DELAY"
+	// envCrashMidSend is the probability, per read of an object being
+	// sent, that the daemon SIGKILLs itself mid-transfer.
+	envCrashMidSend = "LENDISK_TEST_CRASH_MID_SEND"
 )
 
 func TestMain(m *testing.M) {
@@ -33,7 +44,33 @@ func TestMain(m *testing.M) {
 				}
 			}
 		}
+		a.tuneReplication = tuneFromEnv
 		os.Exit(a.run(os.Args[1:]))
 	}
 	os.Exit(m.Run())
+}
+
+// fastReplication are the replication timings for tests.
+func fastReplication(w *replica.Worker) {
+	w.Poll, w.MinBackoff, w.MaxBackoff, w.PauseRetry = 50*time.Millisecond, 100*time.Millisecond, time.Second, 2*time.Second
+	w.Client = replica.Options{DialTimeout: 5 * time.Second, StallTimeout: 10 * time.Second}
+}
+
+// tuneFromEnv applies envReplFast, envSendDelay and envCrashMidSend.
+func tuneFromEnv(w *replica.Worker) {
+	if os.Getenv(envReplFast) == "1" {
+		fastReplication(w)
+	}
+	delay, _ := time.ParseDuration(os.Getenv(envSendDelay))
+	p, _ := strconv.ParseFloat(os.Getenv(envCrashMidSend), 64)
+	if delay <= 0 && p <= 0 {
+		return
+	}
+	w.OnRead = func(_ string, _, read int64) {
+		time.Sleep(delay)
+		if p > 0 && read > 0 && rand.Float64() < p {
+			syscall.Kill(os.Getpid(), syscall.SIGKILL)
+			select {} // never acknowledge
+		}
+	}
 }

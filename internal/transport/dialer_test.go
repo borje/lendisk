@@ -80,3 +80,52 @@ func TestAdmissionRejectionExpires(t *testing.T) {
 		t.Fatalf("rejection not forgotten after DeniedFor: calls %d", calls)
 	}
 }
+
+// A friend whose daemon restarts has forgotten every client: tailcat
+// admits a client as a WireGuard peer only at its first ping. A failed
+// dial drops the cached client, so the next one starts afresh and
+// reaches the restarted friend (#18: replication resumes after a
+// lender's restart).
+func TestDialReachesRestartedServer(t *testing.T) {
+	d := transporttest.Start(t)
+	srvID, me := newID(t), newID(t)
+	serve := func() (*Tailcat, *listener) {
+		srv := newTailcat(t, srvID, d)
+		srv.Admit(func(identity.NodeID) bool { return true })
+		return srv, listen(t, srv)
+	}
+	srv, l := serve()
+	dl, err := NewDialer(me, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dl.Close()
+	dial := func(timeout time.Duration) error {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		c, err := dl.Dial(ctx, srvID.NodeID(), srv.Address())
+		if err == nil {
+			c.Close()
+		}
+		return err
+	}
+	if err := dial(20 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	<-l.conns
+	srv.Close()
+	srv, l = serve()
+	// The first dial after the restart may go to the stale session.
+	start := time.Now()
+	for dial(3*time.Second) != nil {
+		if time.Since(start) > 30*time.Second {
+			t.Fatal("the restarted server is never reached")
+		}
+	}
+	select {
+	case c := <-l.conns:
+		c.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("no connection accepted after the restart")
+	}
+}

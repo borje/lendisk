@@ -16,6 +16,7 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/profile"
+	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/version"
 )
@@ -76,7 +77,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 3)
+			errc := make(chan error, 4)
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore}
 			ready := make(chan struct{})
@@ -107,7 +108,8 @@ func (a *app) serveCmd() *cobra.Command {
 					return err
 				}
 			}
-			// The lender-only profile has nothing on loopback (PEER-9).
+			// The lender-only profile has nothing on loopback (PEER-9)
+			// and no buckets to replicate.
 			if cfg.Role == "full" {
 				ln, err := net.Listen("tcp", cfg.Endpoint.Loopback)
 				if err != nil {
@@ -119,6 +121,15 @@ func (a *app) serveCmd() *cobra.Command {
 				}
 				running++
 				go func() { errc <- bridge.Serve(ctx, ln, br.LoopbackHandler(), log) }()
+
+				// Replication to friends (#18) never blocks the endpoint
+				// (REPL-9): it reads the store and lendisk.db only.
+				w := &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log}
+				if a.tuneReplication != nil {
+					a.tuneReplication(w)
+				}
+				running++
+				go func() { w.Run(ctx); errc <- nil }()
 			}
 
 			var first error

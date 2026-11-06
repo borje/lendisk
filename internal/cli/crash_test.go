@@ -30,8 +30,9 @@ type daemonProc struct {
 }
 
 // startProc starts the daemon; with crashAfterStore > 0 it kills itself
-// with that probability in capture's crash window (see TestMain).
-func (n *node) startProc(t *testing.T, addr string, logw io.Writer, crashAfterStore float64) *daemonProc {
+// with that probability in capture's crash window (see TestMain). env
+// adds NAME=value settings for TestMain's hooks.
+func (n *node) startProc(t *testing.T, addr string, logw io.Writer, crashAfterStore float64, env ...string) *daemonProc {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
@@ -39,6 +40,7 @@ func (n *node) startProc(t *testing.T, addr string, logw io.Writer, crashAfterSt
 	}
 	cmd := exec.Command(exe, "serve", "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", addr)
 	cmd.Env = append(os.Environ(), envExec+"=1", fmt.Sprintf("%s=%g", envCrashAfterStore, crashAfterStore))
+	cmd.Env = append(cmd.Env, env...)
 	cmd.Stdout, cmd.Stderr = logw, logw
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
