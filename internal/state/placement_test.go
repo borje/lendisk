@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 	"time"
 )
@@ -162,11 +163,11 @@ func TestRefusedObjectCountsAgainstTheBucket(t *testing.T) {
 	if err := db.AckPlacement(ctx, "C", s1, "h-data/1", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if refused, err := db.RefuseObject(ctx, s1, "gone"); err != nil || !refused {
+	if refused, err := db.RefuseObject(ctx, s1, CauseStore, "gone"); err != nil || !refused {
 		t.Fatal(refused, err)
 	}
 	// Another place's sender comes second: nothing left to refuse (#57).
-	if refused, err := db.RefuseObject(ctx, s1, "gone"); err != nil || refused {
+	if refused, err := db.RefuseObject(ctx, s1, CauseStore, "gone"); err != nil || refused {
 		t.Fatal(refused, err)
 	}
 	for _, place := range []string{"B", "C"} {
@@ -236,9 +237,10 @@ func TestPlaceStatsAndCondition(t *testing.T) {
 	}
 }
 
-// REPL-1, REPL-3 (#57): an identical re-upload of an object whose last
-// done row was refused somewhere, by a place or because the store could
-// not supply it, is queued again and placed at every friend; once it is
+// REPL-1, REPL-3 (#57, #61): an identical re-upload of an object whose
+// last done row was refused somewhere, by a place or because the store
+// could not supply it, is queued again where the refusal was, and acked
+// at once where the place already holds the hash (EP-3); once it is
 // done, the refusals of the older row no longer count. An ordinary
 // retry of an object refused nowhere is still dropped (EP-3).
 func TestIdenticalReuploadHealsARefusedObject(t *testing.T) {
@@ -249,7 +251,7 @@ func TestIdenticalReuploadHealsARefusedObject(t *testing.T) {
 	}{
 		{"place", func(db *DB, seq int64) error { return db.RefusePlacement(ctx, "B", seq, "BadDigest") }},
 		{"store", func(db *DB, seq int64) error {
-			_, err := db.RefuseObject(ctx, seq, "the store holds 0 bytes")
+			_, err := db.RefuseObject(ctx, seq, CauseStore, "the store holds 0 bytes")
 			return err
 		}},
 	} {
@@ -290,10 +292,15 @@ func TestIdenticalReuploadHealsARefusedObject(t *testing.T) {
 			if dup {
 				t.Fatal("the re-upload of a refused object was dropped")
 			}
-			for _, place := range []string{"B", "C"} {
-				if p, ok, _ := db.NextPlacement(ctx, place); !ok || p.Seq != s2 {
-					t.Fatalf("%s head %+v %v", place, p, ok)
-				}
+			if p, ok, _ := db.NextPlacement(ctx, "B"); !ok || p.Seq != s2 {
+				t.Fatalf("B head %+v %v", p, ok)
+			}
+			// C holds the hash already: nothing is sent to it again.
+			if p, ok, _ := db.NextPlacement(ctx, "C"); ok {
+				t.Fatalf("C was queued %+v", p)
+			}
+			if h, ok, _ := db.AckedHash(ctx, "C", "laptop", "data/1"); !ok || h != "h-data/1" {
+				t.Fatalf("C's hash %q %v", h, ok)
 			}
 			st, _ := db.PlaceStats(ctx, time.Now())
 			if st["B"].Refused != 0 || mustRefused(t, db)["laptop"] != 0 {
@@ -307,6 +314,89 @@ func TestIdenticalReuploadHealsARefusedObject(t *testing.T) {
 	}
 }
 
+// EP-3, REPL-1 (#61): a healing re-upload is sent only where the place
+// does not hold the hash: where the older row is still queued (it may be
+// in flight, and a row of another hash before it could still land), the
+// re-upload is queued; where the place acknowledged the hash, it is
+// acked at placement.
+func TestHealingReuploadIsSentOnlyWhereTheHashIsNotHeld(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	for _, f := range []string{"B", "C", "D"} {
+		friend(t, db, f)
+	}
+	s1 := capture(t, db, "laptop", "data/1", OpPut)
+	if err := db.RefusePlacement(ctx, "B", s1, "BadDigest"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AckPlacement(ctx, "C", s1, "h-data/1", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// D has not been sent s1 yet.
+	s2 := capture(t, db, "laptop", "data/1", OpPut)
+	for _, tc := range []struct {
+		place  string
+		queued bool
+	}{{"B", true}, {"C", false}, {"D", true}} {
+		var state string
+		if err := db.QueryRowContext(ctx, `SELECT state FROM placement WHERE place = ? AND seq = ?`, tc.place, s2).
+			Scan(&state); err != nil {
+			t.Fatalf("%s: %v", tc.place, err)
+		}
+		if want := map[bool]string{true: PlacementQueued, false: PlacementAcked}[tc.queued]; state != want {
+			t.Fatalf("%s: %s, want %s", tc.place, state, want)
+		}
+	}
+	var at sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT acked_at FROM placement WHERE place = 'C' AND seq = ?`, s2).Scan(&at); err != nil || !at.Valid {
+		t.Fatalf("C's row has no acknowledgement time: %v %v", at, err)
+	}
+}
+
+// REPL-1 (#61): a row refused only for being larger than one PUT
+// carries keeps that cause and counts against its bucket until
+// multipart replication (#23) re-queues it; one a later write replaced
+// is not re-queued, nor is one refused for another store cause.
+func TestOversizeRefusalsCanBeRequeued(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	friend(t, db, "B")
+	friend(t, db, "C")
+	big := capture(t, db, "laptop", "data/big", OpPut)
+	gone := capture(t, db, "laptop", "data/gone", OpPut)
+	replaced := capture(t, db, "laptop", "data/replaced", OpPut)
+	for _, r := range []struct {
+		seq   int64
+		cause string
+	}{{big, CauseOversize}, {gone, CauseStore}, {replaced, CauseOversize}} {
+		if ok, err := db.RefuseObject(ctx, r.seq, r.cause, "refused"); err != nil || !ok {
+			t.Fatal(ok, err)
+		}
+	}
+	if r := mustRefused(t, db); r["laptop"] != 3 {
+		t.Fatalf("refused %v", r)
+	}
+	later := capture(t, db, "laptop", "data/replaced", OpPut)
+	n, err := db.RequeueOversize(ctx)
+	if err != nil || n != 2 {
+		t.Fatalf("requeued %d %v, want big at B and C", n, err)
+	}
+	for _, place := range []string{"B", "C"} {
+		if p, ok, _ := db.NextPlacement(ctx, place); !ok || p.Seq != big {
+			t.Fatalf("%s head %+v %v", place, p, ok)
+		}
+		if err := db.CancelPlacement(ctx, place, big); err != nil {
+			t.Fatal(err)
+		}
+		if p, ok, _ := db.NextPlacement(ctx, place); !ok || p.Seq != later {
+			t.Fatalf("%s head %+v %v", place, p, ok)
+		}
+	}
+	if r := mustRefused(t, db); r["laptop"] != 1 {
+		t.Fatalf("refused %v, want only data/gone", r)
+	}
+}
+
 func mustRefused(t *testing.T, db *DB) map[string]int64 {
 	t.Helper()
 	r, err := db.RefusedObjects(context.Background())
@@ -316,30 +406,46 @@ func mustRefused(t *testing.T, db *DB) map[string]int64 {
 	return r
 }
 
-// #57: a place's condition goes back to ok, without counting as an
-// acknowledgement, when its FIFO empties for another reason.
+// #57, #61: a place's condition goes back to ok, without counting as an
+// acknowledgement, when its FIFO empties while it waited on this node's
+// store; a condition that is the place's own answer (retrying, quota,
+// removed) stands until the place answers again.
 func TestPlaceConditionResets(t *testing.T) {
 	ctx := context.Background()
-	db := openTest(t)
 	now := time.Unix(1_800_000_000, 0)
-	if err := db.SetPlaceCondition(ctx, "B", ConditionOK, "", now); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.SetPlaceCondition(ctx, "B", ConditionRetrying, "connection refused", now.Add(time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.ResetPlaceCondition(ctx, "B", now.Add(2*time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	c, _ := db.PlaceConditions(ctx)
-	if b := c["B"]; b.Condition != ConditionOK || b.Detail != "" || !b.Since.Equal(now.Add(2*time.Hour)) || !b.LastOK.Equal(now) {
-		t.Fatalf("condition %+v", b)
-	}
-	// A place never contacted gets no condition.
-	if err := db.ResetPlaceCondition(ctx, "C", now); err != nil {
-		t.Fatal(err)
-	}
-	if c, _ := db.PlaceConditions(ctx); len(c) != 1 {
-		t.Fatalf("conditions %+v", c)
+	for _, tc := range []struct {
+		cond  string
+		reset bool
+	}{{ConditionStore, true}, {ConditionRetrying, false}, {ConditionQuota, false}, {ConditionRemoved, false}} {
+		t.Run(tc.cond, func(t *testing.T) {
+			db := openTest(t)
+			if err := db.SetPlaceCondition(ctx, "B", ConditionOK, "", now); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.SetPlaceCondition(ctx, "B", tc.cond, "why", now.Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.ResetPlaceCondition(ctx, "B", now.Add(2*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			c, _ := db.PlaceConditions(ctx)
+			b := c["B"]
+			if !b.LastOK.Equal(now) {
+				t.Fatalf("last ok moved: %+v", b)
+			}
+			if tc.reset && (b.Condition != ConditionOK || b.Detail != "" || !b.Since.Equal(now.Add(2*time.Hour))) {
+				t.Fatalf("not reset: %+v", b)
+			}
+			if !tc.reset && (b.Condition != tc.cond || b.Detail != "why" || !b.Since.Equal(now.Add(time.Hour))) {
+				t.Fatalf("the place's own answer was hidden: %+v", b)
+			}
+			// A place never contacted gets no condition.
+			if err := db.ResetPlaceCondition(ctx, "C", now); err != nil {
+				t.Fatal(err)
+			}
+			if c, _ := db.PlaceConditions(ctx); len(c) != 1 {
+				t.Fatalf("conditions %+v", c)
+			}
+		})
 	}
 }

@@ -326,7 +326,7 @@ func TestStatusShowsStoreRefusalsAgainstTheBucket(t *testing.T) {
 		}
 		seqs = append(seqs, s[0])
 	}
-	if _, err := db.RefuseObject(ctx, seqs[0], "the store holds 0 bytes, the capture 1"); err != nil {
+	if _, err := db.RefuseObject(ctx, seqs[0], state.CauseStore, "the store holds 0 bytes, the capture 1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.RefusePlacement(ctx, "B", seqs[1], "PreconditionFailed"); err != nil {

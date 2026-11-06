@@ -54,9 +54,23 @@ func (p *place) enter() func() {
 
 func (p *place) Put(ctx context.Context, o Object) error {
 	defer p.enter()()
-	b, err := io.ReadAll(o.Body)
-	if err != nil {
-		return err
+	// Like the HTTP transport, the body is read on its own and a
+	// cancelled request returns while a read may still be blocked.
+	type result struct {
+		b   []byte
+		err error
+	}
+	read := make(chan result, 1)
+	go func() { b, err := io.ReadAll(o.Body); read <- result{b, err} }()
+	var b []byte
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case r := <-read:
+		if r.err != nil {
+			return r.err
+		}
+		b = r.b
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -466,6 +480,11 @@ func TestPermanentLocalErrorsDoNotStallTheFIFO(t *testing.T) {
 	if st["B"].Refused != 0 || st["C"].Refused != 0 || fx.refused("laptop") != 5 {
 		t.Fatalf("places %+v, bucket refused %d; want 5 against the bucket", st, fx.refused("laptop"))
 	}
+	// Only the huge object is refused as oversize, so multipart
+	// replication (#23) re-queues it and nothing else (#61).
+	if n, err := fx.db.RequeueOversize(t.Context()); err != nil || n != 2 {
+		t.Fatalf("re-queued %d rows (%v), want data/huge at B and C", n, err)
+	}
 }
 
 // REPL-3 (#50, #57): when the bucket's directory in the store cannot be
@@ -744,20 +763,173 @@ func TestReuploadAfterRefusalReplicates(t *testing.T) {
 	}
 }
 
-// #57: a place whose FIFO empties because its rows were refused for the
-// store, not by its answer, does not stay retrying.
-func TestConditionResetsWhenTheFIFOEmpties(t *testing.T) {
+// #57, #61: a place whose FIFO empties because its rows were refused for
+// the store goes from store back to ok; a place's own answer (retrying,
+// removed) stands until it answers again, also at daemon start.
+func TestEmptyFIFOKeepsThePlacesOwnAnswer(t *testing.T) {
+	t.Run("store resets", func(t *testing.T) {
+		fx := newFixture(t, "B")
+		seq := fx.write("laptop", "data/1", "one")
+		fx.w.open = func(name string) (fs.File, error) {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EIO}
+		}
+		fx.run()
+		waitFor(t, "store", func() bool { return fx.condition("B").Condition == state.ConditionStore })
+		if _, err := fx.db.RefuseObject(t.Context(), seq, state.CauseStore, "rotted"); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
+		if c := fx.condition("B"); c.Detail != "" || !c.LastOK.IsZero() {
+			t.Fatalf("condition %+v", c)
+		}
+	})
+	t.Run("retrying stays until the place answers", func(t *testing.T) {
+		fx := newFixture(t, "B")
+		var offline atomic.Bool
+		offline.Store(true)
+		fx.places["B"].fail = func(string, string) error {
+			if offline.Load() {
+				return errors.New("connection refused")
+			}
+			return nil
+		}
+		seq := fx.write("laptop", "data/1", "one")
+		fx.run()
+		waitFor(t, "retrying", func() bool { return fx.condition("B").Condition == state.ConditionRetrying })
+		// Another place's sender finds the store's copy rotted.
+		if _, err := fx.db.RefuseObject(t.Context(), seq, state.CauseStore, "rotted"); err != nil {
+			t.Fatal(err)
+		}
+		fx.drained("B")
+		time.Sleep(20 * fx.w.Poll) // the sender polls its empty FIFO
+		if c := fx.condition("B"); c.Condition != state.ConditionRetrying {
+			t.Fatalf("an unreachable place shows %+v", c)
+		}
+		offline.Store(false)
+		fx.write("laptop", "data/2", "two")
+		fx.drained("B")
+		if c := fx.condition("B"); c.Condition != state.ConditionOK || c.LastOK.IsZero() {
+			t.Fatalf("condition %+v after the place answered", c)
+		}
+	})
+	t.Run("at daemon start", func(t *testing.T) {
+		fx := newFixture(t, "B", "C")
+		now := time.Now()
+		if err := fx.db.SetPlaceCondition(t.Context(), "B", state.ConditionRemoved, "AccessDenied", now); err != nil {
+			t.Fatal(err)
+		}
+		if err := fx.db.SetPlaceCondition(t.Context(), "C", state.ConditionStore, "EIO", now); err != nil {
+			t.Fatal(err)
+		}
+		fx.run()
+		waitFor(t, "C ok", func() bool { return fx.condition("C").Condition == state.ConditionOK })
+		time.Sleep(10 * fx.w.Poll)
+		if c := fx.condition("B"); c.Condition != state.ConditionRemoved {
+			t.Fatalf("a friend that removed this node shows %+v", c)
+		}
+	})
+}
+
+// REPL-3, OPS-1 (#61): a store failure is alerted when it follows any
+// other outcome, even with the network backoff at its maximum because
+// the friend was offline; later failures of the same run are not
+// alerted again.
+func TestStoreFailureAlertsAtMaximumNetworkBackoff(t *testing.T) {
 	fx := newFixture(t, "B")
-	fx.places["B"].fail = func(string, string) error { return errors.New("connection refused") }
-	seq := fx.write("laptop", "data/1", "one")
-	fx.run()
-	waitFor(t, "retrying", func() bool { return fx.condition("B").Condition == state.ConditionRetrying })
-	// Another place's sender finds the store's copy rotted.
-	if _, err := fx.db.RefuseObject(t.Context(), seq, "rotted"); err != nil {
-		t.Fatal(err)
+	logs := fx.logTo()
+	var attempts atomic.Int32
+	fx.places["B"].fail = func(string, string) error {
+		attempts.Add(1)
+		return errors.New("connection refused")
 	}
-	waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
-	if c := fx.condition("B"); c.Detail != "" || !c.LastOK.IsZero() {
+	fx.write("laptop", "data/1", "one")
+	var failing atomic.Bool
+	fx.w.open = func(name string) (fs.File, error) {
+		if failing.Load() {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EIO}
+		}
+		return os.Open(name)
+	}
+	fx.run()
+	// MinBackoff 10 ms doubles to MaxBackoff 20 ms after the second try.
+	waitFor(t, "maximum backoff", func() bool { return attempts.Load() >= 4 })
+	failing.Store(true)
+	waitFor(t, "store", func() bool { return fx.condition("B").Condition == state.ConditionStore })
+	waitFor(t, "an alert", func() bool { return len(logs.alerts("store")) > 0 })
+	time.Sleep(100 * time.Millisecond) // several store retries
+	if n := len(logs.alerts("store")); n != 1 {
+		t.Fatalf("%d store alerts, want 1", n)
+	}
+}
+
+// EP-3, REPL-1, SEC-7 (#61): while one friend refuses everything, a
+// client re-uploading the same bytes heals the refusal there but sends
+// nothing again to a friend that already acknowledged the hash.
+func TestHealingReuploadIsNotResentToAnHonestFriend(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	fx.places["B"].fail = func(string, string) error { return fmt.Errorf("%w: BadDigest", ErrRejected) }
+	fx.write("laptop", "data/1", "one")
+	fx.run()
+	fx.drained("B")
+	fx.drained("C")
+	for range 3 {
+		fx.write("laptop", "data/1", "one")
+		fx.drained("B")
+		fx.drained("C")
+	}
+	if log, _, _, read := fx.places["C"].snapshot(); len(log) != 1 || read != 3 {
+		t.Fatalf("C was sent %v, %d bytes", log, read)
+	}
+	if _, _, _, read := fx.places["B"].snapshot(); read != 4*3 {
+		t.Fatalf("B read %d bytes; each re-upload heals there", read)
+	}
+	st, _ := fx.db.PlaceStats(t.Context(), time.Now())
+	if st["B"].Refused != 1 || st["C"].Refused != 0 || st["C"].Queued != 0 {
+		t.Fatalf("places %+v", st)
+	}
+}
+
+// hungFile is a store file whose reads block until release is closed.
+type hungFile struct {
+	fs.File
+	release chan struct{}
+}
+
+func (f *hungFile) Read(p []byte) (int, error) {
+	<-f.release
+	return 0, errors.New("released")
+}
+
+// REPL-3, OPS-1 (#61): a store read that never returns while an object
+// is sent ends the send as the store's failure: the place shows store,
+// not retrying, and the object is sent once the store answers.
+func TestHungStoreReadIsTheStoresFault(t *testing.T) {
+	fx := newFixture(t, "B")
+	fx.w.StoreStall = 30 * time.Millisecond
+	logs := fx.logTo()
+	fx.write("laptop", "data/1", "one")
+	release := make(chan struct{})
+	var hung atomic.Bool
+	hung.Store(true)
+	fx.w.open = func(name string) (fs.File, error) {
+		f, err := os.Open(name)
+		if err != nil || !hung.Load() {
+			return f, err
+		}
+		return &hungFile{File: f, release: release}, nil
+	}
+	fx.run()
+	waitFor(t, "store", func() bool { return fx.condition("B").Condition == state.ConditionStore })
+	if c := fx.condition("B"); !strings.Contains(c.Detail, "did not return") {
+		t.Fatalf("condition %+v", c)
+	}
+	if len(logs.alerts("store")) == 0 {
+		t.Fatal("not alerted")
+	}
+	hung.Store(false)
+	close(release)
+	fx.drained("B")
+	if c := fx.condition("B"); c.Condition != state.ConditionOK {
 		t.Fatalf("condition %+v", c)
 	}
 }

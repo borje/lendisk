@@ -10,11 +10,12 @@ import (
 // Placement row states (D6). A queued row is an entry in its place's
 // FIFO; acked keeps the hash the place verified (REPL-10); refused is a
 // refusal that would repeat, out of the FIFO and shown in status: by
-// the place (EP-11, LEND-4), or, with cause 'store', because the node's
-// own store cannot supply the object as captured (RefuseObject, #50).
-// An identical re-upload of the key heals a refusal: FinishPut queues it
-// again, and a refusal a later done write replaced no longer counts
-// (#57).
+// the place (EP-11, LEND-4, cause NULL), or because the node's own store
+// cannot supply the object as captured (RefuseObject, #50; cause
+// CauseStore or CauseOversize). An identical re-upload of the key heals
+// a refusal: FinishPut queues it again where the place does not already
+// hold the hash, and a refusal a later done write replaced no longer
+// counts (#57, #61).
 const (
 	PlacementQueued  = "queued"
 	PlacementAcked   = "acked"
@@ -31,6 +32,15 @@ const (
 	// cannot be read now (a disk not mounted, EMFILE, EIO; #57). Not the
 	// place's fault; the detail says what failed.
 	ConditionStore = "store"
+)
+
+// Causes of a refusal against the bucket (placement.cause): the node's
+// own store could not supply the object as captured. CauseOversize is
+// only that it is larger than one PUT carries, which multipart
+// replication (#23) lifts: RequeueOversize puts those rows back.
+const (
+	CauseStore    = "store"
+	CauseOversize = "oversize"
 )
 
 // current keeps placement rows p whose queue row is the key's latest
@@ -53,12 +63,30 @@ type Placement struct {
 }
 
 // placeTx places a completed queue row. Placement is trivial until
-// pooled placement (#19): every friend gets every row.
-func placeTx(ctx context.Context, tx *sql.Tx, seq int64) error {
-	_, err := tx.ExecContext(ctx, `INSERT INTO placement (seq, place, bucket, key, op, state)
-		SELECT q.seq, f.peer_key, q.bucket, q.key, q.op, 'queued'
+// pooled placement (#19): every friend gets every row. A healing
+// re-upload (heal, #61) is acked at once, without sending, at a place
+// whose latest acknowledged row for the key is a put of the same hash
+// and that has nothing of the key queued (an earlier row in flight there
+// may still replace what it holds): exactly-once holds for honest places
+// while another place keeps refusing.
+func placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) error {
+	_, err := tx.ExecContext(ctx, `WITH c AS (
+		SELECT q.seq, f.peer_key AS place, q.bucket, q.key, q.op, q.sha256,
+			?2 AND q.op = 'put'
+			AND coalesce((SELECT a.op = 'put' AND a.sha256 = q.sha256 FROM placement a
+				WHERE a.place = f.peer_key AND a.bucket = q.bucket AND a.key = q.key AND a.state = 'acked'
+				ORDER BY a.seq DESC LIMIT 1), 0)
+			AND NOT EXISTS (SELECT 1 FROM placement w
+				WHERE w.place = f.peer_key AND w.bucket = q.bucket AND w.key = q.key
+				AND w.state = 'queued' AND w.seq < q.seq) AS held
 		FROM queue q, friendship f
-		WHERE q.seq = ? AND q.state = 'done' AND coalesce(f.address, '') != ''`, seq)
+		WHERE q.seq = ?1 AND q.state = 'done' AND coalesce(f.address, '') != '')
+	INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at)
+		SELECT seq, place, bucket, key, op,
+			CASE WHEN held THEN 'acked' ELSE 'queued' END,
+			CASE WHEN held THEN sha256 END,
+			CASE WHEN held THEN ?3 END
+		FROM c`, seq, heal, time.Now().Unix())
 	return err
 }
 
@@ -105,13 +133,14 @@ func (db *DB) RefusePlacement(ctx context.Context, place string, seq int64, deta
 
 // RefuseObject takes the queue row seq out of every place's FIFO as
 // refused because the node's own store cannot supply the object as
-// captured (#50); RefusedObjects counts it against its bucket, and no
-// place's refusals include it. Rows already acknowledged stay so.
-// refused is false when no row was still queued: another place's sender
-// refused it first, and only one alert is raised (#57).
-func (db *DB) RefuseObject(ctx context.Context, seq int64, detail string) (refused bool, err error) {
-	r, err := db.ExecContext(ctx, `UPDATE placement SET state = 'refused', detail = ?, cause = 'store'
-		WHERE seq = ? AND state = 'queued'`, detail, seq)
+// captured (#50), for cause (CauseStore or CauseOversize);
+// RefusedObjects counts it against its bucket, and no place's refusals
+// include it. Rows already acknowledged stay so. refused is false when
+// no row was still queued: another place's sender refused it first, and
+// only one alert is raised (#57).
+func (db *DB) RefuseObject(ctx context.Context, seq int64, cause, detail string) (refused bool, err error) {
+	r, err := db.ExecContext(ctx, `UPDATE placement SET state = 'refused', detail = ?, cause = ?
+		WHERE seq = ? AND state = 'queued'`, detail, cause, seq)
 	if err != nil {
 		return false, err
 	}
@@ -119,12 +148,26 @@ func (db *DB) RefuseObject(ctx context.Context, seq int64, detail string) (refus
 	return n > 0, err
 }
 
+// RequeueOversize puts the rows refused only for being larger than one
+// PUT carries (CauseOversize), and not replaced by a later write of the
+// key, back into their places' FIFOs, and returns how many. Multipart
+// replication (#23) calls it once it can send them.
+func (db *DB) RequeueOversize(ctx context.Context) (int64, error) {
+	r, err := db.ExecContext(ctx, `UPDATE placement SET state = 'queued', detail = NULL, cause = NULL
+		WHERE state = 'refused' AND cause = 'oversize' AND NOT EXISTS (SELECT 1 FROM queue l
+			WHERE l.bucket = placement.bucket AND l.key = placement.key AND l.seq > placement.seq AND l.state = 'done')`)
+	if err != nil {
+		return 0, err
+	}
+	return r.RowsAffected()
+}
+
 // RefusedObjects returns, per bucket, how many objects were refused
-// because the store could not supply them and not written again since;
-// buckets with none are absent.
+// because the store could not supply them (any cause) and not written
+// again since; buckets with none are absent.
 func (db *DB) RefusedObjects(ctx context.Context) (map[string]int64, error) {
 	rows, err := db.QueryContext(ctx, `SELECT bucket, count(DISTINCT seq) FROM placement p
-		WHERE state = 'refused' AND cause = 'store' AND `+current+` GROUP BY bucket`)
+		WHERE state = 'refused' AND cause IS NOT NULL AND `+current+` GROUP BY bucket`)
 	if err != nil {
 		return nil, err
 	}
@@ -234,13 +277,16 @@ func (db *DB) SetPlaceCondition(ctx context.Context, place, condition, detail st
 	return err
 }
 
-// ResetPlaceCondition sets place's condition back to ok at now, when
-// its FIFO emptied without an answer from it (its rows were refused for
-// the store, #57). LastOK is untouched: nothing was acknowledged. A
-// place with no condition yet gets none.
+// ResetPlaceCondition sets place's condition back to ok at now when it
+// is ConditionStore and its FIFO emptied: the rows it waited on went
+// (refused for the store, #57), so this node's store no longer holds it
+// up. LastOK is untouched: nothing was acknowledged. Every other
+// condition is the place's own last answer (retrying, quota, removed)
+// and stands until the place answers again (#61). A place with no
+// condition yet gets none.
 func (db *DB) ResetPlaceCondition(ctx context.Context, place string, now time.Time) error {
 	_, err := db.ExecContext(ctx, `UPDATE place SET condition = 'ok', detail = NULL, since = ?
-		WHERE place = ? AND condition != 'ok'`, now.Unix(), place)
+		WHERE place = ? AND condition = 'store'`, now.Unix(), place)
 	return err
 }
 

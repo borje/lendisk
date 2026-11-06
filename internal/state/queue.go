@@ -81,7 +81,8 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 // instead and dup is true: an identical re-upload, such as a client's
 // retry after a crash, is not queued twice (EP-3, EP-11). Unless that
 // row was refused at some place: then the re-upload is queued and
-// placed like any write, which heals the refusal (#57).
+// placed, which heals the refusal (#57), but sent only where the place
+// does not already hold the hash (placeTx, #61).
 func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (dup bool, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -109,10 +110,11 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 		dup = true
 		_, err = tx.ExecContext(ctx, `DELETE FROM queue WHERE seq = ?`, seq)
 	case err == nil || errors.Is(err, sql.ErrNoRows):
+		heal := err == nil && op == OpPut && prev.String == sha256
 		_, err = tx.ExecContext(ctx, `UPDATE queue SET state = 'done', size = ?, sha256 = ?, token = NULL WHERE seq = ?`,
 			size, sha256, seq)
 		if err == nil {
-			err = placeTx(ctx, tx, seq)
+			err = placeTx(ctx, tx, seq, heal)
 		}
 	}
 	if err != nil {
@@ -140,7 +142,7 @@ func (db *DB) FinishDelete(ctx context.Context, seqs ...int64) error {
 		if n, err := r.RowsAffected(); err != nil {
 			return err
 		} else if n == 1 {
-			if err := placeTx(ctx, tx, s); err != nil {
+			if err := placeTx(ctx, tx, s, false); err != nil {
 				return err
 			}
 		}

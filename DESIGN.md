@@ -1444,29 +1444,43 @@ upstream bucket is Q-V.
   the index of acknowledged hashes (REPL-10, `state.AckedHash`).
   `refused` (with `detail`) is a refusal that would repeat; the row
   leaves the FIFO. Its `cause` (schema 9) is NULL when the place
-  refused (a `412`) and `store` when the node's own store could not
-  supply the object as captured (`state.RefuseObject`, #50): such a
-  refusal takes the row out of every place's FIFO at once and counts
-  against the bucket (`state.RefusedObjects`), not any place.
+  refused (a `412`), `store` when the node's own store could not
+  supply the object as captured (`state.RefuseObject`, #50), and
+  `oversize` when the only reason was that the object is larger than
+  one PUT carries (#61): such a refusal takes the row out of every
+  place's FIFO at once and counts against the bucket
+  (`state.RefusedObjects`, both causes), not any place.
   *Healing (#57):* a refusal is healed by writing the same bytes again.
   `FinishPut` drops an identical re-upload as a retry (EP-3) only while
   the key's last done row is refused nowhere; when it is refused at
-  some place, the re-upload is queued and placed like any write, at
-  every friend (a friend that already holds the hash accepts it again,
-  LEND-4, so the cost is one re-send there). A refusal counts in
+  some place, the re-upload is queued and placed at every friend, but
+  sent only where the object is not already held (#61): at a place
+  whose latest acknowledged row for the key is a put of the same hash
+  (`state.AckedHash`) and that has nothing of the key queued, the new
+  row is `acked` at placement, without a send. A row of the key still
+  queued there may be in flight and could still replace what the place
+  holds, so then the new row is queued and the older one is cancelled
+  as superseded. So a friend that keeps refusing gets every re-upload,
+  and an honest friend that holds the hash gets none: exactly-once
+  (EP-3) holds for it. A refusal counts in
   `status` (both kinds) only while its row is the key's latest done
   write: once a later write or delete of the key is done, it no longer
   does. A client's ordinary retry, of an object queued or acknowledged
   everywhere, is still dropped, so exactly-once capture (#6) holds. Rows
-  refused as too large for one PUT stay refused when #23 lands; a
-  re-upload heals them, and re-placement (#26) should re-queue them.
+  refused only as too large for one PUT (cause `oversize`) are put back
+  in their places' FIFOs by `state.RequeueOversize` when multipart
+  replication lands: #23 calls it once, at the start of a worker that
+  can send them; a row a later write of the key replaced stays as it
+  is. A re-upload also heals them.
   Table `place` keeps each place's last answer:
   `condition` (`ok`, `retrying`, `quota`, `removed`, and `store` while
   it waits because this node's store cannot be read), `detail`, `since`
-  and `last_ok`, D6's last-reachable time. A sender whose FIFO is empty
-  sets a condition other than `ok` back to `ok` without touching
-  `last_ok` (`state.ResetPlaceCondition`): its rows went for another
-  reason than its answer, such as a refusal for the store. A friend
+  and `last_ok`, D6's last-reachable time. A sender whose FIFO is empty,
+  including at daemon start, sets `store` back to `ok` without touching
+  `last_ok` (`state.ResetPlaceCondition`): the rows it waited on went
+  for another reason than its answer, such as a refusal for the store.
+  `retrying`, `quota` and `removed` are the place's own last answer and
+  stand until it answers again, at its next row (#61). A friend
   added after a row was placed gets no copy of it until re-placement
   (#26).
 - **REPL-1, the metadata barrier.** A metadata row at sequence `m` is
@@ -1599,7 +1613,8 @@ upstream bucket is Q-V.
   gone (`ENOENT`, or `ENOTDIR` for a path through a file), its size
   differs from the capture, it is a directory or special file, its key
   names no file under the bucket, it is larger than one PUT carries
-  (5 GiB, `replica.MaxPutSize`, until multipart replication, #23), or
+  (5 GiB, `replica.MaxPutSize`, until multipart replication, #23;
+  refused with cause `oversize`, *Healing* above), or
   its bytes no longer match the capture hash after a place answered
   `BadDigest` (above). Every other failure to open, stat or read the
   object (`EMFILE` under load, `EACCES` until a restore's ownership is
@@ -1632,10 +1647,16 @@ upstream bucket is Q-V.
   object. When the bucket's directory itself is missing (a store disk
   not mounted), or the object cannot be read now (above), no object is
   blamed: the row waits with backoff (1 s doubling to 5 minutes, for as
-  long as it lasts), the first failure in a row logged at error level
-  with `alert=true`, and the place's condition is `store` with the
+  long as it lasts), and the place's condition is `store` with the
   error as its detail, so `status` names the cause on every place the
-  store holds up. Nothing is refused.
+  store holds up. Nothing is refused. The first store failure after any
+  other outcome (an acknowledgement, a refusal, a network error at any
+  backoff) is logged at error level with `alert=true` and starts its
+  backoff at 1 s; the network's backoff never decides it (#61). A read
+  of the store that does not return while an object is sent is such a
+  failure: after `replica.Worker.StoreStall` (1 minute, half the
+  client's 2-minute stall timeout) the worker cancels the put itself,
+  so a hung disk shows as `store`, not as the friend's `retrying`.
 - **The worker** (`replica.Worker`, started by `serve` in the full
   profile only). It re-reads the friendships every 5 s and runs one
   sender per friend with an address, restarted when the address
