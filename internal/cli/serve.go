@@ -51,6 +51,11 @@ func (a *app) serveCmd() *cobra.Command {
 					return err
 				}
 			}
+			tun, err := a.startTunnel(ctx, cfg, id, db, log)
+			if err != nil {
+				return err
+			}
+			defer tun.Close()
 			schema, _, _ := db.Versions(ctx)
 			log.Info("lendisk started", "version", version.Version, "node_id", nodeID,
 				"role", cfg.Role, "config", cfg.Path, "data_dir", cfg.DataDir, "schema", schema)

@@ -17,6 +17,7 @@ import (
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
+	"github.com/borje/lendisk/internal/transport"
 	"github.com/borje/lendisk/internal/version"
 )
 
@@ -32,6 +33,8 @@ type app struct {
 	newPhrase func() (string, error)
 	// ctx ends `serve` when done; nil means on SIGINT or SIGTERM.
 	ctx context.Context
+	// regions offers the tunnel's relay regions; nil means the public map.
+	regions transport.RegionSource
 }
 
 // Main runs the command line and returns the process exit code.

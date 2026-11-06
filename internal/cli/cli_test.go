@@ -13,22 +13,27 @@ import (
 	"time"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/transport"
+	"github.com/borje/lendisk/internal/transport/transporttest"
 )
 
 const testPhrase = "abandon abandon abandon abandon abandon abandon abandon abandon " +
 	"abandon abandon abandon abandon abandon abandon abandon abandon " +
 	"abandon abandon abandon abandon abandon abandon abandon art"
 
-// node is one simulated machine: its own config and data directories.
+// node is one simulated machine: its own config and data directories,
+// and a local DERP relay standing in for the public ones.
 type node struct {
-	t      *testing.T
-	config string
-	data   string
+	t       *testing.T
+	config  string
+	data    string
+	regions transport.RegionSource
 }
 
 func newNode(t *testing.T) *node {
 	root := t.TempDir()
-	return &node{t: t, config: filepath.Join(root, "etc", "lendisk.toml"), data: filepath.Join(root, "var")}
+	return &node{t: t, config: filepath.Join(root, "etc", "lendisk.toml"), data: filepath.Join(root, "var"),
+		regions: &transporttest.Source{D: transporttest.Start(t)}}
 }
 
 // run executes the CLI with stdin and returns exit code, stdout, stderr.
@@ -38,6 +43,7 @@ func (n *node) run(stdin string, phrase string, args ...string) (int, string, st
 		in: bufio.NewReader(strings.NewReader(stdin)), out: &out, errOut: &errOut,
 		pick:      func(int, int) []int { return []int{0, 11, 23} },
 		newPhrase: func() (string, error) { return phrase, nil },
+		regions:   n.regions,
 	}
 	args = append(args, "--config", n.config, "--data-dir", n.data)
 	code := a.run(args)
@@ -191,7 +197,7 @@ func TestServeLogsStructuredAndStops(t *testing.T) {
 	}
 	var out, errOut bytes.Buffer
 	ctx, cancel := context.WithCancel(context.Background())
-	a := &app{in: bufio.NewReader(strings.NewReader("")), out: &out, errOut: &errOut, ctx: ctx}
+	a := &app{in: bufio.NewReader(strings.NewReader("")), out: &out, errOut: &errOut, ctx: ctx, regions: n.regions}
 	done := make(chan int)
 	go func() {
 		done <- a.run([]string{"serve", "--config", n.config, "--data-dir", n.data, "--log-format", "json", "--log-level", "debug"})

@@ -39,12 +39,18 @@ type Config struct {
 	Role    string `toml:"role" default:"full" help:"node role: full, or lender for a node that only lends (PEER-9)"`
 	DataDir string `toml:"data_dir" default:"/var/lib/lendisk" help:"data directory: lendisk.db, store/, run/"`
 	Log     Log    `toml:"log"`
+	Tunnel  Tunnel `toml:"tunnel"`
 }
 
 // Log is the [log] section (OPS-5).
 type Log struct {
 	Level  string `toml:"level" default:"info" help:"log level: debug, info, warn or error"`
 	Format string `toml:"format" default:"text" help:"log format: text (logfmt) or json"`
+}
+
+// Tunnel is the [tunnel] section: the peer connection (NET-1, SEC-14).
+type Tunnel struct {
+	Region string `toml:"region" help:"DERP relay region in this node's address, by ID or code; empty picks the nearest once. Changing it changes the address"`
 }
 
 // Validate checks values that have a fixed set of choices.
