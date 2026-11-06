@@ -1724,9 +1724,22 @@ upstream bucket is Q-V.
 - **A restarted friend.** tailcat admits a client as a WireGuard peer
   at its first ping only (the "meow" handshake, `Client.up`), and a
   restarted server has forgotten it while the client's session looks
-  valid, so its dials time out. `Tailcat.Dial` therefore drops and
-  closes a cached client when a dial through it fails; the next dial
-  builds a new one, which pings first.
+  valid, so its dials time out. `Tailcat.Dial` keeps one client per
+  friend, shared by every caller (replication now, the control API
+  calls of #24 and #28 later), and counts its open connections. A
+  failed dial does not drop the client, since the caller's own context
+  may have ended or the friend hiccupped: the transport checks the
+  client with a dial of its own, bounded by 10 s, at most one at a
+  time. Only if that check fails too is the client closed and dropped;
+  the next dial builds a new one, which pings first (#52). Closing it
+  then cuts no working connection: the check proves the server no
+  longer takes this client's dials, and tailcat's server keeps one
+  WireGuard session per client key, so a live old client would fight
+  its successor for that session (measured: a second client of the
+  same key to the same server stalls the first one's connections).
+  When the friend's address changes, the old client takes no new dials
+  but stays up until its last connection closes; clients on different
+  relays coexist.
 - **Dialling a friend.** The replica client's HTTP transport uses the
   tailcat `Client.Dial` for that peer as its dial function, so
   replication traffic enters the tunnel from inside the process. No
