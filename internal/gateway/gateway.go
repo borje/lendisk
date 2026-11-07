@@ -7,7 +7,8 @@
 // the free-space floor, object hashes and key names on a borrower's
 // writes (LEND-1, LEND-2, LEND-4, SEC-5); its inner layer
 // captures every write and delete of an own bucket into the replication
-// queue (EP-2, EP-3, EP-7, REPL-3, REPL-10). A friend's node ID is an
+// queue (EP-2, EP-3, EP-7, REPL-3, REPL-10) and serves a read of a key the
+// store lacks from a friend that holds it (EP-10, ID-6). A friend's node ID is an
 // account whose secret is derived per pair (NET-7a).
 //
 // Rules a caller must keep:
@@ -75,6 +76,10 @@ type Gateway struct {
 	Log      *slog.Logger
 	// Clock is the IAM's clock; nil means time.Now.
 	Clock func() time.Time
+
+	// Fetch opens objects at friends for the read-through (EP-10, ID-6);
+	// nil serves only what the store holds.
+	Fetch Fetcher
 
 	// AfterStore is the decorator's crash-window hook. Tests only.
 	AfterStore func()
@@ -203,7 +208,8 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 // decorator wraps be and settles what a crash left pending before
 // anything is served (EP-3).
 func (g *Gateway) decorator(ctx context.Context, be *Store) (*Decorator, error) {
-	d := &Decorator{Backend: be, Uploads: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore, ctx: ctx}
+	d := &Decorator{Backend: be, Uploads: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore,
+		Fetch: g.Fetch, ctx: ctx}
 	if d.Profiles == nil {
 		set, err := profile.Load("")
 		if err != nil {

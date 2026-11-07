@@ -264,3 +264,72 @@ func TestUnreachableFriendFailsRetryably(t *testing.T) {
 		t.Fatalf("took %v", d)
 	}
 }
+
+// EP-10, ID-6 (#30): the read-through fetches an object from the sealed
+// bucket at a friend, signed with the node's ID; a key the friend lacks
+// fails; a friend that stops sending mid-body fails within the stall
+// timeout rather than hanging the read.
+func TestGetFetchesFromTheSealedBucket(t *testing.T) {
+	self := newID(t)
+	body := []byte(strings.Repeat("restic pack ", 5000))
+	rec := &recorder{}
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	f, _ := tunnelLender(t, self, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.ServeHTTP(httptestDiscard{}, r)
+		w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+		w.Header().Set("ETag", `"0123"`)
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/data/ab/abcd"):
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			w.Write(body)
+		case strings.HasSuffix(r.URL.Path, "/data/ab/stall"):
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			w.Write(body[:100])
+			w.(http.Flusher).Flush()
+			<-release
+		default:
+			s3Error(w, 404, "NoSuchKey")
+		}
+	}))
+	f.stall = 2 * time.Second
+	rc, err := f.Get(t.Context(), "laptop", "data/ab/abcd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("fetched %d bytes, %v", len(got), err)
+	}
+	r := rec.all()[0]
+	if r.Method != http.MethodGet || r.Path != "/"+self.SealedName("laptop")+"/data/ab/abcd" {
+		t.Fatalf("fetch was %s %s", r.Method, r.Path)
+	}
+	if a := r.Header.Get("Authorization"); !strings.Contains(a, "Credential="+self.NodeID().String()+"/") {
+		t.Errorf("access key is not the node ID: %s", a)
+	}
+	if rc, err := f.Get(t.Context(), "laptop", "data/none"); err == nil {
+		rc.Close()
+		t.Fatal("a key the friend lacks was fetched")
+	}
+	rc, err = f.Get(t.Context(), "laptop", "data/ab/stall")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	start := time.Now()
+	if _, err := io.ReadAll(rc); err == nil {
+		t.Fatal("a stalled body read to its end")
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Fatalf("a stalled body failed after %v", d)
+	}
+}
+
+// httptestDiscard is a ResponseWriter that keeps nothing.
+type httptestDiscard struct{}
+
+func (httptestDiscard) Header() http.Header         { return http.Header{} }
+func (httptestDiscard) Write(b []byte) (int, error) { return len(b), nil }
+func (httptestDiscard) WriteHeader(int)             {}

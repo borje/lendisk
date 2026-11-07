@@ -51,6 +51,9 @@ type harness struct {
 	lending func(*Lending)
 	// reconcileEvery is the gateway's ReconcileEvery.
 	reconcileEvery time.Duration
+	// fetch is the gateway's read-through fetcher; log, if set, its log.
+	fetch Fetcher
+	log   *slog.Logger
 }
 
 func newHarness(t *testing.T, buckets map[string]string) *harness {
@@ -89,9 +92,13 @@ func newHarnessIn(t *testing.T, dir string, buckets map[string]string) *harness 
 // serve runs the gateway until stop is called or the test ends.
 func (h *harness) serve(noCapture bool) (stop func()) {
 	h.t.Helper()
-	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: quiet,
+	log := h.log
+	if log == nil {
+		log = quiet
+	}
+	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: log,
 		ResolveEvery: 20 * time.Millisecond, noCapture: noCapture, Statfs: h.statfs, Floor: h.floor,
-		ReconcileEvery: h.reconcileEvery}
+		ReconcileEvery: h.reconcileEvery, Fetch: h.fetch}
 	h.gw = g
 	g.lendingHook = h.lending
 	ctx, cancel := context.WithCancel(context.Background())
