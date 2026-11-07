@@ -90,15 +90,22 @@ type LiveKey struct {
 // size a place listed), so a read of it is refused with the reason
 // rather than not found. Keys are compared as bytes, as S3 orders them.
 func (db *DB) LiveKeys(ctx context.Context, bucket, prefix, after string, limit int) ([]LiveKey, error) {
+	// Each branch walks its index in key order and stops at limit, so a
+	// page costs O(limit), not O(keys after the marker) (#30 review).
 	rows, err := db.QueryContext(ctx, `SELECT key, size, modified FROM (
-		SELECT q.key AS key, coalesce(q.size, 0) AS size, q.created_at AS modified FROM queue q
-		WHERE q.bucket = ?1 AND q.key >= ?3 AND q.key > ?2 AND q.state = 'done' AND q.op = 'put'
-			AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
+		SELECT * FROM (
+			SELECT q.key AS key, coalesce(q.size, 0) AS size, q.created_at AS modified FROM queue q
+			WHERE q.bucket = ?1 AND q.key >= ?3 AND q.key > ?2 AND substr(q.key, 1, length(?3)) = ?3
+				AND q.state = 'done' AND q.op = 'put'
+				AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
+			ORDER BY q.key LIMIT ?4)
 		UNION ALL
-		SELECT k.key, coalesce((SELECT max(size) FROM listed l WHERE l.bucket = k.bucket AND l.key = k.key), 0), NULL
-		FROM recovered_key k WHERE k.bucket = ?1 AND k.key >= ?3 AND k.key > ?2 AND `+inConflict+`)
-		WHERE substr(key, 1, length(?4)) = ?4
-		ORDER BY key LIMIT ?5`, bucket, after, prefix, prefix, limit)
+		SELECT * FROM (
+			SELECT k.key AS key, coalesce((SELECT max(size) FROM listed l WHERE l.bucket = k.bucket AND l.key = k.key), 0) AS size, NULL AS modified
+			FROM recovered_key k WHERE k.bucket = ?1 AND k.key >= ?3 AND k.key > ?2 AND substr(k.key, 1, length(?3)) = ?3
+				AND `+inConflict+`
+			ORDER BY k.key LIMIT ?4))
+		ORDER BY key LIMIT ?4`, bucket, after, prefix, limit)
 	if err != nil {
 		return nil, err
 	}

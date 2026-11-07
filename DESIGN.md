@@ -1222,7 +1222,8 @@ upstream bucket is Q-V.
   friend stopped; `serve`; `restic restore latest` with the credential
   `bucket show` prints restores the files exactly, and the store then
   holds only objects restic read, each the version the node wrote,
-  with the older snapshot's packs never fetched.
+  and some data packs (those only the older snapshot needs) are never
+  fetched; the test asserts that some stay unread, not which.
 - **ID-7** The sheet is generated from the manifest; a lender's `tc…`
   string changes only when its key or its configured bootstrap region
   changes (SEC-14), so regeneration is rare. Each bucket is listed with
