@@ -11,6 +11,11 @@ import (
 	"github.com/versity/versitygw/backend/posix"
 )
 
+// HousekeepingDir is lendisk's directory in the store's root (friends'
+// manifests) and in each lent bucket (tombs, TombDir): a direct reader
+// of the store ignores it (COMPAT-4).
+const HousekeepingDir = ".lendisk"
+
 // Store is the posix store the gateway serves (D15), with the metadata
 // storer it was opened with, so capture reads the attributes posix
 // writes through the same storer and bucket paths (EP-3, #62).
@@ -23,10 +28,13 @@ type Store struct {
 // OpenBackend opens the posix store on dir. AbsolutePaths is required:
 // without it posix.New changes the process's working directory (D15).
 // DataIntegrityEtag stays off: resolve's landed tells a PutObject's ETag
-// from a multipart one by the '-' (#62).
+// from a multipart one by the '-' (#62). lendisk's housekeeping
+// directory, .lendisk, is excluded at every depth (RET-2, §3.6): posix
+// never lists it, never takes it for a bucket at the store's root, and
+// refuses every key through it, so no S3 call reaches a tomb.
 func OpenBackend(dir string) (*Store, error) {
 	m := meta.XattrMeta{}
-	p, err := posix.New(dir, m, posix.PosixOpts{AbsolutePaths: true})
+	p, err := posix.New(dir, m, posix.PosixOpts{AbsolutePaths: true, ExcludeDirs: []string{HousekeepingDir}})
 	if err != nil {
 		return nil, fmt.Errorf("opening store %s: %w", dir, err)
 	}

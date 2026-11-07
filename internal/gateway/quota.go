@@ -460,7 +460,7 @@ func (l *Lending) hashStored(ctx context.Context, bucket, key string) (int64, st
 
 // putLent stores a borrower's object in its store bucket (in.Bucket is
 // already mapped).
-func (l *Lending) putLent(ctx context.Context, peer string, in s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
+func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
 	var none s3response.PutObjectOutput
 	key := deref(in.Key)
 	if err := checkKey(key); err != nil {
@@ -483,6 +483,13 @@ func (l *Lending) putLent(ctx context.Context, peer string, in s3response.PutObj
 	}
 	if has {
 		return l.putAgain(b, want, old)
+	}
+	ts, err := l.tombsOf(ctx, peer, sealed, key)
+	if err != nil {
+		return none, err
+	}
+	if len(ts) > 0 {
+		return l.putOverTomb(ctx, peer, *in.Bucket, b, want, ts)
 	}
 	release, err := l.reserve(ctx, peer, size+itemOverhead)
 	if err != nil {
@@ -560,31 +567,6 @@ func (l *Lending) putAgain(b *body, want string, old storedObject) (s3response.P
 	return s3response.PutObjectOutput{ETag: old.etag}, nil
 }
 
-// deleteLent deletes a borrower's object and frees its bytes.
-func (l *Lending) deleteLent(ctx context.Context, peer string, in *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
-	key := deref(in.Key)
-	if err := checkKey(key); err != nil {
-		return nil, err
-	}
-	unlock, err := l.keys.lock(ctx, *in.Bucket, key)
-	if err != nil {
-		return nil, errInternal
-	}
-	defer unlock()
-	old, has, err := l.existing(ctx, *in.Bucket, key)
-	if err != nil {
-		return nil, errInternal
-	}
-	pub := &published{u: l.use(peer)}
-	pub.take()
-	defer pub.release()
-	out, err := l.Next.DeleteObject(ctx, in)
-	if err == nil && has {
-		l.count(peer, -(old.size + itemOverhead))
-	}
-	return out, err
-}
-
 // createBucketLent creates a borrower's bucket through create, which
 // makes the bucket and its row. A new bucket is admitted like a write of
 // itemOverhead bytes and counted (NET-7: CreateBucket counts against
@@ -636,6 +618,15 @@ func (l *Lending) createUploadLent(ctx context.Context, peer, sealed string, in 
 	}
 	if has && old.sha256 != want {
 		return none, errKeyChanged
+	}
+	if !has {
+		ts, err := l.tombsOf(ctx, peer, sealed, key)
+		if err != nil {
+			return none, err
+		}
+		if _, same := sameHash(ts, want); len(ts) > 0 && !same {
+			return none, errKeyChanged
+		}
 	}
 	release, err := l.reserve(ctx, peer, itemOverhead)
 	if err != nil {
@@ -831,6 +822,20 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 	if has && old.sha256 != u.SHA256 {
 		return none, "", errKeyChanged
 	}
+	var tomb *state.Tombstone
+	if !has {
+		ts, err := l.tombsOf(ctx, peer, sealed, key)
+		if err != nil {
+			return none, "", err
+		}
+		t, same := sameHash(ts, u.SHA256)
+		if len(ts) > 0 && !same {
+			return none, "", errKeyChanged
+		}
+		if same {
+			tomb = &t
+		}
+	}
 	ulock, err := l.lockUpload(ctx, uploadID)
 	if err != nil {
 		return none, "", errInternal
@@ -841,6 +846,19 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		return none, "", errNoSuchUpload
 	}
 	parts := cur.Counted
+	if tomb != nil {
+		// The same object, tombstoned: revive it and drop the upload.
+		if err := l.Next.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: in.Bucket, Key: in.Key, UploadId: in.UploadId}); err != nil {
+			return none, "", err
+		}
+		l.count(peer, -(parts + itemOverhead))
+		l.dropUpload(uploadID)
+		etag, err := l.revive(ctx, bucket, *tomb)
+		if err != nil {
+			return none, "", err
+		}
+		return s3response.CompleteMultipartUploadResult{Bucket: in.Bucket, Key: in.Key, ETag: &etag}, "", nil
+	}
 	if has {
 		// The same object again: keep the stored one.
 		if err := l.Next.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: in.Bucket, Key: in.Key, UploadId: in.UploadId}); err != nil {
@@ -1068,6 +1086,13 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 			keyMarker, idMarker = res.NextKeyMarker, res.NextUploadIDMarker
 		}
 	}
+	// Tombstoned objects count as they did live (RET-1); posix lists
+	// nothing under .lendisk.
+	n, tb, err := l.DB.TombstoneUsage(ctx, peer)
+	if err != nil {
+		return 0, err
+	}
+	total += tb + n*itemOverhead
 	rows, err := l.DB.LentUploads(ctx, peer)
 	if err != nil {
 		return 0, err

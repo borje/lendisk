@@ -84,7 +84,7 @@ func (l *lent) put(key string, body []byte, meta map[string]string) error {
 
 // putDirect puts through Lending's borrower path without HTTP.
 func (l *lent) putDirect(key string, body io.Reader, size int64, meta map[string]string) error {
-	_, err := l.lending().putLent(context.Background(), l.peer(), s3response.PutObjectInput{Bucket: &l.store,
+	_, err := l.lending().putLent(context.Background(), l.peer(), *l.bucket, s3response.PutObjectInput{Bucket: &l.store,
 		Key: aws.String(key), ContentLength: &size, Body: body, Metadata: meta})
 	return err
 }
@@ -156,7 +156,7 @@ func (l *lent) mpu(key string, declared string, parts ...[]byte) error {
 // quota, its next put, multipart create and new bucket are refused with
 // lendisk's own 507 QuotaExceeded (unwrapped, so not a 500), nothing is
 // stored, and the counter holds what was stored. A retried create of a
-// bucket it has is not refused.
+// bucket it has is not refused. A deleted object counts until purged.
 func TestOverQuotaRefusedWith507(t *testing.T) {
 	l := lendTo(t, 3*ov+100, nil)
 	ctx := context.Background()
@@ -191,12 +191,22 @@ func TestOverQuotaRefusedWith507(t *testing.T) {
 	if _, err := l.c.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: l.bucket}); err != nil && code(err) != "BucketAlreadyOwnedByYou" {
 		t.Fatalf("retried create of the borrower's bucket: %v", err)
 	}
+	// A delete keeps the object as a tombstone, counted until it is
+	// purged (RET-1); the purge makes room.
 	if _, err := l.c.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: l.bucket, Key: aws.String("data/one")}); err != nil {
+		t.Fatal(err)
+	}
+	l.wantUsage(3*ov + 100)
+	if err := l.put("data/two", second, hashMeta(second)); code(err) != "QuotaExceeded" {
+		t.Fatalf("put while the deleted object is kept: %v", err)
+	}
+	l.lending().Now = func() time.Time { return time.Now().Add(DefaultRetention + time.Hour) }
+	if err := l.lending().purge(ctx); err != nil {
 		t.Fatal(err)
 	}
 	l.wantUsage(2*ov + 40)
 	if err := l.put("data/two", second, hashMeta(second)); err != nil {
-		t.Fatalf("put after a delete: %v", err)
+		t.Fatalf("put after the purge: %v", err)
 	}
 }
 
@@ -484,7 +494,7 @@ func TestPublishedMismatchIsRemoved(t *testing.T) {
 	l := &Lending{Next: ignoringReads{be}, DB: h.db, Uploads: be, StoreDir: h.store, Log: quiet}
 	body := []byte("bytes")
 	n := int64(len(body))
-	_, err = l.putLent(ctx, "peer", s3response.PutObjectInput{Bucket: aws.String("lent-x"), Key: aws.String("k"),
+	_, err = l.putLent(ctx, "peer", "sx", s3response.PutObjectInput{Bucket: aws.String("lent-x"), Key: aws.String("k"),
 		ContentLength: &n, Body: bytes.NewReader(body), Metadata: hashMeta([]byte("other"))})
 	if !isCode(err, "BadDigest") {
 		t.Fatalf("put: %v", err)

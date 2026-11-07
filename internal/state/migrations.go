@@ -364,4 +364,29 @@ var migrations = []Migration{
 		ALTER TABLE relist ADD COLUMN done INTEGER;
 		ALTER TABLE relist ADD COLUMN settled INTEGER;`,
 	},
+	{
+		Version: 19, Compat: 1, Release: "0.1",
+		SQL: `
+		-- A borrower's deleted object, kept for the retention window
+		-- (RET-1, RET-2, #17): its bytes moved to tomb, a path inside the
+		-- bucket's .lendisk/tomb/ directory, on the same filesystem. The
+		-- row is written, pending, before the move and kept (pending 0)
+		-- after it; startup settles a pending row from what the store
+		-- holds. The purger removes the tomb and the row after purge_after.
+		CREATE TABLE tombstone (
+			id          INTEGER PRIMARY KEY,
+			peer_key    TEXT NOT NULL,    -- the borrower's node ID
+			sealed      TEXT NOT NULL,    -- the bucket's sealed name
+			key         TEXT NOT NULL,
+			tomb        TEXT NOT NULL,    -- the bytes' path relative to the bucket directory
+			sha256      TEXT NOT NULL,    -- hex, as the object was stored (LEND-4)
+			etag        TEXT NOT NULL,
+			size        INTEGER NOT NULL,
+			deleted_at  INTEGER NOT NULL, -- unix seconds
+			purge_after INTEGER NOT NULL, -- unix seconds
+			pending     INTEGER NOT NULL DEFAULT 1
+		);
+		CREATE INDEX tombstone_key ON tombstone (peer_key, sealed, key);
+		CREATE INDEX tombstone_purge ON tombstone (pending, purge_after);`,
+	},
 }

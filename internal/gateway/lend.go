@@ -60,7 +60,8 @@ func borrowerOf(access string) (identity.NodeID, bool) {
 //
 // For a borrower it also enforces quota, the free-space floor, object
 // integrity and key names on every write (quota.go: LEND-1, LEND-2,
-// LEND-4, SEC-5).
+// LEND-4, SEC-5), and turns its deletes into tombstones kept for the
+// retention window (tomb.go: RET-1, RET-2).
 type Lending struct {
 	Next backend.Backend
 	DB   *state.DB
@@ -85,6 +86,9 @@ type Lending struct {
 	beforeComplete  func()
 	afterList       func()
 	afterPartStored func(part int32, size int64)
+	beforeTombMove  func() // a tombstone is recorded and its object not yet moved
+
+	tombDirs sync.Mutex // creating and removing directories for tombs and revivals
 
 	keys     keyLocks // one multipart create, completion or delete per borrower's key at a time
 	uploads  keyLocks // one accounting step per borrower's upload at a time
@@ -492,9 +496,10 @@ func (l *Lending) PutObject(ctx context.Context, in s3response.PutObjectInput) (
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
+	sealed := deref(in.Bucket)
 	in.Bucket = b
 	if peer, ok := borrower(ctx); ok {
-		return l.putLent(ctx, peer.String(), in)
+		return l.putLent(ctx, peer.String(), sealed, in)
 	}
 	return l.Next.PutObject(ctx, in)
 }
@@ -591,13 +596,13 @@ func (l *Lending) DeleteObject(ctx context.Context, in *s3.DeleteObjectInput) (*
 	c := *in
 	c.Bucket = b
 	if peer, ok := borrower(ctx); ok {
-		return l.deleteLent(ctx, peer.String(), &c)
+		return l.deleteLent(ctx, peer.String(), deref(in.Bucket), &c)
 	}
 	return l.Next.DeleteObject(ctx, &c)
 }
 
 // DeleteObjects is refused to a borrower (NET-7): each delete is one
-// DeleteObject, so the counter and, later, tombstones see each.
+// DeleteObject, so the counter and tombstones see each (tomb.go).
 func (l *Lending) DeleteObjects(ctx context.Context, in *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
 	if refused(ctx) {
 		return s3response.DeleteResult{}, errNotForBorrower

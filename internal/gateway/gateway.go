@@ -5,7 +5,8 @@
 // decorator's outer layer (Lending) maps a borrower's sealed bucket names
 // to its lent-<id16>-<sealed> buckets (PEER-8, SEC-16) and enforces quota,
 // the free-space floor, object hashes and key names on a borrower's
-// writes (LEND-1, LEND-2, LEND-4, SEC-5); its inner layer
+// writes (LEND-1, LEND-2, LEND-4, SEC-5), and keeps a borrower's deletes
+// as tombstones for the retention window (RET-1, RET-2); its inner layer
 // captures every write and delete of an own bucket into the replication
 // queue (EP-2, EP-3, EP-7, REPL-3, REPL-10) and serves a read of a key the
 // store lacks from a friend that holds it (EP-10, ID-6). A friend's node ID is an
@@ -94,6 +95,9 @@ type Gateway struct {
 	// ReconcileEvery is how often borrowers' usage counters are checked
 	// for their daily reconcile (default an hour).
 	ReconcileEvery time.Duration
+	// PurgeEvery is how often tombs past their retention window are
+	// purged (RET-1; default an hour). The window is read on Clock.
+	PurgeEvery time.Duration
 
 	lending *Lending // once Run has built it; tests only
 	// lendingHook, if set, adjusts Lending before anything is served.
@@ -169,10 +173,29 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		go func() { defer close(resolved); dec.resolveLoop(rctx, every) }()
 		defer func() { cancel(); <-resolved }()
 	}
-	lend := &Lending{Next: dec, DB: g.DB, Uploads: be, StoreDir: g.StoreDir, Floor: g.Floor, Statfs: g.Statfs, Log: g.Log}
+	lend := &Lending{Next: dec, DB: g.DB, Uploads: be, StoreDir: g.StoreDir, Floor: g.Floor, Statfs: g.Statfs, Log: g.Log,
+		Now: g.Clock}
 	g.lending = lend
 	if g.lendingHook != nil {
 		g.lendingHook(lend)
+	}
+	if g.DB != nil {
+		// Tombstones a crash left half-moved are settled before anything
+		// is served, and before the reconcile counts them (RET-1).
+		if err := lend.settleTombs(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("lending: settling the tombstones left by the last run: %w", err)
+		}
+		every := g.PurgeEvery
+		if every <= 0 {
+			every = time.Hour
+		}
+		pctx, cancel := context.WithCancel(ctx)
+		purged := make(chan struct{})
+		go func() { defer close(purged); lend.purgeLoop(pctx, every) }()
+		defer func() { cancel(); <-purged }()
 	}
 	if g.DB != nil {
 		every := g.ReconcileEvery

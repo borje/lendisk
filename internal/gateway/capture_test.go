@@ -47,6 +47,7 @@ type harness struct {
 	statfs func(dir string) (store.Space, error)
 	floor  *config.Floor
 	gw     *Gateway // the last one served
+	stop   func()   // stops the last one served
 	// lending, if set, adjusts the gateway's Lending before it serves.
 	lending func(*Lending)
 	// reconcileEvery is the gateway's ReconcileEvery.
@@ -116,6 +117,7 @@ func (h *harness) serve(noCapture bool) (stop func()) {
 	var once sync.Once
 	stop = func() { once.Do(func() { cancel(); within(h.t, "the gateway stopping", errc) }) }
 	h.t.Cleanup(stop)
+	h.stop = stop
 	return stop
 }
 

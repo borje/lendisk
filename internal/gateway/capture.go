@@ -30,7 +30,7 @@ const MetaCapture = "lendisk-capture"
 // Decorator wraps the store's backend (D4). It captures every successful
 // write and delete of an own bucket's key into the replication queue
 // (EP-2, EP-3), classified by the bucket's tool profile (EP-7);
-// tombstones (#17) are added as further overriding methods. A read of
+// tombstones are Lending's, above it (tomb.go, RET-1). A read of
 // an own bucket's key the store lacks is served through the read-through
 // (readthrough.go, EP-10, ID-6). Buckets that
 // are not the node's own (lent-*) pass through: a borrower's writes are

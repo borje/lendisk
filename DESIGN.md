@@ -1190,8 +1190,8 @@ upstream bucket is Q-V.
   *Known gaps, follow-ups to file:* a list read while a write of the
   same key is still pending here (captured, not yet done) races the
   write; a friend can list objects this node deleted before it was
-  lost, which come back as live until tombstones (#17) let the lists
-  tell them apart; and a friend that never returns keeps its lists
+  lost, unless the friend tombstoned them (#17: its list then carries
+  `tombstoned_at` and recovery counts them as deleted); and a friend that never returns keeps its lists
   pending for ever (backing off to an hour), with no point at which
   recovery gives up on it. A place that is offline is listed when it
   returns: the daemon runs the same lister (every minute, a failed
@@ -1550,7 +1550,7 @@ upstream bucket is Q-V.
     the same storer and bucket paths posix writes it with. The gateway
     hands the `Store` to the decorator as `Decorator.Uploads`, apart from
     the backend it wraps, so a wrapper between the decorator and posix
-    (tombstones #17) cannot hide it (#62); quota is enforced above the
+    cannot hide it (#62); quota is enforced above the
     decorator, in `Lending` (§3.5), and the gateway gives `Lending` the
     same `Store`. The ETag never
     stands in for a missing attribute. versitygw v1.10.0's
@@ -1943,8 +1943,10 @@ upstream bucket is Q-V.
   inserted, acknowledged, refused, re-queued, cancelled and moved, so
   placing an object reads one row per friend. A row acknowledged after
   its delete was placed (a send in flight) stays counted: the count
-  errs towards less room. Tombstones (#17) will change what a delete
-  frees. *Correction from the lender's answers:* the lender's only
+  errs towards less room. A lender keeps a deleted object counted
+  until its purge (§3.6), so this count frees it a retention window
+  early, erring towards more room until the `507` below or the `quota`
+  answer corrects it. *Correction from the lender's answers:* the lender's only
   answer about room so far is `507` (LEND-2; the control API's `quota`
   call is not built): a place whose last answer was `507` counts as
   full, gets no new data and has its unsent data re-routed or dropped
@@ -2380,15 +2382,16 @@ capture decorator, so nothing stands between that and posix (#62).
 - **LEND-1** `Lending` keeps a per-friend counter and enforces the
   friendship's quota (`Friendship.Quota`, the smaller number) on it.
   The counter holds the bytes of the borrower's objects and of the
-  parts of its open multipart uploads, plus tombstones once #17 lands,
-  plus a fixed overhead of 4 KiB for each object, each bucket and each
+  parts of its open multipart uploads, plus its tombstoned objects
+  (§3.6), plus a fixed overhead of 4 KiB for each object, each bucket and each
   open upload. *Decision (#16 review):* the overhead stands for the
   inode, metadata and database row each item costs, so a borrower under
   quota cannot make empty objects, buckets or uploads without end. The
   counter lives in memory under one lock, loaded from `lent_usage` in
   `lendisk.db` once; every change is written to the database first
   and reaches memory only once the database took it. A put adds its
-  bytes and overhead; a delete removes them; a bucket or upload adds
+  bytes and overhead; a delete changes nothing (the object is
+  tombstoned, §3.6) and the purge removes them; a bucket or upload adds
   its overhead; a part adds what it changes over the part of that
   number counted before (`lent_part`), in one transaction with
   `lent_upload.counted` and `lent_usage`, so settling a part costs the
@@ -2402,7 +2405,8 @@ capture decorator, so nothing stands between that and posix (#62).
   order. The counter is reconciled against a listing (`ListObjectsV2`
   of each `lent-` bucket and its rows in `lent_bucket`, plus
   `ListParts` of each upload `ListMultipartUploads` shows, which also
-  resets `lent_part`) once at every start, whatever the last run was,
+  resets `lent_part`, plus the borrower's `tombstone` rows, since
+  posix lists nothing under `.lendisk/`) once at every start, whatever the last run was,
   since one that did not finish leaves no trace, and then once a day,
   checked hourly. The reconcile holds the publication lock exclusively
   while it lists and sets the count, so every write is either counted
@@ -2485,9 +2489,11 @@ capture decorator, so nothing stands between that and posix (#62).
   together with the publication, so of two racing writes of one key
   the second is refused (or accepted unstored if it carries the same
   bytes). Multipart create and completion and deletes hold a per-key
-  lock; none of them waits on a body. Once tombstones land (#17) a
-  tombstoned key is checked the same way and a same-hash put drops the
-  tombstone (§3.6). A retried completion of an upload already in the
+  lock; none of them waits on a body. A key with no object but a
+  tombstone is checked against the tombstones' hashes the same way, at
+  `PutObject`, `CreateMultipartUpload` and completion: no tombstone of
+  that hash is `PreconditionFailed`, the same hash revives the object
+  (§3.6). A retried completion of an upload already in the
   store (its `mp-metadata` upload ID) is answered by posix, and
   verified first if a crash came between completion and verification.
   A borrower's put or multipart create without the hash (64 hex
@@ -2500,7 +2506,11 @@ capture decorator, so nothing stands between that and posix (#62).
   characters, segments separated by single slashes, none empty, `.` or
   `..`, and not under `.lendisk/` (tombstones), `.sgwtmp/` or
   `.vgwlocks/` (posix's own), in any case; anything else is
-  `InvalidArgument` (400). Buckets are confined by the mapping
+  `InvalidArgument` (400). Besides, `OpenBackend` opens posix with
+  `ExcludeDirs: [".lendisk"]` (#17), so for every account posix
+  refuses a key with a `.lendisk` directory at any depth
+  (`ExcludedObjectKey`), lists nothing under one, and does not take
+  the store's own `.lendisk/` for a bucket. Buckets are confined by the mapping
   (PEER-8). `Lending` also refuses `DeleteObjects` to a borrower (NET-7
   lists it), so every delete is one counted `DeleteObject`.
 - **LEND-6** The lending store is the set of `lent-<id16>-<sealed>`
@@ -2523,25 +2533,89 @@ capture decorator, so nothing stands between that and posix (#62).
 
 ### 3.6 Deletion, retention and verification
 
-- **RET-1** Retention is the decorator's on every store; versitygw's
-  versioning is off on every bucket. A borrower's `DeleteObject` moves
-  the object to `.lendisk/tomb/<key>/<unix-time>` inside the same
-  bucket (a rename on `posix`, so it never crosses a filesystem) and
-  writes a row in `tombstones` (borrower, bucket, key, hash, deleted
-  at, purge after); from then on the key is absent from that
-  borrower's reads and listings, the tomb bytes count against quota
-  (LEND-1), and the purger unlinks the tomb copy after the window. A
-  put to a tombstoned key with the same hash is accepted and drops the
-  tombstone, unlinking the tomb copy; with a different hash it is
-  refused (LEND-4). A direct reader of the replica (P-5) sees the
-  bucket as the tool left it after its last delete, plus a `.lendisk/`
-  directory it ignores; export and the recovery sheet's copy command
-  exclude it.
+- **RET-1** Retention is `Lending`'s (`internal/gateway/tomb.go`) on
+  every store; versitygw's versioning is off on every bucket. A
+  borrower's `DeleteObject` of a key that holds an object renames it to
+  `.lendisk/tomb/<key>/<unix nanoseconds>` inside the same bucket (a
+  rename on `posix`, so it never crosses a filesystem and keeps the
+  inode and its xattrs, the hash among them; the tomb's directories are
+  0700), removes the key's directories that leaves empty, and records a
+  `tombstone` row (migration 19: borrower, sealed name, key, tomb path,
+  hash, ETag, size, deleted at, purge after, pending). A delete of a
+  key that holds nothing, tombstoned already or never stored, answers
+  204 and changes nothing. From then on the key is absent from that
+  borrower's GET, HEAD and listings (posix never lists `.lendisk/`),
+  and the tomb's bytes and overhead count against quota as they did
+  live (LEND-1: a delete moves no count). The `list` call carries each
+  tombstoned key, with its newest tombstone's size, hash and
+  `tombstoned_at`, merged in key order with the live keys; a key live
+  again is listed live.
+  *Window (#17):* the purge time is fixed at the delete: deleted at
+  plus `gateway.Retention`, the longer of the friendship's two
+  retention offers exchanged at redeem (`own_retention`, this node's
+  offer as lender, its minimum; `peer_retention`, the borrower's offer,
+  which is its request), 30 days when neither was recorded. So the
+  lender's offer is a floor and a borrower can only lengthen the
+  window, and both sides of a friendship use the same number. Changing
+  an offer later leaves recorded purge times alone, as S3 Object Lock
+  keeps an object's retain-until date.
+  *Purge:* `Lending.purgeLoop`, at start and then hourly
+  (`Gateway.PurgeEvery`), reads tombstones whose purge time is at or
+  before `Lending.Now` (the gateway's injected clock) and, holding the
+  key's lock and the borrower's publication lock, unlinks the tomb,
+  removes the tomb directories that leaves empty, and drops the row
+  and the bytes plus overhead from `lent_usage` in one transaction. A
+  tomb that cannot be removed is logged and tried at the next purge.
+  *Re-put:* a `PutObject` to a key holding no object but tombstones,
+  with the hash of one of them, has its body hashed and discarded (a
+  body only claiming the hash is `BadDigest`) and revives the newest
+  tombstone of that hash: the row is marked pending, the tomb
+  hard-linked back to its key (a link never replaces an object already
+  there), the tomb unlinked and the row dropped; the count is
+  unchanged. A completion of the same hash aborts the upload and
+  revives the same way. Another hash is `PreconditionFailed` (412,
+  LEND-4) before any byte is read, at `PutObject`,
+  `CreateMultipartUpload` and completion, so a tombstoned key takes
+  only its own bytes back until it is purged.
+  *Crash safety:* the row is written, pending, before the rename and
+  marked kept after it; a revival marks it pending before the link.
+  At every start, before anything is served and before the reconcile,
+  `settleTombs` settles each pending row from the store: no tomb at its
+  path (the rename never happened, or the revival finished) drops the
+  row, the object live where it was; a tomb beside a live object of
+  the same hash (a revival linked back) unlinks the tomb and drops the
+  row; a tomb alone, or beside other bytes, is kept. No order of steps
+  leaves bytes without either a key or a kept row. *Accepted race:* a
+  put of an absent key holds no key lock while its body streams, so a
+  put that began before a delete of the same key can publish other
+  bytes beside the new tomb; both are kept and counted, the list shows
+  the key live, and a later delete makes a second tomb (tomb names are
+  unique, never overwritten).
+  A direct reader of the replica (P-5) sees the bucket as the tool left
+  it after its last delete, plus `.lendisk/` and posix's `.sgwtmp/`,
+  which restic ignores (`TestDirectReaderSeesTheToolsLayout` runs
+  `restic snapshots` and `check --read-data` on a lent bucket); export
+  and the recovery sheet's copy command exclude them.
+  *Precedent (#17):* Backblaze B2's "hide" and lifecycle
+  `daysFromHidingToDeleting`: a hidden file vanishes from listings, is
+  still billed as stored, and is deleted after the days set; S3's
+  delete markers likewise hide a version that stays stored and billed.
 - **RET-2** The gate admits no versioned, lifecycle,
-  bucket-deletion, object-lock or admin call (§3.7 allow-list), and
-  keys beginning with `.lendisk/` are refused from borrowers, so
+  bucket-deletion, object-lock or admin call (§3.7 allow-list, #15);
+  `Lending` refuses a borrower's `DeleteObject` with a version ID,
+  `DeleteObjects`, `DeleteBucket` and copies; keys beginning with
+  `.lendisk/` are refused from borrowers by `checkKey`, and posix
+  itself refuses and never lists a `.lendisk` directory at any depth
+  (§3.5 SEC-5); and the purger is not reachable from any request. So
   nothing a borrower can send reaches the tomb directory or the
-  purger.
+  purger. `TestBorrowerCannotPurgeEarly` is the RET-2 AC at the S3
+  surface: with the pair's derived credential a borrower tries delete
+  again, versioned deletes, multi-delete, overwrite, multipart over the
+  key, completing an upload begun before the delete, every spelling of
+  the tomb's path (read, write, delete, copy, tag), versioning then
+  delete, a lifecycle rule and bucket deletion; the tomb's bytes are
+  unchanged after each and after a purge one second before the window
+  ends. #15's hostile-peer harness runs the same list over the tunnel.
 - **RET-3** `undelete` for a friend is the control API `undelete`
   (bucket, since): the lender moves each tomb copy deleted since that
   time back to its key and drops the row; `list` shows beforehand what
@@ -2645,7 +2719,7 @@ capture decorator, so nothing stands between that and posix (#62).
   sealed manifest, §3.1 ID-4) is served (#28). `list` is served (#29):
   `GET /_lendisk/list?bucket=<sealed>&after=<key>&limit=<n>` pages the
   lender's index for that borrower's bucket: key, size, SHA-256 and, if
-  tombstoned, when (`tombstoned_at`, absent until #17), as
+  tombstoned, when (`tombstoned_at`, §3.6), as
   `{"objects": [...], "next": "<key>"}`, `next` absent after the last
   page; at most 1000 keys a page (`gateway.MaxListPage`), the default.
   Like `manifest` it is open to the `peer` role only and keyed by the
@@ -3138,7 +3212,9 @@ capture decorator, so nothing stands between that and posix (#62).
   `<store>/<bucket>/<key>` as plain files with versitygw's xattrs and
   its `.sgwtmp/` and `.vgwlocks/` housekeeping directories; borrowers'
   buckets under `lent-<id16>-` and their sealed names (SEC-16), each
-  with its `.lendisk/tomb/` directory (§3.6); the friends' sealed
+  with its `.lendisk/tomb/` directory (§3.6: one file per tombstone at
+  `.lendisk/tomb/<key>/<unix nanoseconds>`, ignorable by a direct
+  reader); the friends' sealed
   manifests as `.lendisk/manifests/<node ID>` at the store's top (§3.1
   ID-4); `lendisk.db` and its tables; and the export layout
   (one file per key at its key path; Kopia's sharded form with

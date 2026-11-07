@@ -3,11 +3,13 @@ package gateway
 import (
 	"context"
 	"errors"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/s3response"
 
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
@@ -26,7 +28,7 @@ func CheckKey(key string) error { return checkKey(key) }
 
 // LentObject is one key of a borrower's bucket as this lender holds it
 // (NET-7 list): its size, the SHA-256 it was stored with (REPL-10,
-// LEND-4) and, once tombstones exist (#17), when it was tombstoned.
+// LEND-4) and, if it is tombstoned (RET-1), when.
 type LentObject struct {
 	Key          string
 	Size         int64
@@ -39,10 +41,11 @@ type LentObject struct {
 var ErrNoLentBucket = errors.New("no bucket of yours by that name here")
 
 // LentIndex is the lender's index of what it holds for each borrower
-// (NET-7 list, ID-5, REPL-8). It is the store itself: every object a
-// borrower stores carries its hash as x-amz-meta-lendisk-sha256
-// (COMPAT-4), so the index needs no table and survives the loss of
-// lendisk.db with the store. A borrower names its buckets by sealed
+// (NET-7 list, ID-5, REPL-8). Live keys come from the store itself:
+// every object a borrower stores carries its hash as
+// x-amz-meta-lendisk-sha256 (COMPAT-4), so they need no table and
+// survive the loss of lendisk.db with the store. Tombstoned keys come
+// from the tombstone table, merged in key order. A borrower names its buckets by sealed
 // name and reaches only those lent_bucket records as its own (PEER-8),
 // so the caller must pass the borrower the request is answered for,
 // never one a request names.
@@ -53,9 +56,9 @@ type LentIndex struct {
 
 // List returns up to limit keys of borrower's bucket sealed after the
 // key after, in key order, and the key the next page starts after: ""
-// when none follows. Keys of lendisk's
-// own and the store's housekeeping (SEC-5's reserved prefixes) are not
-// listed.
+// when none follows. A tombstoned key is listed with its newest
+// tombstone, unless it is live again. Keys of lendisk's own and the
+// store's housekeeping (SEC-5's reserved prefixes) are not listed.
 func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, after string, limit int) ([]LentObject, string, error) {
 	if limit < 1 || limit > MaxListPage {
 		return nil, "", errors.New("a list page holds 1 to 1000 keys")
@@ -77,18 +80,36 @@ func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, 
 	res, err := x.Store.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: &bucket, StartAfter: &after,
 		ContinuationToken: &after, MaxKeys: &page})
 	if notFound(err) {
-		// Recorded but not in the store: it holds nothing.
-		return []LentObject{}, "", nil
+		// Recorded but not in the store: it holds nothing live.
+		res, err = s3response.ListObjectsV2Result{}, nil
 	}
 	if err != nil {
 		return nil, "", err
 	}
-	out := make([]LentObject, 0, len(res.Contents))
-	next := ""
+	tombs, err := x.DB.TombstonedKeys(ctx, borrower.String(), sealed, after, limit)
+	if err != nil {
+		return nil, "", err
+	}
+	// Each source is read up to limit keys; past the last key of a
+	// source that has more, the other cannot be merged yet, so the page
+	// ends there (bound).
+	bound, bounded := "", false
+	lower := func(k string) {
+		if !bounded || k < bound {
+			bound, bounded = k, true
+		}
+	}
+	if res.IsTruncated != nil && *res.IsTruncated && len(res.Contents) > 0 {
+		lower(deref(res.Contents[len(res.Contents)-1].Key))
+	}
+	if len(tombs) == limit {
+		lower(tombs[len(tombs)-1].Key)
+	}
+	out := make([]LentObject, 0, limit)
+	live := map[string]bool{}
 	for _, o := range res.Contents {
 		key := deref(o.Key)
-		next = key
-		if strings.HasSuffix(key, "/") || checkKey(key) != nil {
+		if bounded && key > bound || strings.HasSuffix(key, "/") || checkKey(key) != nil {
 			continue
 		}
 		h, err := x.Store.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: &key})
@@ -102,10 +123,18 @@ func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, 
 		if h.ContentLength != nil {
 			lo.Size = *h.ContentLength
 		}
+		live[key] = true
 		out = append(out, lo)
 	}
-	if res.IsTruncated == nil || !*res.IsTruncated {
-		next = ""
+	for _, t := range tombs {
+		if bounded && t.Key > bound || live[t.Key] {
+			continue // a key live again is listed live
+		}
+		out = append(out, LentObject{Key: t.Key, Size: t.Size, SHA256: t.SHA256, TombstonedAt: t.DeletedAt})
 	}
-	return out, next, nil
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	if len(out) > limit {
+		return out[:limit], out[limit-1].Key, nil
+	}
+	return out, bound, nil
 }
