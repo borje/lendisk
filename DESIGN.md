@@ -3527,10 +3527,16 @@ design and disappear with it.
   one case per category. On an own bucket they are neither captured nor
   refused, by decision: they create, replace or remove no content, a
   replica carries an object's bytes and its hash (REPL-10) and nothing
-  else, and no supported tool sends them. In practice retention and
-  legal hold fail there anyway (lock is never on) and so do ACLs
-  (`BucketOwnerEnforced`); tags set by a tool live on the local copy
-  only. `RestoreObject` and `SelectObjectContent` are refused for
+  else, and no supported tool sends them; ACLs fail there anyway
+  (`BucketOwnerEnforced`), and tags set by a tool live on the local copy
+  only. Object lock is the exception: `posix`'s
+  `PutObjectLockConfiguration` turns lock on for an existing bucket
+  even with versioning off, after which retention and legal hold would
+  bind objects against lendisk's own deletes. So the gate refuses, for
+  every account, a `PUT` with `?object-lock`, `?retention` or
+  `?legal-hold` and any request with an `X-Amz-Object-Lock-*` header,
+  as it refuses `CreateBucket` asking for lock; lock is never on
+  (`TestObjectLockRefusedOnOwnBuckets`). `RestoreObject` and `SelectObjectContent` are refused for
   borrowers and not implemented on `posix`. Every `backend.Backend`
   method is now in SEC-9's table (`gateway.BackendMethods`), so an
   upgrade that adds one fails `TestBackendMethodsAllClassified` until
@@ -3594,7 +3600,11 @@ design and disappear with it.
     `PutBucketVersioning` answers 501 `VersioningNotConfigured`. Object
     lock is not: `CreateBucket` with `x-amz-bucket-object-lock-enabled`
     succeeds on `posix` and the bucket then reports lock enabled. The
-    gate refuses that header.
+    gate refuses that header. (#15 review: `PutObjectLockConfiguration`
+    turns lock on for an existing bucket too, with versioning off, so the
+    gate refuses it, the retention and legal-hold writes and every
+    `X-Amz-Object-Lock-*` header, for every account;
+    `TestObjectLockRefusedOnOwnBuckets`.)
   - `posix.New` changes the process's working directory to the store
     root unless `PosixOpts.AbsolutePaths` is set; lendisk sets it.
   - restic 0.19.1 `init`, `backup`, `check --read-data` and `restore`

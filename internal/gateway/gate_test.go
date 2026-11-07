@@ -540,7 +540,7 @@ func TestBorrowerRefusedPerCategory(t *testing.T) {
 		for i, call := range calls {
 			err := call()
 			var ae smithy.APIError
-			if !errors.As(err, &ae) || ae.ErrorCode() != "AccessDenied" || !strings.Contains(ae.ErrorMessage(), "friend's node") {
+			if !errors.As(err, &ae) || ae.ErrorCode() != "AccessDenied" || !strings.Contains(ae.ErrorMessage(), "friend's node") && !strings.Contains(ae.ErrorMessage(), "object lock is not offered") {
 				t.Errorf("%s #%d: %v; want the gate's AccessDenied", cat, i, err)
 			}
 		}

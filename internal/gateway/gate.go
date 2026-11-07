@@ -18,8 +18,10 @@ import (
 //
 //   - every PATCH: S3 has none, and every route of the admin API embedgw
 //     mounts on the socket is one (SEC-8);
-//   - CreateBucket asking for object lock, which posix would otherwise
-//     grant (D15);
+//   - object lock: CreateBucket asking for it, PutObjectLockConfiguration
+//     (posix turns lock on for an existing bucket), retention and legal
+//     hold writes, and any X-Amz-Object-Lock-* header (D15, Q-H);
+//   - a credential it cannot read as versitygw reads it (ReadCredentials);
 //   - the control API path, however spelled, raw or decoded the way
 //     versitygw decodes it; it belongs to the bridge on the tunnel and to
 //     nothing behind it;
@@ -112,7 +114,12 @@ func refuse(r request) string {
 		return "lendisk: the admin API is not served"
 	case IsControlPath(r.path) || err == nil && IsControlPath(decoded):
 		return "lendisk: control API not served here"
-	case r.method == http.MethodPut && strings.EqualFold(strings.TrimSpace(r.get("X-Amz-Bucket-Object-Lock-Enabled")), "true"):
+	case r.method == http.MethodPut && strings.EqualFold(strings.TrimSpace(r.get("X-Amz-Bucket-Object-Lock-Enabled")), "true"),
+		r.method == http.MethodPut && (r.has("object-lock") || r.has("retention") || r.has("legal-hold")),
+		r.hasHeaderPrefix("X-Amz-Object-Lock-"):
+		// posix grants lock to a new bucket that asks, turns it on for an
+		// existing one (PutObjectLockConfiguration), and then binds
+		// objects by retention, legal hold or these headers (D15, Q-H).
 		return "lendisk: object lock is not offered"
 	case r.method == http.MethodPost && !r.has("delete") && isBucketPath(decoded):
 		return "lendisk: browser-form uploads are not offered; use PUT"
