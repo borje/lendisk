@@ -3095,9 +3095,12 @@ capture decorator, so nothing stands between that and posix (#62).
 - **Per-friend caps.** fasthttp's `MaxConnections` and `MaxRequests` at
   `gw.sock` are shared by every listener, so the tunnel bounds each
   friend before it gets there (`bridge.Caps`, #15): at most 32 open
-  connections per connection key (`DefaultConns`; a friend has two
-  keys, its node ID and its dial key), a connection over that closed
-  unread at accept; and at most 16 requests in flight per friend,
+  connections per friend (`DefaultConns`), counted on the friend the
+  connection's key resolves to in `lendisk.db` at accept (`Caps.Of`,
+  `RolesIn`), so its node ID and its dial key share one budget, and a
+  connection over that is closed unread; a key with no relationship
+  counts on its own and is refused at its first request anyway; and at
+  most 16 requests in flight per friend,
   counted on the resolved node ID (`DefaultRequests`), one over that
   answered 503 `SlowDown` with `Retry-After: 1` (a JSON 503 on the
   control path), which S3 clients and the replica worker retry. The

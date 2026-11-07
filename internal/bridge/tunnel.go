@@ -149,13 +149,14 @@ func (l *peerListener) Accept() (net.Conn, error) {
 			c.Close()
 			continue
 		}
-		if !l.caps.conn(p) {
-			l.log.Warn("tunnel connection over the key's cap; closed unread", "peer", p.String())
+		friend := l.caps.friendOf(p)
+		if !l.caps.conn(friend) {
+			l.log.Warn("tunnel connection over the friend's cap; closed unread", "peer", friend.String(), "key", p.String())
 			c.Close()
 			continue
 		}
 		l.log.Debug("tunnel connection", "peer", p.String())
-		return &peerConn{Conn: c, peer: p, done: func() { l.caps.connDone(p) }}, nil
+		return &peerConn{Conn: c, peer: p, done: func() { l.caps.connDone(friend) }}, nil
 	}
 }
 

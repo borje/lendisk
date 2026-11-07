@@ -51,9 +51,10 @@ func (g *slowGateway) held() int {
 }
 
 // #16 review, SEC-7: one friend cannot exhaust the tunnel. With caps of
-// 3 connections per key and 2 requests in flight per friend, Bob holding
-// 2 slow requests gets SlowDown for a third and has a fourth connection
-// closed unread, while Carol on the tunnel and a tool on the loopback
+// 3 connections and 2 requests in flight per friend, Bob holding 2 slow
+// requests on his node ID gets SlowDown for a third and has a fourth
+// connection closed unread, though it comes on his dial key: the two
+// keys share one budget, while Carol on the tunnel and a tool on the loopback
 // listener of the same bridge are served; once Bob's requests finish he
 // is served again.
 func TestOneFriendCannotExhaustTheTunnel(t *testing.T) {
@@ -61,8 +62,9 @@ func TestOneFriendCannotExhaustTheTunnel(t *testing.T) {
 	br := New(sock, quiet)
 	l := startLenderCaps(t, br.TunnelS3Handler(), &Caps{Conns: 3, Requests: 2})
 	bob, carol := newID(t), newID(t)
-	for _, f := range []string{bob.NodeID().String(), carol.NodeID().String()} {
-		if err := l.db.AddFriendship(t.Context(), state.Friendship{Peer: f, CreatedAt: time.Now()}); err != nil {
+	bobDial := bob.DialKeyFor(l.self.NodeID())
+	for f, dial := range map[string]string{bob.NodeID().String(): bobDial.NodeID().String(), carol.NodeID().String(): ""} {
+		if err := l.db.AddFriendship(t.Context(), state.Friendship{Peer: f, DialKey: dial, CreatedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -107,14 +109,15 @@ func TestOneFriendCannotExhaustTheTunnel(t *testing.T) {
 		t.Fatalf("Bob's third request in flight: %d %s", resp.StatusCode, body)
 	}
 
-	// Bob now holds three connections; a fourth is closed unread.
+	// Bob now holds three connections; a fourth, on his dial key, is
+	// closed unread.
 	raw, err := net.Dial("tcp", l.tun.ln.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer raw.Close()
 	l.tun.mu.Lock()
-	l.tun.keys[raw.LocalAddr().String()] = bob.NodeID()
+	l.tun.keys[raw.LocalAddr().String()] = bobDial.NodeID()
 	l.tun.mu.Unlock()
 	raw.Write([]byte("GET /sbucket/key HTTP/1.1\r\nHost: lender\r\nAuthorization: " + sigv4(bob.NodeID().String()) + "\r\n\r\n"))
 	raw.SetReadDeadline(time.Now().Add(5 * time.Second))

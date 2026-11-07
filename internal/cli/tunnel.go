@@ -106,7 +106,7 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		a.tuneControl(ctl)
 	}
 	s3 := &bridge.Late{}
-	caps := &bridge.Caps{}
+	caps := &bridge.Caps{Of: bridge.RolesIn(db, a.now)}
 	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, caps, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, caps, log), log)
 	go purgeInvites(ctx, db, adm, a.now, log)
 	log.Info("tunnel listening", "address", tc.Address(), "port", transport.Port, "region", region.RegionCode)

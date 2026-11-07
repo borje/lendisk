@@ -92,6 +92,9 @@ func startLenderCaps(t *testing.T, s3 http.Handler, caps *Caps) *lender {
 	l := &lender{db: db, self: newID(t), tun: &fakeTunnel{keys: map[string]identity.NodeID{}, ln: ln}}
 	ctl := &control.Server{DB: db, Self: l.self, Changed: func() { l.changed.Add(1) }, Log: quiet}
 	roles := RolesIn(db, time.Now)
+	if caps != nil && caps.Of == nil {
+		caps.Of = roles
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
 	go func() {
