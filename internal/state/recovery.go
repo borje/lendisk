@@ -116,7 +116,7 @@ func (db *DB) AddRelists(ctx context.Context, places, buckets []string) error {
 func (db *DB) Relists(ctx context.Context) ([]Relist, error) {
 	rows, err := db.QueryContext(ctx, `SELECT place, bucket, after, coalesce(seen, 0), coalesce(pages, 0), tried_at,
 		coalesce(error, ''), failures
-		FROM relist WHERE abandoned IS NULL ORDER BY place, bucket`)
+		FROM relist WHERE abandoned IS NULL AND done IS NULL ORDER BY place, bucket`)
 	if err != nil {
 		return nil, err
 	}
@@ -144,23 +144,150 @@ func (db *DB) RelistFailed(ctx context.Context, place, bucket, msg string, now t
 }
 
 // AbandonRelist gives up on place's list of bucket (it listed more than
-// a list may hold): what it recorded is dropped, the list is no longer
-// read, and the bucket's keys are decided again without it. The place
-// does not count as listed to its end.
+// a list may hold): the list is no longer read, what it recorded is
+// dropped, and the keys it listed are decided again without it, in
+// batches (SettleFinished). The place does not count as listed to its
+// end.
 func (db *DB) AbandonRelist(ctx context.Context, place, bucket string) error {
+	if _, err := db.ExecContext(ctx, `UPDATE relist SET abandoned = 1, settled = NULL WHERE place = ? AND bucket = ?`,
+		place, bucket); err != nil {
+		return err
+	}
+	return db.SettleFinished(ctx)
+}
+
+// SettleBatch is how many keys one write transaction decides again
+// after a list ends: short enough that other writers (the gateway's
+// captures) wait a fraction of a second at most.
+var SettleBatch = 2000
+
+// SettlePause is the pause between batches. SQLite's busy handler polls
+// a waiting writer at most every 100 ms, so a pause at least that long
+// lets every waiting writer in before the next batch.
+var SettlePause = 100 * time.Millisecond
+
+// pause waits SettlePause, or until ctx ends.
+func pause(ctx context.Context) error {
+	t := time.NewTimer(SettlePause)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// SettleFinished decides again the keys that lists ended since affect,
+// SettleBatch keys per write transaction, and marks each list settled:
+// an abandoned list's keys, without its entries; a finished list's
+// metadata keys one place alone lists (the lone-metadata rule counts
+// the finished list now). It resumes where a crash stopped it, so the
+// lister calls it at the start of every round.
+func (db *DB) SettleFinished(ctx context.Context) error {
+	type ended struct {
+		place, bucket string
+		abandoned     bool
+	}
+	rows, err := db.QueryContext(ctx, `SELECT place, bucket, abandoned IS NOT NULL FROM relist
+		WHERE (done IS NOT NULL OR abandoned IS NOT NULL) AND settled IS NULL ORDER BY place, bucket`)
+	if err != nil {
+		return err
+	}
+	var es []ended
+	for rows.Next() {
+		var e ended
+		if err := rows.Scan(&e.place, &e.bucket, &e.abandoned); err != nil {
+			rows.Close()
+			return err
+		}
+		es = append(es, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, e := range es {
+		if e.abandoned {
+			for {
+				n, err := db.dropBatch(ctx, e.place, e.bucket)
+				if err != nil {
+					return err
+				}
+				if n == 0 {
+					break
+				}
+				if err := pause(ctx); err != nil {
+					return err
+				}
+			}
+		} else {
+			keys, err := column(ctx, db, `SELECT key FROM listed WHERE bucket = ? AND class IN ('metadata', 'snapshot') AND named = 0
+				GROUP BY key HAVING count(*) = 1 ORDER BY key`, e.bucket)
+			if err != nil {
+				return err
+			}
+			for len(keys) > 0 {
+				n := min(len(keys), SettleBatch)
+				if err := db.settleKeys(ctx, e.bucket, keys[:n]); err != nil {
+					return err
+				}
+				keys = keys[n:]
+				if err := pause(ctx); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := db.ExecContext(ctx, `UPDATE relist SET settled = 1 WHERE place = ? AND bucket = ?`, e.place, e.bucket); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// dropBatch drops up to SettleBatch of an abandoned place's entries for
+// bucket and decides their keys again, in one transaction; n is how many.
+func (db *DB) dropBatch(ctx context.Context, place, bucket string) (int, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	keys, err := column(ctx, tx, `SELECT key FROM listed WHERE place = ? AND bucket = ? ORDER BY key LIMIT ?`,
+		place, bucket, SettleBatch)
+	if err != nil || len(keys) == 0 {
+		return 0, err
+	}
+	done, err := listedPlaces(ctx, tx, bucket)
+	if err != nil {
+		return 0, err
+	}
+	for _, k := range keys {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM listed WHERE place = ? AND bucket = ? AND key = ?`, place, bucket, k); err != nil {
+			return 0, err
+		}
+		if err := db.settleKey(ctx, tx, bucket, k, done); err != nil {
+			return 0, err
+		}
+	}
+	return len(keys), tx.Commit()
+}
+
+// settleKeys decides keys of bucket again in one transaction.
+func (db *DB) settleKeys(ctx context.Context, bucket string, keys []string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	for _, q := range []string{`UPDATE relist SET abandoned = 1 WHERE place = ? AND bucket = ?`,
-		`DELETE FROM listed WHERE place = ? AND bucket = ?`} {
-		if _, err := tx.ExecContext(ctx, q, place, bucket); err != nil {
+	done, err := listedPlaces(ctx, tx, bucket)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if err := db.settleKey(ctx, tx, bucket, k, done); err != nil {
 			return err
 		}
-	}
-	if err := db.settleBucket(ctx, tx, bucket); err != nil {
-		return err
 	}
 	return tx.Commit()
 }
@@ -195,37 +322,40 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 		keys = append(keys, o.Key)
 		c.Listed++
 	}
+	var done any
 	if last {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM relist WHERE place = ? AND bucket = ?`, place, bucket); err != nil {
-			return c, err
-		}
-		if err := db.settleBucket(ctx, tx, bucket); err != nil {
-			return c, err
-		}
-		return c, tx.Commit()
+		done = 1
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE relist SET after = ?, seen = coalesce(seen, 0) + ?, pages = coalesce(pages, 0) + 1,
-		tried_at = NULL, error = NULL, failures = 0
-		WHERE place = ? AND bucket = ?`, next, seen, place, bucket); err != nil {
+		tried_at = NULL, error = NULL, failures = 0, done = ?, settled = NULL
+		WHERE place = ? AND bucket = ?`, next, seen, done, place, bucket); err != nil {
 		return c, err
 	}
-	done, err := listedPlaces(ctx, tx, bucket)
+	listed, err := listedPlaces(ctx, tx, bucket)
 	if err != nil {
 		return c, err
 	}
 	for _, k := range keys {
-		if err := db.settleKey(ctx, tx, bucket, k, done); err != nil {
+		if err := db.settleKey(ctx, tx, bucket, k, listed); err != nil {
 			return c, err
 		}
 	}
-	return c, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return c, err
+	}
+	if last {
+		return c, db.SettleFinished(ctx)
+	}
+	return c, nil
 }
 
 // listedPlaces are the friends whose list of bucket was read to its end:
-// none is pending, and none was abandoned.
+// it had a list to read, and that list is done, not abandoned. A friend
+// added since recovery has none, so it does not count.
 func listedPlaces(ctx context.Context, tx *sql.Tx, bucket string) (map[string]bool, error) {
-	ps, err := column(ctx, tx, `SELECT peer_key FROM friendship
-		WHERE peer_key NOT IN (SELECT place FROM relist WHERE bucket = ?)`, bucket)
+	ps, err := column(ctx, tx, `SELECT place FROM relist
+		WHERE bucket = ? AND done IS NOT NULL AND abandoned IS NULL
+		AND place IN (SELECT peer_key FROM friendship)`, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -234,24 +364,6 @@ func listedPlaces(ctx context.Context, tx *sql.Tx, bucket string) (map[string]bo
 		out[p] = true
 	}
 	return out, nil
-}
-
-func (db *DB) settleBucket(ctx context.Context, tx *sql.Tx, bucket string) error {
-	done, err := listedPlaces(ctx, tx, bucket)
-	if err != nil {
-		return err
-	}
-	keys, err := column(ctx, tx, `SELECT DISTINCT key FROM listed WHERE bucket = ?
-		UNION SELECT key FROM recovered_key WHERE bucket = ?`, bucket, bucket)
-	if err != nil {
-		return err
-	}
-	for _, k := range keys {
-		if err := db.settleKey(ctx, tx, bucket, k, done); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 type listedRow struct {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"context"
 	"math/rand/v2"
 	"os"
 	"strconv"
@@ -9,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/borje/lendisk/internal/control"
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/recovery"
@@ -38,7 +41,25 @@ const (
 	// envCrashMidSend is the probability, per read of an object being
 	// sent, that the daemon SIGKILLs itself mid-transfer.
 	envCrashMidSend = "LENDISK_TEST_CRASH_MID_SEND"
+	// envListDelay is a pause before the daemon answers each page of a
+	// friend's list (a Go duration): a friend slow to list.
+	envListDelay = "LENDISK_TEST_LIST_DELAY"
 )
+
+// slowList is a lender's index that answers each page after a delay.
+type slowList struct {
+	control.LentLister
+	delay time.Duration
+}
+
+func (s slowList) List(ctx context.Context, borrower identity.NodeID, sealed, after string, limit int) ([]gateway.LentObject, string, error) {
+	select {
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	case <-time.After(s.delay):
+	}
+	return s.LentLister.List(ctx, borrower, sealed, after, limit)
+}
 
 func TestMain(m *testing.M) {
 	if os.Getenv(envExec) == "1" {
@@ -60,6 +81,9 @@ func TestMain(m *testing.M) {
 			if d, err := time.ParseDuration(os.Getenv(envManifestPoll)); err == nil {
 				p.Poll = d
 			}
+		}
+		if d, err := time.ParseDuration(os.Getenv(envListDelay)); err == nil {
+			a.tuneControl = func(s *control.Server) { s.Lent = slowList{LentLister: s.Lent, delay: d} }
 		}
 		a.tuneRecovery = func(l *recovery.Lister) {
 			if os.Getenv(envReplFast) == "1" {

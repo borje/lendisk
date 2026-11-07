@@ -353,4 +353,15 @@ var migrations = []Migration{
 		ALTER TABLE relist ADD COLUMN pages INTEGER;
 		ALTER TABLE relist ADD COLUMN abandoned INTEGER;`,
 	},
+	{
+		Version: 18, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovery (#29 re-review): a list read to its end is kept, done,
+		-- so only places that listed a bucket count as having listed it (a
+		-- friend added later has no row); settled is set once the keys a
+		-- finished or abandoned list affects were decided again, in short
+		-- batches after it ended.
+		ALTER TABLE relist ADD COLUMN done INTEGER;
+		ALTER TABLE relist ADD COLUMN settled INTEGER;`,
+	},
 }

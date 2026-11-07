@@ -1111,7 +1111,8 @@ upstream bucket is Q-V.
   listed the bucket to its end, which is a conflict too, since REPL-12
   puts metadata at every friend (a hash-named key is that object
   whoever holds it). Only lists read normally to their end count for
-  that: a pending or abandoned friend's silence is no evidence. For a
+  that: a pending or abandoned friend's silence is no evidence, nor
+  that of a friend added since recovery, which has no list at all. For a
   key not named by its hash, a colluding majority of friends therefore
   wins: that is the rule decided, and #70 covers restic's `config` and
   `keys/*`. The
@@ -1141,18 +1142,35 @@ upstream bucket is Q-V.
   The lists still to read are the table
   `relist` (migration 15: place, bucket, the key to resume after, the
   last failure and failures in a row; migration 16 adds `seen`,
-  migration 17 `pages` and `abandoned`),
+  migration 17 `pages` and `abandoned`, migration 18 `done` and
+  `settled`),
   filled by `Restore` for every
-  friend and bucket; the last page of a list drops its row in its
-  transaction, a page before it moves the resume key. Places are
-  listed side by side (4 at a time), each place's buckets one after
-  another, so a slow friend holds up no other. A place that fails is
+  friend and bucket; the last page of a list marks its row `done` in
+  its transaction, a page before it moves the resume key. A done row
+  is kept: "listed this bucket to its end" means exactly a place with
+  a done, not abandoned, row for that bucket that is still a friend,
+  so a friend added after recovery (no row) is no evidence. A page's
+  keys are decided in its own transaction (1,000 keys at most); what
+  an ended list affects beyond them (an abandoned list's keys, a
+  finished list's lone metadata keys) is decided afterwards by
+  `state.SettleFinished` in write transactions of 2,000 keys with a
+  100 ms pause between them, longer than SQLite's busy handler polls,
+  so the gateway's captures wait a fraction of a second, never the
+  whole bucket (200,000 keys abandon in about 25 s with no other write
+  waiting over 0.2 s); `settled` marks it done, and each round resumes
+  it after a crash. Places are listed side by side (4 at a time), each
+  place's buckets one after another, so a slow friend holds up no
+  other, and each round starts one place further on, so slow friends
+  that use every round's budget cannot starve those after them. A
+  database too busy to record a failed or abandoned list is logged and
+  not fatal: the list stays as it was and is tried again. A place that fails is
   skipped for the rest of the round, and `recover` says it is not
   listed. `recover`'s round has a time budget (3 min, injectable):
   what is not finished by then, and every list of a friend named with
   `recover --skip <node ID>`, stays pending, untried, with what it
   recorded; `recover` says so, saves the identity and finishes, and
-  the daemon's lister reads the rest. The daemon's rounds have a
+  the daemon's lister reads the rest. A `--skip` naming no friend in
+  the manifest is warned of. The daemon's rounds have a
   budget of 10 min, so a slow friend delays other friends' retries by
   that at most. When a friend did not serve its manifest,
   `recover` warns that it may hold a newer version and names it. A

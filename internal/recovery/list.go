@@ -56,6 +56,9 @@ type Lister struct {
 	// untried, for the daemon (recover --skip).
 	Skip map[string]bool
 	Log  *slog.Logger
+
+	mu     sync.Mutex
+	rounds int // rounds made: where the next starts
 }
 
 // DefaultMaxKeys is Lister.MaxKeys's default: far above any backup
@@ -128,9 +131,17 @@ func (l *Lister) Round(ctx context.Context) ([]Result, error) { return l.RoundWi
 // this round: each is recorded as failed, and tried again after the
 // backoff. A list past MaxKeys or MaxPages is abandoned (its result says
 // so) and not read again. A list the budget cut short (ErrOutOfTime) or
-// of a friend in Skip (ErrSkipped) stays pending, untried. Results are
-// by place and bucket.
+// of a friend in Skip (ErrSkipped) stays pending, untried. Each round
+// starts one place further on than the last. Results are by place and
+// bucket.
 func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Result, error) {
+	// Lists that ended before a crash may still have keys to decide.
+	if err := l.DB.SettleFinished(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		l.logger().Warn("recovery: deciding the keys of lists that ended failed; trying again next round", "err", err)
+	}
 	rs, err := l.DB.Relists(ctx)
 	if err != nil {
 		return nil, err
@@ -158,46 +169,52 @@ func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Resul
 		}
 		byPlace[r.Place] = append(byPlace[r.Place], r)
 	}
+	// Each round starts one place further on, so places that use every
+	// round's budget cannot keep those after them waiting for ever.
+	l.mu.Lock()
+	start := l.rounds
+	l.rounds++
+	l.mu.Unlock()
+	order := make([]int, len(places))
+	for i := range order {
+		order[i] = (start + i) % len(places)
+	}
 	results := make([][]Result, len(places))
-	errs := make([]error, len(places))
 	parallel := l.Parallel
 	if parallel <= 0 {
 		parallel = 4
 	}
 	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
-	for i, place := range places {
+	for _, i := range order {
+		place := places[i]
+		if l.Skip[place] {
+			for _, r := range byPlace[place] {
+				results[i] = append(results[i], Result{Place: r.Place, Bucket: r.Bucket, Err: ErrSkipped})
+			}
+			continue
+		}
+		sem <- struct{}{} // in order: a place starts only once one before it is done
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if l.Skip[place] {
-				for _, r := range byPlace[place] {
-					results[i] = append(results[i], Result{Place: r.Place, Bucket: r.Bucket, Err: ErrSkipped})
-				}
-				return
-			}
-			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i], errs[i] = l.listPlace(ctx, listCtx, byPlace[place], profiles)
+			results[i] = l.listPlace(ctx, listCtx, byPlace[place], profiles)
 		}()
 	}
 	wg.Wait()
 	var out []Result
 	for i := range places {
 		out = append(out, results[i]...)
-		if errs[i] != nil && err == nil {
-			err = errs[i]
-		}
 	}
-	if ctx.Err() != nil {
-		return out, ctx.Err()
-	}
-	return out, err
+	return out, ctx.Err()
 }
 
 // listPlace reads one place's due lists, one after another: listCtx
-// bounds the listing (the budget), ctx the recording.
-func (l *Lister) listPlace(ctx, listCtx context.Context, rs []state.Relist, profiles profile.Set) ([]Result, error) {
+// bounds the listing (the budget), ctx the recording. A failure to
+// record a failure or an abandon (a busy database) is logged, not
+// fatal: the list stays as it was and is tried again.
+func (l *Lister) listPlace(ctx, listCtx context.Context, rs []state.Relist, profiles profile.Set) []Result {
 	var out []Result
 	var failed error
 	for _, r := range rs {
@@ -212,26 +229,27 @@ func (l *Lister) listPlace(ctx, listCtx context.Context, rs []state.Relist, prof
 			abandoned, res.Err = l.listOne(listCtx, ctx, r, profiles, &res)
 		}
 		if ctx.Err() != nil {
-			return out, ctx.Err()
+			return out
 		}
 		switch {
 		case abandoned:
-			if err := l.DB.AbandonRelist(ctx, r.Place, r.Bucket); err != nil {
-				return out, err
-			}
 			l.logger().Warn("recovery: a place's list is longer than any list may be; abandoned",
 				"place", r.Place, "bucket", r.Bucket, "err", res.Err)
+			if err := l.DB.AbandonRelist(ctx, r.Place, r.Bucket); err != nil {
+				l.logger().Warn("recovery: recording the abandoned list failed; it is read again later",
+					"place", r.Place, "bucket", r.Bucket, "err", err)
+			}
 		case res.Err != nil && listCtx.Err() != nil:
 			res.Err = ErrOutOfTime // left pending, untried
 		case res.Err != nil:
 			failed = res.Err
 			if err := l.DB.RelistFailed(ctx, r.Place, r.Bucket, res.Err.Error(), l.now()); err != nil {
-				return out, err
+				l.logger().Warn("recovery: recording a failed list failed", "place", r.Place, "bucket", r.Bucket, "err", err)
 			}
 		}
 		out = append(out, res)
 	}
-	return out, nil
+	return out
 }
 
 func (l *Lister) logger() *slog.Logger {

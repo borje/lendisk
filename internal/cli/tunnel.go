@@ -102,6 +102,9 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 			}
 		},
 		Manifests: manifests}
+	if a.tuneControl != nil {
+		a.tuneControl(ctl)
+	}
 	s3 := &bridge.Late{}
 	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, log), log)
 	go purgeInvites(ctx, db, adm, a.now, log)

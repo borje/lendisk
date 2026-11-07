@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -158,6 +160,15 @@ func (a *app) runRecover(ctx context.Context, addr string, skip map[string]bool)
 	restored, err := recovery.Restore(ctx, db, m)
 	if err != nil {
 		return err
+	}
+	friends := map[string]bool{}
+	for _, f := range m.Friends {
+		friends[f.ID] = true
+	}
+	for _, id := range slices.Sorted(maps.Keys(skip)) {
+		if !friends[id] {
+			fmt.Fprintf(w, "  ! --skip %s: not a friend in the manifest; nothing to skip\n", id)
+		}
 	}
 	if len(m.Settings.TunnelRegion) == 0 {
 		a.chooseRegion(ctx, cfg, db, log)

@@ -89,6 +89,54 @@ func TestSlowFriendDoesNotHoldUpRecovery(t *testing.T) {
 	}
 }
 
+// #29 re-review: a database too busy to record a failed list does not
+// end the round (or recover): the list stays as it was, tried again.
+func TestUnrecordableFailureIsNotFatal(t *testing.T) {
+	db, l := recovering(t, "generic", "B", "C")
+	if _, err := db.Exec(`CREATE TRIGGER busy BEFORE UPDATE ON relist BEGIN SELECT RAISE(FAIL, 'database is locked'); END`); err != nil {
+		t.Fatal(err)
+	}
+	ok := sum("ok")
+	l.Page = func(_ context.Context, f state.Friendship, _, _ string) (control.ListPage, error) {
+		if f.Peer == "B" {
+			return control.ListPage{}, errors.New("offline")
+		}
+		return control.ListPage{Objects: []control.ListObject{{Key: "k", Size: 1, SHA256: ok}}}, nil
+	}
+	rs, err := l.Round(t.Context())
+	if err != nil {
+		t.Fatalf("round: %v", err)
+	}
+	if len(rs) != 2 {
+		t.Fatalf("results %+v", rs)
+	}
+}
+
+// #29 re-review: rounds start at a different place each time, so places
+// that use every round's budget cannot keep the ones after them from
+// ever being listed.
+func TestRoundsRotateTheStart(t *testing.T) {
+	_, l := recovering(t, "generic", "A", "B", "C")
+	l.Parallel = 1
+	var first atomic.Value
+	l.Page = func(ctx context.Context, f state.Friendship, _, _ string) (control.ListPage, error) {
+		first.CompareAndSwap(nil, f.Peer)
+		<-ctx.Done() // slow: never answers within the budget
+		return control.ListPage{}, ctx.Err()
+	}
+	seen := map[any]bool{}
+	for range 3 {
+		first = atomic.Value{}
+		if _, err := l.RoundWithin(t.Context(), 30*time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		seen[first.Load()] = true
+	}
+	if len(seen) != 3 {
+		t.Fatalf("three rounds started at %v", seen)
+	}
+}
+
 // #29 re-review: pages are capped apart from entries, far below the
 // entry cap: honest pages are full, so a list of empty pages ends.
 func TestEndlessEmptyPagesCapped(t *testing.T) {

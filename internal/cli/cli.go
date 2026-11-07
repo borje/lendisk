@@ -20,6 +20,7 @@ import (
 	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
+	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
 	"github.com/borje/lendisk/internal/manifest"
@@ -80,6 +81,9 @@ type app struct {
 	// afterFetch, if set, runs in recover once the manifests are
 	// fetched and before the places are listed; tests only.
 	afterFetch func()
+	// tuneControl, if set, adjusts the control API server before it
+	// serves (a slow list); tests only.
+	tuneControl func(*control.Server)
 	// tuneRecovery, if set, adjusts the daemon's recovery lister before
 	// it starts (its timings); tests only.
 	tuneRecovery func(*recovery.Lister)
