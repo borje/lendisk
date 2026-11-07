@@ -11,6 +11,7 @@ import (
 
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 )
 
@@ -25,8 +26,8 @@ const (
 	envCrashAfterStore = "LENDISK_TEST_CRASH_AFTER_STORE"
 	// envReplFast=1 makes the replication worker poll and retry in
 	// milliseconds and give up on an absent friend in seconds, and the
-	// manifest pusher make a round every 200 ms and back off for at most
-	// a second (its daily re-push stays daily).
+	// manifest pusher and the recovery lister make a round every 200 ms
+	// and back off for at most a second (the daily re-push stays daily).
 	envReplFast = "LENDISK_TEST_REPL_FAST"
 	// envManifestPoll is the manifest pusher's time between rounds (a Go
 	// duration), overriding envReplFast's.
@@ -58,6 +59,12 @@ func TestMain(m *testing.M) {
 			}
 			if d, err := time.ParseDuration(os.Getenv(envManifestPoll)); err == nil {
 				p.Poll = d
+			}
+		}
+		a.tuneRecovery = func(l *recovery.Lister) {
+			if os.Getenv(envReplFast) == "1" {
+				l.Poll, l.Timeout = 200*time.Millisecond, 10*time.Second
+				l.MinBackoff, l.MaxBackoff = 200*time.Millisecond, time.Second
 			}
 		}
 		os.Exit(a.run(os.Args[1:]))

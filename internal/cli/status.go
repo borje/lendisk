@@ -41,6 +41,23 @@ type Status struct {
 	// Manifest is the node manifest's version and which friends do not
 	// hold it yet (ID-4, #28).
 	Manifest StatusManifest `json:"manifest"`
+	// Recovery is what a recovered node still has to list (ID-5, #29).
+	Recovery StatusRecovery `json:"recovery"`
+}
+
+// StatusRecovery is the lists of places a recovered node has not read
+// yet: each place that was offline at `recover` until the daemon lists
+// it. Empty on a node that was never recovered or has read them all.
+type StatusRecovery struct {
+	Pending []StatusRelist `json:"pending"`
+}
+
+// StatusRelist is one list still to read.
+type StatusRelist struct {
+	Place  string `json:"place"`
+	Bucket string `json:"bucket"`
+	// Error is why the last attempt failed, if one did.
+	Error string `json:"error,omitempty"`
 }
 
 // StatusManifest is the node manifest's delivery (ID-4).
@@ -376,6 +393,14 @@ func (a *app) statusCmd() *cobra.Command {
 			if st.Manifest, err = manifestStatus(cmd.Context(), db); err != nil {
 				return err
 			}
+			rls, err := db.Relists(cmd.Context())
+			if err != nil {
+				return err
+			}
+			st.Recovery.Pending = []StatusRelist{}
+			for _, r := range rls {
+				st.Recovery.Pending = append(st.Recovery.Pending, StatusRelist{Place: r.Place, Bucket: r.Bucket, Error: r.Error})
+			}
 			if asJSON {
 				enc := json.NewEncoder(a.out)
 				enc.SetIndent("", "  ")
@@ -441,6 +466,16 @@ func (a *app) statusCmd() *cobra.Command {
 					fmt.Fprintf(a.out, "  %s holds version %d", p.Peer, p.Held)
 					if p.Error != "" {
 						fmt.Fprintf(a.out, " (last push: %s)", p.Error)
+					}
+					fmt.Fprintln(a.out)
+				}
+			}
+			if n := len(st.Recovery.Pending); n > 0 {
+				fmt.Fprintf(a.out, "Recovery: %d lists of what a friend holds not read yet; read when the friend answers\n", n)
+				for _, r := range st.Recovery.Pending {
+					fmt.Fprintf(a.out, "  %s at %s", r.Bucket, r.Place)
+					if r.Error != "" {
+						fmt.Fprintf(a.out, " (last try: %s)", r.Error)
 					}
 					fmt.Fprintln(a.out)
 				}

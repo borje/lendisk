@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 )
 
 // Client calls a peer's control API over HTTP whose transport dials the
@@ -86,6 +88,36 @@ func (c *Client) PutManifest(ctx context.Context, blob []byte) (ManifestReceipt,
 // (ID-4); a *CallError with status 404 means it keeps none.
 func (c *Client) GetManifest(ctx context.Context) ([]byte, error) {
 	return c.send(ctx, http.MethodGet, ManifestPath, nil, "", MaxManifest)
+}
+
+// maxListAnswer bounds one page of the list call: MaxListPage keys of at
+// most 1024 bytes each, with their sizes and hashes.
+const maxListAnswer = 4 << 20
+
+// ListPage reads one page of the list of this node's bucket sealed at
+// the peer (NET-7), after the key after, at most limit keys (0 means
+// the most the peer serves); a *CallError with status 404 means the
+// peer holds no bucket of this node by that name.
+func (c *Client) ListPage(ctx context.Context, sealed, after string, limit int) (ListPage, error) {
+	q := url.Values{"bucket": {sealed}}
+	if after != "" {
+		q.Set("after", after)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var p ListPage
+	b, err := c.send(ctx, http.MethodGet, ListPath+"?"+q.Encode(), nil, "", maxListAnswer)
+	if err != nil {
+		return p, err
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return p, fmt.Errorf("the peer's answer to %s is malformed: %w", ListPath, err)
+	}
+	if p.Next != "" && p.Next <= after {
+		return p, fmt.Errorf("the peer's list does not move on from %q", after)
+	}
+	return p, nil
 }
 
 func (c *Client) call(ctx context.Context, method, path string, in, out any) error {

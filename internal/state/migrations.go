@@ -295,4 +295,22 @@ var migrations = []Migration{
 			failures     INTEGER NOT NULL DEFAULT 0 -- failed attempts since the last success
 		);`,
 	},
+	{
+		Version: 15, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovery (ID-5, #29): the lists of a place's copy of a bucket
+		-- still to be read to rebuild placement. recover adds one per
+		-- friend and bucket in the manifest; a list read to its end drops
+		-- its row, in the transaction that records its last page. A place
+		-- that was offline keeps its rows until the daemon lists it.
+		CREATE TABLE relist (
+			place     TEXT NOT NULL,              -- the friend's node ID
+			bucket    TEXT NOT NULL,              -- the own bucket's name
+			after     TEXT NOT NULL DEFAULT '',   -- the last key recorded: the next page starts after it
+			tried_at  INTEGER,                    -- unix seconds: the last failed attempt
+			error     TEXT,                       -- its failure
+			failures  INTEGER NOT NULL DEFAULT 0, -- failed attempts in a row
+			PRIMARY KEY (place, bucket)
+		);`,
+	},
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/store"
 	"github.com/borje/lendisk/internal/transport"
@@ -73,6 +74,12 @@ type app struct {
 	// the lost-answer and crash windows (#51); tests only.
 	redeemTransport  func(http.RoundTripper) http.RoundTripper
 	beforeFriendship func() error
+	// afterFetch, if set, runs in recover once the manifests are
+	// fetched and before the places are listed; tests only.
+	afterFetch func()
+	// tuneRecovery, if set, adjusts the daemon's recovery lister before
+	// it starts (its timings); tests only.
+	tuneRecovery func(*recovery.Lister)
 }
 
 func (a *app) checker() store.Checker {
@@ -117,7 +124,7 @@ func (a *app) rootCmd() *cobra.Command {
 	root.SetErr(a.errOut)
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	a.flags = config.RegisterFlags(root.PersistentFlags())
-	root.AddCommand(a.initCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
+	root.AddCommand(a.initCmd(), a.recoverCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
 	root.AddCommand(a.endpointCmd())
 	root.AddCommand(a.inviteCmd(), a.peerCmd())
 	usageArgs(root)

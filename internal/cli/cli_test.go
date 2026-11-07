@@ -41,6 +41,8 @@ type node struct {
 	// every command (app's fields of those names).
 	redeemTransport  func(http.RoundTripper) http.RoundTripper
 	beforeFriendship func() error
+	// afterFetch, when set, is given to every command (recover's hook).
+	afterFetch func()
 	// stdin, when set, is every command's stdin in place of run's.
 	stdin io.Reader
 	// tuneBridge, when set, is given to serveLogged's daemon.
@@ -69,6 +71,7 @@ func (n *node) run(stdin string, phrase string, args ...string) (int, string, st
 		regions:   n.regions,
 		clock:     n.clock, dialTimeout: n.dialTimeout,
 		redeemTransport: n.redeemTransport, beforeFriendship: n.beforeFriendship,
+		afterFetch: n.afterFetch,
 	}
 	args = append(args, "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0")
 	code := a.run(args)

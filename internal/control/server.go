@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
@@ -32,6 +33,9 @@ type Server struct {
 	// Manifests keeps the manifests friends push (ID-4); nil answers
 	// the manifest call 404.
 	Manifests ManifestStore
+	// Lent is this node's index of what it holds for each friend
+	// (NET-7 list); nil answers the list call 404.
+	Lent LentLister
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
@@ -73,6 +77,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	case ManifestPath:
 		s.manifest(w, r, c)
+	case ListPath:
+		if s.method(w, r, http.MethodGet) {
+			s.list(w, r, c)
+		}
 	default:
 		Error(w, http.StatusNotFound, "no such control API call on this node")
 	}
@@ -242,6 +250,53 @@ func (s *Server) manifest(w http.ResponseWriter, r *http.Request, c Caller) {
 		w.Header().Set("Allow", "GET, PUT")
 		Error(w, http.StatusMethodNotAllowed, r.URL.Path+" takes GET or PUT")
 	}
+}
+
+// list is the list call (NET-7, ID-5, REPL-8): a page of the lender's
+// index of one of the caller's buckets, named by sealed name, after the
+// key `after`, at most `limit` keys (default and most
+// gateway.MaxListPage). It is keyed by the resolved caller alone, so a
+// friend lists its own buckets only, and needs no S3 credential: a node
+// rebuilt from its phrase reads it to rebuild its placement.
+func (s *Server) list(w http.ResponseWriter, r *http.Request, c Caller) {
+	if c.Role != state.RolePeer {
+		Error(w, http.StatusForbidden, "the list call is only for a friend")
+		return
+	}
+	if s.Lent == nil {
+		Error(w, http.StatusNotFound, "this node lends nothing")
+		return
+	}
+	q := r.URL.Query()
+	limit := gateway.MaxListPage
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > gateway.MaxListPage {
+			Error(w, http.StatusBadRequest, fmt.Sprintf("list: limit must be 1 to %d", gateway.MaxListPage))
+			return
+		}
+		limit = n
+	}
+	objs, next, err := s.Lent.List(r.Context(), c.Peer, q.Get("bucket"), q.Get("after"), limit)
+	switch {
+	case errors.Is(err, gateway.ErrNoLentBucket):
+		Error(w, http.StatusNotFound, err.Error())
+		return
+	case err != nil:
+		s.Log.Error("list: reading a friend's bucket failed", "peer", c.Peer.String(), "err", err)
+		Error(w, http.StatusInternalServerError, "listing failed on the lender; try again")
+		return
+	}
+	page := ListPage{Objects: make([]ListObject, 0, len(objs)), Next: next}
+	for _, o := range objs {
+		lo := ListObject{Key: o.Key, Size: o.Size, SHA256: o.SHA256}
+		if !o.TombstonedAt.IsZero() {
+			at := o.TombstonedAt.UTC()
+			lo.TombstonedAt = &at
+		}
+		page.Objects = append(page.Objects, lo)
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 // Error writes a control API error.

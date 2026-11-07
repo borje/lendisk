@@ -416,7 +416,8 @@ answer) and a last-reachable time.
   sequence, key, place, state: `queued`, `acked`, `moving`,
   `dropping`). It is never in the manifest: after `recover` it is
   rebuilt by listing each place's copy of each sealed bucket, with the
-  hash from `x-amz-meta-lendisk-sha256` (§3.10).
+  hash from `x-amz-meta-lendisk-sha256` (§3.10), into done queue rows
+  and `acked` placement rows (§3.1 ID-5).
 - Copies are moved only by the borrower's own node (P-2, PEER-11): the
   re-placement worker of §3.4.
 
@@ -923,7 +924,10 @@ upstream bucket is Q-V.
   it embeds, so a rebuilt node keeps its address, SEC-14; the config
   file is the user's and is not in it), `friends` (node ID, `tc…`
   address as the addressing hint, both numbers, both retentions, since
-  when), `overflow` (name, endpoint, bucket, prefix and credential,
+  when, and `dial_key`, the key the friend dials this node with, #69,
+  so a rebuilt node admits the friend again; added in #29 within
+  format 1, since readers ignore a field they do not know and an
+  absent one reads as none), `overflow` (name, endpoint, bucket, prefix and credential,
   S3-1; empty until #38 fills it) and `buckets` (name, sealed name,
   `copies`, profile, created at). Placement (REPL-12) and the buckets'
   own S3 credentials (SEC-3) are not in it. *Envelope*: `ldm1` ‖
@@ -998,17 +1002,39 @@ upstream bucket is Q-V.
   nearest region in practice, and `tunnel.region` pins it.
 - **ID-5** A lender's address is its tailcat `tc…` string, which carries
   the public key and relay bootstrap info and no pre-shared key
-  (SEC-14). `recover` derives the key
-  from the phrase, dials the lender, fetches the manifest over the
-  control API (`GET /_lendisk/manifest`, `manifest.Fetch`: no bucket,
-  no S3 credential and no `lendisk.db` needed), passes the highest
-  `seq` it fetched to `state.ContinueManifest` before the daemon first
-  runs, so the version never goes back and later changes count on from
-  it (#29 must do this; until then nothing sets it and a fresh node
-  counts from 1), then
-  derives the per-pair S3 credentials (§3.7) for every lender listed,
-  and re-derives its dial key for each friend the manifest lists (§3.1
-  ID-1), which the friend still admits.
+  (SEC-14). `lendisk recover <address>` (#29, package `recovery`)
+  runs on a fresh machine only (it refuses a config directory holding
+  an identity), and first asks the user to confirm that the old node
+  is stopped or gone (below); then it reads the phrase from stdin and
+  derives the key from it, dials the lender, and fetches the manifest
+  over the control API (`GET /_lendisk/manifest`, `manifest.Fetch`: no
+  bucket, no S3 credential and no `lendisk.db` needed). A lender can
+  serve an older copy, since the envelope binds node and format, not
+  freshness, so `recovery.Newest` then asks every friend any fetched
+  manifest names, the newest one's included, and keeps the highest
+  `seq`; each lender's answer is printed. `recovery.Restore` passes
+  that `seq` to `state.ContinueManifest` before the daemon first runs,
+  so the version never goes back and later changes count on from it;
+  restores each friendship with its terms and the friend's dial key
+  from the manifest, so the tunnel admits each friend again under the
+  key it always dialled this node with; and saves the relay region the
+  manifest carries (`transport.RestoreRegion`), so the address is
+  unchanged. *Friends' dial keys*: the manifest carries them (ID-4)
+  rather than each friend being asked at recovery, because a friend
+  offline then would stay locked out, and the manifest's copy is the
+  one redeem proved (DialProof), where a friend's answer later would be
+  its word alone. A friend missing from a manifest's dial keys (one
+  written before #29; no release has one) is restored without one:
+  `recover` names it, and only a new invite lets it reach this node.
+  Buckets are restored with new S3 credentials of their own (SEC-3:
+  those are not in the manifest), printed by `bucket show`, and created
+  empty in the store; nothing is downloaded (ID-6 reads on demand,
+  #30). The identity key is written last, so a `recover` that stopped
+  part way runs again on the same directories: what it wrote is kept.
+  The per-pair S3 credentials (§3.7) for every lender are derived when
+  used and never written (NET-7a), and the node re-derives its dial
+  key for each friend the manifest lists (§3.1 ID-1), which the friend
+  still admits.
   *How recovery dials*: with `transport.NewFriendDialer(identity)`, a
   dial-only transport that dials each friend with
   `DialKeyFor(friend)`, the key the daemon dials it with (#69). The
@@ -1032,18 +1058,50 @@ upstream bucket is Q-V.
   lender would have to keep it, and recovery dials each friend anyway.
   `recover` (#29) is for a node whose machine is gone or stopped: a
   still running old node dials its friends with the same dial keys, and
-  two clients of one key at one relay stall each other. It says to stop
-  the old node first, uses one friend dialler for every call of the
-  recovery, and closes it before the daemon starts. Two nodes running
+  two clients of one key at one relay stall each other. It says so and
+  refuses to go on until the user answers `y` to "Is the old node
+  stopped, or its machine gone?" (stdin, before the phrase); nothing
+  can tell from outside whether the old node runs, since it admits
+  only its friends. It uses one friend dialler for every call of the
+  recovery, and closes it before writing the identity key, so before
+  the daemon can start. Two nodes running
   with one identity are wrong in any case (both would replicate and
   push manifests). Overflow target
   credentials found in the manifest are shown once, for the user to
-  put in the environment (SEC-3); they are not written to disk. The
+  put in the environment (SEC-3); they are not written to disk
+  (`printOverflow`; the list is empty until #38). The
   `placement` table (D6) and the hash index are then rebuilt from the
   control API `list` of each reachable place for each sealed bucket
   (§3.7): one paged call per bucket and place, not a request per
-  object. A place that is offline is listed when it returns, and until
-  then its objects count as held wherever else a list found them.
+  object (`recovery.Lister`). Each page is recorded in one transaction
+  (`state.RecordListed`): a key with no done row gets one (a `put`,
+  `done`, with the listed size and hash and the class its bucket's
+  profile gives it; local-only keys are skipped) and an `acked`
+  placement row at that place, sized as the place counts it, so
+  `place_use` holds what each friend holds; a key that has a row is
+  acked at the place only when the hash matches it. So the first list
+  of a key decides the version counted, and a place holding another
+  hash, or a key this node has deleted since, is not counted as
+  holding it (recover prints how many); tombstoned keys are no live
+  objects and are only counted. The lists still to read are the table
+  `relist` (migration 15: place, bucket, the key to resume after, the
+  last failure and failures in a row), filled by `Restore` for every
+  friend and bucket; the last page of a list drops its row in its
+  transaction, a page before it moves the resume key. A place that
+  fails is skipped for the rest of the round, and `recover` says it is
+  not reachable now. A place that is offline is listed when it
+  returns: the daemon runs the same lister (every minute, a failed
+  list due again after 1 min doubling to 1 h), and `status` shows the
+  lists still to read (`recovery.pending`). Until then its objects
+  count as held wherever else a list found them, and are below
+  `copies` where no other place holds enough of them.
+  *Limit: a lender that lost its own `lendisk.db`* keeps the manifest
+  file but admits no one without a friendship (SEC-10, ID-4 above), so
+  it serves neither the manifest nor a list to a recovering node: that
+  friend must be befriended again with a new invite, once the node is
+  recovered from another friend or with `init --restore`. `recover`
+  says so when no friend serves the manifest; the recovery demo must
+  give the address of a friend that kept its database.
 - **ID-6** Read-through is the decorator's `GetObject`/`HeadObject`
   miss path (EP-10); after `recover` every object is a miss until
   fetched, from the first reachable place `placement` names.
@@ -2394,9 +2452,24 @@ capture decorator, so nothing stands between that and posix (#62).
   `list`) is plain HTTP under `/_lendisk/` on the same tunnel port,
   authenticated by the tunnel peer key and checked per request against
   `lendisk.db` (SEC-11). `manifest` (`PUT` and `GET`, the caller's own
-  sealed manifest, §3.1 ID-4) is served (#28). `list` (bucket, after, limit) pages the
-  lender's index for that borrower's bucket from `lendisk.db`: key,
-  size, SHA-256 and, if tombstoned, when; it is what `recover` (ID-5),
+  sealed manifest, §3.1 ID-4) is served (#28). `list` is served (#29):
+  `GET /_lendisk/list?bucket=<sealed>&after=<key>&limit=<n>` pages the
+  lender's index for that borrower's bucket: key, size, SHA-256 and, if
+  tombstoned, when (`tombstoned_at`, absent until #17), as
+  `{"objects": [...], "next": "<key>"}`, `next` absent after the last
+  page; at most 1000 keys a page (`gateway.MaxListPage`), the default.
+  Like `manifest` it is open to the `peer` role only and keyed by the
+  resolved caller (`Caller.Peer`); no parameter names whose bucket, so
+  a friend naming another's sealed name, or a bucket it never made,
+  gets 404. The index is the store itself (`gateway.LentIndex`), not a
+  table in `lendisk.db`: posix lists the `lent-<id16>-<sealed>` bucket
+  in key order from `after` (as both `StartAfter` and the continuation
+  token, since posix reads `StartAfter` only beside one) and each key's
+  hash is the `x-amz-meta-lendisk-sha256` every borrower's object
+  carries (COMPAT-4), read with a local head; keys under the reserved
+  prefixes (SEC-5) are left out. So it needs no second copy kept in
+  step with the store, and it survives the loss of `lendisk.db` with
+  the store. It is what `recover` (ID-5),
   `import` (REPL-8) and `undelete` previews read, so none of them
   needs a request per object. The borrower replicates to a friend with
   the same replica client it uses for overflow targets, dialling

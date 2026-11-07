@@ -3,6 +3,7 @@ package transport
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -361,5 +362,43 @@ func TestEnsureRegionSavesOnceAndFollowsSetting(t *testing.T) {
 	}
 	if _, _, err := EnsureRegion(ctx, db, "nowhere", src); err == nil {
 		t.Fatal("EnsureRegion accepted a region the map does not have")
+	}
+}
+
+// SEC-14, ID-5 (#29): a node rebuilt from its manifest saves the region
+// its old database held, so its address does not move, and the relays'
+// map is not asked; something that is not a region is refused.
+func TestRestoreRegionKeepsTheAddress(t *testing.T) {
+	d := transporttest.Start(t)
+	src := &transporttest.Source{D: d}
+	ctx := t.Context()
+	old, err := state.Open(ctx, t.TempDir(), quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	r, _, err := EnsureRegion(ctx, old, "", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(r)
+	fresh, err := state.Open(ctx, t.TempDir(), quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err := RestoreRegion(ctx, fresh, []byte(`{"RegionID":`)); err == nil {
+		t.Fatal("a damaged region was saved")
+	}
+	if err := RestoreRegion(ctx, fresh, raw); err != nil {
+		t.Fatal(err)
+	}
+	got, chosen, err := EnsureRegion(ctx, fresh, "", src)
+	if err != nil || chosen || got.RegionID != r.RegionID || src.Fetches.Load() != 1 {
+		t.Fatalf("after restore: %+v %v %v", got, chosen, err)
+	}
+	id := newID(t)
+	if AddressOf(id, got) != AddressOf(id, r) {
+		t.Fatal("the restored region gives another address")
 	}
 }

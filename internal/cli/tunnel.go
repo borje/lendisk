@@ -12,6 +12,7 @@ import (
 	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/control"
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/state"
@@ -82,7 +83,18 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 	if err := manifests.Sweep(a.now()); err != nil {
 		log.Warn("sweeping leftover manifest files failed", "dir", manifests.Dir, "err", err)
 	}
-	ctl := &control.Server{DB: db, Self: id, Log: log,
+	// The list call reads what this node holds for each friend from the
+	// store (NET-7 list): a second posix view of it, read only.
+	be, err := gateway.OpenBackend(cfg.StorePath())
+	if err != nil {
+		tc.Close()
+		return nil, err
+	}
+	go func() {
+		<-ctx.Done()
+		be.Shutdown()
+	}()
+	ctl := &control.Server{DB: db, Self: id, Log: log, Lent: &gateway.LentIndex{Store: be, DB: db},
 		Changed: func() {
 			adm.Clear()
 			if changed != nil {

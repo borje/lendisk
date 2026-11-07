@@ -18,6 +18,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/profile"
+	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/version"
@@ -94,7 +95,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 6) // gateway, LAN, loopback, replication, alerts, manifest
+			errc := make(chan error, 7) // gateway, LAN, loopback, replication, alerts, manifest, recovery
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs}
 			ready := make(chan struct{})
@@ -170,6 +171,15 @@ func (a *app) serveCmd() *cobra.Command {
 			go func() { alerts.Run(ctx); errc <- nil }()
 			running++
 			go func() { push.Run(ctx); errc <- nil }()
+			// A recovered node lists each place it could not reach at
+			// recovery when it answers again (ID-5); a node with nothing
+			// left to list only waits.
+			lister := &recovery.Lister{DB: db, Self: id, Dial: tun.Dial, Profiles: profiles, Now: a.clock, Log: log}
+			if a.tuneRecovery != nil {
+				a.tuneRecovery(lister)
+			}
+			running++
+			go func() { lister.Run(ctx); errc <- nil }()
 
 			var first error
 			for i := 0; i < running; i++ {
