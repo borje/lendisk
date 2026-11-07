@@ -149,6 +149,19 @@ func NewDialer(id *identity.Identity, log *slog.Logger) (*Tailcat, error) {
 	return t, nil
 }
 
+// NewFriendDialer returns a transport that only dials, each friend with
+// id.DialKeyFor(friend) as the daemon's transport does (#69): what a
+// node dials its friends with when no daemon runs, as recovery does
+// (ID-5, manifest.Fetch). It has no region, so Listen refuses.
+func NewFriendDialer(id *identity.Identity, log *slog.Logger) (*Tailcat, error) {
+	t, err := NewDialer(id, log)
+	if err != nil {
+		return nil, err
+	}
+	t.dialKeyFor = func(friend identity.NodeID) key.NodePrivate { return nodePrivate(id.DialKeyFor(friend)) }
+	return t, nil
+}
+
 // KeyOf is the node ID an address names.
 func KeyOf(addr string) (identity.NodeID, error) {
 	ci, err := tailcat.ParseAddr(tailcat.Addr(addr))

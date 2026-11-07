@@ -16,6 +16,7 @@ import (
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/state"
@@ -75,18 +76,25 @@ func (a *app) serveCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			tun, err := a.startTunnel(ctx, cfg, id, db, log)
+			// The node manifest (ID-4), pushed to every friend; in both
+			// profiles, since a lender-only node is rebuilt from it too.
+			push := &manifest.Pusher{DB: db, Self: id, Now: a.clock, Random: a.random, Log: log}
+			tun, err := a.startTunnel(ctx, cfg, id, db, log, push.Kick)
 			if err != nil {
 				return err
 			}
 			defer tun.Close()
+			push.Dial = tun.Dial
+			if a.tuneManifest != nil {
+				a.tuneManifest(push)
+			}
 			schema, _, _ := db.Versions(ctx)
 			log.Info("lendisk started", "version", version.Version, "node_id", nodeID,
 				"role", cfg.Role, "config", cfg.Path, "data_dir", cfg.DataDir, "schema", schema)
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 5) // gateway, LAN, loopback, replication, alerts
+			errc := make(chan error, 6) // gateway, LAN, loopback, replication, alerts, manifest
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs}
 			ready := make(chan struct{})
@@ -160,6 +168,8 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 			running++
 			go func() { alerts.Run(ctx); errc <- nil }()
+			running++
+			go func() { push.Run(ctx); errc <- nil }()
 
 			var first error
 			for i := 0; i < running; i++ {

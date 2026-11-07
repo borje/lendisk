@@ -13,6 +13,7 @@ import (
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 )
@@ -40,8 +41,11 @@ type tunnel struct {
 // startTunnel chooses the region if none is saved yet, starts the
 // transport with admission over db and serves the tunnel port until ctx
 // ends: the bridge's tunnel middleware in front of the control API
-// (§3.7) and, once tun.S3 is set, S3 for friends.
-func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.Identity, db *state.DB, log *slog.Logger) (*tunnel, error) {
+// (§3.7) and, once tun.S3 is set, S3 for friends. changed, if set, is
+// called after the control API commits a friendship (the manifest
+// pusher's Kick, ID-4).
+func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.Identity, db *state.DB, log *slog.Logger,
+	changed func()) (*tunnel, error) {
 	region, chosen, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays())
 	if err != nil {
 		return nil, err
@@ -72,7 +76,20 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		<-ctx.Done()
 		ln.Close()
 	}()
-	ctl := &control.Server{DB: db, Self: id, Changed: adm.Clear, Log: log}
+	// Friends' manifests live in the store, not lendisk.db (ID-4); a Put
+	// that crashed may have left a temporary file.
+	manifests := &manifest.Store{Dir: manifest.Dir(cfg.StorePath())}
+	if err := manifests.Sweep(a.now()); err != nil {
+		log.Warn("sweeping leftover manifest files failed", "dir", manifests.Dir, "err", err)
+	}
+	ctl := &control.Server{DB: db, Self: id, Log: log,
+		Changed: func() {
+			adm.Clear()
+			if changed != nil {
+				changed()
+			}
+		},
+		Manifests: manifests}
 	s3 := &bridge.Late{}
 	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, log), log)
 	go purgeInvites(ctx, db, adm, a.now, log)

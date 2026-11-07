@@ -2,11 +2,15 @@ package control
 
 import (
 	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/borje/lendisk/internal/identity"
@@ -25,6 +29,9 @@ type Server struct {
 	// Changed is called after a friendship or invite is committed, so
 	// admission forgets its rejections (Admission.Clear, SEC-15).
 	Changed func()
+	// Manifests keeps the manifests friends push (ID-4); nil answers
+	// the manifest call 404.
+	Manifests ManifestStore
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
@@ -64,6 +71,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if s.method(w, r, http.MethodPost) {
 			s.redeem(w, r, c)
 		}
+	case ManifestPath:
+		s.manifest(w, r, c)
 	default:
 		Error(w, http.StatusNotFound, "no such control API call on this node")
 	}
@@ -172,6 +181,66 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 	s.Log.Info("invite redeemed", "peer", f.Peer, "quota", f.Quota())
 	writeJSON(w, http.StatusOK, RedeemResponse{Number: f.OwnNumber, RetentionSeconds: int64(f.OwnRetention / time.Second),
 		DialKey: ownDial.NodeID().String(), DialProof: dialProof})
+}
+
+// manifest is the node manifest call (ID-4, NET-7): PUT stores the
+// caller's manifest envelope, GET returns it. Both are keyed by the
+// connection's key alone, so a friend reaches its own manifest only,
+// and need no bucket and no S3 credential: a node restored from its
+// phrase fetches its manifest before it has anything else. The lender
+// sees that a manifest exists and its size; the envelope is sealed with
+// a key only the friend's identity derives.
+func (s *Server) manifest(w http.ResponseWriter, r *http.Request, c Caller) {
+	if c.Role != state.RolePeer {
+		Error(w, http.StatusForbidden, "the manifest call is only for a friend")
+		return
+	}
+	if s.Manifests == nil {
+		Error(w, http.StatusNotFound, "this node keeps no manifests")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		b, err := s.Manifests.Get(c.Peer)
+		switch {
+		case errors.Is(err, ErrNoManifest):
+			Error(w, http.StatusNotFound, ErrNoManifest.Error())
+		case err != nil:
+			s.Log.Error("manifest: reading a friend's manifest failed", "peer", c.Peer.String(), "err", err)
+			Error(w, http.StatusInternalServerError, "reading the manifest failed on the lender; try again")
+		default:
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(b)
+		}
+	case http.MethodPut:
+		b, err := io.ReadAll(io.LimitReader(r.Body, MaxManifest+1))
+		switch {
+		case err != nil:
+			Error(w, http.StatusBadRequest, "manifest: reading the body failed")
+			return
+		case len(b) > MaxManifest:
+			Error(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("a manifest is at most %d bytes", MaxManifest))
+			return
+		}
+		err = s.Manifests.Put(c.Peer, b)
+		switch {
+		case errors.Is(err, ErrBadManifest):
+			Error(w, http.StatusBadRequest, err.Error())
+			return
+		case err != nil:
+			s.Log.Error("manifest: storing a friend's manifest failed", "peer", c.Peer.String(), "err", err)
+			Error(w, http.StatusInternalServerError, "storing the manifest failed on the lender; try again")
+			return
+		}
+		sum := sha256.Sum256(b)
+		s.Log.Debug("manifest stored", "peer", c.Peer.String(), "size", len(b))
+		writeJSON(w, http.StatusOK, ManifestReceipt{Size: int64(len(b)), SHA256: hex.EncodeToString(sum[:])})
+	default:
+		w.Header().Set("Allow", "GET, PUT")
+		Error(w, http.StatusMethodNotAllowed, r.URL.Path+" takes GET or PUT")
+	}
 }
 
 // Error writes a control API error.
