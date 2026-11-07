@@ -261,13 +261,17 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 	case err != nil:
 		return fmt.Errorf("redeeming the invite at node %s: %w; run the same `lendisk peer add` again to finish", them, err)
 	}
+	theirDial, err := resp.InviterDialKey(id, them, ik.NodeID())
+	if err != nil {
+		return fmt.Errorf("node %s stored the friendship but its answer is not usable: %w; run the same `lendisk peer add` again to finish", them, err)
+	}
 	if a.beforeFriendship != nil {
 		if err := a.beforeFriendship(); err != nil {
 			return err
 		}
 	}
 	f := state.Friendship{
-		Peer: them.String(), Address: inv.Address,
+		Peer: them.String(), Address: inv.Address, DialKey: theirDial.String(),
 		OwnNumber: number, PeerNumber: resp.Number,
 		OwnRetention: ret, PeerRetention: time.Duration(resp.RetentionSeconds) * time.Second,
 		CreatedAt: a.now(),
@@ -288,7 +292,7 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 const redeemInProgress = "a redeem of this invite is already in progress (another `lendisk peer add` of it is running); let it finish, then check `lendisk peer list`"
 
 // redeem calls redeem at them, dialling with the invite key; the proof
-// by self binds that key. timedOut reports that the call ran out of
+// by self binds that key and self's dial key (#69). timedOut reports that the call ran out of
 // time.
 func (a *app) redeem(ctx context.Context, log *slog.Logger, key, self *identity.Identity, them identity.NodeID,
 	address string, req control.RedeemRequest) (resp control.RedeemResponse, timedOut bool, err error) {
@@ -297,7 +301,7 @@ func (a *app) redeem(ctx context.Context, log *slog.Logger, key, self *identity.
 		return resp, false, err
 	}
 	defer dl.Close()
-	if req.Proof, err = control.RedeemProof(self, them, key.NodeID()); err != nil {
+	if err := req.Prove(self, them, key.NodeID()); err != nil {
 		return resp, false, err
 	}
 	cctx, cancel := context.WithTimeout(ctx, a.redeemTimeout())

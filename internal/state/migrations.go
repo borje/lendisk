@@ -267,4 +267,13 @@ var migrations = []Migration{
 		-- A bucket's metadata, for what is not yet sent to a place (D6).
 		CREATE INDEX queue_metadata ON queue (bucket, key, seq) WHERE class IN ('metadata', 'snapshot');`,
 	},
+	{
+		Version: 13, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The key the friend dials with (ID-1, SEC-10, #69), node-ID form,
+		-- exchanged at redeem; admitted with the friend's rights and named
+		-- as the friend. NULL for a friendship made before it existed.
+		ALTER TABLE friendship ADD COLUMN dial_key TEXT;
+		CREATE UNIQUE INDEX friendship_dial_key ON friendship (dial_key);`,
+	},
 }

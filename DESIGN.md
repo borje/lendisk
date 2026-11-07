@@ -1,6 +1,6 @@
 # lendisk — design
 
-Status: draft v0.15, 2026-11-06. Companion to REQUIREMENTS.md v0.11.1.
+Status: draft v0.16, 2026-11-07. Companion to REQUIREMENTS.md v0.11.2.
 REQUIREMENTS.md v0.9 made the two requirement changes this design
 needed (Q-T, resolved); its later versions moved third-party
 credentials to the environment,
@@ -87,8 +87,11 @@ S3-3). v0.15 follows the first capture code (#6): a multipart object's
 hash is the SHA-256 of the whole object, read once at completion,
 rather than a composite of its parts, so every object has one hash and
 replication picks part sizes freely (EP-3, REPL-10); and dependencies
-are pinned by `go.sum` rather than vendored (OPS-8). The trust model is
-unchanged throughout.
+are pinned by `go.sum` rather than vendored (OPS-8). v0.16 gives
+each node a dial key per friend for its tunnel clients, beside the
+identity key its server keeps, since a relay delivers a key's packets to the last
+of its connections to write (§3.1, §3.2, §3.7, §3.9; #69). The trust
+model is unchanged throughout.
 
 ## 1. Name
 
@@ -875,8 +878,19 @@ upstream bucket is Q-V.
 ### 3.1 Identity and recovery
 
 - **ID-1** The identity is an X25519 key: the WireGuard key tailcat
-  uses (D5). Node ID, tunnel key and S3 access key (NET-7a) are
-  literally the same key; there is no Ed25519 and no conversion.
+  uses (D5). Node ID, the tunnel server's key and S3 access key
+  (NET-7a) are literally the same key; there is no Ed25519 and no
+  conversion. The node's tunnel client for each friend uses an X25519
+  key of its own, the dial key for that friend
+  (`Identity.DialKeyFor`): HKDF-SHA256 over the private key with the
+  info `"lendisk-dial-v1"` followed by the friend's 32 key bytes,
+  clamped (§3.7 says why). It is derived from the private key rather
+  than the BIP-39 seed because the daemon holds only the key file
+  (ID-3), as with the other derivations below; the phrase and the
+  friend's ID recover it. It is not an identity: the friend learns it
+  at redeem (PEER-2) and maps it to the node ID (SEC-10, SEC-12), and
+  the address, the S3 credential and every control API answer stay
+  keyed by the node ID.
   Nothing in the design needs a signature today: invites carry a
   symmetric secret (PEER-1), the challenge is an HMAC (VER-1), the
   manifest is AEAD-encrypted under a derived key (ID-4), and the
@@ -913,7 +927,10 @@ upstream bucket is Q-V.
   (SEC-14). `recover` derives the key
   from the phrase, dials the lender, fetches the manifest over the
   control API (no S3 credential needed yet), then derives the per-pair
-  S3 credentials (§3.7) for every lender listed. Overflow target
+  S3 credentials (§3.7) for every lender listed, and re-derives its
+  dial key for each friend the manifest lists (§3.1 ID-1), which the
+  friend still admits; the lender dialled first gets its own the same
+  way, from its key in the address. Overflow target
   credentials found in the manifest are shown once, for the user to
   put in the environment (SEC-3); they are not written to disk. The
   `placement` table (D6) and the hash index are then rebuilt from the
@@ -952,7 +969,7 @@ upstream bucket is Q-V.
   the `invite` role, until the invite expires, while it is unused or
   its redeemer is still a friend (the retry of PEER-2, §3.9);
   the invited node dials with that key to call `redeem`, after which
-  its real key replaces it. Expired invite rows, used or not, are
+  it dials with its dial key for the inviting node (ID-1). Expired invite rows, used or not, are
   deleted by `invite` before it adds one, by the daemon at start and
   every minute after, which then clears the admission cache.
 - **PEER-2** `peer add <invite>` shows the inviter's number and
@@ -962,15 +979,35 @@ upstream bucket is Q-V.
   retention offer, the number its user chose (LEND-8) and a proof that
   it holds the key its address names, since the connection is
   authenticated by the invite key, not by that key: HMAC-SHA256 over
-  the invite key's 32 bytes, keyed with
+  the invite key's 32 bytes and then the dial key's 32 bytes
+  (`dial_key`, ID-1: the redeemer's dial key for the inviting node),
+  keyed with
   `HKDF-SHA256(X25519(own key, other key), info="lendisk-redeem-v1")`,
   which either side computes and no one else can (ID-1: no
-  signature). The inviting node refuses a missing or wrong proof or
-  its own address; it then marks the invite used by the proven key
-  (`invite.redeemed_by`, migration 8) and inserts the friendship row
-  in one transaction, answers with its own number and retention, and
-  closes the connection (`Connection: close`). The invited node writes
-  its row only after that answer.
+  signature). So the proof binds the dial key, and a request seen on
+  the way cannot carry another. `dial_proof` shows the redeemer holds
+  that dial key for that node: HMAC-SHA256 over the invite key and
+  then the redeemer's node ID, keyed with
+  `HKDF-SHA256(X25519(dial key, inviter's key),
+  info="lendisk-redeem-dial-v1")`; without it a node could report
+  another's dial key and be named by that key's connections, and
+  without the node ID it could copy another redeemer's `dial_proof`
+  (#69 review). The inviting node refuses a missing or wrong proof, its
+  own address, a missing dial key (`400`, "upgrade lendisk on the
+  redeeming node"), a dial key that is either node's ID, its own dial
+  key for the redeemer or the invite key, and a wrong `dial_proof`; it then marks the invite used by the proven key
+  (`invite.redeemed_by`, migration 8) and inserts the friendship row,
+  with `dial_key` (migration 13), in one transaction. A dial key that
+  is already another friend's dial key or node ID is refused (`409`;
+  `state.ErrDialKeyTaken`, and a unique index on `dial_key`). It
+  answers with its own number and retention, its own dial key for the
+  redeemer and its `dial_proof` (keyed by X25519 of that dial key and
+  the redeemer's key, over the invite key and the inviter's node ID;
+  `RedeemResponse.InviterDialKey` checks it), and closes the
+  connection (`Connection: close`). The invited node writes its row,
+  with the inviter's dial key, only after that answer, and refuses an
+  answer without a proven dial key. `control.RedeemRequest.Prove`
+  fills the redeemer's three fields.
   The answer can be lost, or the invited node can stop before writing
   its row, after the inviting node committed (#51, #56). So the
   invited node first records the terms it offers in `pending_redeem`
@@ -995,8 +1032,9 @@ upstream bucket is Q-V.
   A proven key that is already a friend is answered, not refused: any
   unexpired invite, used by it, unused or used by another, answers
   `redeem` with the stored friendship's terms, the request's address,
-  number and retention applied as the friend's latest report, and an
-  unused invite is marked used by it (`state.DB.RedeemInvite`). The
+  number, retention and dial key applied as the friend's latest
+  report, and an unused invite is marked used by it
+  (`state.DB.RedeemInvite`). The
   proof binds the invite key of this connection, so a proof seen
   elsewhere does not carry over; `redeem` is served to the `invite`
   role only, never over a friend's own key. An expired invite's key
@@ -1016,7 +1054,8 @@ upstream bucket is Q-V.
   timeout, a lost answer or a `5xx` keeps it and tells the user to
   run the same `peer add` again. Both rows
   hold peer key, address, own number, the other's number as last
-  reported and each side's retention (migration 5), and each
+  reported and each side's retention (migration 5), and the other's
+  dial key (migration 13), and each
   becomes an account in the other's `IAMService`: each is the other's
   lender and borrower. The derived secret (NET-7a) serves both
   directions: the X25519 shared secret is the same either way, the
@@ -2269,6 +2308,39 @@ capture decorator, so nothing stands between that and posix (#62).
   `lendisk.db` on every lookup so a removed friend's next request is
   refused. The bridge refuses a request whose access key is not the
   tunnel peer key (SEC-12). The derived secret is never stored.
+- **One key per engine: the identity key serves, a dial key per
+  friend dials (#69).** A node's tailcat `Server` and each of its
+  tailcat `Client`s hold their own connection to the relay. With one
+  key for two of them, a node whose friends share its relay (the
+  common case: friends in one region pick the same nearest relay) has
+  two relay connections under one key, and derpserver delivers a
+  key's packets to whichever of its connections last sent a frame
+  (`lastWriterIsActive`, the default; Q-S noted the duplicate). A
+  tailcat client drops the "meow" pings and WireGuard packets meant
+  for the server. So once A's client had written last, B's client
+  could not reach A's server at all, and B's failing client, pinging
+  every second, then held B's key the same way: two failing clients
+  kept each other failing until a restart dropped one's relay
+  connection (#69; measured: A's server never logged B's ping, and
+  closing A's client alone let B through at once). It is the #52 stall
+  between a server and a client of one process. Two clients of one
+  process with one key stall the same way: a review of the first fix,
+  which gave every client one shared dial key, showed a download from
+  B dropped while the client to C uploaded, every packet relayed
+  (`TestTwoFriendsOnOneRelayCarryAtOnce`, with
+  `TS_DEBUG_ALWAYS_USE_DERP`). So the identity key stays with the
+  `Server` (the address, SEC-14) and each `Client` gets the dial key
+  for its friend (ID-1): `transport.NewTailcat` derives it, and
+  `transport.NewDialer` dials with the key it is given (the invite key
+  of `peer add`). The listening side admits a friend's dial key with
+  that friend's rights and resolves it to the friend's node ID before
+  anything acts on it (`state.DB.TunnelPeer`, SEC-10, SEC-12).
+  Friendships made before migration 13 have no dial key, and are given
+  no fallback to the shared key: 0.1 is unreleased (no tag) and every
+  install is a development one, while a fallback would keep the stall
+  for those friendships and add a control call to swap keys later.
+  Such a friend refuses this node's dials; drop the row on both sides
+  and befriend again, which stores both dial keys.
 - **A restarted friend.** tailcat admits a client as a WireGuard peer
   at its first ping only (the "meow" handshake, `Client.up`), and a
   restarted server has forgotten it while the client's session looks
@@ -2323,7 +2395,8 @@ capture decorator, so nothing stands between that and posix (#62).
   it, since tailcat's shutdown may wait on the admission hook, which
   takes that lock.
 - **Dialling a friend.** The replica client's HTTP transport uses the
-  tailcat `Client.Dial` for that peer as its dial function, so
+  tailcat `Client.Dial` for that peer, on the dial key for it, as its dial
+  function, so
   replication traffic enters the tunnel from inside the process. No
   listener is opened on the borrower's side for replication.
 - **NET-7b** `peer forward` opens a listener on the loopback address
@@ -2352,7 +2425,9 @@ capture decorator, so nothing stands between that and posix (#62).
   function, and the hook handed to tailcat is never nil and refuses
   while no function is set. `Dial` takes the friend's key and its
   address and refuses an address that names another key; it keeps one
-  tailcat `Client` per friend (Q-S). The tunnel port, 9000, is a
+  tailcat `Client` per friend (Q-S), on the dial key for that friend. `PeerOf` names
+  the key a connection authenticated with, a friend's dial key
+  included, and callers resolve it with `state.DB.TunnelPeer`. The tunnel port, 9000, is a
   constant, not a setting, since friends dial it without being told.
   `transport.NewDialer` is a dial-only transport with any key and no
   region, which never listens: `peer add` dials with the invite key
@@ -2549,11 +2624,14 @@ capture decorator, so nothing stands between that and posix (#62).
   list, which did the same while empty, is gone at the pinned commit). tailcat retries a rejected client
   about once a second, so the hook keeps a negative cache per key,
   cleared whenever a relationship or invite changes. The lookup is
-  `state.DB.PeerRole` over the `friendship` table (keyed by the peer's
-  node ID) and the `invite` table (keyed by the invite key's node ID,
+  `state.DB.TunnelPeer` over the `friendship` table (keyed by the peer's
+  node ID, and admitting the friend's `dial_key` in the same `peer`
+  role, #69) and the `invite` table (keyed by the invite key's node ID,
   admitted while `expires_at` is in the future and either `used_at` is
   null or `redeemed_by` still has a friendship row, for PEER-2's
-  retry).
+  retry). Deleting the friendship row refuses both keys at once.
+  `state.DB.PeerRole`, which the `IAMService` uses, reads node IDs
+  only, so a dial key is never an S3 account.
   The cache is `transport.Admission`: it remembers rejections only,
   never admissions or errors, each for 30 seconds
   (`transport.DeniedFor`), empties itself at 4096 keys, and
@@ -2574,8 +2652,8 @@ capture decorator, so nothing stands between that and posix (#62).
   routing or proxying if there is none. It reads the row on every
   request, not once per connection, so quota and state changes apply
   to the next request (SEC-15). It is `bridge.TunnelHandler`: it puts
-  the caller (key and role) in the request context as a
-  `control.Caller`, sends `/_lendisk/` to the `control.Server` and
+  the caller (the resolved peer's node ID and role; `bridge.RolesIn`)
+  in the request context as a `control.Caller`, sends `/_lendisk/` to the `control.Server` and
   everything else to the S3 handler (#14). A refusal is a JSON error
   on the control path and S3 `AccessDenied` XML elsewhere; a failed
   lookup is a 503, never an admission. The `IAMService` repeats the
@@ -2598,7 +2676,11 @@ capture decorator, so nothing stands between that and posix (#62).
   refused, and so is an `Authorization` header in any scheme but
   `AWS4-HMAC-SHA256` (SigV2's `AWS key:sig` included) and a request
   whose header and query name two different keys
-  (`bridge.AccessKeyOf`, `Bridge.TunnelS3Handler`). The control API takes the borrower from the context, never
+  (`bridge.AccessKeyOf`, `Bridge.TunnelS3Handler`). A friend dials
+  with its dial key (ID-1), which the middleware resolves to the
+  friend's node ID before anything acts on it; "the peer key" here is
+  that node ID, so the access key and the per-pair secret stay keyed
+  by node ID and a request signed with the dial key is refused. The control API takes the borrower from the context, never
   from a parameter. `redeem` is the one call whose connection is not
   the friend's own key; the friend's key comes from its address and is
   accepted only with the key-agreement proof of §3.2 (PEER-2).
@@ -2618,9 +2700,11 @@ capture decorator, so nothing stands between that and posix (#62).
   unexpired invite, `redeem` answers a proven key that is already a
   friend with that friendship's terms (§3.2, #56); every other key
   finds a used invite used.
-- **SEC-14** `DisablePresharedKey` is set and `Key` is the identity's
-  WireGuard key (ID-1), so the `tc…` address is a function of the
-  public key and the bootstrap region only. The address embeds the
+- **SEC-14** `DisablePresharedKey` is set and the `Server`'s `Key` is
+  the identity's WireGuard key (ID-1), so the `tc…` address is a
+  function of the public key and the bootstrap region only. The dial
+  key that clients use is in no address; a friend learns it in the
+  redeem, bound by the proof (PEER-2). The address embeds the
   region's relay nodes, not just its ID (Q-Q), so the whole
   `tailcfg.DERPRegion` is chosen once (the `tunnel.region` setting, or
   by latency when unset) and saved in `lendisk.db`, never in the config
@@ -2646,8 +2730,8 @@ capture decorator, so nothing stands between that and posix (#62).
   clears the hook's cache, cancels the contexts of in-flight requests
   from that key and closes its connections (the bridge tracks them per
   key, including the proxied half to `gw.sock`), and, when no
-  relationship is left, calls `Server.DisconnectClient`, in that
-  order. tailcat's disconnect alone resets nothing and cuts only the
+  relationship is left, calls `Server.DisconnectClient` for both the
+  friend's node ID and its dial key, in that order. tailcat's disconnect alone resets nothing and cuts only the
   server-to-client direction: the client's packets still arrive on
   open connections for some seconds, and a connection closed after
   the disconnect never tells the client (Q-Q). So lendisk closes its
@@ -3009,11 +3093,16 @@ design and disappear with it.
   also run its own). Measure their RSS with Q-M against OPS-7.
   Fallback: dial lenders on demand and close a `Client` after an idle
   period, at the cost of a fresh hole punch per replication burst.
-  A serving node that dials a friend in its own region holds two DERP
+  A serving node that dialled a friend in its own region held two DERP
   connections with one key, its server's and its client's; derpserver
-  keeps both and sends to the last writer. #18's two-node test runs
-  both nodes on one relay, restarts each mid-transfer and passes, but
-  a relayed-only friendship under load is for G-1 to watch.
+  keeps both and sends to the last writer. That stalled friendships
+  (#69): a node's own client took the packets meant for its server.
+  Since v0.16 each client dials with the dial key for its friend
+  (ID-1, §3.7), so the server and each client have a key of their own
+  at the relay, and no two connections share one: two clients to the
+  same friend never run at one relay (#52), and a dial key belongs to
+  one friend. What is left for G-1 is the cost of the engines, not the
+  key.
 - **Q-T (resolved)** REQUIREMENTS.md v0.9 made the two changes this
   design needed: EP-16 admits a store behind an S3 service the user
   names, with EP-12, EP-15, LEND-6, COMPAT-4 and scenarios 1 and 7

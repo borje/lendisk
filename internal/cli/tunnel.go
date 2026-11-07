@@ -53,8 +53,8 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 	if err != nil {
 		return nil, err
 	}
-	adm := transport.NewAdmission(func(ctx context.Context, peer identity.NodeID) (bool, error) {
-		r, err := db.PeerRole(ctx, peer.String(), a.now())
+	adm := transport.NewAdmission(func(ctx context.Context, key identity.NodeID) (bool, error) {
+		_, r, err := db.TunnelPeer(ctx, key.String(), a.now())
 		return r != state.RoleNone, err
 	}, log)
 	admit := adm.Admit
@@ -72,12 +72,9 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		<-ctx.Done()
 		ln.Close()
 	}()
-	roles := func(ctx context.Context, peer identity.NodeID) (state.Role, error) {
-		return db.PeerRole(ctx, peer.String(), a.now())
-	}
 	ctl := &control.Server{DB: db, Self: id, Changed: adm.Clear, Log: log}
 	s3 := &bridge.Late{}
-	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(roles, ctl, s3, log), log)
+	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, log), log)
 	go purgeInvites(ctx, db, adm, a.now, log)
 	log.Info("tunnel listening", "address", tc.Address(), "port", transport.Port, "region", region.RegionCode)
 	return &tunnel{Transport: tc, Admission: adm, S3: s3}, nil

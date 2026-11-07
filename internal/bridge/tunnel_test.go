@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -87,9 +88,7 @@ func startLenderS3(t *testing.T, s3 http.Handler) *lender {
 	}
 	l := &lender{db: db, self: newID(t), tun: &fakeTunnel{keys: map[string]identity.NodeID{}, ln: ln}}
 	ctl := &control.Server{DB: db, Self: l.self, Changed: func() { l.changed.Add(1) }, Log: quiet}
-	roles := func(ctx context.Context, p identity.NodeID) (state.Role, error) {
-		return db.PeerRole(ctx, p.String(), time.Now())
-	}
+	roles := RolesIn(db, time.Now)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
 	go func() { done <- ServeTunnel(ctx, ln, l.tun.peerOf, TunnelHandler(roles, ctl, s3, quiet), quiet) }()
@@ -247,28 +246,35 @@ func TestRedeemBindsProvenKey(t *testing.T) {
 	bobAddr := transport.AddressOf(bob, d.Region)
 
 	// Mallory holds the invite but claims Bob's address.
-	forged, _ := control.RedeemProof(mallory, l.self.NodeID(), ik.NodeID())
-	_, err := c.Redeem(t.Context(), control.RedeemRequest{Address: bobAddr, Number: 1 << 30, RetentionSeconds: 3600, Proof: forged})
+	forged := control.RedeemRequest{Address: bobAddr, Number: 1 << 30, RetentionSeconds: 3600}
+	forged.Prove(mallory, l.self.NodeID(), ik.NodeID())
+	_, err := c.Redeem(t.Context(), forged)
 	var ce *control.CallError
 	if !errors.As(err, &ce) || ce.Status != http.StatusForbidden {
 		t.Fatalf("forged proof: %v", err)
 	}
 	// The inviting node's own address.
-	selfProof, _ := control.RedeemProof(bob, l.self.NodeID(), ik.NodeID())
-	if _, err := c.Redeem(t.Context(), control.RedeemRequest{Address: transport.AddressOf(l.self, d.Region), Number: 1, RetentionSeconds: 1, Proof: selfProof}); err == nil {
+	selfReq := control.RedeemRequest{Address: transport.AddressOf(l.self, d.Region), Number: 1, RetentionSeconds: 1}
+	selfReq.Prove(bob, l.self.NodeID(), ik.NodeID())
+	if _, err := c.Redeem(t.Context(), selfReq); err == nil {
 		t.Fatal("redeemed with the inviter's own address")
 	}
 
-	proof, _ := control.RedeemProof(bob, l.self.NodeID(), ik.NodeID())
-	resp, err := c.Redeem(t.Context(), control.RedeemRequest{Address: bobAddr, Number: 100 << 30, RetentionSeconds: 3600, Proof: proof})
+	req := control.RedeemRequest{Address: bobAddr, Number: 100 << 30, RetentionSeconds: 3600}
+	req.Prove(bob, l.self.NodeID(), ik.NodeID())
+	resp, err := c.Redeem(t.Context(), req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if resp.Number != 80<<30 || resp.RetentionSeconds != 30*24*3600 {
 		t.Fatalf("redeem answer %+v", resp)
 	}
+	// The answer carries the inviting node's dial key, proven (#69).
+	if dial, err := resp.InviterDialKey(bob, l.self.NodeID(), ik.NodeID()); err != nil || dial != l.self.DialKeyFor(bob.NodeID()).NodeID() {
+		t.Fatalf("inviter's dial key %v, %v", dial, err)
+	}
 	f, err := l.db.GetFriendship(t.Context(), bob.NodeID().String())
-	if err != nil || f.Quota() != 80<<30 || f.Address != bobAddr {
+	if err != nil || f.Quota() != 80<<30 || f.Address != bobAddr || f.DialKey != bob.DialKeyFor(l.self.NodeID()).NodeID().String() {
 		t.Fatalf("friendship %+v, %v", f, err)
 	}
 	if _, err := l.db.GetFriendship(t.Context(), ik.NodeID().String()); !errors.Is(err, state.ErrNotFound) {
@@ -278,13 +284,155 @@ func TestRedeemBindsProvenKey(t *testing.T) {
 		t.Fatalf("Changed called %d times", l.changed.Load())
 	}
 	// Replay by Mallory, proving her own address: refused.
-	mallProof, _ := control.RedeemProof(mallory, l.self.NodeID(), ik.NodeID())
-	_, err = c.Redeem(t.Context(), control.RedeemRequest{Address: transport.AddressOf(mallory, d.Region), Number: 1 << 30, RetentionSeconds: 3600, Proof: mallProof})
+	mallReq := control.RedeemRequest{Address: transport.AddressOf(mallory, d.Region), Number: 1 << 30, RetentionSeconds: 3600}
+	mallReq.Prove(mallory, l.self.NodeID(), ik.NodeID())
+	_, err = c.Redeem(t.Context(), mallReq)
 	if !errors.As(err, &ce) || ce.Status != http.StatusConflict || !strings.Contains(ce.Message, "already used") {
 		t.Fatalf("replayed redeem by another key: %v", err)
 	}
 	if _, err := l.db.GetFriendship(t.Context(), mallory.NodeID().String()); !errors.Is(err, state.ErrNotFound) {
 		t.Fatal("a replay made a friendship")
+	}
+}
+
+// #69: the dial key a redeem stores is the redeemer's, bound by its
+// proof and held by it. A third key that saw Bob's request cannot put
+// its own dial key in it, nor can Bob claim a key he does not hold, and
+// a request without a dial key is refused. Each refusal leaves no
+// friendship, and Bob's own request then succeeds.
+func TestRedeemDialKeyCannotBeSwapped(t *testing.T) {
+	d := transporttest.Start(t)
+	l := startLender(t)
+	ik, bob, mallory := newID(t), newID(t), newID(t)
+	l.addInvite(t, ik)
+	c := l.tun.client(ik)
+	bobs := control.RedeemRequest{Address: transport.AddressOf(bob, d.Region), Number: 1 << 30, RetentionSeconds: 3600}
+	if err := bobs.Prove(bob, l.self.NodeID(), ik.NodeID()); err != nil {
+		t.Fatal(err)
+	}
+	mallDial := mallory.DialKeyFor(l.self.NodeID())
+	mallDialProof, _ := control.DialProof(mallDial, l.self.NodeID(), ik.NodeID(), bob.NodeID())
+	stolen := bobs
+	stolen.DialKey, stolen.DialProof = mallDial.NodeID().String(), mallDialProof
+	unheld := bobs
+	unheld.DialKey = mallDial.NodeID().String()
+	unheld.Proof, _ = control.RedeemProof(bob, l.self.NodeID(), ik.NodeID(), mallDial.NodeID())
+	none := bobs
+	none.DialKey, none.DialProof = "", nil
+	asNodeID := bobs
+	asNodeID.DialKey = bob.NodeID().String()
+	// Mallory redeems as herself, claiming Bob's dial key with the
+	// dial_proof copied from Bob's request (review of #69): the proof
+	// names the redeemer, so it does not carry over.
+	reused := control.RedeemRequest{Address: transport.AddressOf(mallory, d.Region), Number: 1 << 30, RetentionSeconds: 3600,
+		DialKey: bobs.DialKey, DialProof: bobs.DialProof}
+	reused.Proof, _ = control.RedeemProof(mallory, l.self.NodeID(), ik.NodeID(), bob.DialKeyFor(l.self.NodeID()).NodeID())
+	// The invite key as the dial key: it is the redeem's own key.
+	asInvite := bobs
+	asInvite.DialKey = ik.NodeID().String()
+	asInvite.Proof, _ = control.RedeemProof(bob, l.self.NodeID(), ik.NodeID(), ik.NodeID())
+	asInvite.DialProof = inviteDialProof(ik, l.self.NodeID(), ik.NodeID(), bob.NodeID())
+	for name, tc := range map[string]struct {
+		req  control.RedeemRequest
+		code int
+	}{
+		"stolen proof, Mallory's dial key":         {stolen, http.StatusForbidden},
+		"a dial key Bob does not hold":             {unheld, http.StatusForbidden},
+		"no dial key":                              {none, http.StatusBadRequest},
+		"the node ID as dial key":                  {asNodeID, http.StatusBadRequest},
+		"Mallory reusing Bob's dial key and proof": {reused, http.StatusForbidden},
+		"the invite key as dial key":               {asInvite, http.StatusBadRequest},
+	} {
+		_, err := c.Redeem(t.Context(), tc.req)
+		var ce *control.CallError
+		if !errors.As(err, &ce) || ce.Status != tc.code {
+			t.Fatalf("%s: %v, want %d", name, err, tc.code)
+		}
+		if fs, _ := l.db.Friendships(t.Context()); len(fs) != 0 {
+			t.Fatalf("%s left a friendship: %+v", name, fs)
+		}
+	}
+	if _, r, err := l.db.TunnelPeer(t.Context(), mallDial.NodeID().String(), time.Now()); err != nil || r != state.RoleNone {
+		t.Fatalf("Mallory's dial key has role %q, %v", r, err)
+	}
+	if _, err := c.Redeem(t.Context(), bobs); err != nil {
+		t.Fatalf("Bob's own request after the refusals: %v", err)
+	}
+	if p, r, _ := l.db.TunnelPeer(t.Context(), bob.DialKeyFor(l.self.NodeID()).NodeID().String(), time.Now()); p != bob.NodeID().String() || r != state.RolePeer {
+		t.Fatalf("Bob's dial key names %s %q", p, r)
+	}
+}
+
+// inviteDialProof is control.DialProof by dial for the redeem of the
+// invite with inviteKey between holder and other.
+func inviteDialProof(dial *identity.Identity, other, inviteKey, holder identity.NodeID) []byte {
+	p, err := control.DialProof(dial, other, inviteKey, holder)
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
+
+// #69 review: the invited node takes the inviter's dial key only with
+// a proof by that key naming the inviter; a missing or forged proof, or
+// one made for another node, is refused.
+func TestInviterDialKeyNeedsItsProof(t *testing.T) {
+	inviter, bob, mallory, ik := newID(t), newID(t), newID(t), newID(t)
+	dial := inviter.DialKeyFor(bob.NodeID())
+	good := control.RedeemResponse{DialKey: dial.NodeID().String(), DialProof: inviteDialProof(dial, bob.NodeID(), ik.NodeID(), inviter.NodeID())}
+	if got, err := good.InviterDialKey(bob, inviter.NodeID(), ik.NodeID()); err != nil || got != dial.NodeID() {
+		t.Fatalf("a proven dial key: %v, %v", got, err)
+	}
+	missing := good
+	missing.DialProof = nil
+	forged := good
+	forged.DialProof = inviteDialProof(mallory, bob.NodeID(), ik.NodeID(), inviter.NodeID())
+	other := good
+	other.DialProof = inviteDialProof(dial, bob.NodeID(), ik.NodeID(), mallory.NodeID())
+	for name, r := range map[string]control.RedeemResponse{"missing": missing, "forged": forged, "naming another node": other} {
+		if _, err := r.InviterDialKey(bob, inviter.NodeID(), ik.NodeID()); err == nil {
+			t.Errorf("a %s proof was accepted", name)
+		}
+	}
+	// A proof for another redeemer does not carry over.
+	if _, err := good.InviterDialKey(mallory, inviter.NodeID(), ik.NodeID()); err == nil {
+		t.Error("a proof made for Bob was accepted by Mallory")
+	}
+}
+
+// SEC-12 (#69): a friend's connection on its dial key is answered for
+// the friend: the caller is its node ID. Once the friendship is
+// removed, the dial key is refused like any stranger's.
+func TestDialKeySpeaksForTheFriendUntilRemoved(t *testing.T) {
+	var seen atomic.Value
+	s3 := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _ := control.CallerFrom(r.Context())
+		seen.Store(c)
+		w.WriteHeader(http.StatusOK)
+	})
+	l := startLenderS3(t, s3)
+	friend := newID(t)
+	if err := l.db.AddFriendship(t.Context(), state.Friendship{Peer: friend.NodeID().String(), DialKey: friend.DialKeyFor(l.self.NodeID()).NodeID().String(),
+		OwnNumber: 1, PeerNumber: 1, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	c := l.tun.client(friend.DialKeyFor(l.self.NodeID()))
+	if v, err := c.Version(t.Context()); err != nil || v.Protocol != control.Protocol {
+		t.Fatalf("version on the dial key: %+v %v", v, err)
+	}
+	if got := status(t, c, "GET", "/"); got != http.StatusOK {
+		t.Fatalf("S3 on the dial key: %d", got)
+	}
+	if got, _ := seen.Load().(control.Caller); got.Peer != friend.NodeID() || got.Role != state.RolePeer {
+		t.Fatalf("caller %+v; want the friend's node ID", got)
+	}
+	if _, err := l.db.ExecContext(t.Context(), `DELETE FROM friendship`); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range everyRequest {
+		if got := status(t, c, r.method, r.path); got != http.StatusForbidden {
+			t.Errorf("%s %s with a removed friend's dial key: %d, want 403", r.method, r.path, got)
+		}
 	}
 }
 
@@ -298,7 +446,7 @@ func TestRedeemRetryBySameKeyAnswersSameTerms(t *testing.T) {
 	l.addInvite(t, ik)
 	c := l.tun.client(ik)
 	req := control.RedeemRequest{Address: transport.AddressOf(bob, d.Region), Number: 100 << 30, RetentionSeconds: 3600}
-	req.Proof, _ = control.RedeemProof(bob, l.self.NodeID(), ik.NodeID())
+	req.Prove(bob, l.self.NodeID(), ik.NodeID())
 	first, err := c.Redeem(t.Context(), req)
 	if err != nil {
 		t.Fatal(err)
@@ -307,7 +455,7 @@ func TestRedeemRetryBySameKeyAnswersSameTerms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retry by the redeeming key: %v", err)
 	}
-	if again != first {
+	if !reflect.DeepEqual(again, first) {
 		t.Fatalf("retry answered %+v, first %+v", again, first)
 	}
 	if fs, _ := l.db.Friendships(t.Context()); len(fs) != 1 {

@@ -84,6 +84,10 @@ func (s *Server) method(w http.ResponseWriter, r *http.Request, m string) bool {
 // that stores the friendship, and the invite key's connection is closed
 // after the answer (SEC-13).
 //
+// The redeemer's dial key (#69) is bound by its proof and proven by
+// DialProof, and stored on the friendship; the answer carries this
+// node's dial key with its own DialProof.
+//
 // The proven key may have lost the answer (#51, #56): if it is a friend
 // already, any unexpired invite answers it with that friendship's terms
 // (state.RedeemInvite). The proof binds the invite key of this
@@ -112,9 +116,32 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 		Error(w, http.StatusBadRequest, "redeem: number and retention must be positive")
 		return
 	}
-	want, err := RedeemProof(s.Self, friend, c.Peer)
+	if req.DialKey == "" {
+		Error(w, http.StatusBadRequest, "redeem: no dial key: upgrade lendisk on the redeeming node")
+		return
+	}
+	dial, err := identity.ParseNodeID(req.DialKey)
+	switch {
+	case err != nil:
+		Error(w, http.StatusBadRequest, "redeem: dial key: "+err.Error())
+		return
+	case dial == friend || dial == s.Self.NodeID() || dial == s.Self.DialKeyFor(friend).NodeID() || dial == c.Peer:
+		Error(w, http.StatusBadRequest, "redeem: the dial key is a node ID, the invite key or this node's dial key")
+		return
+	}
+	want, err := RedeemProof(s.Self, friend, c.Peer, dial)
 	if err != nil || !hmac.Equal(want, req.Proof) {
-		Error(w, http.StatusForbidden, "redeem: the proof does not match the address's key")
+		Error(w, http.StatusForbidden, "redeem: the proof does not match the address's key and the dial key")
+		return
+	}
+	if !checkDialProof(s.Self, dial, c.Peer, friend, req.DialProof) {
+		Error(w, http.StatusForbidden, "redeem: the dial key's proof does not match the dial key")
+		return
+	}
+	ownDial := s.Self.DialKeyFor(friend)
+	dialProof, err := DialProof(ownDial, friend, c.Peer, s.Self.NodeID())
+	if err != nil {
+		Error(w, http.StatusInternalServerError, "redeem failed on the inviting node; try again")
 		return
 	}
 	f, err := s.DB.RedeemInvite(r.Context(), c.Peer.String(), state.Friendship{
@@ -122,6 +149,7 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 		Address:       req.Address,
 		PeerNumber:    req.Number,
 		PeerRetention: time.Duration(req.RetentionSeconds) * time.Second,
+		DialKey:       dial.String(),
 	}, s.now())
 	switch {
 	case errors.Is(err, state.ErrInviteSpent):
@@ -129,6 +157,9 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 		return
 	case errors.Is(err, state.ErrExists):
 		Error(w, http.StatusConflict, "you are already friends with this node")
+		return
+	case errors.Is(err, state.ErrDialKeyTaken):
+		Error(w, http.StatusConflict, "redeem: the dial key already names another friend of this node")
 		return
 	case err != nil:
 		s.Log.Error("redeem: storing the friendship failed", "err", err)
@@ -139,7 +170,8 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 		s.Changed()
 	}
 	s.Log.Info("invite redeemed", "peer", f.Peer, "quota", f.Quota())
-	writeJSON(w, http.StatusOK, RedeemResponse{Number: f.OwnNumber, RetentionSeconds: int64(f.OwnRetention / time.Second)})
+	writeJSON(w, http.StatusOK, RedeemResponse{Number: f.OwnNumber, RetentionSeconds: int64(f.OwnRetention / time.Second),
+		DialKey: ownDial.NodeID().String(), DialProof: dialProof})
 }
 
 // Error writes a control API error.

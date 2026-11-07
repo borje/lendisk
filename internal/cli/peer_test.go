@@ -534,16 +534,20 @@ func TestThirdKeyWithNewInviteRefused(t *testing.T) {
 	aKey, _ := transport.KeyOf(inv2.Address)
 	bAddr, cAddr, dAddr := b.status().Node.Address, c.status().Node.Address, d.status().Node.Address
 	bID, cID, dID := b.identity(), c.identity(), d.identity()
-	proof := func(self *identity.Identity, invKey identity.NodeID) []byte {
-		p, err := control.RedeemProof(self, aKey, invKey)
-		if err != nil {
+	proof := func(self *identity.Identity, invKey identity.NodeID) control.RedeemRequest {
+		var r control.RedeemRequest
+		if err := r.Prove(self, aKey, invKey); err != nil {
 			t.Fatal(err)
 		}
-		return p
+		return r
 	}
-	redeem := func(cl *control.Client, addr string, proof []byte) error {
-		_, err := cl.Redeem(t.Context(), control.RedeemRequest{Address: addr, Number: 1 << 30,
-			RetentionSeconds: 86400, Proof: proof})
+	// unproven names self's dial key and proves nothing.
+	unproven := func(self *identity.Identity) control.RedeemRequest {
+		return control.RedeemRequest{DialKey: self.DialKeyFor(aKey).NodeID().String()}
+	}
+	redeem := func(cl *control.Client, addr string, r control.RedeemRequest) error {
+		r.Address, r.Number, r.RetentionSeconds = addr, 1<<30, 86400
+		_, err := cl.Redeem(t.Context(), r)
 		return err
 	}
 	refused := func(what string, err error) {
@@ -556,12 +560,12 @@ func TestThirdKeyWithNewInviteRefused(t *testing.T) {
 	viaInvite := tunnelClient(t, key2, inv2.Address)
 	refused("C as B, its own proof", redeem(viaInvite, bAddr, proof(cID, key2.NodeID())))
 	refused("C as B, B's proof of the first invite", redeem(viaInvite, bAddr, proof(bID, key1.NodeID())))
-	refused("C as B, no proof", redeem(viaInvite, bAddr, nil))
+	refused("C as B, no proof", redeem(viaInvite, bAddr, unproven(cID)))
 
 	viaD := tunnelClient(t, dID, inv2.Address)
 	refused("D's own key as B", redeem(viaD, bAddr, proof(dID, dID.NodeID())))
 	refused("D's own key as C", redeem(viaD, cAddr, proof(dID, dID.NodeID())))
-	refused("D's own key, no proof", redeem(viaD, dAddr, nil))
+	refused("D's own key, no proof", redeem(viaD, dAddr, unproven(dID)))
 	refused("D's own key for itself", redeem(viaD, dAddr, proof(dID, dID.NodeID())))
 
 	if len(a.peers()) != 2 {

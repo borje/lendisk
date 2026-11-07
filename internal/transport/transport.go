@@ -14,6 +14,12 @@
 //     Admission.Clear, so a key refused before is looked up again.
 //   - Close an accepted connection whose PeerOf fails before reading
 //     from it (SEC-12).
+//   - A node serves with its identity key and dials each friend with
+//     its dial key for that friend (identity.DialKeyFor, #69). PeerOf
+//     names the key a connection authenticated with, which for a friend
+//     is its dial key: resolve it with state.DB.TunnelPeer before acting
+//     for anyone, and admit with the same lookup. To drop a friend,
+//     Disconnect both its keys.
 //   - The address is a pure function of the identity key and the saved
 //     DERP region (SEC-14). EnsureRegion chooses the region once and
 //     saves it in lendisk.db; never pick one per start.
@@ -40,8 +46,8 @@ type Transport interface {
 	// Listen starts serving the tunnel port. It fails with
 	// ErrNoAdmission when Admit was not given a function.
 	Listen(ctx context.Context) (net.Listener, error)
-	// Dial connects to a friend's tunnel port. addr is the friend's
-	// address; it must name peer's key.
+	// Dial connects to a friend's tunnel port, with this node's dial
+	// key. addr is the friend's address; it must name peer's key.
 	Dial(ctx context.Context, peer identity.NodeID, addr string) (net.Conn, error)
 	// PeerOf returns the key that authenticated an accepted connection.
 	PeerOf(c net.Conn) (identity.NodeID, error)

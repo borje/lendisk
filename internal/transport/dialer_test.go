@@ -3,8 +3,10 @@ package transport
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -779,6 +781,162 @@ func TestCloseReleasesTheLockBeforeClosingTailcat(t *testing.T) {
 		}
 		if locked > 0 {
 			t.Fatalf("%s: Close held its lock across %d of %d tailcat closes", tc.name, locked, calls)
+		}
+	}
+}
+
+// #69: a friend that refuses this node (its lendisk.db was lost) and
+// then admits it again (the friendship is restored by a one-shot
+// command, so no Clear) is reached again without restarting the
+// dialler: within DeniedFor, after which the friend asks its database
+// again, plus one round of the transport's check of its client.
+func TestRefusedThenAdmittedFriendIsReachedAgain(t *testing.T) {
+	d := transporttest.Start(t)
+	srvID, me := newID(t), newID(t)
+	var friends atomic.Bool
+	friends.Store(true)
+	var mu sync.Mutex
+	now := time.Now()
+	adm := NewAdmission(func(context.Context, identity.NodeID) (bool, error) {
+		return friends.Load(), nil
+	}, quiet)
+	adm.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	serve := func() (*Tailcat, *listener) {
+		srv := newTailcat(t, srvID, d)
+		srv.Admit(adm.Admit)
+		return srv, listen(t, srv)
+	}
+	srv, l := serve()
+	dl := newTailcat(t, me, d)
+	dial := func(timeout time.Duration) error {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		c, err := dl.Dial(ctx, srvID.NodeID(), srv.Address())
+		if err == nil {
+			c.Close()
+		}
+		return err
+	}
+	if err := dial(20 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	<-l.conns
+
+	// The friend loses its database and restarts: it refuses us.
+	friends.Store(false)
+	srv.Close()
+	srv, l = serve()
+	for i := range 3 {
+		if err := dial(5 * time.Second); err == nil {
+			t.Fatalf("dial %d reached a friend that refuses us", i)
+		}
+	}
+
+	// The friendship is restored, and the friend's rejection expires.
+	friends.Store(true)
+	mu.Lock()
+	now = now.Add(DeniedFor)
+	mu.Unlock()
+	deadline := time.Now().Add(probeTimeout + quietFor)
+	var err error
+	for {
+		if err = dial(5 * time.Second); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the friend that admits us again is not reached: %v", err)
+		}
+	}
+	select {
+	case c := <-l.conns:
+		c.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("no connection accepted after the friend admitted us")
+	}
+}
+
+// #69, as the daemons run it: each node serves and dials its friend
+// with one transport at one relay. With one key for both, the relay
+// gave the server's packets to the node's own client, the last to
+// write, which dropped them: B could not reach A once A had dialled B,
+// and two failing clients kept each other failing. With a dial key for
+// the client, B loses its database and restarts refusing A, which keeps
+// dialling it; once they are friends again, both dial each other, and
+// each reaches the other without a restart.
+func TestRefusedThenAdmittedFriendsReachEachOther(t *testing.T) {
+	d := transporttest.Start(t)
+	aID, bID := newID(t), newID(t)
+	var bKnowsA atomic.Bool
+	bKnowsA.Store(true)
+	a := newTailcat(t, aID, d)
+	a.Admit(func(p identity.NodeID) bool { return p == bID.DialKeyFor(aID.NodeID()).NodeID() })
+	la := listen(t, a)
+	serveB := func() (*Tailcat, *listener) {
+		b := newTailcat(t, bID, d)
+		b.Admit(func(p identity.NodeID) bool { return p == aID.DialKeyFor(bID.NodeID()).NodeID() && bKnowsA.Load() })
+		return b, listen(t, b)
+	}
+	b, lb := serveB()
+	dial := func(from, to *Tailcat, peer identity.NodeID, timeout time.Duration) error {
+		ctx, cancel := context.WithTimeout(t.Context(), timeout)
+		defer cancel()
+		c, err := from.Dial(ctx, peer, to.Address())
+		if err == nil {
+			c.Close()
+		}
+		return err
+	}
+	drain := func(l *listener) {
+		for {
+			select {
+			case c := <-l.conns:
+				c.Close()
+			default:
+				return
+			}
+		}
+	}
+	if err := dial(a, b, bID.NodeID(), 20*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := dial(b, a, aID.NodeID(), 20*time.Second); err != nil {
+		t.Fatalf("B cannot reach A after A dialled B: %v", err)
+	}
+
+	// B loses its database and restarts: it refuses A, and dials no one.
+	bKnowsA.Store(false)
+	b.Close()
+	b, lb = serveB()
+	for i := range 3 {
+		if err := dial(a, b, bID.NodeID(), 5*time.Second); err == nil {
+			t.Fatalf("dial %d reached a friend that refuses us", i)
+		}
+	}
+
+	// Friends again: each dials the other, as the manifest pushers and
+	// replication do.
+	bKnowsA.Store(true)
+	drain(la)
+	drain(lb)
+	deadline := time.Now().Add(probeTimeout + quietFor)
+	reach := func(name string, from, to *Tailcat, peer identity.NodeID, done chan<- error) {
+		for {
+			err := dial(from, to, peer, 5*time.Second)
+			if err == nil || time.Now().After(deadline) {
+				if err != nil {
+					err = fmt.Errorf("%s: %w", name, err)
+				}
+				done <- err
+				return
+			}
+		}
+	}
+	done := make(chan error, 2)
+	go reach("A to B", a, b, bID.NodeID(), done)
+	go reach("B to A", b, a, aID.NodeID(), done)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatalf("not reached after being friends again: %v", err)
 		}
 	}
 }

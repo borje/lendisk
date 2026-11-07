@@ -6,6 +6,9 @@ import (
 	"testing"
 )
 
+// dialVector is the test phrase's dial key for the all-zero node ID.
+const dialVector = "3gzxeblrqbx5l37n5fiaamohptvjt2zindazckha5hdtgfvmf5eteio3"
+
 var sealedForm = regexp.MustCompile(`^s[a-z2-7]{26}$`)
 
 // SEC-16 AC (naming half): the sealed name is a valid S3 bucket name that
@@ -82,5 +85,42 @@ func TestPairSecretIsSymmetric(t *testing.T) {
 	}
 	if _, err := a.S3Secret(NodeID{}); err == nil {
 		t.Fatal("a key agreement with the all-zero key was accepted")
+	}
+}
+
+// ID-1 (#69): a node dials each friend with its own key, derived from
+// the identity key and the friend's node ID, so the phrase and the
+// friend list recover it; it is not the identity key, is the same on
+// every derivation, differs between friends and between identities,
+// and is fixed by a vector.
+func TestDialKeyPerFriendIsDerivedAndDistinct(t *testing.T) {
+	a, err := FromPhrase(vector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, _ := NewPhrase()
+	other, _ := FromPhrase(p)
+	var friend NodeID // the all-zero ID, for the vector
+	d := a.DialKeyFor(friend)
+	if d.NodeID() == a.NodeID() {
+		t.Fatal("the dial key is the identity key")
+	}
+	again, _ := FromPhrase(vector)
+	if again.DialKeyFor(friend).NodeID() != d.NodeID() {
+		t.Fatal("the same phrase gave another dial key")
+	}
+	if a.DialKeyFor(other.NodeID()).NodeID() == d.NodeID() {
+		t.Fatal("two friends share a dial key")
+	}
+	if other.DialKeyFor(friend).NodeID() == d.NodeID() {
+		t.Fatal("two identities gave the same dial key")
+	}
+	if k := d.PrivateKey().Bytes(); k[0]&7 != 0 || k[31]&128 != 0 || k[31]&64 == 0 {
+		t.Fatal("dial key not clamped")
+	}
+	// A change to the derivation would leave every friend admitting a
+	// key this node no longer dials with.
+	if got := d.NodeID().String(); got != dialVector {
+		t.Fatalf("dial key of the test phrase is %s; the derivation changed", got)
 	}
 }

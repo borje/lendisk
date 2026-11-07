@@ -295,3 +295,79 @@ func TestFriendshipsListsOldRows(t *testing.T) {
 		t.Fatalf("friendships %+v", fs)
 	}
 }
+
+// SEC-10, SEC-12 (#69): a friend's dial key is admitted with exactly the
+// friend's rights and names the friend; its identity key still does. An
+// invite key names itself. Removing the friendship refuses both keys.
+func TestTunnelPeerMapsDialKeyToFriend(t *testing.T) {
+	ctx := context.Background()
+	db := openPeers(t)
+	now := time.Unix(1_800_000_000, 0)
+	if err := db.AddFriendship(ctx, Friendship{Peer: "bob", DialKey: "bobdial", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddInvite(ctx, Invite{Key: "ik", Number: 1, Retention: time.Hour, ExpiresAt: now.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := db.GetFriendship(ctx, "bob"); f.DialKey != "bobdial" {
+		t.Fatalf("stored dial key %q", f.DialKey)
+	}
+	for _, c := range []struct{ key, peer string }{{"bob", "bob"}, {"bobdial", "bob"}} {
+		peer, role, err := db.TunnelPeer(ctx, c.key, now)
+		if err != nil || peer != c.peer || role != RolePeer {
+			t.Fatalf("TunnelPeer(%s) = %q %q %v", c.key, peer, role, err)
+		}
+	}
+	if peer, role, _ := db.TunnelPeer(ctx, "ik", now); peer != "ik" || role != RoleInvite {
+		t.Fatalf("invite key: %q %q", peer, role)
+	}
+	if _, role, _ := db.TunnelPeer(ctx, "stranger", now); role != RoleNone {
+		t.Fatalf("stranger: %q", role)
+	}
+	// The dial key is not an S3 account: PeerRole reads node IDs only.
+	if r, _ := db.PeerRole(ctx, "bobdial", now); r != RoleNone {
+		t.Fatalf("PeerRole of a dial key = %q", r)
+	}
+	// A dial key is one friend's: a second friend cannot claim it, nor a
+	// friend's node ID.
+	for _, f := range []Friendship{{Peer: "carol", DialKey: "bobdial"}, {Peer: "carol", DialKey: "bob"}} {
+		if err := db.AddFriendship(ctx, f); !errors.Is(err, ErrDialKeyTaken) {
+			t.Fatalf("carol with dial key %s: %v", f.DialKey, err)
+		}
+	}
+	mustExec(t, db, `DELETE FROM friendship WHERE peer_key = 'bob'`)
+	for _, k := range []string{"bob", "bobdial"} {
+		if _, role, err := db.TunnelPeer(ctx, k, now); err != nil || role != RoleNone {
+			t.Fatalf("removed friend's key %s: %q %v", k, role, err)
+		}
+	}
+}
+
+// PEER-2 retry (#51, #69): a redeem again stores the friend's dial key
+// as its latest report, and a dial key that is another friend's is
+// refused.
+func TestRedeemStoresDialKey(t *testing.T) {
+	ctx := context.Background()
+	db := openPeers(t)
+	now := time.Unix(1_800_000_000, 0)
+	for _, k := range []string{"ik1", "ik2", "ik3"} {
+		if err := db.AddInvite(ctx, Invite{Key: k, Number: 1, Retention: time.Hour, ExpiresAt: now.Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.RedeemInvite(ctx, "ik1", Friendship{Peer: "bob", DialKey: "d1", PeerNumber: 1, PeerRetention: time.Hour}, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RedeemInvite(ctx, "ik2", Friendship{Peer: "bob", DialKey: "d2", PeerNumber: 1, PeerRetention: time.Hour}, now); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := db.GetFriendship(ctx, "bob"); f.DialKey != "d2" {
+		t.Fatalf("dial key after the second redeem %q", f.DialKey)
+	}
+	if _, err := db.RedeemInvite(ctx, "ik3", Friendship{Peer: "carol", DialKey: "d2", PeerNumber: 1, PeerRetention: time.Hour}, now); !errors.Is(err, ErrDialKeyTaken) {
+		t.Fatalf("carol claiming bob's dial key: %v", err)
+	}
+	if _, err := db.GetFriendship(ctx, "carol"); !errors.Is(err, ErrNotFound) {
+		t.Fatal("a refused dial key left a friendship")
+	}
+}
