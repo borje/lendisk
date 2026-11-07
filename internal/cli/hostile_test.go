@@ -108,6 +108,32 @@ type hostile struct {
 	// close drops the attacker's tunnel client, so its key can dial
 	// another node: two clients with one key displace each other.
 	close func()
+	// respell, if set, rewrites the signed Authorization header.
+	respell func(string) string
+}
+
+// respelled is h on the same connection, rewriting its Authorization
+// header with f after signing.
+func (h *hostile) respelled(label string, f func(string) string) *hostile {
+	c := *h
+	c.label, c.respell = label, f
+	return &c
+}
+
+// respellings write the access key in an Authorization header in ways
+// versitygw still reads as that key: it removes every whitespace
+// character after the scheme (#15 review).
+func respellings(access string) map[string]func(string) string {
+	half := len(access) / 2
+	return map[string]func(string) string{
+		"Credential =": func(h string) string { return strings.Replace(h, "Credential=", "Credential =", 1) },
+		"a space in the key": func(h string) string {
+			return strings.Replace(h, access, access[:half]+" "+access[half:], 1)
+		},
+		"a tab in the key": func(h string) string {
+			return strings.Replace(h, access, access[:half]+"\t"+access[half:], 1)
+		},
+	}
 }
 
 // attacker dials target at addr with key and signs S3 as access with
@@ -198,6 +224,10 @@ func (h *hostile) send(a attack) reply {
 		if err := v4.NewSigner().SignHTTP(ctx, aws.Credentials{AccessKeyID: h.access, SecretAccessKey: h.secret}, req, payload,
 			"s3", "us-east-1", time.Now()); err != nil {
 			h.t.Fatal(err)
+		}
+		if h.respell != nil {
+			// The header is not signed; versitygw reads it either way.
+			req.Header.Set("Authorization", h.respell(req.Header.Get("Authorization")))
 		}
 	}
 	resp, err := h.hc.Do(req)

@@ -2,57 +2,42 @@ package bridge
 
 import (
 	"net/http"
-	"strings"
 	"sync/atomic"
 
 	"github.com/versity/versitygw/s3err"
 
 	"github.com/borje/lendisk/internal/control"
+	"github.com/borje/lendisk/internal/gateway"
 )
 
 // AccessKeyOf returns the access key a SigV4 request names, read without
-// verifying anything: from the Authorization header's Credential= or a
+// verifying anything and exactly as versitygw reads it
+// (gateway.ReadCredentials): from the Authorization header or a
 // presigned URL's X-Amz-Credential. It returns false when the request
-// has neither, or names two different keys.
+// has neither, names two different keys, or carries a credential that
+// cannot be read that way.
 func AccessKeyOf(r *http.Request) (string, bool) {
-	var keys []string
-	if h := r.Header.Get("Authorization"); h != "" {
-		k, ok := headerAccessKey(h)
-		if !ok {
-			return "", false
-		}
-		keys = append(keys, k)
-	}
-	if q := r.URL.Query(); q.Has("X-Amz-Credential") {
-		k, _, _ := strings.Cut(q.Get("X-Amz-Credential"), "/")
-		keys = append(keys, k)
-	}
-	if len(keys) == 0 || keys[0] == "" {
+	c := credentialsOf(r)
+	if !c.Readable || len(c.Keys) == 0 || c.Keys[0] == "" {
 		return "", false
 	}
-	for _, k := range keys[1:] {
-		if k != keys[0] {
+	for _, k := range c.Keys[1:] {
+		if k != c.Keys[0] {
 			return "", false
 		}
 	}
-	return keys[0], true
+	return c.Keys[0], true
 }
 
-// headerAccessKey reads Credential=<key>/… from a SigV4 Authorization
-// header. Any other scheme (SigV2's "AWS key:sig") is not a credential
-// form lendisk accepts on the tunnel.
-func headerAccessKey(h string) (string, bool) {
-	scheme, rest, ok := strings.Cut(h, " ")
-	if !ok || scheme != "AWS4-HMAC-SHA256" {
-		return "", false
-	}
-	for _, part := range strings.Split(rest, ",") {
-		if v, ok := strings.CutPrefix(strings.TrimSpace(part), "Credential="); ok {
-			k, _, _ := strings.Cut(v, "/")
-			return k, k != ""
+// credentialsOf reads r's credentials (gateway.ReadCredentials).
+func credentialsOf(r *http.Request) gateway.Credentials {
+	var query [][2]string
+	for k, vs := range r.URL.Query() {
+		for _, v := range vs {
+			query = append(query, [2]string{k, v})
 		}
 	}
-	return "", false
+	return gateway.ReadCredentials(r.Header.Values("Authorization"), query)
 }
 
 // TunnelS3Handler serves S3 on the tunnel port behind TunnelHandler

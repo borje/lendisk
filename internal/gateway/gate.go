@@ -117,7 +117,11 @@ func refuse(r request) string {
 	case r.method == http.MethodPost && !r.has("delete") && isBucketPath(decoded):
 		return "lendisk: browser-form uploads are not offered; use PUT"
 	}
-	if r.fromBorrower() {
+	creds := ReadCredentials(r.all("Authorization"), r.query)
+	if !creds.Readable {
+		return "lendisk: the request's credential cannot be read; sign it with SigV4"
+	}
+	if creds.Friend {
 		if err != nil {
 			return "lendisk: the request path is malformed"
 		}
@@ -126,50 +130,15 @@ func refuse(r request) string {
 	return ""
 }
 
-// fromBorrower reports whether any credential the request names is a
-// node ID: in a SigV4 or SigV2 Authorization header, or a presigned
-// URL's query of either version. Read without verifying anything;
-// versitygw verifies the one it uses.
-func (r request) fromBorrower() bool { return NamesFriend(r.get("Authorization"), r.query) }
-
-// NamesFriend reports whether any credential a request names is a node
-// ID, a friend's access key (NET-7a): in its Authorization header (SigV4
-// Credential= or SigV2 "AWS key:sig") or its query (a presigned URL's
-// X-Amz-Credential or AWSAccessKeyId). Nothing is verified. The gate uses
-// it to apply the borrower list, and the bridge to refuse a friend's
-// credential on loopback and LAN listeners.
-func NamesFriend(authorization string, query [][2]string) bool {
-	var keys []string
-	if h := authorization; h != "" {
-		scheme, rest, _ := strings.Cut(h, " ")
-		switch scheme {
-		case "AWS4-HMAC-SHA256":
-			for _, part := range strings.Split(rest, ",") {
-				if v, ok := strings.CutPrefix(strings.TrimSpace(part), "Credential="); ok {
-					k, _, _ := strings.Cut(v, "/")
-					keys = append(keys, k)
-				}
-			}
-		case "AWS":
-			k, _, _ := strings.Cut(rest, ":")
-			keys = append(keys, k)
+// all is every value of header h, ignoring case.
+func (r request) all(h string) []string {
+	var out []string
+	for _, kv := range r.header {
+		if strings.EqualFold(kv[0], h) {
+			out = append(out, kv[1])
 		}
 	}
-	for _, kv := range query {
-		switch {
-		case strings.EqualFold(kv[0], "X-Amz-Credential"):
-			k, _, _ := strings.Cut(kv[1], "/")
-			keys = append(keys, k)
-		case kv[0] == "AWSAccessKeyId":
-			keys = append(keys, kv[1])
-		}
-	}
-	for _, k := range keys {
-		if _, ok := borrowerOf(strings.TrimSpace(k)); ok {
-			return true
-		}
-	}
-	return false
+	return out
 }
 
 // refusedHeaders are headers that would make an admitted op do something

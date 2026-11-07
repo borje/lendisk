@@ -152,6 +152,18 @@ func TestHostilePeer(t *testing.T) {
 		} {
 			w.mustRefuse(s3Attacks(bSealed, "data/ab/x", nil))
 		}
+		// B's own credential respelled with whitespace, which versitygw
+		// still reads as B's node ID: still refused everything outside
+		// the list (#15 review).
+		for name, f := range respellings(bID.NodeID().String()) {
+			w := h.respelled(h.label+", "+name, f)
+			w.mustRefuse(s3Attacks(bSealed, "data/ef/pack", isRefused))
+			// The spelling is live: versitygw authenticates it as B.
+			head := s3Attacks(bSealed, "x", func(op gateway.Op) bool { return op.Action == "s3_HeadBucket" })[0]
+			if r := w.send(head); r.status != http.StatusOK {
+				t.Errorf("%s: HeadBucket %v; the respelling is not read as B's key", w.label, r)
+			}
+		}
 		sameTree(t, h.label+" with others' credentials", before, tree(t, store))
 	}
 

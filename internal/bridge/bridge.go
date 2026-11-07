@@ -88,13 +88,13 @@ func (b *Bridge) LoopbackHandler() http.Handler {
 				Description: "lendisk: control API not served here", HTTPStatusCode: http.StatusForbidden})
 			return
 		}
-		var query [][2]string
-		for k, vs := range r.URL.Query() {
-			for _, v := range vs {
-				query = append(query, [2]string{k, v})
-			}
+		creds := credentialsOf(r)
+		if !creds.Readable {
+			writeError(w, s3err.APIError{Code: "AccessDenied", HTTPStatusCode: http.StatusForbidden,
+				Description: "lendisk: the request's credential cannot be read; sign it with SigV4"})
+			return
 		}
-		if gateway.NamesFriend(r.Header.Get("Authorization"), query) {
+		if creds.Friend {
 			b.Log.Warn("refused a friend's credential on a tool listener", "remote", r.RemoteAddr, "method", r.Method)
 			writeError(w, s3err.APIError{Code: "AccessDenied", HTTPStatusCode: http.StatusForbidden,
 				Description: "lendisk: a friend's node is served on the tunnel only, not on this listener"})

@@ -2731,8 +2731,19 @@ capture decorator, so nothing stands between that and posix (#62).
   is an allow-list of shapes, not a copy of versitygw's router. An
   object key must pass `checkKey` (nothing under `.lendisk/`, no empty,
   `.` or `..` segment), answered 400 as `Lending` answers it. The
-  borrower list applies when any credential the request names (SigV4
-  or SigV2 header, presigned query of either) is a node ID. The control
+  borrower list applies when any credential the request names is a
+  node ID, read as versitygw reads it (`gateway.ReadCredentials`):
+  versitygw v1.10.0 splits the Authorization header at its first space
+  and removes every whitespace character from each part that holds a
+  space before reading `Credential=` (`sigv4auth.ParseAuthorization`),
+  so `Credential =<id>` or a node ID with a space or tab inside is that
+  node ID to it, and to the gate. A whitespace-free spelling of any
+  `Credential=` value, a SigV2 key and every `X-Amz-Credential` are
+  checked too. A credential the gate cannot read the way versitygw does
+  (two Authorization headers, another scheme, SigV2, a malformed header
+  or `X-Amz-Credential`, an `AWSAccessKeyId`) is refused for every
+  account, never read as "no friend"; versitygw would refuse it anyway.
+  The control
   path is refused for every account both as sent and as decoded, so
   `/%5Flendisk/x` and `/_lendisk%2Fx` are refused as `/_lendisk/x` is
   (`TestGateRefusesControlPathAsFiberDecodes`). The control API
