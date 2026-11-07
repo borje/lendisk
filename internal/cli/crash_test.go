@@ -42,6 +42,7 @@ func (n *node) startProc(t *testing.T, addr string, logw io.Writer, crashAfterSt
 	cmd.Env = append(os.Environ(), envExec+"=1", fmt.Sprintf("%s=%g", envCrashAfterStore, crashAfterStore))
 	cmd.Env = append(cmd.Env, env...)
 	cmd.Stdout, cmd.Stderr = logw, logw
+	dieWithTest(cmd)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
