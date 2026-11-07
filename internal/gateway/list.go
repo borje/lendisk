@@ -16,6 +16,14 @@ import (
 // MaxListPage is the most keys one page of the NET-7 list carries.
 const MaxListPage = 1000
 
+// MaxObjectSize is the largest object S3 stores (5 TiB): a listed size
+// above it is no object a lender holds.
+const MaxObjectSize = 5 << 40
+
+// CheckKey reports whether key is one a borrower may name (SEC-5): what
+// a list from a lender may carry, too.
+func CheckKey(key string) error { return checkKey(key) }
+
 // LentObject is one key of a borrower's bucket as this lender holds it
 // (NET-7 list): its size, the SHA-256 it was stored with (REPL-10,
 // LEND-4) and, once tombstones exist (#17), when it was tombstoned.

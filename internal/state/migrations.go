@@ -313,4 +313,35 @@ var migrations = []Migration{
 			PRIMARY KEY (place, bucket)
 		);`,
 	},
+	{
+		Version: 16, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovery's verdict per key (ID-5, #29 review): what each place
+		-- listed, and which version counts. A key is held when the places
+		-- agree, or most of them do, or the user picked one; single when one
+		-- place lists it; conflict when places tie, or one place lists a
+		-- metadata key that another listed place lacks. Only the version
+		-- that counts has a queue row (seq) and acked placement rows.
+		ALTER TABLE relist ADD COLUMN seen INTEGER; -- keys and pages read so far: capped
+		CREATE TABLE listed (
+			bucket TEXT NOT NULL,
+			key    TEXT NOT NULL,
+			place  TEXT NOT NULL,
+			size   INTEGER NOT NULL,
+			sha256 TEXT NOT NULL,
+			class  TEXT NOT NULL,
+			named  INTEGER NOT NULL DEFAULT 0, -- 1: the key is named by its hash, which matched
+			PRIMARY KEY (bucket, key, place)
+		);
+		CREATE TABLE recovered_key (
+			bucket  TEXT NOT NULL,
+			key     TEXT NOT NULL,
+			verdict TEXT NOT NULL, -- held | single | conflict
+			reason  TEXT,          -- why, for status
+			sha256  TEXT,          -- the version that counts; NULL for a conflict
+			seq     INTEGER,       -- the queue row recovery made for it
+			picked  TEXT,          -- the hash the user picked (bucket resolve)
+			PRIMARY KEY (bucket, key)
+		);`,
+	},
 }

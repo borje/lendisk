@@ -134,3 +134,29 @@ func TestGlobStarMatchesAcrossSlashesQuestionMatchesOne(t *testing.T) {
 		}
 	}
 }
+
+// ID-5 (#29 review): restic names its packs, indexes and snapshots by
+// the SHA-256 of their content, so a listed hash must be the name; its
+// config and keys are not so named, nor is any generic key.
+func TestResticKeysNamedByTheirHash(t *testing.T) {
+	set, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := strings.Repeat("ab", 32)
+	r := set.Get("restic")
+	for key, want := range map[string]bool{
+		"data/ab/" + h: true, "index/" + h: true, "snapshots/" + h: true,
+		"config": false, "keys/" + h: false, "locks/" + h: false,
+	} {
+		if got := r.HashNamed(key); got != want {
+			t.Errorf("restic %s: %v, want %v", key, got, want)
+		}
+	}
+	if set.Get("generic").HashNamed("data/ab/"+h) || set.Get("none").HashNamed("index/"+h) {
+		t.Error("a generic key is named by its hash")
+	}
+	if NameHash("data/ab/"+h) != h || NameHash("config") != "config" {
+		t.Error("the name's hash is its last segment")
+	}
+}

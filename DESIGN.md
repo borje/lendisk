@@ -417,7 +417,8 @@ answer) and a last-reachable time.
   `dropping`). It is never in the manifest: after `recover` it is
   rebuilt by listing each place's copy of each sealed bucket, with the
   hash from `x-amz-meta-lendisk-sha256` (§3.10), into done queue rows
-  and `acked` placement rows (§3.1 ID-5).
+  and `acked` placement rows for the version of each key most friends
+  list, a tie being a conflict the user resolves (§3.1 ID-5).
 - Copies are moved only by the borrower's own node (P-2, PEER-11): the
   re-placement worker of §3.4.
 
@@ -1029,8 +1030,12 @@ upstream bucket is Q-V.
   Buckets are restored with new S3 credentials of their own (SEC-3:
   those are not in the manifest), printed by `bucket show`, and created
   empty in the store; nothing is downloaded (ID-6 reads on demand,
-  #30). The identity key is written last, so a `recover` that stopped
-  part way runs again on the same directories: what it wrote is kept.
+  #30). The identity key is saved after everything else recover writes
+  but `initialised_at` and the initial config file, and `recover`
+  refuses a directory holding an identity key: so a `recover` that
+  stopped before saving the key runs again on the same directories and
+  keeps what it wrote, and one that stopped after saving it has
+  restored everything, and the daemon's lister reads what it did not.
   The per-pair S3 credentials (§3.7) for every lender are derived when
   used and never written (NET-7a), and the node re-derives its dial
   key for each friend the manifest lists (§3.1 ID-1), which the friend
@@ -1073,23 +1078,73 @@ upstream bucket is Q-V.
   `placement` table (D6) and the hash index are then rebuilt from the
   control API `list` of each reachable place for each sealed bucket
   (§3.7): one paged call per bucket and place, not a request per
-  object (`recovery.Lister`). Each page is recorded in one transaction
-  (`state.RecordListed`): a key with no done row gets one (a `put`,
-  `done`, with the listed size and hash and the class its bucket's
-  profile gives it; local-only keys are skipped) and an `acked`
-  placement row at that place, sized as the place counts it, so
-  `place_use` holds what each friend holds; a key that has a row is
-  acked at the place only when the hash matches it. So the first list
-  of a key decides the version counted, and a place holding another
-  hash, or a key this node has deleted since, is not counted as
-  holding it (recover prints how many); tombstoned keys are no live
-  objects and are only counted. The lists still to read are the table
+  object (`recovery.Lister`).
+  *A friend's list is not trusted.* The control client refuses a page
+  whose keys do not rise strictly past the key it started after, or
+  whose `next` is not past them; the lister rejects, logs and counts
+  each entry with a key a borrower could not name (SEC-5's check,
+  `gateway.CheckKey`), a size below 0 or above 5 TiB, a hash that is
+  not 64 lower-case hex digits, or, for a key the bucket's profile
+  names by its hash (`hash_named`), a hash that is not the name:
+  that friend's entry for the key counts as not held, whatever order
+  the friends are listed in. Every entry and every page counts toward
+  a cap per bucket and place (10 million, `relist.seen`); a list past
+  it is abandoned with what it recorded, so a friend that lists
+  without end cannot keep recovery listing. Only the lender's
+  `NoSuchBucket` code means it holds nothing of the bucket; any other
+  refusal, a 404 from a node without the call included, is a failure
+  tried again.
+  *Which version counts* (user decision of 2026-11-07, #29 review).
+  Each page is recorded in one transaction (`state.RecordListed`):
+  every place's size and hash for each key goes in the table `listed`
+  (migration 16; local-only keys skipped, tombstoned keys only
+  counted), and the key's verdict (table `recovered_key`) is made
+  again from all places' entries: the hash most places list counts
+  (`held`); a tie between hashes is a `conflict`; a key one place
+  lists is a `single` source and counts, except a metadata or snapshot
+  key not named by its hash that another place, listed to its end,
+  lacks, which is a conflict too, since REPL-12 puts metadata at every
+  friend (a hash-named key is that object whoever holds it). The
+  verdict is made again as each further list arrives (a friend
+  returning breaks a tie 2 to 1), and whenever a list ends. Only the
+  version that counts has a queue row (`put`, `done`, with the listed
+  size, hash and the class the bucket's profile gives) and `acked`
+  placement rows, at exactly the places that list that hash, sized as
+  each place counts it, so `place_use` holds what each friend holds; a
+  conflict has neither, so no place counts as holding it, and
+  `state.KeyConflict` is what the read-through (#30) checks to refuse
+  it with the reason. A key this node has written since recovery is
+  its own: lists only add the places holding that version. `status`
+  shows the conflicts, with each friend's hash and the command that
+  picks it (`recovery.conflicts`), and, for buckets outside the
+  encryption guarantee only (EP-8: a restic or Kopia repository's MAC
+  catches a forged object), the count of single-source objects as
+  unverified (`recovery.unverified`). `lendisk bucket resolve <bucket>
+  <key> <friend>` picks that friend's version (`state.ResolveKey`):
+  it counts from then on, at every friend holding it. Restic's
+  `config` and `keys/*` are not named by their hash, so one friend's
+  stale but genuine copy is accepted; verifying them against hashes in
+  the manifest is #70 (post-v1).
+  The lists still to read are the table
   `relist` (migration 15: place, bucket, the key to resume after, the
-  last failure and failures in a row), filled by `Restore` for every
+  last failure and failures in a row; migration 16 adds `seen`),
+  filled by `Restore` for every
   friend and bucket; the last page of a list drops its row in its
   transaction, a page before it moves the resume key. A place that
   fails is skipped for the rest of the round, and `recover` says it is
-  not reachable now. A place that is offline is listed when it
+  not reachable now. When a friend did not serve its manifest,
+  `recover` warns that it may hold a newer version and names it. A
+  floor at the lender (refusing a manifest push below the stored
+  `seq`) is not possible as things stand: the lender cannot read `seq`
+  inside the sealed envelope, and putting it outside would be an
+  envelope change.
+  *Known gaps, follow-ups to file:* a list read while a write of the
+  same key is still pending here (captured, not yet done) races the
+  write; a friend can list objects this node deleted before it was
+  lost, which come back as live until tombstones (#17) let the lists
+  tell them apart; and a friend that never returns keeps its lists
+  pending for ever (backing off to an hour), with no point at which
+  recovery gives up on it. A place that is offline is listed when it
   returns: the daemon runs the same lister (every minute, a failed
   list due again after 1 min doubling to 1 h), and `status` shows the
   lists still to read (`recovery.pending`). Until then its objects
@@ -1635,7 +1690,11 @@ upstream bucket is Q-V.
   `snapshot`, `metadata` and `data`, in which `*` matches any run of
   characters, `/` included, and `?` one. A key's class is local-only,
   else snapshot, else metadata, by the first list it matches, and data
-  otherwise; a snapshot key is placed as metadata. A bucket whose
+  otherwise; a snapshot key is placed as metadata. A fifth list,
+  `hash_named`, names the keys the tool names by the SHA-256 of their
+  content as their last segment (restic: `data/*`, `index/*`,
+  `snapshots/*`; not `config` or `keys/*`), which recovery checks
+  (§3.1 ID-5). A bucket whose
   profile has no file classifies every key as data. The compiled-in
   files are `restic` and `generic`; `kopia` comes with #7. The
   decorator classifies a key at capture: a local-only key (restic
@@ -2461,15 +2520,19 @@ capture decorator, so nothing stands between that and posix (#62).
   Like `manifest` it is open to the `peer` role only and keyed by the
   resolved caller (`Caller.Peer`); no parameter names whose bucket, so
   a friend naming another's sealed name, or a bucket it never made,
-  gets 404. The index is the store itself (`gateway.LentIndex`), not a
+  gets 404 with the code `NoSuchBucket` in the error body (`code`),
+  the one answer a borrower reads as "holds nothing of it"; other 404s
+  carry no code. The index is the store itself (`gateway.LentIndex`), not a
   table in `lendisk.db`: posix lists the `lent-<id16>-<sealed>` bucket
   in key order from `after` (as both `StartAfter` and the continuation
   token, since posix reads `StartAfter` only beside one) and each key's
   hash is the `x-amz-meta-lendisk-sha256` every borrower's object
   carries (COMPAT-4), read with a local head; keys under the reserved
   prefixes (SEC-5) are left out. So it needs no second copy kept in
-  step with the store, and it survives the loss of `lendisk.db` with
-  the store. It is what `recover` (ID-5),
+  step with the store. Serving it still needs `lendisk.db`: the
+  friendship that admits the caller and the `lent_bucket` row that
+  makes the sealed name the caller's; a lender that lost its database
+  serves no list until both are back (§3.1 ID-4). It is what `recover` (ID-5),
   `import` (REPL-8) and `undelete` previews read, so none of them
   needs a request per object. The borrower replicates to a friend with
   the same replica client it uses for overflow targets, dialling

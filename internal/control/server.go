@@ -280,7 +280,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, c Caller) {
 	objs, next, err := s.Lent.List(r.Context(), c.Peer, q.Get("bucket"), q.Get("after"), limit)
 	switch {
 	case errors.Is(err, gateway.ErrNoLentBucket):
-		Error(w, http.StatusNotFound, err.Error())
+		writeJSON(w, http.StatusNotFound, errorBody{Error: err.Error(), Code: CodeNoSuchBucket})
 		return
 	case err != nil:
 		s.Log.Error("list: reading a friend's bucket failed", "peer", c.Peer.String(), "err", err)

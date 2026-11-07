@@ -221,8 +221,9 @@ func TestOfflinePlaceListedWhenItReturns(t *testing.T) {
 	if err := db.AddRelists(ctx, []string{"B", "C"}, []string{"laptop"}); err != nil {
 		t.Fatal(err)
 	}
-	objs := []control.ListObject{{Key: "config", Size: 155, SHA256: "h0"}, {Key: "data/aa/1", Size: 100, SHA256: "h1"},
-		{Key: "locks/x", Size: 5, SHA256: "hl"}, {Key: "snapshots/s1", Size: 10, SHA256: "h2"}}
+	h1, h2 := sum("pack"), sum("snapshot")
+	objs := []control.ListObject{{Key: "config", Size: 155, SHA256: sum("config")}, {Key: "data/aa/" + h1, Size: 100, SHA256: h1},
+		{Key: "locks/x", Size: 5, SHA256: sum("lock")}, {Key: "snapshots/" + h2, Size: 10, SHA256: h2}}
 	p := &pages{held: map[string][]control.ListObject{"B": objs, "C": objs}, offline: map[string]bool{"C": true},
 		sealed: self.SealedName("laptop"), t: t}
 	l := &Lister{DB: db, Self: self, Page: p.page, Now: tick, Log: quiet, Poll: 10 * time.Millisecond}
@@ -232,7 +233,7 @@ func TestOfflinePlaceListedWhenItReturns(t *testing.T) {
 		t.Fatalf("round %+v %v", rs, err)
 	}
 	for _, r := range rs {
-		if r.Place == "B" && (r.Err != nil || r.Held != 3) || r.Place == "C" && r.Err == nil {
+		if r.Place == "B" && (r.Err != nil || r.Listed != 3) || r.Place == "C" && r.Err == nil {
 			t.Fatalf("result %+v", r)
 		}
 	}

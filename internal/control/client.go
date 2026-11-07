@@ -33,6 +33,7 @@ func (c *Client) protocol() string {
 type CallError struct {
 	Status  int
 	Message string
+	Code    string // the refusal's code, if the peer named one
 }
 
 func (e *CallError) Error() string {
@@ -114,7 +115,16 @@ func (c *Client) ListPage(ctx context.Context, sealed, after string, limit int) 
 	if err := json.Unmarshal(b, &p); err != nil {
 		return p, fmt.Errorf("the peer's answer to %s is malformed: %w", ListPath, err)
 	}
-	if p.Next != "" && p.Next <= after {
+	// Keys rise strictly from after, and the next page starts past them,
+	// so a list ends however the peer answers (#29 review).
+	last := after
+	for _, o := range p.Objects {
+		if o.Key <= last {
+			return p, fmt.Errorf("the peer's list does not rise past %q (it sent %q)", last, o.Key)
+		}
+		last = o.Key
+	}
+	if p.Next != "" && p.Next <= after || p.Next != "" && len(p.Objects) > 0 && p.Next < last {
 		return p, fmt.Errorf("the peer's list does not move on from %q", after)
 	}
 	return p, nil
@@ -175,7 +185,7 @@ func (c *Client) send(ctx context.Context, method, path string, body io.Reader, 
 		if json.Unmarshal(b, &e) != nil || e.Error == "" {
 			e.Error = http.StatusText(resp.StatusCode)
 		}
-		return nil, &CallError{Status: resp.StatusCode, Message: e.Error}
+		return nil, &CallError{Status: resp.StatusCode, Message: e.Error, Code: e.Code}
 	}
 	if int64(len(b)) > max {
 		return nil, fmt.Errorf("the peer's answer to %s is over %d bytes", path, max)

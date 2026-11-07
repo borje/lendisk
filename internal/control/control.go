@@ -229,10 +229,17 @@ type VersionResponse struct {
 	Version  string `json:"version"`
 }
 
-// errorBody is every control API error.
+// errorBody is every control API error. Code, when set, names a refusal
+// the caller acts on, beside its HTTP status.
 type errorBody struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
+
+// CodeNoSuchBucket answers a list of a bucket the caller has none of at
+// the lender: the lender holds nothing of it. Any other 404 (a node
+// that lends nothing, or one without the call) is not that.
+const CodeNoSuchBucket = "NoSuchBucket"
 
 // The redeem proofs' key derivations; each distinct from every other
 // info string (identity's included).

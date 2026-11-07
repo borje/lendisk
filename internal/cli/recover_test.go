@@ -104,8 +104,14 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 
 	s3c := s3client(a.addr, own)
 	body := make([]byte, 2048)
-	for _, k := range []string{"config", "keys/k1", "index/i1", "data/aa/p1", "data/bb/p2", "snapshots/s1", "locks/l1"} {
+	// restic's layout: packs, indexes and snapshots named by their hash.
+	for _, k := range []string{"config", "keys/k1", "index/", "data/", "data/", "snapshots/", "locks/l1"} {
 		rand.Read(body)
+		if h := sha256Hex(body); k == "data/" {
+			k += h[:2] + "/" + h
+		} else if strings.HasSuffix(k, "/") {
+			k += h
+		}
 		if _, err := s3c.PutObject(t.Context(), &s3.PutObjectInput{Bucket: aws.String("laptop"), Key: aws.String(k),
 			Body: bytes.NewReader(body)}); err != nil {
 			t.Fatal(err)

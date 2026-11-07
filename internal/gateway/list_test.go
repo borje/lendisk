@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -42,6 +44,16 @@ func TestLentIndexPagesABorrowersBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx := &LentIndex{Store: be, DB: h.db}
+
+	// What lendisk keeps beside a borrower's objects in its bucket
+	// (tombstones, #17) is no key of the borrower's: not listed (SEC-5).
+	for _, k := range []string{".lendisk/tomb/config", ".LENDISK/x"} {
+		p := filepath.Join(h.store, LentName(b.NodeID(), sealed), filepath.FromSlash(k))
+		os.MkdirAll(filepath.Dir(p), 0o700)
+		if err := os.WriteFile(p, []byte("tomb"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	var got []LentObject
 	after := ""

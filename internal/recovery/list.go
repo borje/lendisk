@@ -3,12 +3,14 @@ package recovery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/borje/lendisk/internal/control"
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/profile"
@@ -41,14 +43,27 @@ type Lister struct {
 	// per failure to at most MaxBackoff (defaults 1 min and 1 h).
 	Timeout, Poll          time.Duration
 	MinBackoff, MaxBackoff time.Duration
-	Log                    *slog.Logger
+	// MaxKeys bounds one place's list of one bucket, in entries and
+	// pages read (default DefaultMaxKeys): past it the list is abandoned,
+	// so a friend that lists without end cannot keep recovery listing.
+	MaxKeys int64
+	Log     *slog.Logger
 }
+
+// DefaultMaxKeys is Lister.MaxKeys's default: far above any backup
+// repository's object count (restic's 16 MiB packs make 10 million
+// objects 160 TB).
+const DefaultMaxKeys = 10_000_000
 
 // Result is a list read in a round, whole or until it failed.
 type Result struct {
 	Place, Bucket string
 	state.ListedCount
-	Err error // nil when the list was read to its end
+	// Rejected counts entries refused: a key a borrower may not name, a
+	// size no object has, a malformed hash, or a hash that is not the
+	// name of a key named by its hash. Each is logged.
+	Rejected int
+	Err      error // nil when the list was read to its end
 }
 
 func or(d, def time.Duration) time.Duration {
@@ -84,7 +99,8 @@ func (l *Lister) Pending(ctx context.Context) (int, error) {
 
 // Round reads every list that is due, place by place. A place that
 // fails one list is not asked for its others in this round: each is
-// recorded as failed, and tried again after the backoff.
+// recorded as failed, and tried again after the backoff. A list past
+// MaxKeys is abandoned (its result says so) and not tried again.
 func (l *Lister) Round(ctx context.Context) ([]Result, error) {
 	rs, err := l.DB.Relists(ctx)
 	if err != nil {
@@ -104,15 +120,23 @@ func (l *Lister) Round(ctx context.Context) ([]Result, error) {
 			continue
 		}
 		res := Result{Place: r.Place, Bucket: r.Bucket}
+		var abandoned bool
 		if err, ok := failed[r.Place]; ok {
 			res.Err = err
 		} else {
-			res.ListedCount, res.Err = l.listOne(ctx, r, profiles)
+			abandoned, res.Err = l.listOne(ctx, r, profiles, &res)
 		}
 		if ctx.Err() != nil {
 			return out, ctx.Err()
 		}
-		if res.Err != nil {
+		switch {
+		case abandoned:
+			if err := l.DB.AbandonRelist(ctx, r.Place, r.Bucket); err != nil {
+				return out, err
+			}
+			l.logger().Warn("recovery: a place's list is longer than any list may be; abandoned",
+				"place", r.Place, "bucket", r.Bucket, "err", res.Err)
+		case res.Err != nil:
 			failed[r.Place] = res.Err
 			if err := l.DB.RelistFailed(ctx, r.Place, r.Bucket, res.Err.Error(), l.now()); err != nil {
 				return out, err
@@ -123,61 +147,127 @@ func (l *Lister) Round(ctx context.Context) ([]Result, error) {
 	return out, nil
 }
 
-// listOne reads one list from its resume point to its end.
-func (l *Lister) listOne(ctx context.Context, r state.Relist, profiles profile.Set) (state.ListedCount, error) {
-	var total state.ListedCount
+func (l *Lister) logger() *slog.Logger {
+	if l.Log == nil {
+		return slog.New(slog.DiscardHandler)
+	}
+	return l.Log
+}
+
+// errNoMoreThan is a list past MaxKeys.
+type errNoMoreThan int64
+
+func (e errNoMoreThan) Error() string {
+	return fmt.Sprintf("the place lists more than %d keys and pages; its list was abandoned", int64(e))
+}
+
+// listOne reads one list from its resume point to its end, counting in
+// res; abandoned reports a list past MaxKeys.
+func (l *Lister) listOne(ctx context.Context, r state.Relist, profiles profile.Set, res *Result) (abandoned bool, err error) {
 	f, err := l.DB.GetFriendship(ctx, r.Place)
 	if errors.Is(err, state.ErrNotFound) {
 		// No longer a friend: nothing to list there.
-		_, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, nil, "", true)
-		return total, err
+		_, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, nil, 0, "", true)
+		return false, err
 	} else if err != nil {
-		return total, err
+		return false, err
 	}
 	prof := profiles.Get("")
 	if b, err := l.DB.GetBucket(ctx, r.Bucket); err == nil {
 		prof = profiles.Get(b.Profile)
 	} else if !errors.Is(err, state.ErrNotFound) {
-		return total, err
+		return false, err
 	}
 	page := l.Page
-	var done func()
 	if page == nil {
+		var done func()
 		page, done = l.controlPage(f)
 		defer done()
 	}
-	sealed, after := l.Self.SealedName(r.Bucket), r.After
+	maxKeys := l.MaxKeys
+	if maxKeys <= 0 {
+		maxKeys = DefaultMaxKeys
+	}
+	sealed, after, seen := l.Self.SealedName(r.Bucket), r.After, r.Seen
 	for {
 		pctx, cancel := context.WithTimeout(ctx, or(l.Timeout, time.Minute))
 		p, err := page(pctx, f, sealed, after)
 		cancel()
 		var ce *control.CallError
-		if errors.As(err, &ce) && ce.Status == http.StatusNotFound {
-			// The place holds no bucket of this name: nothing of it.
+		if errors.As(err, &ce) && ce.Code == control.CodeNoSuchBucket {
+			// The place holds no bucket of this name: nothing of it. Any
+			// other refusal, 404s included, is tried again.
 			p, err = control.ListPage{}, nil
 		}
 		if err != nil {
-			return total, err
+			return false, err
+		}
+		// Every page counts, an empty one too, so a list ends.
+		seen += int64(max(len(p.Objects), 1))
+		if seen > maxKeys {
+			return true, errNoMoreThan(maxKeys)
 		}
 		objs := make([]state.Listed, 0, len(p.Objects))
+		last := after
 		for _, o := range p.Objects {
+			if o.Key <= last {
+				return false, fmt.Errorf("the place's list does not rise past %q", last)
+			}
+			last = o.Key
 			class := prof.Classify(o.Key)
 			if class == profile.LocalOnly {
 				continue // never replicated; a place should not hold it
 			}
+			if why := l.reject(prof, o); why != "" {
+				res.Rejected++
+				l.logger().Warn("recovery: a place listed an entry that cannot be right; not counted",
+					"place", r.Place, "bucket", r.Bucket, "key", o.Key, "why", why)
+				continue
+			}
 			objs = append(objs, state.Listed{Key: o.Key, Size: o.Size, SHA256: o.SHA256, Class: string(class),
-				Tombstoned: o.TombstonedAt != nil})
+				Tombstoned: o.TombstonedAt != nil, HashNamed: prof.HashNamed(o.Key)})
 		}
-		n, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, objs, p.Next, p.Next == "")
+		if p.Next != "" && (p.Next <= after || p.Next < last) {
+			return false, fmt.Errorf("the place's list does not move on from %q", after)
+		}
+		n, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, objs, max(len(p.Objects), 1), p.Next, p.Next == "")
 		if err != nil {
-			return total, err
+			return false, err
 		}
-		total.Add(n)
+		res.ListedCount.Add(n)
 		if p.Next == "" {
-			return total, nil
+			return false, nil
 		}
 		after = p.Next
 	}
+}
+
+// reject says why a listed entry cannot be a copy of the borrower's
+// object, or "" if it can.
+func (l *Lister) reject(prof *profile.Profile, o control.ListObject) string {
+	switch {
+	case gateway.CheckKey(o.Key) != nil:
+		return "a key a borrower cannot name"
+	case o.Size < 0 || o.Size > gateway.MaxObjectSize:
+		return fmt.Sprintf("size %d", o.Size)
+	case !isSHA256(o.SHA256):
+		return "not a SHA-256 in lower-case hex"
+	case prof.HashNamed(o.Key) && profile.NameHash(o.Key) != o.SHA256:
+		return "its hash is not the one its name gives"
+	}
+	return ""
+}
+
+func isSHA256(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // controlPage is the list call at f over Dial; done closes its
@@ -219,7 +309,7 @@ func (l *Lister) Run(ctx context.Context) {
 					continue
 				}
 				l.Log.Info("recovery: a place's list read", "place", r.Place, "bucket", r.Bucket,
-					"held", r.Held, "differ", r.Differ, "tombstoned", r.Tombstoned)
+					"listed", r.Listed, "rejected", r.Rejected, "tombstoned", r.Tombstoned)
 			}
 		}
 		select {

@@ -2,7 +2,10 @@ package control_test
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"testing"
 
@@ -98,8 +101,52 @@ func TestListCallPagesCallersOwnBucketOnly(t *testing.T) {
 	if _, err := ca.ListPage(ctx, a.SealedName("laptop"), "", 5000); !isStatus(err, http.StatusBadRequest) {
 		t.Fatalf("an oversized page: %v", err)
 	}
+	// #29 review: "no such bucket of yours" has its own code; any other
+	// 404 (a node lending nothing, an older node without the call) does
+	// not, so a borrower does not read it as "holds nothing".
+	var ce *control.CallError
+	if _, err := cb.ListPage(ctx, a.SealedName("laptop"), "", 10); !errors.As(err, &ce) || ce.Code != control.CodeNoSuchBucket {
+		t.Fatalf("no such bucket: %v", err)
+	}
 	l.srv.Lent = nil
-	if _, err := ca.ListPage(ctx, a.SealedName("laptop"), "", 10); !isStatus(err, http.StatusNotFound) {
+	if _, err := ca.ListPage(ctx, a.SealedName("laptop"), "", 10); !errors.As(err, &ce) || ce.Status != http.StatusNotFound ||
+		ce.Code == control.CodeNoSuchBucket {
 		t.Fatalf("a node lending nothing: %v", err)
+	}
+	resp, err = ca.Do(ctx, http.MethodGet, control.Prefix+"no-such-call", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("an unknown call: %d", resp.StatusCode)
+	}
+}
+
+// #29 review: a list that does not move past the key it was asked to
+// start after, or whose keys do not rise above it, is refused, so a
+// hostile lender cannot keep a recovery listing forever.
+func TestListPageMustMoveOn(t *testing.T) {
+	for name, body := range map[string]string{
+		"next not past after": `{"objects":[],"next":"m"}`,
+		"next before after":   `{"objects":[],"next":"a"}`,
+		"key not past after":  `{"objects":[{"key":"m","size":1,"sha256":"x"}]}`,
+		"keys not rising":     `{"objects":[{"key":"q","size":1,"sha256":"x"},{"key":"p","size":1,"sha256":"x"}]}`,
+		"repeated key":        `{"objects":[{"key":"q","size":1,"sha256":"x"},{"key":"q","size":1,"sha256":"x"}]}`,
+		"next behind keys":    `{"objects":[{"key":"q","size":1,"sha256":"x"}],"next":"p"}`,
+	} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set(control.ProtocolHeader, control.Protocol)
+			w.Write([]byte(body))
+		}))
+		c := &control.Client{HTTP: &http.Client{Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", ts.Listener.Addr().String())
+			},
+		}}}
+		if _, err := c.ListPage(t.Context(), "s", "m", 0); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+		ts.Close()
 	}
 }

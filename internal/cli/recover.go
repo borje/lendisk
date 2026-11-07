@@ -124,16 +124,7 @@ func (a *app) runRecover(ctx context.Context, addr string) error {
 		defer cancel()
 		return manifest.Fetch(fctx, id, addr, dl.Dial)
 	})
-	for _, f := range tried {
-		switch {
-		case f.Err != nil:
-			fmt.Fprintf(w, "  %s: %v\n", f.Peer, f.Err)
-		case m != nil && f.Seq == m.Seq:
-			fmt.Fprintf(w, "  %s: version %d (newest)\n", f.Peer, f.Seq)
-		default:
-			fmt.Fprintf(w, "  %s: version %d, older\n", f.Peer, f.Seq)
-		}
-	}
+	printFetched(w, tried, m)
 	if err != nil {
 		return fmt.Errorf("no friend served this node's manifest; nothing was restored: %w. "+
 			"Check that the friend runs `lendisk serve`, or try another friend's address; "+
@@ -181,7 +172,17 @@ func (a *app) runRecover(ctx context.Context, addr string) error {
 		}
 	}
 	log.Info("node recovered", "node_id", nodeID, "manifest_version", m.Seq)
-	a.printRecovered(w, m, restored, results, nodeAddress(ctx, cfg, id, log))
+	held := map[string]map[string]int64{}
+	for _, b := range m.Buckets {
+		if held[b.Name], err = db.HeldAt(ctx, b.Name); err != nil {
+			return err
+		}
+	}
+	conflicts, err := db.Conflicts(ctx)
+	if err != nil {
+		return err
+	}
+	a.printRecovered(w, m, restored, results, nodeAddress(ctx, cfg, id, log), held, conflicts)
 	return nil
 }
 
@@ -221,8 +222,32 @@ func (a *app) restoreBuckets(ctx context.Context, storeDir string, db *state.DB,
 	return nil
 }
 
+// printFetched says what each friend served of the manifest, and warns
+// when one did not answer: it may hold a newer version than the one
+// kept, which this node then continues from below (#29 review).
+func printFetched(w io.Writer, tried []recovery.Fetched, m *manifest.Manifest) {
+	var silent []string
+	for _, f := range tried {
+		switch {
+		case f.Err != nil:
+			fmt.Fprintf(w, "  %s: %v\n", f.Peer, f.Err)
+			silent = append(silent, f.Peer.String())
+		case m != nil && f.Seq == m.Seq:
+			fmt.Fprintf(w, "  %s: version %d (newest)\n", f.Peer, f.Seq)
+		default:
+			fmt.Fprintf(w, "  %s: version %d, older\n", f.Peer, f.Seq)
+		}
+	}
+	if m != nil && len(silent) > 0 {
+		fmt.Fprintf(w, "  ! Warning: %s did not answer and may hold a newer version of the manifest than %d\n"+
+			"    (a friend or bucket added since would be missing). If so, stop here and run recover again once they answer.\n",
+			strings.Join(silent, ", "), m.Seq)
+	}
+}
+
 // printRecovered says what recover restored and what to run next.
-func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Restored, results []recovery.Result, addr string) {
+func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Restored, results []recovery.Result, addr string,
+	held map[string]map[string]int64, conflicts []state.RecoveredKey) {
 	fmt.Fprintf(w, "\nRecovered from manifest version %d.\n", m.Seq)
 	if addr != "" {
 		fmt.Fprintf(w, "Address: %s\n", addr)
@@ -248,9 +273,12 @@ func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Resto
 			case res.Err != nil:
 				fmt.Fprintf(w, "    at %s: not reachable now; listed when it answers, while `lendisk serve` runs\n", res.Place)
 			default:
-				fmt.Fprintf(w, "    at %s: %d objects", res.Place, res.Held)
-				if res.Differ > 0 {
-					fmt.Fprintf(w, ", %d in another version than the other friends hold (not counted)", res.Differ)
+				fmt.Fprintf(w, "    at %s: %d objects", res.Place, held[b.Name][res.Place])
+				if d := int64(res.Listed) - held[b.Name][res.Place]; d > 0 {
+					fmt.Fprintf(w, ", %d more in a version that does not count", d)
+				}
+				if res.Rejected > 0 {
+					fmt.Fprintf(w, ", %d rejected as not this bucket's (see the log)", res.Rejected)
 				}
 				if res.Tombstoned > 0 {
 					fmt.Fprintf(w, ", %d deleted and kept for retention", res.Tombstoned)
@@ -258,6 +286,10 @@ func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Resto
 				fmt.Fprintln(w)
 			}
 		}
+	}
+	if len(conflicts) > 0 {
+		fmt.Fprintf(w, "\n%d objects are in conflict: the friends disagree about them, and none is used until you pick.\n", len(conflicts))
+		fmt.Fprintln(w, "`lendisk status` lists them; `lendisk bucket resolve <bucket> <key> <friend>` picks a friend's version.")
 	}
 	printOverflow(w, m.Overflow)
 	fmt.Fprintln(w, "\nThe local store is empty: nothing was downloaded.")
