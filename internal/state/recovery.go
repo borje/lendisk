@@ -139,21 +139,28 @@ func (db *DB) Relists(ctx context.Context) ([]Relist, error) {
 // RelistFailed records a failed attempt to list place's copy of bucket.
 func (db *DB) RelistFailed(ctx context.Context, place, bucket, msg string, now time.Time) error {
 	_, err := db.ExecContext(ctx, `UPDATE relist SET tried_at = ?, error = ?, failures = failures + 1
-		WHERE place = ? AND bucket = ?`, now.Unix(), msg, place, bucket)
+		WHERE place = ? AND bucket = ? AND done IS NULL AND abandoned IS NULL`, now.Unix(), msg, place, bucket)
 	return err
 }
 
 // AbandonRelist gives up on place's list of bucket (it listed more than
-// a list may hold): the list is no longer read, what it recorded is
-// dropped, and the keys it listed are decided again without it, in
-// batches (SettleFinished). The place does not count as listed to its
+// a list may hold): the list is no longer read, and SettleFinished, which
+// the caller runs next, drops what it recorded and decides the keys it
+// listed again without it. The place does not count as listed to its
 // end.
 func (db *DB) AbandonRelist(ctx context.Context, place, bucket string) error {
-	if _, err := db.ExecContext(ctx, `UPDATE relist SET abandoned = 1, settled = NULL WHERE place = ? AND bucket = ?`,
-		place, bucket); err != nil {
-		return err
-	}
-	return db.SettleFinished(ctx)
+	_, err := db.ExecContext(ctx, `UPDATE relist SET abandoned = 1, settled = NULL WHERE place = ? AND bucket = ?`,
+		place, bucket)
+	return err
+}
+
+// Unsettled counts the lists that ended (read to their end or
+// abandoned) whose keys SettleFinished has not yet decided again.
+func (db *DB) Unsettled(ctx context.Context) (int, error) {
+	var n int
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM relist
+		WHERE (done IS NOT NULL OR abandoned IS NOT NULL) AND settled IS NULL`).Scan(&n)
+	return n, err
 }
 
 // SettleBatch is how many keys one write transaction decides again
@@ -297,9 +304,9 @@ func (db *DB) settleKeys(ctx context.Context, bucket string, keys []string) erro
 // on each key it names, made again with every place's entries. seen is
 // how many entries the page carried, rejected ones included, which
 // counts toward the list's cap. The list's resume point moves to next,
-// or, when last, the list is dropped from relist and every key of the
-// bucket is decided again, since a place listed to its end that lacks a
-// metadata key makes it a conflict.
+// or, when last, the list is done: SettleFinished, which the caller runs
+// next, decides again the keys its end affects (a place listed to its
+// end that lacks a metadata key makes it a conflict).
 func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Listed, seen int, next string, last bool) (ListedCount, error) {
 	var c ListedCount
 	tx, err := db.BeginTx(ctx, nil)
@@ -340,13 +347,7 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 			return c, err
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		return c, err
-	}
-	if last {
-		return c, db.SettleFinished(ctx)
-	}
-	return c, nil
+	return c, tx.Commit()
 }
 
 // listedPlaces are the friends whose list of bucket was read to its end:

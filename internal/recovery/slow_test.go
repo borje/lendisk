@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/borje/lendisk/internal/control"
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -93,7 +94,9 @@ func TestSlowFriendDoesNotHoldUpRecovery(t *testing.T) {
 // end the round (or recover): the list stays as it was, tried again.
 func TestUnrecordableFailureIsNotFatal(t *testing.T) {
 	db, l := recovering(t, "generic", "B", "C")
-	if _, err := db.Exec(`CREATE TRIGGER busy BEFORE UPDATE ON relist BEGIN SELECT RAISE(FAIL, 'database is locked'); END`); err != nil {
+	// Only B's row is too busy to update; C's list is recorded as ever.
+	if _, err := db.Exec(`CREATE TRIGGER busy BEFORE UPDATE ON relist WHEN OLD.place = 'B'
+		BEGIN SELECT RAISE(FAIL, 'database is locked'); END`); err != nil {
 		t.Fatal(err)
 	}
 	ok := sum("ok")
@@ -109,6 +112,98 @@ func TestUnrecordableFailureIsNotFatal(t *testing.T) {
 	}
 	if len(rs) != 2 {
 		t.Fatalf("results %+v", rs)
+	}
+	for _, r := range rs {
+		if r.Place == "C" && (r.Err != nil || r.Listed != 1) || r.Place == "B" && r.Err == nil {
+			t.Fatalf("result %+v", r)
+		}
+	}
+	if got := heldKeys(t, db, "C"); got["k"] != ok {
+		t.Fatalf("C's list was not recorded: %v", got)
+	}
+	if rels, _ := db.Relists(t.Context()); len(rels) != 1 || rels[0].Place != "B" {
+		t.Fatalf("still to read %+v", rels)
+	}
+}
+
+// #29 re-review: settling that fails after a list ended (a busy
+// database, a crash, a shutdown) is not lost: the list counts as read,
+// not failed, and the daemon's lister goes on making rounds until it is
+// settled, though no list is left to read.
+func TestFailedSettleIsResumed(t *testing.T) {
+	ctx := t.Context()
+	db, l := recovering(t, "restic", "B", "C")
+	l.Poll = 10 * time.Millisecond
+	cfg := sum("config")
+	l.Page = served(map[string][]control.ListObject{"B": {{Key: "config", Size: 155, SHA256: cfg}}})
+	// B lists config; C lists nothing, and its list ends while the
+	// database refuses to decide keys again.
+	only := map[string]bool{"C": true}
+	l.Skip = only
+	if _, err := l.Round(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER busy BEFORE UPDATE ON recovered_key BEGIN SELECT RAISE(FAIL, 'database is locked'); END`); err != nil {
+		t.Fatal(err)
+	}
+	l.Skip = map[string]bool{"B": true}
+	rs, err := l.Round(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rs {
+		if r.Place == "C" && r.Err != nil {
+			t.Fatalf("C's list, read to its end, reported as %v", r.Err)
+		}
+	}
+	if rels, _ := db.Relists(ctx); len(rels) != 0 {
+		t.Fatalf("still to read %+v", rels)
+	}
+	if n, _ := l.Pending(ctx); n != 1 {
+		t.Fatalf("pending %d: the unsettled list must keep the lister going", n)
+	}
+	if _, err := db.Exec(`DROP TRIGGER busy`); err != nil {
+		t.Fatal(err)
+	}
+	l.Skip = nil
+	run, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go l.Run(run)
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		ks, _ := db.RecoveredKeys(ctx, "laptop")
+		if n, _ := l.Pending(ctx); n == 0 && len(ks) == 1 && ks[0].Verdict == state.VerdictConflict {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("not settled: %+v", ks)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n, _ := l.Pending(ctx); n != 0 {
+		t.Fatalf("pending %d after settling", n)
+	}
+}
+
+// #29 re-review: a page holds at most gateway.MaxListPage keys; a longer
+// one fails the list, as any malformed answer does.
+func TestOversizedPageFailsTheList(t *testing.T) {
+	db, l := recovering(t, "generic", "B")
+	var objs []control.ListObject
+	for i := 0; i <= gateway.MaxListPage; i++ {
+		k := fmt.Sprintf("%05d", i)
+		objs = append(objs, control.ListObject{Key: k, Size: 1, SHA256: sum(k)})
+	}
+	l.Page = served(map[string][]control.ListObject{"B": objs})
+	rs, err := l.Round(t.Context())
+	if err != nil || len(rs) != 1 || rs[0].Err == nil {
+		t.Fatalf("round %+v %v", rs, err)
+	}
+	if got := heldKeys(t, db, "B"); len(got) != 0 {
+		t.Fatalf("%d keys of the oversized page recorded", len(got))
+	}
+	if rels, _ := db.Relists(t.Context()); len(rels) != 1 || rels[0].Failures != 1 {
+		t.Fatalf("still to read %+v", rels)
 	}
 }
 

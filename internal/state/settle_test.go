@@ -23,6 +23,7 @@ func TestFriendAddedLaterIsNotListed(t *testing.T) {
 	if _, err := db.RecordListed(ctx, "B", "laptop", nil, 0, "", true); err != nil {
 		t.Fatal(err)
 	}
+	settle(t, db)
 	if v := verdict(t, db, "laptop", "index/9"); v.Verdict != VerdictSingle {
 		t.Fatalf("with a friend added since: %+v", v)
 	}
@@ -79,6 +80,9 @@ func TestSettlingLargeBucketKeepsWritersMoving(t *testing.T) {
 	}()
 	start := time.Now()
 	if err := db.AbandonRelist(ctx, "X", "laptop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SettleFinished(ctx); err != nil {
 		t.Fatal(err)
 	}
 	took := time.Since(start)

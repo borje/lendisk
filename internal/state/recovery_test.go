@@ -32,6 +32,7 @@ func list(t *testing.T, db *DB, place, bucket string, objs ...Listed) {
 	if _, err := db.RecordListed(context.Background(), place, bucket, objs, len(objs), "", true); err != nil {
 		t.Fatal(err)
 	}
+	settle(t, db)
 }
 
 func verdict(t *testing.T, db *DB, bucket, key string) RecoveredKey {
@@ -83,6 +84,7 @@ func TestListsRebuildPlacement(t *testing.T) {
 	if _, err = db.RecordListed(ctx, "B", "laptop", b[1:], 1, "", true); err != nil {
 		t.Fatal(err)
 	}
+	settle(t, db)
 	list(t, db, "B", "laptop", b...) // repeated, as after a crash
 	got, err = db.RecordListed(ctx, "C", "laptop", []Listed{b[0], b[1],
 		{Key: "data/gone", Size: 3, SHA256: "h3", Class: "data", Tombstoned: true}}, 3, "", true)
@@ -287,8 +289,19 @@ func TestFailedListStaysPending(t *testing.T) {
 	if err := db.AbandonRelist(ctx, "B", "laptop"); err != nil {
 		t.Fatal(err)
 	}
+	settle(t, db)
 	if rs := mustRelists(t, db); len(rs) != 1 || rs[0].Bucket != "desktop" {
 		t.Fatalf("after abandoning %+v", rs)
+	}
+}
+
+func settle(t *testing.T, db *DB) {
+	t.Helper()
+	if err := db.SettleFinished(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := db.Unsettled(context.Background()); err != nil || n != 0 {
+		t.Fatalf("unsettled %d %v", n, err)
 	}
 }
 

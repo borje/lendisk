@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+
+	"github.com/borje/lendisk/internal/gateway"
 )
 
 // Client calls a peer's control API over HTTP whose transport dials the
@@ -115,8 +117,12 @@ func (c *Client) ListPage(ctx context.Context, sealed, after string, limit int) 
 	if err := json.Unmarshal(b, &p); err != nil {
 		return p, fmt.Errorf("the peer's answer to %s is malformed: %w", ListPath, err)
 	}
-	// Keys rise strictly from after, and the next page starts past them,
-	// so a list ends however the peer answers (#29 review).
+	// A page holds at most MaxListPage keys, rising strictly from after,
+	// and the next page starts past them, so a list ends however the peer
+	// answers (#29 review).
+	if len(p.Objects) > gateway.MaxListPage {
+		return p, fmt.Errorf("the peer's page holds %d keys, more than %d", len(p.Objects), gateway.MaxListPage)
+	}
 	last := after
 	for _, o := range p.Objects {
 		if o.Key <= last {

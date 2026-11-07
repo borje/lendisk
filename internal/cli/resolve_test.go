@@ -53,6 +53,9 @@ func TestStatusShowsConflictsAndBucketResolvePicks(t *testing.T) {
 		if _, err := db.RecordListed(ctx, place, bucket, objs, len(objs), "", true); err != nil {
 			t.Fatal(err)
 		}
+		if err := db.SettleFinished(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	rec("B", "laptop", state.Listed{Key: "config", Size: 1, SHA256: "hb", Class: "metadata"},
 		state.Listed{Key: "data/x", Size: 1, SHA256: "hx", Class: "data"})

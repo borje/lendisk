@@ -3,10 +3,12 @@ package control_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/borje/lendisk/internal/control"
@@ -134,6 +136,7 @@ func TestListPageMustMoveOn(t *testing.T) {
 		"keys not rising":     `{"objects":[{"key":"q","size":1,"sha256":"x"},{"key":"p","size":1,"sha256":"x"}]}`,
 		"repeated key":        `{"objects":[{"key":"q","size":1,"sha256":"x"},{"key":"q","size":1,"sha256":"x"}]}`,
 		"next behind keys":    `{"objects":[{"key":"q","size":1,"sha256":"x"}],"next":"p"}`,
+		"page too long":       oversized(),
 	} {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set(control.ProtocolHeader, control.Protocol)
@@ -149,4 +152,19 @@ func TestListPageMustMoveOn(t *testing.T) {
 		}
 		ts.Close()
 	}
+}
+
+// oversized is a page of one key more than a page may hold, short keys
+// rising past "m".
+func oversized() string {
+	var b strings.Builder
+	b.WriteString(`{"objects":[`)
+	for i := 0; i <= gateway.MaxListPage; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `{"key":"n%05d","size":1,"sha256":"x"}`, i)
+	}
+	b.WriteString(`]}`)
+	return b.String()
 }

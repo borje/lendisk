@@ -25,6 +25,7 @@ func TestAbandonedListLeavesNoConflicts(t *testing.T) {
 	if err := db.AbandonRelist(ctx, "X", "laptop"); err != nil {
 		t.Fatal(err)
 	}
+	settle(t, db)
 	ks, err := db.RecoveredKeys(ctx, "laptop")
 	if err != nil || len(ks) != 1 || ks[0].Key != "a" {
 		t.Fatalf("recovered keys after abandoning X: %d %v", len(ks), err)
@@ -50,6 +51,7 @@ func TestLoneMetadataCountsOnlyFinishedLists(t *testing.T) {
 	if err := db.AbandonRelist(ctx, "X", "laptop"); err != nil {
 		t.Fatal(err)
 	}
+	settle(t, db)
 	// P is still pending.
 	if v := verdict(t, db, "laptop", "index/9"); v.Verdict != VerdictSingle {
 		t.Fatalf("with no other finished list: %+v", v)

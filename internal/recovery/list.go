@@ -116,10 +116,24 @@ func (l *Lister) due(r state.Relist, now time.Time) bool {
 	return now.Sub(r.TriedAt) >= min(wait, ceil)
 }
 
-// Pending reports how many lists are still to read.
+// Pending reports how many lists are still to read, or ended without
+// their keys being decided again yet (state.Unsettled): the daemon makes
+// rounds while any is.
 func (l *Lister) Pending(ctx context.Context) (int, error) {
 	rs, err := l.DB.Relists(ctx)
-	return len(rs), err
+	if err != nil {
+		return 0, err
+	}
+	n, err := l.DB.Unsettled(ctx)
+	return len(rs) + n, err
+}
+
+// settle decides again what lists that ended affect, within ctx (the
+// round's budget); what is left is for a later round.
+func (l *Lister) settle(ctx context.Context) {
+	if err := l.DB.SettleFinished(ctx); err != nil && ctx.Err() == nil {
+		l.logger().Warn("recovery: deciding the keys of lists that ended failed; trying again next round", "err", err)
+	}
 }
 
 // Round reads every list that is due, with no time budget.
@@ -135,13 +149,6 @@ func (l *Lister) Round(ctx context.Context) ([]Result, error) { return l.RoundWi
 // starts one place further on than the last. Results are by place and
 // bucket.
 func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Result, error) {
-	// Lists that ended before a crash may still have keys to decide.
-	if err := l.DB.SettleFinished(ctx); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		l.logger().Warn("recovery: deciding the keys of lists that ended failed; trying again next round", "err", err)
-	}
 	rs, err := l.DB.Relists(ctx)
 	if err != nil {
 		return nil, err
@@ -157,6 +164,9 @@ func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Resul
 		listCtx, cancel = context.WithTimeout(ctx, budget)
 	}
 	defer cancel()
+	// Lists that ended before (a crash, a failure) may still have keys
+	// to decide; that too is bounded by the budget.
+	l.settle(listCtx)
 	now := l.now()
 	var places []string
 	byPlace := map[string][]state.Relist{}
@@ -171,8 +181,12 @@ func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Resul
 	}
 	// Each round starts one place further on, so places that use every
 	// round's budget cannot keep those after them waiting for ever.
+	parallel := l.Parallel
+	if parallel <= 0 {
+		parallel = 4
+	}
 	l.mu.Lock()
-	start := l.rounds
+	start := l.rounds * parallel
 	l.rounds++
 	l.mu.Unlock()
 	order := make([]int, len(places))
@@ -180,10 +194,6 @@ func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Resul
 		order[i] = (start + i) % len(places)
 	}
 	results := make([][]Result, len(places))
-	parallel := l.Parallel
-	if parallel <= 0 {
-		parallel = 4
-	}
 	sem := make(chan struct{}, parallel)
 	var wg sync.WaitGroup
 	for _, i := range order {
@@ -203,6 +213,7 @@ func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Resul
 		}()
 	}
 	wg.Wait()
+	l.settle(listCtx) // what the lists that ended in this round affect
 	var out []Result
 	for i := range places {
 		out = append(out, results[i]...)
@@ -236,7 +247,7 @@ func (l *Lister) listPlace(ctx, listCtx context.Context, rs []state.Relist, prof
 			l.logger().Warn("recovery: a place's list is longer than any list may be; abandoned",
 				"place", r.Place, "bucket", r.Bucket, "err", res.Err)
 			if err := l.DB.AbandonRelist(ctx, r.Place, r.Bucket); err != nil {
-				l.logger().Warn("recovery: recording the abandoned list failed; it is read again later",
+				l.logger().Warn("recovery: marking the list abandoned failed; it stays pending, so it is read and abandoned again later",
 					"place", r.Place, "bucket", r.Bucket, "err", err)
 			}
 		case res.Err != nil && listCtx.Err() != nil:
@@ -311,6 +322,9 @@ func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles 
 			return true, fmt.Errorf("the place lists more than %d keys; its list was abandoned", maxKeys)
 		case pages > maxPages:
 			return true, fmt.Errorf("the place's list runs to more than %d pages; it was abandoned", maxPages)
+		}
+		if len(p.Objects) > gateway.MaxListPage {
+			return false, fmt.Errorf("the place's page holds %d keys, more than %d", len(p.Objects), gateway.MaxListPage)
 		}
 		objs := make([]state.Listed, 0, len(p.Objects))
 		last := after

@@ -1150,20 +1150,29 @@ upstream bucket is Q-V.
   is kept: "listed this bucket to its end" means exactly a place with
   a done, not abandoned, row for that bucket that is still a friend,
   so a friend added after recovery (no row) is no evidence. A page's
-  keys are decided in its own transaction (1,000 keys at most); what
-  an ended list affects beyond them (an abandoned list's keys, a
-  finished list's lone metadata keys) is decided afterwards by
-  `state.SettleFinished` in write transactions of 2,000 keys with a
-  100 ms pause between them, longer than SQLite's busy handler polls,
-  so the gateway's captures wait a fraction of a second, never the
-  whole bucket (200,000 keys abandon in about 25 s with no other write
-  waiting over 0.2 s); `settled` marks it done, and each round resumes
-  it after a crash. Places are listed side by side (4 at a time), each
-  place's buckets one after another, so a slow friend holds up no
-  other, and each round starts one place further on, so slow friends
-  that use every round's budget cannot starve those after them. A
-  database too busy to record a failed or abandoned list is logged and
-  not fatal: the list stays as it was and is tried again. A place that fails is
+  keys are decided in its own transaction: a page holds at most 1,000
+  keys (`gateway.MaxListPage`), and a longer one fails the list, in the
+  control client and in the lister alike. What an ended list affects
+  beyond its pages (an abandoned list's keys, a finished list's lone
+  metadata keys) is decided afterwards by `state.SettleFinished`, which
+  the lister runs at the start and the end of every round, in write
+  transactions of 2,000 keys with a 100 ms pause between them, longer
+  than SQLite's busy handler polls, so the gateway's captures wait a
+  fraction of a second, never the whole bucket (200,000 keys abandon in
+  about 25 s with no other write waiting over 0.2 s). `settled` marks a
+  list's settling finished. Settling is bounded by the round's budget
+  like the listing: what it does not finish (or a crash, a shutdown or
+  a busy database interrupts) is left, and the daemon's lister counts
+  every ended list not yet settled as pending (`state.Unsettled`), so
+  it goes on making rounds until settling finishes, though no list is
+  left to read. A list read to its end is never reported failed for
+  its settling; `RelistFailed` touches no ended row. Places are listed
+  side by side (4 at a time), each place's buckets one after another,
+  so a slow friend holds up no other, and each round starts 4 places
+  further on, so slow friends that use every round's budget cannot
+  starve those after them. A database too busy to mark a list failed
+  or abandoned is logged and not fatal: the list stays pending, and is
+  read (and, past its cap, abandoned) again later. A place that fails is
   skipped for the rest of the round, and `recover` says it is not
   listed. `recover`'s round has a time budget (3 min, injectable):
   what is not finished by then, and every list of a friend named with
