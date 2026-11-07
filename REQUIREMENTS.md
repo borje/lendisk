@@ -1,6 +1,6 @@
 # lendisk — requirements
 
-Status: draft v0.11.2, 2026-11-07. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.11.3, 2026-11-08. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
@@ -19,7 +19,9 @@ key is a plain file; v0.11.1 (2026-11-06) makes the `copies = 1`
 warning unconditional, in `bucket add` and `status` only, and not an
 alert (EP-6); v0.11.2 gives a node a dial key per friend, derived
 from the same phrase, to connect to its friends with (ID-1, SEC-10,
-SEC-12, SEC-14). The design
+SEC-12, SEC-14); v0.11.3 lets a profile name the few keys its tool
+rewrites in place, which replicate as rewrites while lenders keep the
+replaced version (EP-7, EP-11, LEND-4, RET-1). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -438,7 +440,13 @@ double the surface for no change in the core problem.
     because a replica has no use for them and a tool that reads a
     replica makes its own (restic: `locks/*`; Kopia: `_log*`).
 
-  A key no rule matches is data. The `generic` profile has no snapshot,
+  A profile may also name **rewritable keys**: the few keys its tool
+  rewrites in place in normal use (restic: `config`, rewritten by
+  `restic migrate`; Kopia: `kopia.repository`, `kopia.blobcfg` and
+  `kopia.maintenance`, the last after every maintenance run). A
+  rewritable key keeps its class. A rewrite of one is replicated like a
+  new write and raises no alert (EP-11), and each lender keeps the
+  version it replaces as a tombstone (LEND-4, RET-1). A key no rule matches is data. The `generic` profile has no snapshot,
   metadata or local-only keys: everything is data. restic and kopia are
   inside the encryption guarantee; generic is not (EP-8). Profiles are
   data, not code; adding one shall not require a release.
@@ -457,7 +465,8 @@ double the surface for no change in the core problem.
   endpoint from any reachable place that holds it, and the fetched
   object stored locally.
 - **EP-11** Immutability policy: a write to a key that a replica has
-  already acknowledged, with content whose hash differs, shall raise an
+  already acknowledged, with content whose hash differs, unless the key
+  is rewritable in its bucket's profile (EP-7), shall raise an
   alert, shall not be replicated, and shall be reported in `status` with
   the key and both hashes. The local write itself is allowed (the local
   store is the user's). Identical re-uploads are silently accepted.
@@ -658,7 +667,9 @@ double the surface for no change in the core problem.
   (`lendisk peer list`).
 - **LEND-4** A lender shall verify every received object against the hash
   the borrower sends with it (REPL-10), reject a mismatch, and reject a
-  write to an existing key whose stored hash differs. It shall never need
+  write to an existing key whose stored hash differs unless the borrower
+  sends it as a rewrite (EP-7); a rewrite is stored and the version it
+  replaces becomes a tombstone (RET-1). It shall never need
   the backup tool's password and shall never inspect object contents
   beyond the hash.
 - **LEND-5** A lender may rate-limit each borrower independently.
@@ -722,8 +733,9 @@ double the surface for no change in the core problem.
 
 ### 4.6 Deletion, retention and verification
 
-- **RET-1** A lender shall never remove object data on a delete request.
-  The object becomes a tombstone, which the lender removes after the
+- **RET-1** A lender shall never remove object data on a delete request
+  or a rewrite (LEND-4). The deleted object, or the version a rewrite
+  replaces, becomes a tombstone, which the lender removes after the
   retention window. Default 30 days; the lender sets a minimum, the
   borrower may request a longer window.
 - **RET-2** There shall be no operation a borrower can invoke that purges
@@ -1244,6 +1256,16 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.11.3 (2026-11-08)** Kopia rewrites `kopia.maintenance` after
+  every maintenance run, and `kopia.repository` and `kopia.blobcfg` on
+  a password change or `set-parameters`; restic rewrites `config` in
+  `restic migrate` (#74). Under v0.11.2 each such rewrite raised the
+  immutability alert and never reached friends. EP-7 adds rewritable
+  keys per profile; EP-11 exempts them; LEND-4 accepts a rewrite the
+  borrower marks as one, and RET-1 keeps the replaced version as a
+  tombstone for the retention window, as S3 Object Lock with versioning
+  keeps a replaced version until its retain-until date. RET-2 is
+  unchanged: no borrower operation loses data within the window.
 - **v0.11.2 (2026-11-07)** A node connects to each friend with a dial
   key per friend, derived from the same phrase as its identity key,
   which it keeps for serving (#69). With one key for both, a relay
