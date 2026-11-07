@@ -3083,7 +3083,7 @@ capture decorator, so nothing stands between that and posix (#62).
   unchanged; the admitted operations reach nothing but B's own
   buckets; each answer on the dial key equals the answer on the node
   ID; a request signed with the dial key, C's credential or A's node ID
-  as the access key is refused; RET-2's attack list leaves B's
+  as the access key is refused; B's own key respelled with whitespace (`respellings`), which versitygw still reads as B, is refused everything outside the list; RET-2's attack list leaves B's
   tombstone intact; the redeem abuses of #69 are refused; and after B's
   friendship row is deleted, both keys are refused everything on their
   open connections. An unknown identity, and B at C (not its friend),
@@ -3210,20 +3210,30 @@ capture decorator, so nothing stands between that and posix (#62).
   `Server.PeerKey(conn.RemoteAddr())` and puts the key in the request
   context through `http.Server.ConnContext`; a connection without a key
   is closed before any byte is read. For an S3 request it reads the
-  access key from the `Authorization` header's `Credential=` or a presigned
-  URL's `X-Amz-Credential`, without verifying anything, and refuses the
-  request unless it equals the peer key; versitygw then verifies the
-  signature for that access key. A request with neither form is
-  refused, and so is an `Authorization` header in any scheme but
-  `AWS4-HMAC-SHA256` (SigV2's `AWS key:sig` included) and a request
-  whose header and query name two different keys
-  (`bridge.AccessKeyOf`, `Bridge.TunnelS3Handler`). A friend dials
+  access key without verifying anything, exactly as versitygw reads it
+  (`gateway.ReadCredentials`, §3.7 NET-7): from the `Authorization`
+  header, split at its first space with every whitespace character
+  removed from each part that holds a space, then `Credential=` as the
+  first of three comma-separated pairs; or from a presigned URL's
+  `X-Amz-Credential`. It refuses the request unless that key equals the
+  peer key; versitygw then verifies the signature for that access key.
+  A request with no credential is refused, and so is one whose
+  credential cannot be read that way (two `Authorization` headers,
+  any scheme but `AWS4-HMAC-SHA256`, SigV2's `AWS key:sig` included,
+  a malformed header or `X-Amz-Credential`, an `AWSAccessKeyId`) and
+  one whose header and query name two different keys
+  (`bridge.AccessKeyOf`, `Bridge.TunnelS3Handler`). Since the reading
+  is versitygw's, `Credential =<id>` or an ID with a space or tab
+  inside is that ID here too: it passes this check only on the
+  connection of that ID, and the gate then applies the borrower list to
+  it. A friend dials
   with its dial key (ID-1), which the middleware resolves to the
   friend's node ID before anything acts on it; "the peer key" here is
   that node ID, so the access key and the per-pair secret stay keyed
-  by node ID and a request signed with the dial key is refused. The control API takes the borrower from the context, never
-  from a parameter. `redeem` is the one call whose connection is not
-  the friend's own key; the friend's key comes from its address and is
+  by node ID and a request signed with the dial key is refused. The
+  control API takes the borrower from the context, never from a
+  parameter. `redeem` is the one call whose connection is not the
+  friend's own key; the friend's key comes from its address and is
   accepted only with the key-agreement proof of §3.2 (PEER-2).
   `bridge.ServeTunnel` does this: a listener wrapper resolves
   `Transport.PeerOf` at accept and closes a connection without a key
@@ -3231,8 +3241,16 @@ capture decorator, so nothing stands between that and posix (#62).
   *A friend's credential is served on the tunnel only (#15).* The
   loopback and LAN handler (`Bridge.LoopbackHandler`) refuses with
   `AccessDenied`, before the gateway sees it, any request whose
-  Authorization header or presigned query names a node ID as the
-  access key, SigV4 or SigV2 (`gateway.NamesFriend`). Off the tunnel,
+  credential, read as versitygw reads it, is a node ID, or whose
+  whitespace-free spelling of any `Credential=`, SigV2 key or
+  `X-Amz-Credential` is one, and any request whose credential it
+  cannot read (`gateway.ReadCredentials`;
+  `TestLoopbackRefusesFriendCredential`,
+  `TestListenersReadSpacedCredentials`). Behind it, the gate applies
+  the borrower list to the same reading and `Lending` refuses every
+  method outside it to a borrower's authenticated account, so a
+  reading that missed a spelling would still reach no refused method
+  (§3.9 SEC-9). Off the tunnel,
   nothing binds the request to the connection's key (SEC-12), the
   per-friend caps do not apply and SEC-15's per-key connection closing
   cannot reach it; a borrower who could reach a lender's LAN listener
