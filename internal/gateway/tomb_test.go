@@ -152,9 +152,9 @@ func TestDeleteMovesTheObjectIntoTheTomb(t *testing.T) {
 	if keys := l.listKeys(); fmt.Sprint(keys) != "[data/ab/other]" {
 		t.Fatalf("listed %v", keys)
 	}
-	v1, err := l.c.ListObjects(ctx, &s3.ListObjectsInput{Bucket: l.bucket})
-	if err != nil || len(v1.Contents) != 1 {
-		t.Fatalf("list v1 %+v %v", v1, err)
+	// List v1 is not on NET-7's list (#15).
+	if _, err := l.c.ListObjects(ctx, &s3.ListObjectsInput{Bucket: l.bucket}); code(err) != "AccessDenied" {
+		t.Fatalf("list v1: %v", err)
 	}
 	// Deleting it again, or a key never stored, changes nothing.
 	if err := l.del("data/ab/pack"); err != nil {

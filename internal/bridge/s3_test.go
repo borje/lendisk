@@ -150,3 +150,39 @@ func TestLoopbackRefusesControlPathAfterCleaning(t *testing.T) {
 		}
 	}
 }
+
+// #14, #15: a friend's credential (a node ID as the access key) is
+// served on the tunnel only. On the loopback and LAN listeners a request
+// naming a node ID, in a header or a presigned query, SigV4 or SigV2, is
+// refused before the gateway sees it; an own bucket's key passes.
+func TestLoopbackRefusesFriendCredential(t *testing.T) {
+	sock, g := startFakeGateway(t)
+	h := New(sock, quiet).LoopbackHandler()
+	friend := newID(t).NodeID().String()
+	serve := func(target, auth string) int {
+		r := httptest.NewRequest("GET", target, nil)
+		if auth != "" {
+			r.Header.Set("Authorization", auth)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	for name, c := range map[string][2]string{
+		"SigV4 header":   {"/sbucket/key", sigv4(friend)},
+		"SigV2 header":   {"/sbucket/key", "AWS " + friend + ":c2ln"},
+		"presigned v4":   {"/sbucket/key?X-Amz-Credential=" + friend + "%2F20261106%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=00", ""},
+		"presigned v2":   {"/sbucket/key?AWSAccessKeyId=" + friend + "&Signature=00", ""},
+		"own key beside": {"/sbucket/key?X-Amz-Credential=" + friend + "%2Fx", sigv4("LDKAAAAAAAAAAAAAAAAA")},
+	} {
+		if code := serve(c[0], c[1]); code != http.StatusForbidden {
+			t.Errorf("%s: %d, want 403", name, code)
+		}
+	}
+	if n := g.count(); n != 0 {
+		t.Fatalf("%d friend requests reached the gateway", n)
+	}
+	if code := serve("/sbucket/key", sigv4("LDKAAAAAAAAAAAAAAAAA")); code != http.StatusOK {
+		t.Fatalf("an own bucket's key: %d", code)
+	}
+}

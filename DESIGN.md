@@ -1381,8 +1381,10 @@ upstream bucket is Q-V.
   ownership-control writes, `PutObjectAcl`, `ChangeBucketOwner`,
   `ListBucketsAndOwners`, `CopyObject` and `UploadPartCopy` (their
   source is a bucket inside a string), and `DeleteBucket` (its row and
-  quota count would go stale). The rest of NET-7's narrowing is the
-  gate's (#15). `CreateBucket` creates the bucket with lendisk's own
+  quota count would go stale). Beyond those it refuses, as its first
+  step, every other method SEC-9's table classifies Refused or
+  Unreachable (#15 review), so NET-7's narrowing does not rest on the
+  gate alone (§3.7 NET-7, §3.9 SEC-9). `CreateBucket` creates the bucket with lendisk's own
   private ACL owned by the borrower's account and `BucketOwnerEnforced`,
   whatever ACL headers came with it, then inserts the row; a retry that
   finds `BucketAlreadyOwnedByYou` inserts it too, so a crash between
@@ -2601,11 +2603,12 @@ capture decorator, so nothing stands between that and posix (#62).
   still billed as stored, and is deleted after the days set; S3's
   delete markers likewise hide a version that stays stored and billed.
 - **RET-2** The gate admits no versioned, lifecycle,
-  bucket-deletion, object-lock or admin call (§3.7 allow-list, #15);
-  `Lending` refuses a borrower's `DeleteObject` with a version ID,
-  `DeleteObjects`, `DeleteBucket` and copies; keys beginning with
-  `.lendisk/` are refused from borrowers by `checkKey`, and posix
-  itself refuses and never lists a `.lendisk` directory at any depth
+  bucket-deletion, object-lock, tagging or admin call from a borrower
+  (§3.7 NET-7, `gateway.Surface`); `Lending` refuses a borrower's
+  `DeleteObject` with a version ID, `DeleteObjects`, `DeleteBucket` and
+  copies; keys beginning with `.lendisk/` are refused from borrowers by
+  the gate and again by `checkKey` in `Lending`, and posix itself
+  refuses and never lists a `.lendisk` directory at any depth
   (§3.5 SEC-5); and the purger is not reachable from any request. So
   nothing a borrower can send reaches the tomb directory or the
   purger. `TestBorrowerCannotPurgeEarly` is the RET-2 AC at the S3
@@ -2615,7 +2618,13 @@ capture decorator, so nothing stands between that and posix (#62).
   the tomb's path (read, write, delete, copy, tag), versioning then
   delete, a lifecycle rule and bucket deletion; the tomb's bytes are
   unchanged after each and after a purge one second before the window
-  ends. #15's hostile-peer harness runs the same list over the tunnel.
+  ends. `TestHostilePeer` (§3.9 SEC-7) runs the same list, in the same
+  order, over the tunnel from both of the borrower's keys
+  (`purgeAttacks`). Completing the upload begun before the delete
+  while it is still open revives the tombstoned object, since it
+  declared that object's hash, and stores none of the parts' bytes:
+  nothing is lost, and a later delete starts a new window
+  (`TestCompletingAnOldUploadRevivesTheObject`).
 - **RET-3** `undelete` for a friend is the control API `undelete`
   (bucket, since): the lender moves each tomb copy deleted since that
   time back to its key and drops the row; `list` shows beforehand what
@@ -2710,8 +2719,36 @@ capture decorator, so nothing stands between that and posix (#62).
   authenticates, so, like the bridge (SEC-12), it reads the access key
   from the request without verifying it and applies this list when the
   key is a node ID; versitygw then verifies the signature, so a forged
-  key gains nothing. It classifies the request by method, path and
-  query string the way S3 routes them. The control API
+  key gains nothing. It admits a borrower's request only in the exact
+  shape of one admitted entry of `gateway.Surface` (SEC-9): its method
+  and level (service, bucket or object, from the path as versitygw's
+  `DecodeURL` decodes it), that entry's query keys present (with
+  `list-type=2` for `ListObjectsV2`), no other query key but the
+  entry's `Allow` list, the SDK's `x-id` and `X-Amz-*` signature keys,
+  and no header beginning `X-Amz-Copy-Source`, `X-Amz-Object-Lock-`,
+  `X-Amz-Bypass-Governance-Retention`, `X-Amz-Tagging`, `X-Amz-Acl`,
+  `X-Amz-Grant-` or `X-Amz-Server-Side-Encryption`. So a version id,
+  another action's query key or a copy source turns an admitted
+  request into a refused one, whatever versitygw would route it to; it
+  is an allow-list of shapes, not a copy of versitygw's router. An
+  object key must pass `checkKey` (nothing under `.lendisk/`, no empty,
+  `.` or `..` segment), answered 400 as `Lending` answers it. The
+  borrower list applies when any credential the request names is a
+  node ID, read as versitygw reads it (`gateway.ReadCredentials`):
+  versitygw v1.10.0 splits the Authorization header at its first space
+  and removes every whitespace character from each part that holds a
+  space before reading `Credential=` (`sigv4auth.ParseAuthorization`),
+  so `Credential =<id>` or a node ID with a space or tab inside is that
+  node ID to it, and to the gate. A whitespace-free spelling of any
+  `Credential=` value, a SigV2 key and every `X-Amz-Credential` are
+  checked too. A credential the gate cannot read the way versitygw does
+  (two Authorization headers, another scheme, SigV2, a malformed header
+  or `X-Amz-Credential`, an `AWSAccessKeyId`) is refused for every
+  account, never read as "no friend"; versitygw would refuse it anyway.
+  The control
+  path is refused for every account both as sent and as decoded, so
+  `/%5Flendisk/x` and `/_lendisk%2Fx` are refused as `/_lendisk/x` is
+  (`TestGateRefusesControlPathAsFiberDecodes`). The control API
   (`redeem`, `challenge`, `manifest`, `quota`, `version`, `undelete`,
   `list`) is plain HTTP under `/_lendisk/` on the same tunnel port,
   authenticated by the tunnel peer key and checked per request against
@@ -3034,9 +3071,42 @@ capture decorator, so nothing stands between that and posix (#62).
   names, and lendisk refuses to start if that file, or a generated key
   it would reuse, is readable by anyone but the service user. It is not in the manifest: a recovered
   node generates a new certificate, and clients are given the new one.
-- **SEC-7** The hostile-peer test exercises every S3 operation through
-  the tunnel bridge and every control API endpoint, from an allowed
-  peer's identity and from an unknown one.
+- **SEC-7** The hostile-peer harness (`internal/cli/hostile_test.go`,
+  run by `TestHostilePeer`) drives real nodes over the local relay
+  (`transporttest`). Its attacks are one request per S3 action in
+  `gateway.Surface` (`s3Attacks`), SigV4-signed with whatever
+  credential the attacker chooses, and every control API call
+  (`controlAttacks`); a later ticket adds an attack or a phase there.
+  With friendships A–B and A–C, a hostile B, holding every credential
+  its node holds, sends A all of them from its node ID and from its
+  dial key: everything outside NET-7's list is refused and A's store is
+  unchanged; the admitted operations reach nothing but B's own
+  buckets; each answer on the dial key equals the answer on the node
+  ID; a request signed with the dial key, C's credential or A's node ID
+  as the access key is refused; B's own key respelled with whitespace (`respellings`), which versitygw still reads as B, is refused everything outside the list; RET-2's attack list leaves B's
+  tombstone intact; the redeem abuses of #69 are refused; and after B's
+  friendship row is deleted, both keys are refused everything on their
+  open connections. An unknown identity, and B at C (not its friend),
+  are refused the connection. The `admitall` build
+  (`TestMiddlewareAloneRefusesStranger`) sends the whole list from an
+  unknown identity whose connection is admitted, and the middleware
+  refuses every request (SEC-11). `peer remove` (#25) replaces the
+  row deletion and adds the zero-peers-after-removal state of SEC-10.
+- **Per-friend caps.** fasthttp's `MaxConnections` and `MaxRequests` at
+  `gw.sock` are shared by every listener, so the tunnel bounds each
+  friend before it gets there (`bridge.Caps`, #15): at most 32 open
+  connections per friend (`DefaultConns`), counted on the friend the
+  connection's key resolves to in `lendisk.db` at accept (`Caps.Of`,
+  `RolesIn`), so its node ID and its dial key share one budget, and a
+  connection over that is closed unread; a key with no relationship
+  counts on its own and is refused at its first request anyway; and at
+  most 16 requests in flight per friend,
+  counted on the resolved node ID (`DefaultRequests`), one over that
+  answered 503 `SlowDown` with `Retry-After: 1` (a JSON 503 on the
+  control path), which S3 clients and the replica worker retry. The
+  borrower's replica client moves one object per bucket at a time over
+  a couple of connections (§3.4), well inside both. Loopback and LAN
+  listeners are not counted. The caps are constants, not settings.
 - **SEC-8** versitygw's web UI, website, metrics and event endpoints
   are not configured, and versitygw opens no TCP port at all. Its admin
   API cannot be left out: with `AdminPorts` empty, `embedgw` mounts it
@@ -3055,14 +3125,37 @@ capture decorator, so nothing stands between that and posix (#62).
   process and no other socket. Every listener is one REQUIREMENTS.md
   names. Checked with `ss -lntup` and `ss -lxp`, with and without an
   `endpoint.listen` entry.
-- **SEC-9** The classification table covers every S3 action versitygw
-  routes at the pinned version, plus every `backend.Backend` method,
-  each marked admitted, refused at the gate, internal (`GetBucketAcl`
-  and `GetBucketPolicy`, which versitygw calls for itself) or
-  unreachable for a borrower's account, with a test that
-  sends one request per S3 action through the bridge and asserts the
-  outcome. It is re-reviewed on every versitygw upgrade, together with
-  the replication-hole review (Q-H).
+- **SEC-9** The classification is Go code: `gateway.Surface`, one entry
+  per S3 action versitygw v1.10.0 routes (by its metrics action name,
+  with a request that routes there), and `gateway.BackendMethods`, one
+  per `backend.Backend` method. `TestSurfaceCoversEveryRoutedAction`
+  reads the pinned `s3api/router.go` and fails on an action the table
+  does not name, or one it names that is no longer routed;
+  `TestBackendMethodsAllClassified` does the same against the
+  interface by reflection; `TestSurfaceExamplesRouteAsNamed` sends each
+  example through versitygw's own router and checks the action it
+  reaches; `TestGateAdmitsNET7ListOnly` sends each, signed as a
+  borrower, through the router behind the gate: an admitted one is
+  routed, a refused one is answered by the gate and never routed. For a
+  borrower's account:
+
+  | Class | S3 actions | Backend methods |
+  |---|---|---|
+  | Admitted | `ListBuckets` (own only), `CreateBucket`, `HeadBucket`, `ListObjectsV2`, `PutObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`, `GetObject` (ranged), `HeadObject`, `DeleteObject` (no version id) | the same thirteen |
+  | Refused at the gate | copies (`CopyObject`, `UploadPartCopy`), `DeleteObjects`, browser-form `PostObject`, `RenameObject`, `RestoreObject`, `SelectObjectContent`; list v1, `ListObjectVersions`, `ListMultipartUploads`, `GetObjectAttributes`, `GetBucketLocation`, torrent; ACLs, policy, ownership controls; bucket and object tagging; object-lock configuration, retention, legal hold; versioning; CORS and website; lifecycle, analytics, encryption, intelligent tiering, inventory, metrics, replication, public access block, logging, request payment, notification, accelerate; annotations; `DeleteBucket`; CORS preflight (`OPTIONS`); versitygw's error routes | every other method that an S3 action names |
+  | Internal | none | `GetBucketAcl`, `GetBucketPolicy` (access check on every request), `GetBucketCors` (when a request carries `Origin`), `GetBucketVersioning`, `GetObjectLockConfiguration`, `GetObjectRetention`, `GetObjectLegalHold` (object-lock checks on writes and deletes), and `String`, `Shutdown`, `NormalizeObjectKey`, `StoresDotSegmentKeys`, `ValidateUploadID` |
+  | Unreachable | none | `ChangeBucketOwner`, `ListBucketsAndOwners`: the admin API only, whose every route is a `PATCH` the gate refuses (SEC-8) |
+
+  Every class but Admitted is decided at the gate, before versitygw
+  routes or authenticates and before the backend is touched. `Lending`
+  then refuses every Refused and Unreachable backend method a second
+  time, keyed on the account versitygw authenticated rather than the
+  gate's unverified reading of the key, as its first step
+  (`TestLendingRefusesEveryRefusedMethodToABorrower` calls each one
+  directly as a borrower, with no store and no database behind it). The table is re-reviewed on every
+  versitygw upgrade, together with the replication-hole review (Q-H),
+  and the two tests above fail when an upgrade adds an action or a
+  method.
 - **SEC-10** `Server.AllowClient` is always set, before `Start`, to a
   lendisk function that looks the key up in `lendisk.db`: a
   relationship row admits it in the `peer` role, an unexpired invite
@@ -3117,24 +3210,62 @@ capture decorator, so nothing stands between that and posix (#62).
   `Server.PeerKey(conn.RemoteAddr())` and puts the key in the request
   context through `http.Server.ConnContext`; a connection without a key
   is closed before any byte is read. For an S3 request it reads the
-  access key from the `Authorization` header's `Credential=` or a presigned
-  URL's `X-Amz-Credential`, without verifying anything, and refuses the
-  request unless it equals the peer key; versitygw then verifies the
-  signature for that access key. A request with neither form is
-  refused, and so is an `Authorization` header in any scheme but
-  `AWS4-HMAC-SHA256` (SigV2's `AWS key:sig` included) and a request
-  whose header and query name two different keys
-  (`bridge.AccessKeyOf`, `Bridge.TunnelS3Handler`). A friend dials
+  access key without verifying anything, exactly as versitygw reads it
+  (`gateway.ReadCredentials`, §3.7 NET-7): from the `Authorization`
+  header, split at its first space with every whitespace character
+  removed from each part that holds a space, then `Credential=` as the
+  first of three comma-separated pairs; or from a presigned URL's
+  `X-Amz-Credential`. It refuses the request unless that key equals the
+  peer key; versitygw then verifies the signature for that access key.
+  A request with no credential is refused, and so is one whose
+  credential cannot be read that way (two `Authorization` headers,
+  any scheme but `AWS4-HMAC-SHA256`, SigV2's `AWS key:sig` included,
+  a malformed header or `X-Amz-Credential`, an `AWSAccessKeyId`) and
+  one whose header and query name two different keys
+  (`bridge.AccessKeyOf`, `Bridge.TunnelS3Handler`). Since the reading
+  is versitygw's, `Credential =<id>` or an ID with a space or tab
+  inside is that ID here too: it passes this check only on the
+  connection of that ID, and the gate then applies the borrower list to
+  it. A friend dials
   with its dial key (ID-1), which the middleware resolves to the
   friend's node ID before anything acts on it; "the peer key" here is
   that node ID, so the access key and the per-pair secret stay keyed
-  by node ID and a request signed with the dial key is refused. The control API takes the borrower from the context, never
-  from a parameter. `redeem` is the one call whose connection is not
-  the friend's own key; the friend's key comes from its address and is
+  by node ID and a request signed with the dial key is refused. The
+  control API takes the borrower from the context, never from a
+  parameter. `redeem` is the one call whose connection is not the
+  friend's own key; the friend's key comes from its address and is
   accepted only with the key-agreement proof of §3.2 (PEER-2).
   `bridge.ServeTunnel` does this: a listener wrapper resolves
   `Transport.PeerOf` at accept and closes a connection without a key
   unread, and `ConnContext` puts the key in the request context.
+  *A friend's credential is served on the tunnel only (#15).* The
+  loopback and LAN handler (`Bridge.LoopbackHandler`) refuses with
+  `AccessDenied`, before the gateway sees it, any request whose
+  credential, read as versitygw reads it, is a node ID, or whose
+  whitespace-free spelling of any `Credential=`, SigV2 key or
+  `X-Amz-Credential` is one, and any request whose credential it
+  cannot read (`gateway.ReadCredentials`;
+  `TestLoopbackRefusesFriendCredential`,
+  `TestListenersReadSpacedCredentials`). Behind it, the gate applies
+  the borrower list to the same reading and `Lending` refuses every
+  method outside it to a borrower's authenticated account, so a
+  reading that missed a spelling would still reach no refused method
+  (§3.9 SEC-9). Off the tunnel,
+  nothing binds the request to the connection's key (SEC-12), the
+  per-friend caps do not apply and SEC-15's per-key connection closing
+  cannot reach it; a borrower who could reach a lender's LAN listener
+  and derive the pair's secret would bypass all three. No lendisk path
+  needs it: replication, recovery and `peer forward` (NET-7b) all reach
+  the lender's tunnel port, and the tool behind `peer forward` talks
+  to a listener on the borrower's machine. *Precedent:* Syncthing
+  accepts a device ID only as the TLS identity on its sync protocol
+  listener, never on its GUI and REST listener, which has its own API
+  key; Tailscale grants by node identity only for traffic that arrives
+  over the tailnet interface, and `WhoIs` names no identity for an
+  address outside it; MinIO is the counterexample, where a service
+  account's key works on every listener unless a policy adds an
+  `aws:SourceIp` condition. lendisk follows the first two: a
+  credential is valid on the listener its identity was proven on.
 - **SEC-13** In the `invite` role the middleware admits `POST
   /_lendisk/redeem` and refuses every other S3 and control API request,
   `version` included. `redeem` checks the role again; holding the
@@ -3387,7 +3518,7 @@ design and disappear with it.
 - **Q-G (resolved)** No lendisk proxy and no SigV4 code in lendisk:
   versitygw terminates every signature, and the tunnel bridge passes
   requests to it with the signed headers untouched (§3.7).
-- **Q-H (open, again since v0.9)** The decorator must be checked against
+- **Q-H (resolved at v1.10.0, #15; re-run on every upgrade)** The decorator must be checked against
   the full `backend.Backend` interface at the pinned version: every
   method that can create, replace or remove an object (including
   `CopyObject`, `UploadPartCopy`, `PutObjectTagging`, `RestoreObject`
@@ -3407,8 +3538,30 @@ design and disappear with it.
   are refused on own buckets by the decorator and the browser-form
   `POST` by the gate (§3.3 EP-2); posix's `DeleteObjects` deletes
   through its own `DeleteObject`, not the decorator's, so nothing is
-  captured twice. The metadata-only methods are neither captured nor
-  refused yet; the rest of the review is still to do.
+  captured twice. *Settled for metadata (#15):* from a borrower, every
+  metadata-only write (`PutObjectTagging`, `DeleteObjectTagging`,
+  `PutObjectAcl`, `PutObjectRetention`, `PutObjectLegalHold`, the
+  bucket-level tagging, ACL, policy, lock, versioning, CORS and website
+  calls) is refused at the gate, and so are the headers that would do
+  the same on an admitted write (`X-Amz-Tagging`, `X-Amz-Object-Lock-*`,
+  `X-Amz-Acl`, `X-Amz-Grant-*`); `TestBorrowerRefusedPerCategory` has
+  one case per category. On an own bucket they are neither captured nor
+  refused, by decision: they create, replace or remove no content, a
+  replica carries an object's bytes and its hash (REPL-10) and nothing
+  else, and no supported tool sends them; ACLs fail there anyway
+  (`BucketOwnerEnforced`), and tags set by a tool live on the local copy
+  only. Object lock is the exception: `posix`'s
+  `PutObjectLockConfiguration` turns lock on for an existing bucket
+  even with versioning off, after which retention and legal hold would
+  bind objects against lendisk's own deletes. So the gate refuses, for
+  every account, a `PUT` with `?object-lock`, `?retention` or
+  `?legal-hold` and any request with an `X-Amz-Object-Lock-*` header,
+  as it refuses `CreateBucket` asking for lock; lock is never on
+  (`TestObjectLockRefusedOnOwnBuckets`). `RestoreObject` and `SelectObjectContent` are refused for
+  borrowers and not implemented on `posix`. Every `backend.Backend`
+  method is now in SEC-9's table (`gateway.BackendMethods`), so an
+  upgrade that adds one fails `TestBackendMethodsAllClassified` until
+  it is reviewed here.
 - **Q-I (gate, resolved 2026-11-05)** The embedded design depends on
   five properties of versitygw at the pinned version. Pinned at
   **v1.10.0** (tag commit `72f75bd`, 2026-10-22), pinned by `go.sum`; it needs Go
@@ -3468,7 +3621,11 @@ design and disappear with it.
     `PutBucketVersioning` answers 501 `VersioningNotConfigured`. Object
     lock is not: `CreateBucket` with `x-amz-bucket-object-lock-enabled`
     succeeds on `posix` and the bucket then reports lock enabled. The
-    gate refuses that header.
+    gate refuses that header. (#15 review: `PutObjectLockConfiguration`
+    turns lock on for an existing bucket too, with versioning off, so the
+    gate refuses it, the retention and legal-hold writes and every
+    `X-Amz-Object-Lock-*` header, for every account;
+    `TestObjectLockRefusedOnOwnBuckets`.)
   - `posix.New` changes the process's working directory to the store
     root unless `PosixOpts.AbsolutePaths` is set; lendisk sets it.
   - restic 0.19.1 `init`, `backup`, `check --read-data` and `restore`

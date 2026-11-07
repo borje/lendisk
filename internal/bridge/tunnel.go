@@ -50,7 +50,12 @@ type PeerOf func(net.Conn) (identity.NodeID, error)
 // the caller (the resolved peer: a friend's node ID, never its dial
 // key) in the request context, and everything else to s3
 // (Bridge.TunnelS3Handler in the daemon). A nil s3 answers S3 with 501.
-func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Logger) http.Handler {
+// A friend at its cap of requests in flight (caps, shared with
+// ServeTunnel; nil means the defaults) is answered 503 SlowDown.
+func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, caps *Caps, log *slog.Logger) http.Handler {
+	if caps == nil {
+		caps = &Caps{}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		isControl := strings.HasPrefix(r.URL.Path, control.Prefix)
 		refuse := func(code int, msg string) {
@@ -96,6 +101,19 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Lo
 			refuse(http.StatusForbidden, state.NoRelationship)
 			return
 		}
+		if !caps.request(peer) {
+			log.Warn("tunnel request refused: the friend is at its cap of requests in flight", "peer", peer.String())
+			w.Header().Set("Retry-After", "1")
+			if isControl {
+				refuse(http.StatusServiceUnavailable, "too many requests in flight from this node; retry shortly")
+			} else {
+				w.Header().Set(control.ProtocolHeader, control.Protocol)
+				writeError(w, s3err.APIError{Code: "SlowDown", HTTPStatusCode: http.StatusServiceUnavailable,
+					Description: "lendisk: too many requests in flight from this node; retry shortly"})
+			}
+			return
+		}
+		defer caps.requestDone(peer)
 		r = r.WithContext(control.WithCaller(r.Context(), control.Caller{Peer: peer, Role: role}))
 		switch {
 		case isControl:
@@ -110,16 +128,12 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, log *slog.Lo
 
 type peerKey struct{}
 
-// peerConn is an accepted tunnel connection with its key.
-type peerConn struct {
-	net.Conn
-	peer identity.NodeID
-}
-
-// peerListener closes, unread, every connection without a peer key.
+// peerListener closes, unread, every connection without a peer key, and
+// every connection over its key's cap.
 type peerListener struct {
 	net.Listener
 	peerOf PeerOf
+	caps   *Caps
 	log    *slog.Logger
 }
 
@@ -135,15 +149,25 @@ func (l *peerListener) Accept() (net.Conn, error) {
 			c.Close()
 			continue
 		}
+		friend := l.caps.friendOf(p)
+		if !l.caps.conn(friend) {
+			l.log.Warn("tunnel connection over the friend's cap; closed unread", "peer", friend.String(), "key", p.String())
+			c.Close()
+			continue
+		}
 		l.log.Debug("tunnel connection", "peer", p.String())
-		return &peerConn{Conn: c, peer: p}, nil
+		return &peerConn{Conn: c, peer: p, done: func() { l.caps.connDone(friend) }}, nil
 	}
 }
 
 // ServeTunnel serves h on the tunnel listener ln until ctx is cancelled.
 // Each request's context carries the key of its connection (SEC-12),
-// which TunnelHandler reads.
-func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, h http.Handler, log *slog.Logger) error {
+// which TunnelHandler reads. caps bounds each key's open connections; it
+// is the Caps given to TunnelHandler, and nil means the defaults.
+func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, caps *Caps, h http.Handler, log *slog.Logger) error {
+	if caps == nil {
+		caps = &Caps{}
+	}
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
@@ -162,7 +186,7 @@ func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, h http.Han
 		defer cancel()
 		srv.Shutdown(shut)
 	}()
-	err := srv.Serve(&peerListener{Listener: ln, peerOf: peerOf, log: log})
+	err := srv.Serve(&peerListener{Listener: ln, peerOf: peerOf, caps: caps, log: log})
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

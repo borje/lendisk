@@ -76,12 +76,28 @@ func New(socket string, log *slog.Logger) *Bridge {
 	return b
 }
 
-// LoopbackHandler serves the S3 endpoint for tools on this host (EP-1).
+// LoopbackHandler serves the S3 endpoint for tools on this host (EP-1)
+// and on the LAN listeners (EP-17). A friend's credential, a node ID as
+// the access key, is refused here: it is served on the tunnel only,
+// where the connection's key binds it (SEC-12) and the per-friend caps
+// apply (#15, DESIGN §3.9).
 func (b *Bridge) LoopbackHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if gateway.IsControlPath(r.URL.Path) {
 			writeError(w, s3err.APIError{Code: "AccessDenied",
 				Description: "lendisk: control API not served here", HTTPStatusCode: http.StatusForbidden})
+			return
+		}
+		creds := credentialsOf(r)
+		if !creds.Readable {
+			writeError(w, s3err.APIError{Code: "AccessDenied", HTTPStatusCode: http.StatusForbidden,
+				Description: "lendisk: the request's credential cannot be read; sign it with SigV4"})
+			return
+		}
+		if creds.Friend {
+			b.Log.Warn("refused a friend's credential on a tool listener", "remote", r.RemoteAddr, "method", r.Method)
+			writeError(w, s3err.APIError{Code: "AccessDenied", HTTPStatusCode: http.StatusForbidden,
+				Description: "lendisk: a friend's node is served on the tunnel only, not on this listener"})
 			return
 		}
 		b.proxy.ServeHTTP(w, r)
