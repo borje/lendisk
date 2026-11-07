@@ -86,3 +86,21 @@ func TestTombstoneRows(t *testing.T) {
 		t.Fatalf("after pend and drop %+v", ts)
 	}
 }
+
+// A purge time with a fraction of a second is stored rounded up, so a
+// tomb is never purged before its window ends (RET-2).
+func TestPurgeTimeRoundedUp(t *testing.T) {
+	db := openTest(t)
+	ctx := context.Background()
+	at := time.Unix(2_000_000_000, 500_000_000)
+	if _, err := db.AddTombstone(ctx, Tombstone{Peer: "p", Sealed: "s", Key: "k", Tomb: ".lendisk/tomb/k/1", PurgeAfter: at, DeletedAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	ts, err := db.TombstonesOf(ctx, "p", "s", "k")
+	if err != nil || len(ts) != 1 {
+		t.Fatal(ts, err)
+	}
+	if ts[0].PurgeAfter.Before(at) {
+		t.Fatalf("purge after %v, earlier than %v", ts[0].PurgeAfter, at)
+	}
+}

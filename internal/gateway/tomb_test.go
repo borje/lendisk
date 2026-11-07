@@ -721,3 +721,63 @@ func TestTombstoneRecordedBeforeTheMove(t *testing.T) {
 		t.Fatalf("before the move: rows %+v, object live %v", seen, live)
 	}
 }
+
+// A key whose tomb path would run through another tomb (ENOTDIR) fails
+// its delete at once and keeps the object, instead of the delete
+// spinning with the key's lock held.
+func TestDeleteFailsWhenNoTombCanBeNamed(t *testing.T) {
+	l, _ := lendWithClock(t, 0, 0)
+	body := []byte("first")
+	if err := l.put("a", body, hashMeta(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.del("a"); err != nil {
+		t.Fatal(err)
+	}
+	ns := filepath.Base(l.tombs("a")[0].Tomb)
+	other := []byte("second")
+	if err := l.put("a/"+ns, other, hashMeta(other)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- l.del("a/" + ns) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("delete succeeded without a tomb")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("delete hangs choosing a tomb")
+	}
+	if got, err := os.ReadFile(filepath.Join(l.dir, "a", ns)); err != nil || !bytes.Equal(got, other) {
+		t.Fatalf("object after the failed delete: %q, %v", got, err)
+	}
+}
+
+// A purge working from a due list read before a revive leaves the
+// revived row alone: it neither removes its tomb nor frees its bytes.
+func TestPurgeSkipsARowRevivedSinceTheDueList(t *testing.T) {
+	l, c := lendWithClock(t, day, day)
+	body := []byte("kept")
+	if err := l.put("k", body, hashMeta(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.del("k"); err != nil {
+		t.Fatal(err)
+	}
+	ts := l.tombs("k")
+	c.advance(2 * day)
+	if err := l.h.db.PendTombstone(context.Background(), ts[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	usage := l.usage()
+	if err := l.lending().purgeOne(context.Background(), ts[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.tombBytes(ts[0]); err != nil {
+		t.Fatalf("tomb of a pending row removed: %v", err)
+	}
+	if got := l.usage(); got != usage {
+		t.Fatalf("usage %d after skipping, want %d", got, usage)
+	}
+}

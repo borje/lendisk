@@ -48,7 +48,7 @@ func scanTombs(rows *sql.Rows, err error) ([]Tombstone, error) {
 func (db *DB) AddTombstone(ctx context.Context, t Tombstone) (int64, error) {
 	res, err := db.ExecContext(ctx, `INSERT INTO tombstone (peer_key, sealed, key, tomb, sha256, etag, size, deleted_at, purge_after)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, t.Peer, t.Sealed, t.Key, t.Tomb, t.SHA256, t.ETag, t.Size,
-		t.DeletedAt.Unix(), t.PurgeAfter.Unix())
+		t.DeletedAt.Unix(), ceilUnix(t.PurgeAfter))
 	if err != nil {
 		return 0, err
 	}
@@ -132,4 +132,14 @@ func (db *DB) TombstonedKeys(ctx context.Context, peer, sealed, after string, li
 		WHERE peer_key = ? AND sealed = ? AND key > ? AND id = (SELECT id FROM tombstone u
 			WHERE u.peer_key = t.peer_key AND u.sealed = t.sealed AND u.key = t.key ORDER BY deleted_at DESC, id DESC LIMIT 1)
 		ORDER BY key LIMIT ?`, peer, sealed, after, limit))
+}
+
+// ceilUnix is t in whole seconds, rounded up, so a stored purge time
+// is never earlier than the one asked for (RET-2).
+func ceilUnix(t time.Time) int64 {
+	s := t.Unix()
+	if t.Nanosecond() > 0 {
+		s++
+	}
+	return s
 }

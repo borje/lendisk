@@ -3,11 +3,13 @@ package gateway
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"time"
 
@@ -73,12 +75,18 @@ func (l *Lending) objectPath(bucket, rel string) string {
 
 // tombName returns a path for a new tomb of key, under TombDir, that no
 // tomb holds yet. The caller holds the key's lock.
-func (l *Lending) tombName(bucket, key string, now time.Time) string {
+func (l *Lending) tombName(bucket, key string, now time.Time) (string, error) {
 	n := now.UnixNano()
 	for {
 		rel := path.Join(TombDir, key, strconv.FormatInt(n, 10))
-		if _, err := os.Lstat(l.objectPath(bucket, rel)); errors.Is(err, fs.ErrNotExist) {
-			return rel
+		_, err := os.Lstat(l.objectPath(bucket, rel))
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return rel, nil
+		case err != nil:
+			// ENOTDIR (a tomb where a directory must go), EACCES, EIO:
+			// no later name fares better.
+			return "", fmt.Errorf("choosing a tomb for %q: %w", key, err)
 		}
 		n++
 	}
@@ -157,7 +165,12 @@ func (l *Lending) deleteLent(ctx context.Context, peer, sealed string, in *s3.De
 	pub.take()
 	defer pub.release()
 	now := l.now()
-	t := state.Tombstone{Peer: peer, Sealed: sealed, Key: key, Tomb: l.tombName(bucket, key, now), SHA256: old.sha256,
+	tomb, err := l.tombName(bucket, key, now)
+	if err != nil {
+		l.log().Error("lending: no tomb for an object; the object stays", "bucket", bucket, "key", key, "err", err)
+		return nil, errInternal
+	}
+	t := state.Tombstone{Peer: peer, Sealed: sealed, Key: key, Tomb: tomb, SHA256: old.sha256,
 		ETag: old.etag, Size: old.size, DeletedAt: now, PurgeAfter: now.Add(Retention(f))}
 	id, err := l.DB.AddTombstone(context.Background(), t)
 	if err != nil {
@@ -396,6 +409,15 @@ func (l *Lending) purgeOne(ctx context.Context, t state.Tombstone) error {
 	pub := &published{u: l.use(t.Peer)}
 	pub.take()
 	defer pub.release()
+	// The due list was read before the lock: a revive since may have
+	// marked the row pending or dropped it.
+	rows, err := l.DB.TombstonesOf(ctx, t.Peer, t.Sealed, t.Key)
+	if err != nil {
+		return err
+	}
+	if !slices.ContainsFunc(rows, func(r state.Tombstone) bool { return r.ID == t.ID && !r.Pending }) {
+		return nil
+	}
 	if err := l.removeTomb(bucket, t.Tomb); err != nil {
 		return err
 	}
