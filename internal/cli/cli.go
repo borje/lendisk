@@ -84,6 +84,9 @@ type app struct {
 	// tuneControl, if set, adjusts the control API server before it
 	// serves (a slow list); tests only.
 	tuneControl func(*control.Server)
+	// tuneFetch, if set, adjusts the read-through's fetcher before the
+	// gateway serves. Tests only.
+	tuneFetch func(*replica.Fetcher)
 	// tuneRecovery, if set, adjusts the daemon's recovery lister before
 	// it starts (its timings); tests only.
 	tuneRecovery func(*recovery.Lister)

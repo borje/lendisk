@@ -28,7 +28,8 @@ const (
 	// queue row is completed: the window startup settles (EP-3).
 	envCrashAfterStore = "LENDISK_TEST_CRASH_AFTER_STORE"
 	// envReplFast=1 makes the replication worker poll and retry in
-	// milliseconds and give up on an absent friend in seconds, and the
+	// milliseconds and give up on an absent friend in seconds (the
+	// read-through's fetches too), and the
 	// manifest pusher and the recovery lister make a round every 200 ms
 	// and back off for at most a second (the daily re-push stays daily).
 	envReplFast = "LENDISK_TEST_REPL_FAST"
@@ -84,6 +85,11 @@ func TestMain(m *testing.M) {
 		}
 		if d, err := time.ParseDuration(os.Getenv(envListDelay)); err == nil {
 			a.tuneControl = func(s *control.Server) { s.Lent = slowList{LentLister: s.Lent, delay: d} }
+		}
+		a.tuneFetch = func(f *replica.Fetcher) {
+			if os.Getenv(envReplFast) == "1" {
+				f.Client = replica.Options{DialTimeout: 5 * time.Second, StallTimeout: 10 * time.Second}
+			}
 		}
 		a.tuneRecovery = func(l *recovery.Lister) {
 			if os.Getenv(envReplFast) == "1" {

@@ -96,8 +96,15 @@ func (a *app) serveCmd() *cobra.Command {
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
 			errc := make(chan error, 7) // gateway, LAN, loopback, replication, alerts, manifest, recovery
+			// The read-through (EP-10, ID-6) fetches what the store lacks
+			// from the friends holding it, over the tunnel.
+			fetch := &replica.Fetcher{DB: db, Self: id, Dial: tun.Dial}
+			if a.tuneFetch != nil {
+				a.tuneFetch(fetch)
+			}
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
-				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs}
+				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
+				Fetch: fetch}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
 			select {

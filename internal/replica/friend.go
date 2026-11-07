@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -167,6 +168,42 @@ func (f *Friend) Delete(ctx context.Context, bucket, key string) error {
 		return classify(fmt.Errorf("deleting %s: %w", key, err))
 	}
 	return nil
+}
+
+// Get opens key of the bucket at the friend for the read-through
+// (EP-10, ID-6): the whole object, from its sealed name. The caller
+// verifies the bytes against the hash it expects; the friend's word is
+// not taken for it. A body that moves no bytes for the stall timeout
+// fails, so a friend switched off mid-transfer cannot hang the read.
+func (f *Friend) Get(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	body, _, _, err := f.core.GetObject(ctx, f.self.SealedName(bucket), key, minio.GetObjectOptions{})
+	if err != nil {
+		cancel()
+		return nil, classify(fmt.Errorf("fetching %s: %w", key, err))
+	}
+	return &fetched{watchdog: newWatchdog(body, f.stall, cancel), body: body, cancel: cancel}, nil
+}
+
+// fetched is a friend's object body being read; Close ends its request.
+type fetched struct {
+	*watchdog
+	body   io.Closer
+	cancel context.CancelFunc
+}
+
+func (b *fetched) Read(p []byte) (int, error) {
+	n, err := b.watchdog.Read(p)
+	if err != nil && err != io.EOF && b.stalled() {
+		err = fmt.Errorf("no progress for %v: %w", b.d, err)
+	}
+	return n, err
+}
+
+func (b *fetched) Close() error {
+	b.stop()
+	b.cancel()
+	return b.body.Close()
 }
 
 // classify marks a place's refusals with the kind the worker acts on

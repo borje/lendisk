@@ -1207,8 +1207,22 @@ upstream bucket is Q-V.
   says so when no friend serves the manifest; the recovery demo must
   give the address of a friend that kept its database.
 - **ID-6** Read-through is the decorator's `GetObject`/`HeadObject`
-  miss path (EP-10); after `recover` every object is a miss until
-  fetched, from the first reachable place `placement` names.
+  miss path (EP-10, §3.3, #30); after `recover` every object is a miss
+  until fetched, from a place recovery recorded `acked` with the
+  version that counts, and a recovered key in conflict is refused with
+  the command that resolves it. Listing the bucket shows the keys the
+  index holds before any is read, so restic finds its keys, snapshots
+  and indexes on a store that is still empty. `restic restore latest`
+  then fetches the config, keys, snapshots and indexes, and the packs
+  of the snapshot it restores; nothing else (scenario 3). The AC is
+  `TestResticRestoreThroughFriendsAfterRecovery` in `internal/cli`:
+  three friends, a restic bucket at two copies, two snapshots (files
+  removed between them), replication drained; the node's directories
+  deleted; `recover` with the phrase and one friend's address; one
+  friend stopped; `serve`; `restic restore latest` with the credential
+  `bucket show` prints restores the files exactly, and the store then
+  holds only objects restic read, each the version the node wrote,
+  with the older snapshot's packs never fetched.
 - **ID-7** The sheet is generated from the manifest; a lender's `tc…`
   string changes only when its key or its configured bootstrap region
   changes (SEC-14), so regeneration is rare. Each bucket is listed with
@@ -1749,14 +1763,79 @@ upstream bucket is Q-V.
   decorator classifies a key at capture: a local-only key (restic
   `locks/*`, Kopia `_log*`) gets no queue row at all; the others get a
   queue row with their class, and placement rows as §3.4 says.
-- **EP-10** The decorator's `GetObject`/`HeadObject` turn a not-found
-  from the backend into a fetch through the replica interface (D12; a
-  ranged `GetObject` by the replica client) from a place `placement`
-  names as `acked` for the key, friends before overflow targets and
-  the most recently reachable first, falling through to the next on
-  failure; they write the object into the store and return it. A miss
-  happens after `recover` (ID-6) and after VER-5 has removed a rotten
-  object; nothing else removes an object from the local store (EP-9).
+- **EP-10** The read-through (`gateway/readthrough.go`, #30). The
+  decorator's `GetObject` and `HeadObject` turn the store's not-found
+  for an own bucket's key (not a local-only one; `lent-*` buckets pass
+  through) into a fetch:
+  - *Refused or not found.* A recovered key in conflict
+    (`state.KeyConflict`, §3.1 ID-5) is refused with `409 KeyConflict`,
+    whose message gives the reason and `lendisk bucket resolve <bucket>
+    <key> <friend>`. A key with no version that counts
+    (`state.Source`: no done queue row, or its latest is a delete) keeps
+    the store's `NoSuchKey`.
+  - *Where from.* The version that counts is the key's latest done
+    queue row, a put, with its size and SHA-256; the places are those
+    whose latest `acked` placement row for the key is a put of that
+    hash, which after `recover` are exactly the friends that listed the
+    winning hash. They are tried most recently reachable first: by the
+    later of `place.last_ok` (replication's last acknowledgement) and
+    the read-through's own last successful fetch from the place, kept in
+    memory; a place whose last fetch failed goes after every other, so
+    an offline friend costs one dial timeout, not one per object. A
+    failure falls through to the next place. Friends only until overflow
+    targets exist (#38), which would come after them.
+  - *Verified as it passes.* The body (`replica.Fetcher`, which builds
+    a `replica.Friend` per friend and calls `Friend.Get`: a whole-object
+    `GetObject` from the sealed bucket, with the stall watchdog, and a
+    dial timeout of 10 s rather than replication's 30 s, since a reader
+    waits) is streamed into the store with a plain backend `PutObject`
+    through a verifying reader: more bytes than the recorded size, fewer
+    at the end, or another SHA-256 once the size has passed fail the
+    read before posix links the object, so wrong bytes are never stored.
+    That is the place's fault: logged as such (`read-through: a friend
+    served bytes that are not the version it acknowledged`, with the
+    place), counted as its failed fetch, and the next place tried. It is
+    not an alert: VER-1's challenge (#27) is the verdict on a friend. A
+    failure of the local store stops the fetch (`500`); no place would
+    do better.
+  - *Stored without capture.* The object goes to the backend under the
+    decorator, so it gets no queue row and no placement: the places it
+    came from hold it already. It carries no `lendisk-capture` token,
+    which nothing needs, since only queue rows are settled against the
+    store.
+  - *Then served.* The request is answered from the store. A ranged
+    `GetObject` fetches the whole object, verifies and stores it, then
+    serves the range: restic's packs are about 16 MiB, so the simple way
+    costs little, and the next range of the pack is local. A `HEAD`
+    fetches the whole object too.
+  - *Once per key.* The fetch holds the key's lock (`keyLocks`, as a
+    captured write does) and, holding it, looks at the store again: of
+    concurrent misses of one key one fetches, the rest find it stored;
+    a write of the key waits for the fetch, and a fetch after a delete
+    finds no version and answers not-found.
+  - *No place could serve it*: `503 ServiceUnavailable` saying so, which
+    restic retries; nothing is stored.
+  - *Listing.* `ListObjectsV2` of an own bucket merges the store's page
+    with the index's live keys (`state.LiveKeys`: each key whose latest
+    done write is a put, and each recovered key in conflict, so reading
+    it says why) from the same marker, in byte order, folding keys under
+    a delimiter into common prefixes as posix does; the store's entry
+    wins a name both have, and the next continuation token is the last
+    name returned, which posix takes as its marker. An index entry has
+    the size and capture (or listing) time and no ETag. On a node that
+    lost nothing the index adds no key the store lacks. `ListObjects`
+    (v1) is not merged: restic, Kopia, rclone and the AWS CLI use v2.
+  - A miss happens after `recover` (ID-6) and after VER-5 has removed a
+    rotten object; nothing else removes an object from the local store
+    (EP-9). Only what a tool reads is fetched; no download runs in the
+    background.
+  - *Tests:* `TestMissFetchesFromAFriendAndRejectsWrongBytes`,
+    `TestNoFriendServingTheVersionStoresNothing`,
+    `TestHeadAndRangedReadFetchTheWholeObject`,
+    `TestConflictRefusedAndUnknownNotFound`,
+    `TestConcurrentMissesFetchOnce` and
+    `TestListShowsRecoveredKeysBeforeTheyAreRead` (`internal/gateway`);
+    the restic AC is §3.1 ID-6.
   *Post-v1, evict mode:* an eviction worker would delete a pack once
   `copies` places have acknowledged it and no restic lock is present,
   or for Kopia once the bucket has been idle for a configured
@@ -2109,7 +2188,9 @@ upstream bucket is Q-V.
   the lender hashes the whole stream it receives and compares with
   `x-amz-meta-lendisk-sha256` (LEND-4). minio-go's *signed* trailer is never
   used: its framing is refused by versitygw and Garage. A target that
-  refuses checksums gets none, per target. `Get` with a range is `GetObject` with a range option.
+  refuses checksums gets none, per target. `Get` is `GetObject` of the whole object
+  (`Friend.Get`, the read-through's fetch, §3.3 EP-10; a range would be
+  a range option, which nothing needs yet).
   `Head`, `List` and `Delete` map to `StatObject`, `ListObjects` (with
   versions at an overflow target) and `RemoveObject`. For a friend,
   `List` is the control API call of §3.7 and `Undelete` is §3.6.

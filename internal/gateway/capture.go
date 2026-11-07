@@ -30,7 +30,9 @@ const MetaCapture = "lendisk-capture"
 // Decorator wraps the store's backend (D4). It captures every successful
 // write and delete of an own bucket's key into the replication queue
 // (EP-2, EP-3), classified by the bucket's tool profile (EP-7);
-// tombstones (#17) are added as further overriding methods. Buckets that
+// tombstones (#17) are added as further overriding methods. A read of
+// an own bucket's key the store lacks is served through the read-through
+// (readthrough.go, EP-10, ID-6). Buckets that
 // are not the node's own (lent-*) pass through: a borrower's writes are
 // policed above, by Lending (quota.go).
 //
@@ -54,6 +56,9 @@ type Decorator struct {
 	DB       *state.DB
 	Profiles profile.Set
 	Log      *slog.Logger
+	// Fetch opens objects at friends for the read-through (EP-10,
+	// readthrough.go); nil fetches nothing.
+	Fetch Fetcher
 	// AfterStore, if set, is called after the store accepted a captured
 	// request and before its row is completed: the crash window startup
 	// settles. Tests only.
@@ -69,6 +74,8 @@ type Decorator struct {
 	// completing holds the claim on each upload being completed (under
 	// mu), so a retry can wait for its outcome rather than for the key.
 	completing map[string]*completion
+	// reach is what the read-through saw of each place (under mu).
+	reach map[string]reach
 
 	// ctx bounds the background hashes of completed uploads (nil: never
 	// cancelled); hashes counts them, so the gateway waits for them to
