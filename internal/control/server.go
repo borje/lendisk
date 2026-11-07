@@ -185,7 +185,8 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 
 // manifest is the node manifest call (ID-4, NET-7): PUT stores the
 // caller's manifest envelope, GET returns it. Both are keyed by the
-// connection's key alone, so a friend reaches its own manifest only,
+// resolved caller (Caller.Peer, the friend's node ID, never the dial key
+// it connected with) alone, so a friend reaches its own manifest only,
 // and need no bucket and no S3 credential: a node restored from its
 // phrase fetches its manifest before it has anything else. The lender
 // sees that a manifest exists and its size; the envelope is sealed with

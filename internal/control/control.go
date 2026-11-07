@@ -13,7 +13,8 @@
 //   - Only redeem is open to the invite role (SEC-13); the middleware
 //     enforces it, and Server checks the role again.
 //   - manifest stores and returns the caller's own manifest only, keyed
-//     by the connection's key; no parameter names whose (ID-4).
+//     by the resolved caller (Caller.Peer, the friend's node ID even on a
+//     dial-key connection); no parameter names whose (ID-4).
 //   - Nothing here returns another peer, ever (PEER-10).
 package control
 

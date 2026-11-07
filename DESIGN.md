@@ -968,7 +968,8 @@ upstream bucket is Q-V.
   current version (`manifest.pending`): never acknowledged, or the last
   push, the daily one included, failed. Both profiles push: a lender-only node
   is rebuilt from its manifest too. *Lender*: the call is open to the
-  `peer` role only (SEC-11, SEC-13) and keyed by the connection's key,
+  `peer` role only (SEC-11, SEC-13) and keyed by the resolved caller
+  (`Caller.Peer`, the friend's node ID, never the dial key it connected with),
   so a friend stores and reads its own manifest and no other; no
   parameter names whose. The body is at most 1 MiB
   (`control.MaxManifest`) and must have the envelope's shape (`ldm`,
