@@ -266,7 +266,11 @@ func Fetch(ctx context.Context, self *identity.Identity, addr string, dial DialF
 	case errors.As(err, &ce) && ce.Status == http.StatusNotFound:
 		return nil, fmt.Errorf("the lender %s keeps no manifest for this node: try another lender", peer)
 	case errors.As(err, &ce) && ce.Status == http.StatusForbidden:
-		return nil, fmt.Errorf("the lender %s does not know this node (%s): check the phrase, or try another lender", peer, ce.Message)
+		// A lender that lost its lendisk.db keeps the manifest file but
+		// admits no one it has no friendship with (SEC-10): only a new
+		// invite between the two makes it a friend again (ID-4).
+		return nil, fmt.Errorf("the lender %s does not know this node (%s): check the phrase, or try another lender; "+
+			"if that friend lost its lendisk.db, it knows you again only after a new invite", peer, ce.Message)
 	case err != nil:
 		return nil, fmt.Errorf("fetching the manifest from %s: %w", peer, err)
 	}

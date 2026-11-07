@@ -9,6 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
+
+	"github.com/borje/lendisk/internal/gateway"
 )
 
 // Client calls a peer's control API over HTTP whose transport dials the
@@ -31,6 +35,7 @@ func (c *Client) protocol() string {
 type CallError struct {
 	Status  int
 	Message string
+	Code    string // the refusal's code, if the peer named one
 }
 
 func (e *CallError) Error() string {
@@ -88,6 +93,49 @@ func (c *Client) GetManifest(ctx context.Context) ([]byte, error) {
 	return c.send(ctx, http.MethodGet, ManifestPath, nil, "", MaxManifest)
 }
 
+// maxListAnswer bounds one page of the list call: MaxListPage keys of at
+// most 1024 bytes each, with their sizes and hashes.
+const maxListAnswer = 4 << 20
+
+// ListPage reads one page of the list of this node's bucket sealed at
+// the peer (NET-7), after the key after, at most limit keys (0 means
+// the most the peer serves); a *CallError with status 404 means the
+// peer holds no bucket of this node by that name.
+func (c *Client) ListPage(ctx context.Context, sealed, after string, limit int) (ListPage, error) {
+	q := url.Values{"bucket": {sealed}}
+	if after != "" {
+		q.Set("after", after)
+	}
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	var p ListPage
+	b, err := c.send(ctx, http.MethodGet, ListPath+"?"+q.Encode(), nil, "", maxListAnswer)
+	if err != nil {
+		return p, err
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return p, fmt.Errorf("the peer's answer to %s is malformed: %w", ListPath, err)
+	}
+	// A page holds at most MaxListPage keys, rising strictly from after,
+	// and the next page starts past them, so a list ends however the peer
+	// answers (#29 review).
+	if len(p.Objects) > gateway.MaxListPage {
+		return p, fmt.Errorf("the peer's page holds %d keys, more than %d", len(p.Objects), gateway.MaxListPage)
+	}
+	last := after
+	for _, o := range p.Objects {
+		if o.Key <= last {
+			return p, fmt.Errorf("the peer's list does not rise past %q (it sent %q)", last, o.Key)
+		}
+		last = o.Key
+	}
+	if p.Next != "" && p.Next <= after || p.Next != "" && len(p.Objects) > 0 && p.Next < last {
+		return p, fmt.Errorf("the peer's list does not move on from %q", after)
+	}
+	return p, nil
+}
+
 func (c *Client) call(ctx context.Context, method, path string, in, out any) error {
 	var body io.Reader
 	if in != nil {
@@ -143,7 +191,7 @@ func (c *Client) send(ctx context.Context, method, path string, body io.Reader, 
 		if json.Unmarshal(b, &e) != nil || e.Error == "" {
 			e.Error = http.StatusText(resp.StatusCode)
 		}
-		return nil, &CallError{Status: resp.StatusCode, Message: e.Error}
+		return nil, &CallError{Status: resp.StatusCode, Message: e.Error, Code: e.Code}
 	}
 	if int64(len(b)) > max {
 		return nil, fmt.Errorf("the peer's answer to %s is over %d bytes", path, max)

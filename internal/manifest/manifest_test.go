@@ -112,9 +112,13 @@ func TestBuildListsFriendsAndBucketsNotPlacement(t *testing.T) {
 	db := openDB(t)
 	self := newID(t)
 	friend := newID(t).NodeID().String()
+	// The key the friend dials this node with (#69): a node rebuilt from
+	// the manifest must admit it again (ID-5, #29).
+	dial := newID(t).NodeID().String()
 	created := time.Unix(1_800_000_000, 0)
 	if err := db.AddFriendship(ctx, state.Friendship{Peer: friend, Address: "tcfriendaddr", OwnNumber: 10 << 30,
-		PeerNumber: 20 << 30, OwnRetention: 30 * 24 * time.Hour, PeerRetention: 60 * 24 * time.Hour, CreatedAt: created}); err != nil {
+		PeerNumber: 20 << 30, OwnRetention: 30 * 24 * time.Hour, PeerRetention: 60 * 24 * time.Hour, CreatedAt: created,
+		DialKey: dial}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.AddBucket(ctx, state.Bucket{Name: "laptop", Profile: "restic", Copies: 2, AccessKey: "AKIDSECRETACCESS",
@@ -130,7 +134,7 @@ func TestBuildListsFriendsAndBucketsNotPlacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(c.Friends) != 1 || c.Friends[0] != (Friend{ID: friend, Address: "tcfriendaddr", OwnNumber: 10 << 30,
-		PeerNumber: 20 << 30, OwnRetentionSeconds: 30 * 86400, PeerRetentionSeconds: 60 * 86400, Since: created.UTC()}) {
+		PeerNumber: 20 << 30, OwnRetentionSeconds: 30 * 86400, PeerRetentionSeconds: 60 * 86400, Since: created.UTC(), DialKey: dial}) {
 		t.Fatalf("friends %+v", c.Friends)
 	}
 	if len(c.Buckets) != 1 || c.Buckets[0] != (Bucket{Name: "laptop", Sealed: self.SealedName("laptop"), Copies: 2,

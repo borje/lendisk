@@ -52,7 +52,26 @@ type Profile struct {
 	Snapshot  []string `toml:"snapshot"`
 	Metadata  []string `toml:"metadata"`
 	Data      []string `toml:"data"`
+	// HashNamedKeys are the keys the tool names by the SHA-256 of their
+	// content, in hex, as their last path segment: recovery rejects a
+	// listed hash that is not the name (ID-5).
+	HashNamedKeys []string `toml:"hash_named"`
 }
+
+// HashNamed reports whether the tool names key by the SHA-256 of its
+// content (NameHash).
+func (p *Profile) HashNamed(key string) bool {
+	for _, pat := range p.HashNamedKeys {
+		if glob(pat, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// NameHash is the hash a hash-named key's name carries: its last path
+// segment.
+func NameHash(key string) string { return key[strings.LastIndexByte(key, '/')+1:] }
 
 // Classify returns the class of key: local-only, else snapshot, else
 // metadata, else data, by the first list a pattern of matches.
@@ -134,9 +153,9 @@ func (s Set) add(file string, b []byte) error {
 		return fmt.Errorf("%s: %w", file, err)
 	}
 	if un := md.Undecoded(); len(un) > 0 {
-		return fmt.Errorf("%s: unknown key %q (expected encrypted, local_only, snapshot, metadata, data)", file, un[0].String())
+		return fmt.Errorf("%s: unknown key %q (expected encrypted, local_only, snapshot, metadata, data, hash_named)", file, un[0].String())
 	}
-	for _, l := range [][]string{p.LocalOnly, p.Snapshot, p.Metadata, p.Data} {
+	for _, l := range [][]string{p.LocalOnly, p.Snapshot, p.Metadata, p.Data, p.HashNamedKeys} {
 		for _, pat := range l {
 			if pat == "" {
 				return fmt.Errorf("%s: empty pattern", file)

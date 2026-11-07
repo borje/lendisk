@@ -91,6 +91,12 @@ type Friend struct {
 	OwnRetentionSeconds  int64     `json:"own_retention_seconds"`
 	PeerRetentionSeconds int64     `json:"peer_retention_seconds"`
 	Since                time.Time `json:"since"`
+	// DialKey is the key the friend dials this node with (#69), learnt at
+	// redeem and proven there: a node rebuilt from the manifest admits
+	// the friend by it again (ID-5). Absent from a manifest written
+	// before it was added, and for a friendship without one; readers
+	// that predate it ignore it, so format stays 1.
+	DialKey string `json:"dial_key,omitempty"`
 }
 
 // Overflow is an overflow target (S3-1). None exist before #38; the
@@ -136,7 +142,7 @@ func Build(ctx context.Context, db *state.DB, self *identity.Identity) (Content,
 	for _, f := range fs {
 		c.Friends = append(c.Friends, Friend{ID: f.Peer, Address: f.Address, OwnNumber: f.OwnNumber, PeerNumber: f.PeerNumber,
 			OwnRetentionSeconds: int64(f.OwnRetention / time.Second), PeerRetentionSeconds: int64(f.PeerRetention / time.Second),
-			Since: f.CreatedAt.UTC()})
+			Since: f.CreatedAt.UTC(), DialKey: f.DialKey})
 	}
 	bs, err := db.Buckets(ctx)
 	if err != nil {

@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"path/filepath"
 	"slices"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 	"github.com/borje/lendisk/internal/version"
@@ -41,6 +44,46 @@ type Status struct {
 	// Manifest is the node manifest's version and which friends do not
 	// hold it yet (ID-4, #28).
 	Manifest StatusManifest `json:"manifest"`
+	// Recovery is what a recovered node still has to list (ID-5, #29).
+	Recovery StatusRecovery `json:"recovery"`
+}
+
+// StatusRecovery is the lists of places a recovered node has not read
+// yet: each place that was offline at `recover` until the daemon lists
+// it. Empty on a node that was never recovered or has read them all.
+type StatusRecovery struct {
+	Pending []StatusRelist `json:"pending"`
+	// Conflicts are recovered objects the friends disagree about, as
+	// many for one version as for another (or a metadata object one
+	// friend alone holds): none is used until `bucket resolve` picks.
+	Conflicts []StatusConflict `json:"conflicts"`
+	// Unverified counts, per bucket outside the encryption guarantee
+	// (EP-8), the recovered objects one friend alone listed: nothing
+	// checked them. Encrypted tools check their own objects.
+	Unverified []StatusUnverified `json:"unverified"`
+}
+
+// StatusConflict is one recovered object in conflict.
+type StatusConflict struct {
+	Bucket string `json:"bucket"`
+	Key    string `json:"key"`
+	Reason string `json:"reason"`
+	// Places maps each friend that lists it to the SHA-256 it holds.
+	Places map[string]string `json:"places"`
+}
+
+// StatusUnverified counts a bucket's single-source objects.
+type StatusUnverified struct {
+	Bucket  string `json:"bucket"`
+	Objects int64  `json:"objects"`
+}
+
+// StatusRelist is one list still to read.
+type StatusRelist struct {
+	Place  string `json:"place"`
+	Bucket string `json:"bucket"`
+	// Error is why the last attempt failed, if one did.
+	Error string `json:"error,omitempty"`
 }
 
 // StatusManifest is the node manifest's delivery (ID-4).
@@ -376,6 +419,39 @@ func (a *app) statusCmd() *cobra.Command {
 			if st.Manifest, err = manifestStatus(cmd.Context(), db); err != nil {
 				return err
 			}
+			rls, err := db.Relists(cmd.Context())
+			if err != nil {
+				return err
+			}
+			st.Recovery.Pending = []StatusRelist{}
+			for _, r := range rls {
+				st.Recovery.Pending = append(st.Recovery.Pending, StatusRelist{Place: r.Place, Bucket: r.Bucket, Error: r.Error})
+			}
+			cs, err := db.Conflicts(cmd.Context())
+			if err != nil {
+				return err
+			}
+			st.Recovery.Conflicts = []StatusConflict{}
+			for _, c := range cs {
+				st.Recovery.Conflicts = append(st.Recovery.Conflicts, StatusConflict{Bucket: c.Bucket, Key: c.Key,
+					Reason: c.Reason, Places: c.Places})
+			}
+			singles, err := db.SingleSources(cmd.Context())
+			if err != nil {
+				return err
+			}
+			st.Recovery.Unverified = []StatusUnverified{}
+			if len(singles) > 0 {
+				profiles, err := profile.Load(filepath.Join(cfg.ConfigDir(), "profiles"))
+				if err != nil {
+					return err
+				}
+				for _, b := range bs {
+					if n := singles[b.Name]; n > 0 && !profiles.Get(b.Profile).Encrypted {
+						st.Recovery.Unverified = append(st.Recovery.Unverified, StatusUnverified{Bucket: b.Name, Objects: n})
+					}
+				}
+			}
 			if asJSON {
 				enc := json.NewEncoder(a.out)
 				enc.SetIndent("", "  ")
@@ -444,6 +520,28 @@ func (a *app) statusCmd() *cobra.Command {
 					}
 					fmt.Fprintln(a.out)
 				}
+			}
+			if n := len(st.Recovery.Pending); n > 0 {
+				fmt.Fprintf(a.out, "Recovery: %d lists of what a friend holds not read yet; read when the friend answers\n", n)
+				for _, r := range st.Recovery.Pending {
+					fmt.Fprintf(a.out, "  %s at %s", r.Bucket, r.Place)
+					if r.Error != "" {
+						fmt.Fprintf(a.out, " (last try: %s)", r.Error)
+					}
+					fmt.Fprintln(a.out)
+				}
+			}
+			if n := len(st.Recovery.Conflicts); n > 0 {
+				fmt.Fprintf(a.out, "Recovery: %d objects in conflict, used by nothing until you pick a friend's version:\n", n)
+				for _, c := range st.Recovery.Conflicts {
+					fmt.Fprintf(a.out, "  %s %s: %s\n", c.Bucket, c.Key, c.Reason)
+					for _, p := range slices.Sorted(maps.Keys(c.Places)) {
+						fmt.Fprintf(a.out, "    %s holds %s: `lendisk bucket resolve %s %s %s`\n", p, c.Places[p], c.Bucket, c.Key, p)
+					}
+				}
+			}
+			for _, u := range st.Recovery.Unverified {
+				fmt.Fprintf(a.out, "Recovery: %d objects of %s came from one friend alone, unverified\n", u.Objects, u.Bucket)
 			}
 			if len(st.Alerts) == 0 {
 				fmt.Fprintln(a.out, "Alerts:  none")

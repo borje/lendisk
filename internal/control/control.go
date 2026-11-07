@@ -14,7 +14,8 @@
 //     enforces it, and Server checks the role again.
 //   - manifest stores and returns the caller's own manifest only, keyed
 //     by the resolved caller (Caller.Peer, the friend's node ID even on a
-//     dial-key connection); no parameter names whose (ID-4).
+//     dial-key connection); no parameter names whose (ID-4). list is
+//     keyed the same way: a friend pages its own buckets only (NET-7).
 //   - Nothing here returns another peer, ever (PEER-10).
 package control
 
@@ -28,6 +29,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
@@ -41,14 +43,39 @@ const Protocol = "0.1"
 // API request and response.
 const ProtocolHeader = "Lendisk-Protocol"
 
-// Paths of the control API. Only redeem, version and manifest are served
-// so far; the others are refused as not yet served.
+// Paths of the control API. Only redeem, version, manifest and list are
+// served so far; the others are refused as not yet served.
 const (
 	Prefix       = gateway.ControlPrefix
 	RedeemPath   = Prefix + "redeem"
 	VersionPath  = Prefix + "version"
 	ManifestPath = Prefix + "manifest"
+	ListPath     = Prefix + "list"
 )
+
+// LentLister is the lender's index of what it holds for each borrower
+// (NET-7 list); gateway.LentIndex is the implementation. List must
+// answer for borrower alone, which the control API takes from the
+// caller, never from the request.
+type LentLister interface {
+	List(ctx context.Context, borrower identity.NodeID, sealed, after string, limit int) ([]gateway.LentObject, string, error)
+}
+
+// ListPage is one page of the list call: keys in order, and the key the
+// next page starts after, "" after the last page.
+type ListPage struct {
+	Objects []ListObject `json:"objects"`
+	Next    string       `json:"next,omitempty"`
+}
+
+// ListObject is one key of a borrower's bucket at the lender: its size,
+// its SHA-256 (REPL-10) and, if tombstoned, when (RET-1).
+type ListObject struct {
+	Key          string     `json:"key"`
+	Size         int64      `json:"size"`
+	SHA256       string     `json:"sha256"`
+	TombstonedAt *time.Time `json:"tombstoned_at,omitempty"`
+}
 
 // MaxManifest bounds one node manifest envelope (ID-4). A friend keeps
 // one here, so this bounds what the manifest call can make a lender
@@ -202,10 +229,17 @@ type VersionResponse struct {
 	Version  string `json:"version"`
 }
 
-// errorBody is every control API error.
+// errorBody is every control API error. Code, when set, names a refusal
+// the caller acts on, beside its HTTP status.
 type errorBody struct {
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
+
+// CodeNoSuchBucket answers a list of a bucket the caller has none of at
+// the lender: the lender holds nothing of it. Any other 404 (a node
+// that lends nothing, or one without the call) is not that.
+const CodeNoSuchBucket = "NoSuchBucket"
 
 // The redeem proofs' key derivations; each distinct from every other
 // info string (identity's included).

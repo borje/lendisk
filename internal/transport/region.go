@@ -46,6 +46,24 @@ func (publicRelays) Pick(ctx context.Context, m *tailcfg.DERPMap) (tailcfg.DERPR
 	return id, err
 }
 
+// RestoreRegion saves raw, a region as SavedRegion stores it, taken
+// from the node manifest of a node being rebuilt (ID-4, ID-5), so its
+// address stays what its friends hold (SEC-14).
+func RestoreRegion(ctx context.Context, st NodeStore, raw json.RawMessage) error {
+	var r tailcfg.DERPRegion
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return fmt.Errorf("the manifest's tunnel region is not valid: %w", err)
+	}
+	if len(r.Nodes) == 0 {
+		return fmt.Errorf("the manifest's tunnel region %d has no relay", r.RegionID)
+	}
+	b, err := json.Marshal(&r)
+	if err != nil {
+		return err
+	}
+	return st.SetNode(ctx, regionKey, string(b))
+}
+
 // SavedRegion returns the region saved in st, or nil if none is.
 func SavedRegion(ctx context.Context, st NodeStore) (*tailcfg.DERPRegion, error) {
 	v, ok, err := st.GetNode(ctx, regionKey)

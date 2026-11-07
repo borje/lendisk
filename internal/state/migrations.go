@@ -295,4 +295,73 @@ var migrations = []Migration{
 			failures     INTEGER NOT NULL DEFAULT 0 -- failed attempts since the last success
 		);`,
 	},
+	{
+		Version: 15, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovery (ID-5, #29): the lists of a place's copy of a bucket
+		-- still to be read to rebuild placement. recover adds one per
+		-- friend and bucket in the manifest; a list read to its end drops
+		-- its row, in the transaction that records its last page. A place
+		-- that was offline keeps its rows until the daemon lists it.
+		CREATE TABLE relist (
+			place     TEXT NOT NULL,              -- the friend's node ID
+			bucket    TEXT NOT NULL,              -- the own bucket's name
+			after     TEXT NOT NULL DEFAULT '',   -- the last key recorded: the next page starts after it
+			tried_at  INTEGER,                    -- unix seconds: the last failed attempt
+			error     TEXT,                       -- its failure
+			failures  INTEGER NOT NULL DEFAULT 0, -- failed attempts in a row
+			PRIMARY KEY (place, bucket)
+		);`,
+	},
+	{
+		Version: 16, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovery's verdict per key (ID-5, #29 review): what each place
+		-- listed, and which version counts. A key is held when the places
+		-- agree, or most of them do, or the user picked one; single when one
+		-- place lists it; conflict when places tie, or one place lists a
+		-- metadata key that another listed place lacks. Only the version
+		-- that counts has a queue row (seq) and acked placement rows.
+		ALTER TABLE relist ADD COLUMN seen INTEGER; -- keys and pages read so far: capped
+		CREATE TABLE listed (
+			bucket TEXT NOT NULL,
+			key    TEXT NOT NULL,
+			place  TEXT NOT NULL,
+			size   INTEGER NOT NULL,
+			sha256 TEXT NOT NULL,
+			class  TEXT NOT NULL,
+			named  INTEGER NOT NULL DEFAULT 0, -- 1: the key is named by its hash, which matched
+			PRIMARY KEY (bucket, key, place)
+		);
+		CREATE TABLE recovered_key (
+			bucket  TEXT NOT NULL,
+			key     TEXT NOT NULL,
+			verdict TEXT NOT NULL, -- held | single | conflict
+			reason  TEXT,          -- why, for status
+			sha256  TEXT,          -- the version that counts; NULL for a conflict
+			seq     INTEGER,       -- the queue row recovery made for it
+			picked  TEXT,          -- the hash the user picked (bucket resolve)
+			PRIMARY KEY (bucket, key)
+		);`,
+	},
+	{
+		Version: 17, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovery (#29 re-review): pages read of a list, capped apart from
+		-- its entries; and a list abandoned past a cap, kept so its place
+		-- does not count as listed to its end, but no longer read.
+		ALTER TABLE relist ADD COLUMN pages INTEGER;
+		ALTER TABLE relist ADD COLUMN abandoned INTEGER;`,
+	},
+	{
+		Version: 18, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovery (#29 re-review): a list read to its end is kept, done,
+		-- so only places that listed a bucket count as having listed it (a
+		-- friend added later has no row); settled is set once the keys a
+		-- finished or abandoned list affects were decided again, in short
+		-- batches after it ended.
+		ALTER TABLE relist ADD COLUMN done INTEGER;
+		ALTER TABLE relist ADD COLUMN settled INTEGER;`,
+	},
 }

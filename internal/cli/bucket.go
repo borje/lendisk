@@ -97,7 +97,37 @@ func (a *app) bucketCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.AddCommand(add, list, show)
+	resolve := &cobra.Command{
+		Use:   "resolve <bucket> <key> <friend>",
+		Short: "After recover, use a friend's version of an object the friends disagree about",
+		Long: `After recover (ID-5), an object the friends list in different versions,
+as many friends for one as for another, is in conflict: no version is
+used until you pick one. ` + "`lendisk status`" + ` lists each with what every
+friend holds. resolve uses the version the named friend (its node ID)
+holds, and counts every friend holding that version as holding it.`,
+		Args: cobra.ExactArgs(3),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, db, err := a.openState(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+			db.Clock = a.clock
+			err = db.ResolveKey(cmd.Context(), args[0], args[1], args[2])
+			switch {
+			case errors.Is(err, state.ErrNotConflict):
+				return fmt.Errorf("%s in %s is not a conflict; nothing to resolve", args[1], args[0])
+			case errors.Is(err, state.ErrNotFound):
+				return fmt.Errorf("friend %s does not list %s in bucket %s, or recovery found no such object; `lendisk status` lists the conflicts",
+					args[2], args[1], args[0])
+			case err != nil:
+				return err
+			}
+			fmt.Fprintf(a.out, "%s in %s: using the version friend %s holds.\n", args[1], args[0], args[2])
+			return nil
+		},
+	}
+	cmd.AddCommand(add, list, show, resolve)
 	return cmd
 }
 

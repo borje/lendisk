@@ -19,3 +19,7 @@ metadata = ["config", "keys/*", "index/*", "snapshots/*"]
 
 # Placed at `copies` places.
 data = ["data/*"]
+
+# Named by the SHA-256 of their content: recovery accepts a friend's copy
+# only if its hash is the name (ID-5). config and keys/ are not so named.
+hash_named = ["data/*", "index/*", "snapshots/*"]
