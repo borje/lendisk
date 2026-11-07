@@ -75,7 +75,10 @@ type lender struct {
 func startLender(t *testing.T) *lender { return startLenderS3(t, nil) }
 
 // startLenderS3 is startLender with s3 as the tunnel's S3 handler.
-func startLenderS3(t *testing.T, s3 http.Handler) *lender {
+func startLenderS3(t *testing.T, s3 http.Handler) *lender { return startLenderCaps(t, s3, nil) }
+
+// startLenderCaps is startLenderS3 with the given per-friend caps.
+func startLenderCaps(t *testing.T, s3 http.Handler, caps *Caps) *lender {
 	t.Helper()
 	db, err := state.Open(t.Context(), t.TempDir(), quiet)
 	if err != nil {
@@ -91,7 +94,9 @@ func startLenderS3(t *testing.T, s3 http.Handler) *lender {
 	roles := RolesIn(db, time.Now)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
-	go func() { done <- ServeTunnel(ctx, ln, l.tun.peerOf, TunnelHandler(roles, ctl, s3, quiet), quiet) }()
+	go func() {
+		done <- ServeTunnel(ctx, ln, l.tun.peerOf, caps, TunnelHandler(roles, ctl, s3, caps, quiet), quiet)
+	}()
 	t.Cleanup(func() { cancel(); <-done })
 	return l
 }

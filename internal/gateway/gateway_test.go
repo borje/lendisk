@@ -45,7 +45,11 @@ func TestGateRefuses(t *testing.T) {
 		{"POST", "/laptop/data/ab", "", false, false},
 	}
 	for _, c := range cases {
-		if got := refuse(request{method: c.method, path: c.path, objectLock: c.lock, multiDelete: c.multiDelete}) != ""; got != c.refused {
+		r := request{method: c.method, path: c.path, header: [][2]string{{"X-Amz-Bucket-Object-Lock-Enabled", c.lock}}}
+		if c.multiDelete {
+			r.query = [][2]string{{"delete", ""}}
+		}
+		if got := refuse(r) != ""; got != c.refused {
 			t.Errorf("%s %s lock=%q: refused=%v, want %v", c.method, c.path, c.lock, got, c.refused)
 		}
 	}

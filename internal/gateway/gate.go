@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 
@@ -11,27 +12,31 @@ import (
 )
 
 // Gate is lendisk's fiber middleware in front of versitygw's routing and
-// authentication (D4, NET-7, SEC-8). It refuses by the shape of the
-// request, before versitygw does anything with it:
+// authentication (D4, NET-7, SEC-8, SEC-9). It refuses by the shape of
+// the request, before versitygw does anything with it. For every
+// account:
 //
 //   - every PATCH: S3 has none, and every route of the admin API embedgw
 //     mounts on the socket is one (SEC-8);
 //   - CreateBucket asking for object lock, which posix would otherwise
 //     grant (D15);
-//   - the control API path, which belongs to the bridge on the tunnel and
-//     to nothing behind it;
+//   - the control API path, however spelled, raw or decoded the way
+//     versitygw decodes it; it belongs to the bridge on the tunnel and to
+//     nothing behind it;
 //   - a browser-form POST upload (a POST to a bucket that is not a
 //     multi-delete): it reaches the backend's PutObject, but no backup tool
 //     uses it and its policy-signed form is a second way in (Q-H, §3.3).
 //
+// For a borrower's account, a request whose access key (read unverified,
+// as the bridge does; versitygw verifies it next) is a node ID, it
+// admits exactly the Admitted ops of Surface in their exact shape and
+// refuses everything else (NET-7, SEC-9): see borrowerRefusal.
+//
 // Server-side copies are refused on own buckets by the decorator, which
 // knows the bucket map (Q-H).
-//
-// The borrower allow-list (NET-7, #15) grows here.
 func Gate() s3api.Option {
 	return s3api.WithMiddleware("/", func(c fiber.Ctx) error {
-		if msg := refuse(request{method: c.Method(), path: c.Path(), objectLock: c.Get("X-Amz-Bucket-Object-Lock-Enabled"),
-			multiDelete: c.Request().URI().QueryArgs().Has("delete")}); msg != "" {
+		if msg := refuse(requestOf(c)); msg != "" {
 			return deny(c, msg)
 		}
 		return c.Next()
@@ -53,24 +58,219 @@ func IsControlPath(p string) bool {
 
 // request is what the gate looks at.
 type request struct {
-	method, path string
-	objectLock   string // the x-amz-bucket-object-lock-enabled header
-	multiDelete  bool   // the query has "delete"
+	method string
+	path   string      // as sent, before any decoding (fasthttp's PathOriginal)
+	query  [][2]string // the query's keys and values, in order, as fasthttp parses them
+	header [][2]string // the headers' names and values
+}
+
+func requestOf(c fiber.Ctx) request {
+	r := request{method: c.Method(), path: string(c.Request().URI().PathOriginal())}
+	for k, v := range c.Request().URI().QueryArgs().All() {
+		r.query = append(r.query, [2]string{string(k), string(v)})
+	}
+	for k, v := range c.Request().Header.All() {
+		r.header = append(r.header, [2]string{string(k), string(v)})
+	}
+	return r
+}
+
+// get is the first value of header h, ignoring case.
+func (r request) get(h string) string {
+	for _, kv := range r.header {
+		if strings.EqualFold(kv[0], h) {
+			return kv[1]
+		}
+	}
+	return ""
+}
+
+func (r request) has(key string) bool {
+	for _, kv := range r.query {
+		if kv[0] == key {
+			return true
+		}
+	}
+	return false
+}
+
+// value is the query's first value for key, as fiber's Query reads it.
+func (r request) value(key string) string {
+	for _, kv := range r.query {
+		if kv[0] == key {
+			return kv[1]
+		}
+	}
+	return ""
 }
 
 // refuse returns why a request is refused, or "" to let it through.
 func refuse(r request) string {
+	decoded, err := url.PathUnescape(r.path)
 	switch {
 	case r.method == http.MethodPatch:
 		return "lendisk: the admin API is not served"
-	case IsControlPath(r.path):
+	case IsControlPath(r.path) || err == nil && IsControlPath(decoded):
 		return "lendisk: control API not served here"
-	case r.method == http.MethodPut && strings.EqualFold(strings.TrimSpace(r.objectLock), "true"):
+	case r.method == http.MethodPut && strings.EqualFold(strings.TrimSpace(r.get("X-Amz-Bucket-Object-Lock-Enabled")), "true"):
 		return "lendisk: object lock is not offered"
-	case r.method == http.MethodPost && !r.multiDelete && isBucketPath(r.path):
+	case r.method == http.MethodPost && !r.has("delete") && isBucketPath(decoded):
 		return "lendisk: browser-form uploads are not offered; use PUT"
 	}
+	if r.fromBorrower() {
+		if err != nil {
+			return "lendisk: the request path is malformed"
+		}
+		return borrowerRefusal(r, decoded)
+	}
 	return ""
+}
+
+// fromBorrower reports whether any credential the request names is a
+// node ID: in a SigV4 or SigV2 Authorization header, or a presigned
+// URL's query of either version. Read without verifying anything;
+// versitygw verifies the one it uses.
+func (r request) fromBorrower() bool { return NamesFriend(r.get("Authorization"), r.query) }
+
+// NamesFriend reports whether any credential a request names is a node
+// ID, a friend's access key (NET-7a): in its Authorization header (SigV4
+// Credential= or SigV2 "AWS key:sig") or its query (a presigned URL's
+// X-Amz-Credential or AWSAccessKeyId). Nothing is verified. The gate uses
+// it to apply the borrower list, and the bridge to refuse a friend's
+// credential on loopback and LAN listeners.
+func NamesFriend(authorization string, query [][2]string) bool {
+	var keys []string
+	if h := authorization; h != "" {
+		scheme, rest, _ := strings.Cut(h, " ")
+		switch scheme {
+		case "AWS4-HMAC-SHA256":
+			for _, part := range strings.Split(rest, ",") {
+				if v, ok := strings.CutPrefix(strings.TrimSpace(part), "Credential="); ok {
+					k, _, _ := strings.Cut(v, "/")
+					keys = append(keys, k)
+				}
+			}
+		case "AWS":
+			k, _, _ := strings.Cut(rest, ":")
+			keys = append(keys, k)
+		}
+	}
+	for _, kv := range query {
+		switch {
+		case strings.EqualFold(kv[0], "X-Amz-Credential"):
+			k, _, _ := strings.Cut(kv[1], "/")
+			keys = append(keys, k)
+		case kv[0] == "AWSAccessKeyId":
+			keys = append(keys, kv[1])
+		}
+	}
+	for _, k := range keys {
+		if _, ok := borrowerOf(strings.TrimSpace(k)); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// refusedHeaders are headers that would make an admitted op do something
+// NET-7 does not offer: copy, lock, retain, tag, grant, or encrypt with
+// a key the lender never sees (Q-H, RET-2). A borrower's request with
+// any header beginning with one of these is refused.
+var refusedHeaders = []string{
+	"X-Amz-Copy-Source",
+	"X-Amz-Object-Lock-",
+	"X-Amz-Bypass-Governance-Retention",
+	"X-Amz-Tagging",
+	"X-Amz-Acl",
+	"X-Amz-Grant-",
+	"X-Amz-Server-Side-Encryption",
+	"X-Amz-Bucket-Object-Lock-Enabled",
+}
+
+// errNotOffered is the gate's answer to a borrower outside the list.
+const errNotOffered = "lendisk: this operation is not offered to a friend's node (NET-7)"
+
+// borrowerRefusal admits a borrower's request only when it has the exact
+// shape of one Admitted op in Surface: its method and level, that op's
+// query keys present, no query key beyond those, the op's Allow and the
+// signature's, and no refused header. An object's key must be one a
+// borrower may name (checkKey: nothing under .lendisk/, no empty, "." or
+// ".." segment, SEC-5). decoded is the path as versitygw decodes it.
+func borrowerRefusal(r request, decoded string) string {
+	for _, h := range refusedHeaders {
+		if r.hasHeaderPrefix(h) {
+			return errNotOffered
+		}
+	}
+	level, key := levelOf(decoded)
+	for _, op := range Surface {
+		if op.Class != Admitted || op.Method != r.method || op.Level != level || !r.shaped(op) {
+			continue
+		}
+		if level == Object && checkKey(key) != nil {
+			return errBadKey.Description // answered as Lending answers it (SEC-5)
+		}
+		return ""
+	}
+	return errNotOffered
+}
+
+// hasHeaderPrefix reports whether the request carries a header whose
+// name begins with prefix, ignoring case.
+func (r request) hasHeaderPrefix(prefix string) bool {
+	for _, kv := range r.header {
+		if len(kv[0]) >= len(prefix) && strings.EqualFold(kv[0][:len(prefix)], prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// shaped reports whether r's query is exactly op's: each of op.Query's
+// keys present (with its value where versitygw routes on the value), and
+// every other key one of op.Allow or a signature or SDK key.
+func (r request) shaped(op Op) bool {
+	want, _ := url.ParseQuery(op.Query)
+	for k := range want {
+		if !r.has(k) {
+			return false
+		}
+		if k == "list-type" && r.value(k) != "2" {
+			return false
+		}
+	}
+	for _, kv := range r.query {
+		k := kv[0]
+		_, routed := want[k]
+		switch {
+		case routed:
+		case k == "x-id", len(k) > 6 && strings.EqualFold(k[:6], "x-amz-"):
+		default:
+			allowed := false
+			for _, a := range op.Allow {
+				allowed = allowed || a == k
+			}
+			if !allowed {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// levelOf splits a decoded path-style path into its level and key, as
+// versitygw's routes do: "/" is the service, "/b" and "/b/" the bucket,
+// anything longer an object.
+func levelOf(p string) (Level, string) {
+	p = strings.TrimPrefix(p, "/")
+	if p == "" {
+		return Service, ""
+	}
+	_, key, ok := strings.Cut(p, "/")
+	if !ok || key == "" {
+		return Bucket, ""
+	}
+	return Object, key
 }
 
 // isBucketPath reports whether a path-style path names a bucket only.
@@ -81,6 +281,9 @@ func isBucketPath(path string) bool {
 
 func deny(c fiber.Ctx, msg string) error {
 	e := s3err.APIError{Code: "AccessDenied", Description: msg, HTTPStatusCode: http.StatusForbidden}
+	if msg == errBadKey.Description {
+		e = errBadKey
+	}
 	c.Set(fiber.HeaderContentType, fiber.MIMEApplicationXML)
 	return c.Status(e.HTTPStatusCode).Send(e.XMLBody("", ""))
 }

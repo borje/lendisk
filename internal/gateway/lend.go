@@ -56,7 +56,7 @@ func borrowerOf(access string) (identity.NodeID, bool) {
 // calls that would weaken the ownership wall (ACLs, policies, ownership
 // controls, bucket owner), copies (their source names a bucket in a
 // string), DeleteBucket and DeleteObjects are refused; the NET-7 allow-list in the gate
-// (#15) narrows the rest.
+// (Gate, Surface) narrows the rest.
 //
 // For a borrower it also enforces quota, the free-space floor, object
 // integrity and key names on every write (quota.go: LEND-1, LEND-2,
@@ -275,7 +275,7 @@ func (l *Lending) PutBucketAcl(ctx context.Context, bucket string, data []byte) 
 
 // DeleteBucket is refused to a borrower: its row in the mapping table and
 // its bytes in the quota count would have to go with it, which is not
-// built (#15).
+// built.
 func (l *Lending) DeleteBucket(ctx context.Context, bucket string) error {
 	if refused(ctx) {
 		return errNotForBorrower

@@ -3,44 +3,44 @@
 package cli
 
 import (
-	"net/http"
 	"strings"
 	"testing"
 
-	"github.com/borje/lendisk/internal/control"
-	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/transport"
 )
 
 // SEC-11 AC: in the admitall build the tunnel admits every key, and an
-// identity with no relationship still has every request refused by the
-// middleware, on a node with zero peers and on one with a friend.
-// Run with `go test -tags admitall ./internal/cli`.
+// identity with no relationship still has every request of the
+// hostile-peer harness refused by the middleware (every S3 operation
+// versitygw routes, signed with the stranger's own derivable secret,
+// and every control call), on a node with zero peers and on one with a
+// friend. Run with `go test -tags admitall ./internal/cli`.
 func TestMiddlewareAloneRefusesStranger(t *testing.T) {
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
-	p, _ := identity.NewPhrase()
-	strangerKey, _ := identity.FromPhrase(p)
+	stranger := strangerID(t)
 	addr := a.status().Node.Address
-
+	aKey, err := transport.KeyOf(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret, err := stranger.S3Secret(aKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := attacker(t, "a stranger", stranger, addr, stranger.NodeID().String(), secret)
+	sealed := stranger.SealedName("laptop")
 	check := func(when string) {
-		c := tunnelClient(t, strangerKey, addr)
-		for _, r := range [][2]string{
-			{"GET", control.VersionPath},
-			{"POST", control.RedeemPath},
-			{"POST", control.Prefix + "challenge"},
-			{"GET", control.Prefix + "manifest"},
-			{"POST", control.Prefix + "quota"},
-			{"GET", control.Prefix + "list"},
-			{"GET", "/"},
-			{"PUT", "/sbucket/key"},
-		} {
-			resp, err := c.Do(t.Context(), r[0], r[1], strings.NewReader("{}"))
-			if err != nil {
-				t.Fatalf("%s: %s %s: the connection was not admitted: %v", when, r[0], r[1], err)
+		t.Helper()
+		h.label = "a stranger, " + when
+		attacks := append(s3Attacks(sealed, "data/ab/x", nil), controlAttacks(sealed, sealed)...)
+		for _, at := range attacks {
+			r := h.send(at)
+			if r.err != nil {
+				t.Fatalf("%s: %s %s: the connection was not admitted: %v", when, at.method, at.target, r.err)
 			}
-			resp.Body.Close()
-			if resp.StatusCode != http.StatusForbidden {
-				t.Errorf("%s: %s %s from a stranger: %d, want 403", when, r[0], r[1], resp.StatusCode)
+			if r.status != 403 {
+				t.Errorf("%s: %s (%s %s): %v, want 403", when, at.name, at.method, at.target, r)
 			}
 		}
 	}
