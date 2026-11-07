@@ -61,7 +61,10 @@ type Pusher struct {
 	kick     chan struct{}
 	mu       sync.Mutex
 	inflight map[string]bool
-	wg       sync.WaitGroup
+	// again is set when a round passed over a due friend because a push
+	// to it was in flight; the push's end then starts another round.
+	again bool
+	wg    sync.WaitGroup
 }
 
 func (p *Pusher) init() {
@@ -166,7 +169,11 @@ func (p *Pusher) Round(ctx context.Context) {
 	var todo []state.Friendship
 	p.mu.Lock()
 	for _, f := range fs {
-		if !p.inflight[f.Peer] && p.due(pushes[f.Peer], v.Seq, now) {
+		switch {
+		case !p.due(pushes[f.Peer], v.Seq, now):
+		case p.inflight[f.Peer]:
+			p.again = true
+		default:
 			todo = append(todo, f)
 		}
 	}
@@ -189,7 +196,12 @@ func (p *Pusher) Round(ctx context.Context) {
 			defer func() {
 				p.mu.Lock()
 				delete(p.inflight, f.Peer)
+				again := p.again
+				p.again = false
 				p.mu.Unlock()
+				if again && ctx.Err() == nil {
+					p.Kick()
+				}
 				p.wg.Done()
 			}()
 			pctx, cancel := context.WithTimeout(ctx, timeout)

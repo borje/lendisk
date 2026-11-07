@@ -18,6 +18,8 @@ type lenders struct {
 	got     map[string][][]byte
 	offline map[string]bool
 	pushed  chan string
+	// hold, when set, keeps every push in flight until it is closed.
+	hold chan struct{}
 }
 
 func newLenders() *lenders {
@@ -32,6 +34,11 @@ func (l *lenders) push(_ context.Context, f state.Friendship, blob []byte) error
 	}
 	l.got[f.Peer] = append(l.got[f.Peer], blob)
 	l.pushed <- f.Peer
+	if hold := l.hold; hold != nil {
+		l.mu.Unlock()
+		<-hold
+		l.mu.Lock()
+	}
 	return nil
 }
 
@@ -185,6 +192,36 @@ func TestKickPushesWithoutWaitingForPoll(t *testing.T) {
 		case <-r.lenders.pushed:
 		case <-time.After(10 * time.Second):
 			t.Fatal("Kick did not push the change")
+		}
+	}
+}
+
+// ID-4 "on every change": a change made while a push to a friend is
+// still in flight is pushed when that push ends, not at the next poll.
+func TestChangeDuringAPushIsPushedWhenItEnds(t *testing.T) {
+	r := newPushRig(t)
+	r.p.Poll = time.Hour
+	r.lenders.hold = make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { r.p.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	for range 2 {
+		select {
+		case <-r.lenders.pushed:
+		case <-time.After(10 * time.Second):
+			t.Fatal("no first round")
+		}
+	}
+	r.addBucket("laptop")
+	r.p.Kick()
+	time.Sleep(200 * time.Millisecond) // let the kicked round find both in flight
+	close(r.lenders.hold)
+	for range 2 {
+		select {
+		case <-r.lenders.pushed:
+		case <-time.After(10 * time.Second):
+			t.Fatal("the change was not pushed after the push in flight ended")
 		}
 	}
 }
