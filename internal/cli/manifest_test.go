@@ -131,8 +131,8 @@ func TestRedeemPushesManifestAtOnce(t *testing.T) {
 //   - B loses lendisk.db and restarts: the manifest file is unchanged.
 //     B knows A again only once they are friends again (SEC-10), here
 //     through a new invite that A answers with the stored terms (#51).
-//   - B lost its store too: being befriended again makes A push the
-//     same version again.
+//   - B lost its store too: being befriended again makes the running A
+//     push the same version again.
 //   - With A's machine gone, a fresh machine with nothing but A's phrase
 //     fetches it from B and opens it: every bucket with its sealed name
 //     and copies, B with its address, A's own address.
@@ -251,13 +251,8 @@ func TestManifestOnLenderSurvivesItsDatabaseLoss(t *testing.T) {
 	if ps := bn.peers(); len(ps) != 1 || ps[0].ID != aKey {
 		t.Fatalf("B's friends after the new invite: %+v", ps)
 	}
-	// A's tunnel client to B, refused by the B that had lost lendisk.db,
-	// does not recover within minutes (a transport matter outside #28);
-	// a restart gives A a fresh one. Without the delivery dropped by the
-	// new redeem, the restarted A would still not push: its version did
-	// not change and B acknowledged it moments ago.
-	a.p.kill()
-	a.start()
+	// The running A pushes again: its version did not change and B
+	// acknowledged it moments ago, but the new redeem dropped that.
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		if held, err = os.ReadFile(file); err == nil {
@@ -284,7 +279,10 @@ func TestManifestOnLenderSurvivesItsDatabaseLoss(t *testing.T) {
 		t.Fatal("the fresh machine has buckets")
 	}
 	id := fresh.identity()
-	dl, err := transport.NewDialer(id, slog.New(slog.DiscardHandler))
+	// Recovery dials each lender with this node's dial key for it, as the
+	// daemon will (ID-5): B, which lost its database, learnt it again at
+	// the new redeem.
+	dl, err := transport.NewFriendDialer(id, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

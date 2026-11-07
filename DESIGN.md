@@ -955,7 +955,7 @@ upstream bucket is Q-V.
   hung friend holds up no other. After failed pushes in a row a friend
   is due again only 1 min after the last, doubling per failure to at
   most 1 h. The table `manifest_push`
-  (migration 12) keeps per friend the `seq` acknowledged, when, the
+  (migration 14) keeps per friend the `seq` acknowledged, when, the
   last attempt, its failure and the failures in a row, so a friend
   that missed a push (it was offline, or this node was) gets it at the
   first round after its backoff in which it answers. Committing a
@@ -1008,19 +1008,34 @@ upstream bucket is Q-V.
   derives the per-pair S3 credentials (§3.7) for every lender listed,
   and re-derives its dial key for each friend the manifest lists (§3.1
   ID-1), which the friend still admits.
-  The fetch dials with the node's own key, because the lender answers
-  for the connection's key alone and knows no other (SEC-11, SEC-12).
-  A separate fetch key derived from the identity was rejected: the
-  lender would have to learn and keep it in `lendisk.db`, and `recover`
-  dials with the node's key anyway for `list` and the S3 reads, so it
-  would move the #52 problem rather than remove it. That problem: two
-  tailcat clients of one key at one relay stall each other (§3.7), so
-  while the old node still runs, its connections and the recovering
-  machine's stall. `recover` (#29) is for a node whose machine is gone or
-  stopped; it says to stop the old node first, uses one transport for
-  every call of the recovery, and closes it before the daemon starts.
-  Two nodes running with one identity are wrong in any case (both would
-  replicate and push manifests). Overflow target
+  *How recovery dials*: with `transport.NewFriendDialer(identity)`, a
+  dial-only transport that dials each friend with
+  `DialKeyFor(friend)`, the key the daemon dials it with (#69). The
+  fresh machine has no friendships yet, but it needs none: the dial key
+  depends on the phrase and the lender's node ID alone, and the
+  lender's ID is in its `tc…` address. The lender's tunnel resolves the
+  dial key to the friend (`state.TunnelPeer`), so the manifest call,
+  keyed by `Caller.Peer`, answers with the friend's own manifest. The
+  lender admits the dial key wherever its friendship row holds it:
+  every friendship made since #69, and one made again after the lender
+  lost `lendisk.db` (the redeem exchanges dial keys again, as the end
+  to end test checks). Dialling with the identity key was the other
+  choice: the lender admits it too, but it is the key the recovered
+  node's own tunnel server holds at its relay, and one key held by two
+  of a node's engines at one relay lets one take the other's packets
+  (§3.7, the reason for #69); the dial key is held by nothing else
+  once the old machine is gone. The one friendship it misses is one
+  made before #69 whose row has no dial key, which no release has; such
+  a friend admits the identity key, through `transport.NewDialer`.
+  A separate fetch key, learnt by the lender, was rejected earlier: the
+  lender would have to keep it, and recovery dials each friend anyway.
+  `recover` (#29) is for a node whose machine is gone or stopped: a
+  still running old node dials its friends with the same dial keys, and
+  two clients of one key at one relay stall each other. It says to stop
+  the old node first, uses one friend dialler for every call of the
+  recovery, and closes it before the daemon starts. Two nodes running
+  with one identity are wrong in any case (both would replicate and
+  push manifests). Overflow target
   credentials found in the manifest are shown once, for the user to
   put in the environment (SEC-3); they are not written to disk. The
   `placement` table (D6) and the hash index are then rebuilt from the

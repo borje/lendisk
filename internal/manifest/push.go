@@ -247,10 +247,12 @@ func client(dial DialFunc, peer identity.NodeID, addr string) (*control.Client, 
 
 // Fetch fetches self's manifest from the lender at addr and opens it
 // (ID-5): nothing but the identity is needed, no bucket, no S3
-// credential and no lendisk.db. dial must dial with self's own key,
-// since the lender answers the manifest call for the connection's key
-// alone (SEC-11, SEC-12); use one transport for the whole recovery, as
-// two clients of one key stall each other at the lender's relay (#52).
+// credential and no lendisk.db. dial should be the Dial of
+// transport.NewFriendDialer(self): it dials the lender with
+// self.DialKeyFor(lender), the key the daemon will dial it with (#69),
+// which the lender resolves to self and answers for (SEC-11, SEC-12).
+// Use that one transport for the whole recovery and close it before the
+// daemon starts, so one key never has two clients at a relay.
 func Fetch(ctx context.Context, self *identity.Identity, addr string, dial DialFunc) (*Manifest, error) {
 	peer, err := transport.KeyOf(addr)
 	if err != nil {

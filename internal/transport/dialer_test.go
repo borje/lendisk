@@ -141,6 +141,43 @@ func TestDialReachesRestartedServer(t *testing.T) {
 	}
 }
 
+// ID-5 (#28): a friend dialler, what recovery dials with before any
+// daemon runs, dials each friend with the dial key for it (#69), as the
+// daemon's transport does, not with the identity key; and it serves
+// nothing.
+func TestFriendDialerDialsWithTheDialKey(t *testing.T) {
+	d := transporttest.Start(t)
+	srvID, me := newID(t), newID(t)
+	srv := newTailcat(t, srvID, d)
+	srv.Admit(func(identity.NodeID) bool { return true })
+	l := listen(t, srv)
+	dl, err := NewFriendDialer(me, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dl.Close()
+	if _, err := dl.Listen(t.Context()); err == nil {
+		t.Fatal("a friend dialler listens")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	c, err := dl.Dial(ctx, srvID.NodeID(), srv.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var s net.Conn
+	select {
+	case s = <-l.conns:
+	case <-ctx.Done():
+		t.Fatal("no connection accepted")
+	}
+	defer s.Close()
+	if got, err := srv.PeerOf(s); err != nil || got != me.DialKeyFor(srvID.NodeID()).NodeID() {
+		t.Fatalf("dialled as %v (%v), want the dial key %v", got, err, me.DialKeyFor(srvID.NodeID()).NodeID())
+	}
+}
+
 // echo checks that the dialled connection c and its accepted end s still
 // carry bytes both ways.
 func echo(t *testing.T, c, s net.Conn, msg string) {

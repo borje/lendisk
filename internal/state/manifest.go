@@ -33,10 +33,6 @@ func (db *DB) ManifestVersion(ctx context.Context) (ManifestVersion, error) {
 	return manifestVersion(ctx, db)
 }
 
-type querier interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
 func manifestVersion(ctx context.Context, q querier) (ManifestVersion, error) {
 	var v ManifestVersion
 	get := func(key string) (string, error) {
