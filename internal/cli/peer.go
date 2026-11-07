@@ -276,7 +276,11 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 		OwnRetention: ret, PeerRetention: time.Duration(resp.RetentionSeconds) * time.Second,
 		CreatedAt: a.now(),
 	}
-	if err := db.FinishRedeem(ctx, ikID, f); err != nil {
+	if err := db.FinishRedeem(ctx, ikID, f); errors.Is(err, state.ErrDialKeyTaken) {
+		// A retry would get the same answer: only a hostile or broken
+		// inviter answers with another friend's key (#69).
+		return fmt.Errorf("node %s answered with a dial key that already names another friend here, so its friendship was not stored: %w; do not retry this invite, and ask the inviter about it", them, err)
+	} else if err != nil {
 		return fmt.Errorf("node %s stored the friendship but this node could not: %w; run the same `lendisk peer add` again to finish", them, err)
 	}
 	if resp.Number != inv.Number || f.PeerRetention != inv.Retention {
