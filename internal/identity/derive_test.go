@@ -6,8 +6,8 @@ import (
 	"testing"
 )
 
-// dialVector is the dial key of the test phrase.
-const dialVector = "4a6lsyzxvsgrjxzjb5dh6ameee3tdk2le7dzq26uumyyvxkl2jhcgqm6"
+// dialVector is the test phrase's dial key for the all-zero node ID.
+const dialVector = "3gzxeblrqbx5l37n5fiaamohptvjt2zindazckha5hdtgfvmf5eteio3"
 
 var sealedForm = regexp.MustCompile(`^s[a-z2-7]{26}$`)
 
@@ -88,25 +88,31 @@ func TestPairSecretIsSymmetric(t *testing.T) {
 	}
 }
 
-// ID-1 (#69): the dial key is derived from the identity key, so the
-// phrase recovers it; it is not the identity key, is the same on every
-// derivation, differs between identities, and is fixed by a vector.
-func TestDialKeyIsDerivedAndDistinct(t *testing.T) {
+// ID-1 (#69): a node dials each friend with its own key, derived from
+// the identity key and the friend's node ID, so the phrase and the
+// friend list recover it; it is not the identity key, is the same on
+// every derivation, differs between friends and between identities,
+// and is fixed by a vector.
+func TestDialKeyPerFriendIsDerivedAndDistinct(t *testing.T) {
 	a, err := FromPhrase(vector)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := a.DialKey()
+	p, _ := NewPhrase()
+	other, _ := FromPhrase(p)
+	var friend NodeID // the all-zero ID, for the vector
+	d := a.DialKeyFor(friend)
 	if d.NodeID() == a.NodeID() {
 		t.Fatal("the dial key is the identity key")
 	}
 	again, _ := FromPhrase(vector)
-	if again.DialKey().NodeID() != d.NodeID() {
+	if again.DialKeyFor(friend).NodeID() != d.NodeID() {
 		t.Fatal("the same phrase gave another dial key")
 	}
-	p, _ := NewPhrase()
-	other, _ := FromPhrase(p)
-	if other.DialKey().NodeID() == d.NodeID() {
+	if a.DialKeyFor(other.NodeID()).NodeID() == d.NodeID() {
+		t.Fatal("two friends share a dial key")
+	}
+	if other.DialKeyFor(friend).NodeID() == d.NodeID() {
 		t.Fatal("two identities gave the same dial key")
 	}
 	if k := d.PrivateKey().Bytes(); k[0]&7 != 0 || k[31]&128 != 0 || k[31]&64 == 0 {

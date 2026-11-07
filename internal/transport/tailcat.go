@@ -32,15 +32,16 @@ func Version() string { return version.Module("github.com/tailscale/tailcat") }
 // Tailcat is the Transport over tailcat (D5): a tailcat Server on the
 // identity's key, with no pre-shared key and the saved region, serving
 // Port; and one tailcat Client per dialled friend, with the dial key
-// (identity.DialKey, #69). The two keys differ because a relay delivers
-// a key's packets to whichever of its connections wrote last: with one
-// key, the node's own client would take the packets meant for its
-// server (DESIGN §3.7).
+// for that friend (identity.DialKeyFor, #69). Every engine has a key of
+// its own because a relay delivers a key's packets to whichever of its
+// connections wrote last: with one key, the node's own client would
+// take the packets meant for its server, or for its client to another
+// friend (DESIGN §3.7).
 type Tailcat struct {
-	key     key.NodePrivate // the server's: the identity key
-	dialKey key.NodePrivate // every client's
-	region  *tailcfg.DERPRegion
-	logf    logger.Logf
+	key        key.NodePrivate                       // the server's: the identity key
+	dialKeyFor func(identity.NodeID) key.NodePrivate // a client's, by friend
+	region     *tailcfg.DERPRegion
+	logf       logger.Logf
 
 	// probeTimeout bounds the transport's own check of a client after
 	// a dial through it failed; quietFor is how long a client's open
@@ -98,8 +99,8 @@ const (
 )
 
 // NewTailcat returns a transport for id with the saved region: it
-// serves with id and dials with id.DialKey(). It neither listens nor
-// dials until asked.
+// serves with id and dials each friend with id.DialKeyFor(friend). It
+// neither listens nor dials until asked.
 func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Logger) (*Tailcat, error) {
 	if id == nil {
 		return nil, errors.New("transport: no identity key")
@@ -109,9 +110,8 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 	}
 	epoch := time.Now()
 	t := &Tailcat{
-		key:     nodePrivate(id),
-		dialKey: nodePrivate(id.DialKey()),
-		region:  region,
+		key:    nodePrivate(id),
+		region: region,
 		logf: func(format string, args ...any) {
 			log.Debug(strings.TrimSpace(fmt.Sprintf(format, args...)), "component", "tailcat")
 		},
@@ -128,6 +128,7 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 		done:         make(chan struct{}),
 	}
 	t.check = t.dialCheck
+	t.dialKeyFor = func(friend identity.NodeID) key.NodePrivate { return nodePrivate(id.DialKeyFor(friend)) }
 	return t, nil
 }
 
@@ -144,7 +145,7 @@ func NewDialer(id *identity.Identity, log *slog.Logger) (*Tailcat, error) {
 		return nil, err
 	}
 	t.region = nil
-	t.dialKey = t.key
+	t.dialKeyFor = func(identity.NodeID) key.NodePrivate { return t.key }
 	return t, nil
 }
 
@@ -333,7 +334,7 @@ func (t *Tailcat) clientFor(ctx context.Context, peer identity.NodeID, relay rel
 				continue
 			}
 			c = &tailcatClient{
-				Client: &tailcat.Client{Server: tailcat.Addr(addr), Key: t.dialKey, Logf: t.logf},
+				Client: &tailcat.Client{Server: tailcat.Addr(addr), Key: t.dialKeyFor(peer), Logf: t.logf},
 				t:      t,
 				peer:   peer,
 				relay:  relay,

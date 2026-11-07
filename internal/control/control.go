@@ -105,8 +105,8 @@ func CallerFrom(ctx context.Context) (Caller, bool) {
 
 // RedeemRequest is what the invited node sends. Address names its own
 // key, which Proof shows it holds; Proof also binds DialKey, the key it
-// dials with (#69), which DialProof shows it holds. Prove fills all
-// three.
+// dials the inviting node with (#69), which DialProof shows it holds.
+// Prove fills all three.
 type RedeemRequest struct {
 	Address          string `json:"address"`
 	Number           int64  `json:"number"`
@@ -116,15 +116,15 @@ type RedeemRequest struct {
 	DialProof        []byte `json:"dial_proof"`
 }
 
-// Prove sets the request's dial key to self's and its two proofs, for
-// the redeem of the invite with inviteKey at inviter.
+// Prove sets the request's dial key to self's for inviter and its two
+// proofs, for the redeem of the invite with inviteKey at inviter.
 func (r *RedeemRequest) Prove(self *identity.Identity, inviter, inviteKey identity.NodeID) error {
-	dial := self.DialKey()
+	dial := self.DialKeyFor(inviter)
 	var err error
 	if r.Proof, err = RedeemProof(self, inviter, inviteKey, dial.NodeID()); err != nil {
 		return err
 	}
-	if r.DialProof, err = DialProof(dial, inviter, inviteKey); err != nil {
+	if r.DialProof, err = DialProof(dial, inviter, inviteKey, self.NodeID()); err != nil {
 		return err
 	}
 	r.DialKey = dial.NodeID().String()
@@ -132,7 +132,8 @@ func (r *RedeemRequest) Prove(self *identity.Identity, inviter, inviteKey identi
 }
 
 // RedeemResponse is the inviting node's side of the new friendship,
-// with its dial key and DialProof that it holds it (#69).
+// with its dial key for the redeeming node and DialProof that it holds
+// it (#69).
 type RedeemResponse struct {
 	Number           int64  `json:"number"`
 	RetentionSeconds int64  `json:"retention_seconds"`
@@ -152,10 +153,10 @@ func (r RedeemResponse) InviterDialKey(self *identity.Identity, inviter, inviteK
 	if err != nil {
 		return identity.NodeID{}, fmt.Errorf("the inviting node's dial key: %w", err)
 	}
-	if dial == inviter || dial == self.NodeID() || dial == self.DialKey().NodeID() {
-		return identity.NodeID{}, errors.New("the inviting node's dial key is a node ID or this node's dial key")
+	if dial == inviter || dial == self.NodeID() || dial == self.DialKeyFor(inviter).NodeID() || dial == inviteKey {
+		return identity.NodeID{}, errors.New("the inviting node's dial key is a node ID, the invite key or this node's dial key")
 	}
-	if !checkDialProof(self, dial, inviteKey, r.DialProof) {
+	if !checkDialProof(self, dial, inviteKey, inviter, r.DialProof) {
 		return identity.NodeID{}, errors.New("the inviting node's dial key is not proven")
 	}
 	return dial, nil
@@ -189,18 +190,21 @@ func RedeemProof(self *identity.Identity, other, inviteKey, dialKey identity.Nod
 	return proof(self, other, proofInfo, inviteKey[:], dialKey[:])
 }
 
-// DialProof shows that a dial key's holder took part in this redeem:
-// the same construction keyed by X25519(dial key, other) with
-// "lendisk-redeem-dial-v1", over the invite key. Without it a node
-// could report another's dial key as its own and be named by that
-// key's connections.
-func DialProof(dial *identity.Identity, other, inviteKey identity.NodeID) ([]byte, error) {
-	return proof(dial, other, dialProofInfo, inviteKey[:])
+// DialProof shows that a dial key's holder took part in this redeem
+// for holder, the node the dial key stands for: the same construction
+// keyed by X25519(dial key, other) with "lendisk-redeem-dial-v1", over
+// the invite key and then holder's node ID. Without it a node could
+// report another's dial key as its own and be named by that key's
+// connections; without holder, a proof copied from another node's
+// request would do (#69 review).
+func DialProof(dial *identity.Identity, other, inviteKey, holder identity.NodeID) ([]byte, error) {
+	return proof(dial, other, dialProofInfo, inviteKey[:], holder[:])
 }
 
-// checkDialProof checks, as self, got from the holder of dial.
-func checkDialProof(self *identity.Identity, dial, inviteKey identity.NodeID, got []byte) bool {
-	want, err := proof(self, dial, dialProofInfo, inviteKey[:])
+// checkDialProof checks, as self, got from the holder of dial for
+// holder.
+func checkDialProof(self *identity.Identity, dial, inviteKey, holder identity.NodeID, got []byte) bool {
+	want, err := proof(self, dial, dialProofInfo, inviteKey[:], holder[:])
 	return err == nil && hmac.Equal(want, got)
 }
 

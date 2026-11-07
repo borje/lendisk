@@ -543,7 +543,7 @@ func TestThirdKeyWithNewInviteRefused(t *testing.T) {
 	}
 	// unproven names self's dial key and proves nothing.
 	unproven := func(self *identity.Identity) control.RedeemRequest {
-		return control.RedeemRequest{DialKey: self.DialKey().NodeID().String()}
+		return control.RedeemRequest{DialKey: self.DialKeyFor(aKey).NodeID().String()}
 	}
 	redeem := func(cl *control.Client, addr string, r control.RedeemRequest) error {
 		r.Address, r.Number, r.RetentionSeconds = addr, 1<<30, 86400

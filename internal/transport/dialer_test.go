@@ -869,11 +869,11 @@ func TestRefusedThenAdmittedFriendsReachEachOther(t *testing.T) {
 	var bKnowsA atomic.Bool
 	bKnowsA.Store(true)
 	a := newTailcat(t, aID, d)
-	a.Admit(func(p identity.NodeID) bool { return p == bID.DialKey().NodeID() })
+	a.Admit(func(p identity.NodeID) bool { return p == bID.DialKeyFor(aID.NodeID()).NodeID() })
 	la := listen(t, a)
 	serveB := func() (*Tailcat, *listener) {
 		b := newTailcat(t, bID, d)
-		b.Admit(func(p identity.NodeID) bool { return p == aID.DialKey().NodeID() && bKnowsA.Load() })
+		b.Admit(func(p identity.NodeID) bool { return p == aID.DialKeyFor(bID.NodeID()).NodeID() && bKnowsA.Load() })
 		return b, listen(t, b)
 	}
 	b, lb := serveB()

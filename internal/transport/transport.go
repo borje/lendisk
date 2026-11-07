@@ -14,11 +14,12 @@
 //     Admission.Clear, so a key refused before is looked up again.
 //   - Close an accepted connection whose PeerOf fails before reading
 //     from it (SEC-12).
-//   - A node serves with its identity key and dials with its dial key
-//     (identity.DialKey, #69). PeerOf names the key a connection
-//     authenticated with, which for a friend is its dial key: resolve it
-//     with state.DB.TunnelPeer before acting for anyone, and admit with
-//     the same lookup. To drop a friend, Disconnect both its keys.
+//   - A node serves with its identity key and dials each friend with
+//     its dial key for that friend (identity.DialKeyFor, #69). PeerOf
+//     names the key a connection authenticated with, which for a friend
+//     is its dial key: resolve it with state.DB.TunnelPeer before acting
+//     for anyone, and admit with the same lookup. To drop a friend,
+//     Disconnect both its keys.
 //   - The address is a pure function of the identity key and the saved
 //     DERP region (SEC-14). EnsureRegion chooses the region once and
 //     saves it in lendisk.db; never pick one per start.

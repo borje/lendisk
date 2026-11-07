@@ -17,8 +17,9 @@ type Friendship struct {
 	OwnRetention  time.Duration // how long this node keeps the friend's deletes (RET-1)
 	PeerRetention time.Duration // how long the friend keeps this node's
 	CreatedAt     time.Time
-	// DialKey is the key the friend dials with (#69), node-ID form,
-	// learnt at redeem; "" for a friendship made before it existed.
+	// DialKey is the key the friend dials this node with (#69), in
+	// node-ID form, learnt at redeem; "" for a friendship made before
+	// it existed.
 	DialKey string
 }
 

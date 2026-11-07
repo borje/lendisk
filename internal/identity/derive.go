@@ -18,8 +18,9 @@ const (
 	nameInfo = "lendisk-bucket-name-v1"
 	// s3Info fixes the per-pair S3 secret (NET-7a).
 	s3Info = "lendisk-s3-v1"
-	// dialInfo fixes the dial key; changing it makes every friend refuse
-	// this node's dials until they learn the new key.
+	// dialInfo fixes the dial keys, before the friend's 32 key bytes;
+	// changing it makes every friend refuse this node's dials until they
+	// learn the new key.
 	dialInfo = "lendisk-dial-v1"
 	// sealedLen is the characters of the HMAC kept: 130 bits.
 	sealedLen = 26
@@ -40,14 +41,17 @@ func (id *Identity) SealedName(bucket string) string {
 	return "s" + b32.EncodeToString(m.Sum(nil))[:sealedLen]
 }
 
-// DialKey is the key this node dials its friends with (ID-1, #69):
-// HKDF-SHA256(private key, info="lendisk-dial-v1"), clamped for X25519.
-// The identity key serves; a second key dials, because one key held by
-// a node's server and its client at one relay lets the relay deliver
-// the server's packets to the client (DESIGN §3.7). It depends on the
-// phrase alone, so recovery gives the same dial key.
-func (id *Identity) DialKey() *Identity {
-	d, err := FromSecret(id.priv.Bytes(), dialInfo)
+// DialKeyFor is the key this node dials friend with (ID-1, #69):
+// HKDF-SHA256(private key, info="lendisk-dial-v1" || friend's 32 key
+// bytes), clamped for X25519. The identity key serves; each friend gets
+// a key of its own to be dialled with, because a relay delivers a key's
+// packets to the last of its connections to write, so one key held by
+// two of a node's tailcat engines at one relay (its server and a
+// client, or two clients) lets one take the other's packets (DESIGN
+// §3.7). It depends on the phrase and the friend's ID alone, so
+// recovery re-derives it from the friend list.
+func (id *Identity) DialKeyFor(friend NodeID) *Identity {
+	d, err := FromSecret(id.priv.Bytes(), dialInfo+string(friend[:]))
 	if err != nil {
 		panic(err) // a 32-byte secret always derives
 	}

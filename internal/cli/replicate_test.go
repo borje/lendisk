@@ -306,9 +306,10 @@ func TestReplicateResticBackupToFriend(t *testing.T) {
 
 // REPL-3, NET-1 (#69): two friends on one relay, each with a bucket,
 // replicate to each other at the same time and both queues drain. Each
-// daemon serves with its identity key and dials with its dial key; with
-// one key for both, a node's own client took the packets meant for its
-// server at the relay, and the second node to dial never got through.
+// daemon serves with its identity key and dials with its dial key for
+// the other; with one key for both, a node's own client took the
+// packets meant for its server at the relay, and the second node to
+// dial never got through.
 func TestFriendsReplicateToEachOtherAtOnce(t *testing.T) {
 	if testing.Short() {
 		t.Skip("long")

@@ -212,7 +212,7 @@ func TestFriendAdmittedAndNamed(t *testing.T) {
 	adm, db, _ := dbAdmission(t)
 	srvID, cliID := newID(t), newID(t)
 	if _, err := db.Exec(`INSERT INTO friendship (peer_key, created_at, dial_key) VALUES (?, 0, ?)`,
-		cliID.NodeID().String(), cliID.DialKey().NodeID().String()); err != nil {
+		cliID.NodeID().String(), cliID.DialKeyFor(srvID.NodeID()).NodeID().String()); err != nil {
 		t.Fatal(err)
 	}
 	srv := newTailcat(t, srvID, d)
@@ -239,8 +239,8 @@ func TestFriendAdmittedAndNamed(t *testing.T) {
 	}
 	defer sc.Close()
 	got, err := srv.PeerOf(sc)
-	if err != nil || got != cliID.DialKey().NodeID() {
-		t.Fatalf("PeerOf = %v, %v; want the dial key %v", got, err, cliID.DialKey().NodeID())
+	if err != nil || got != cliID.DialKeyFor(srvID.NodeID()).NodeID() {
+		t.Fatalf("PeerOf = %v, %v; want the dial key %v", got, err, cliID.DialKeyFor(srvID.NodeID()).NodeID())
 	}
 	if friend, role, err := db.TunnelPeer(ctx, got.String(), time.Now()); err != nil || friend != cliID.NodeID().String() || role != state.RolePeer {
 		t.Fatalf("the dial key resolves to %s %q %v", friend, role, err)
@@ -266,7 +266,7 @@ func TestFriendAdmittedAndNamed(t *testing.T) {
 	if _, err := srv.PeerOf(&net.TCPConn{}); err == nil {
 		t.Fatal("PeerOf a connection that is not the tunnel's succeeded")
 	}
-	if !srv.Disconnect(cliID.DialKey().NodeID()) {
+	if !srv.Disconnect(cliID.DialKeyFor(srvID.NodeID()).NodeID()) {
 		t.Fatal("Disconnect: friend was not connected")
 	}
 }

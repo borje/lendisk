@@ -125,8 +125,8 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 	case err != nil:
 		Error(w, http.StatusBadRequest, "redeem: dial key: "+err.Error())
 		return
-	case dial == friend || dial == s.Self.NodeID() || dial == s.Self.DialKey().NodeID():
-		Error(w, http.StatusBadRequest, "redeem: the dial key is a node ID or this node's dial key")
+	case dial == friend || dial == s.Self.NodeID() || dial == s.Self.DialKeyFor(friend).NodeID() || dial == c.Peer:
+		Error(w, http.StatusBadRequest, "redeem: the dial key is a node ID, the invite key or this node's dial key")
 		return
 	}
 	want, err := RedeemProof(s.Self, friend, c.Peer, dial)
@@ -134,12 +134,12 @@ func (s *Server) redeem(w http.ResponseWriter, r *http.Request, c Caller) {
 		Error(w, http.StatusForbidden, "redeem: the proof does not match the address's key and the dial key")
 		return
 	}
-	if !checkDialProof(s.Self, dial, c.Peer, req.DialProof) {
+	if !checkDialProof(s.Self, dial, c.Peer, friend, req.DialProof) {
 		Error(w, http.StatusForbidden, "redeem: the dial key's proof does not match the dial key")
 		return
 	}
-	ownDial := s.Self.DialKey()
-	dialProof, err := DialProof(ownDial, friend, c.Peer)
+	ownDial := s.Self.DialKeyFor(friend)
+	dialProof, err := DialProof(ownDial, friend, c.Peer, s.Self.NodeID())
 	if err != nil {
 		Error(w, http.StatusInternalServerError, "redeem failed on the inviting node; try again")
 		return

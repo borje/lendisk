@@ -17,9 +17,9 @@ negotiation, the local copy is always complete, an S3 service as the
 node's own store is post-v1, lock files stay local, and the identity
 key is a plain file; v0.11.1 (2026-11-06) makes the `copies = 1`
 warning unconditional, in `bucket add` and `status` only, and not an
-alert (EP-6); v0.11.2 gives a node a dial key, derived from the
-same phrase, to connect to its friends with (ID-1, SEC-10, SEC-12,
-SEC-14). The design
+alert (EP-6); v0.11.2 gives a node a dial key per friend, derived
+from the same phrase, to connect to its friends with (ID-1, SEC-10,
+SEC-12, SEC-14). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -278,11 +278,12 @@ double the surface for no change in the core problem.
 - **ID-1** A node shall have exactly one cryptographic identity. The node
   ID is the public key, displayed in a human-readable encoding with a
   checksum. The node serves its friends with the identity key and
-  connects to them with a dial key derived from the same phrase. The
-  dial key is not a second identity: friends learn it when they become
-  friends (PEER-2), and it stands for the node's identity. AC: two nodes
-  initialised from the same phrase have the same ID and the same dial
-  key.
+  connects to each friend with a dial key per friend, derived from the
+  same phrase and that friend's ID. A dial key is not a second
+  identity: the friend learns it when they become friends (PEER-2),
+  and it stands for the node's identity with that friend alone. AC: two
+  nodes initialised from the same phrase have the same ID and the same
+  dial key for each friend.
 - **ID-2** `lendisk init` shall generate a 24-word recovery phrase,
   derive the identity from it, show it once and require the user to
   confirm they wrote it down.
@@ -923,7 +924,8 @@ double the surface for no change in the core problem.
   No state of the node, including a fresh install, the moment after the
   last peer is removed, a restart and an upgrade, shall admit an unknown
   identity. A friend is admitted by its identity key or by its dial key
-  (ID-1), with that friend's rights alone either way; removing the
+  for this node (ID-1: a dial key per friend), with that friend's
+  rights alone either way; removing the
   friendship refuses both. AC: SEC-7's hostile-peer test runs from an unknown identity
   against a node with zero peers, with one peer, and with zero peers
   after the last one is removed; every connection is refused before any
@@ -1242,11 +1244,13 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
-- **v0.11.2 (2026-11-07)** A node connects to its friends with a dial
-  key derived from the same phrase as its identity key, which it keeps
-  for serving (#69). With one key for both, a relay shared by two
-  friends delivered packets meant for a node's server to its own
-  client, and a friendship could stall until a restart. ID-1, SEC-10,
+- **v0.11.2 (2026-11-07)** A node connects to each friend with a dial
+  key per friend, derived from the same phrase as its identity key,
+  which it keeps for serving (#69). With one key for both, a relay
+  shared by two friends delivered packets meant for a node's server to
+  its own client, and a friendship could stall until a restart; with
+  one dial key for all friends, the same happened between the node's
+  connections to two friends. ID-1, SEC-10,
   SEC-12 and SEC-14 reworded to match; the node ID, the address and the
   S3 credential (NET-7a) are unchanged.
 - **v0.11 (2026-11-04)** Simplifications from a review of v0.10.1
