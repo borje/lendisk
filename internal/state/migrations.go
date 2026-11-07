@@ -344,4 +344,13 @@ var migrations = []Migration{
 			PRIMARY KEY (bucket, key)
 		);`,
 	},
+	{
+		Version: 17, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovery (#29 re-review): pages read of a list, capped apart from
+		-- its entries; and a list abandoned past a cap, kept so its place
+		-- does not count as listed to its end, but no longer read.
+		ALTER TABLE relist ADD COLUMN pages INTEGER;
+		ALTER TABLE relist ADD COLUMN abandoned INTEGER;`,
+	},
 }

@@ -22,7 +22,8 @@ import (
 )
 
 func (a *app) recoverCmd() *cobra.Command {
-	return &cobra.Command{
+	var skip []string
+	cmd := &cobra.Command{
 		Use:   "recover <lender address>",
 		Short: "Rebuild this node on a new machine from the recovery phrase and one friend's address",
 		Long: `recover rebuilds a node whose machine is lost (ID-5). It reads the
@@ -36,16 +37,33 @@ downloaded: the local store starts empty.
 Stop the old node first if it still runs: it dials your friends with
 the same keys, and two nodes with one identity stall each other.
 
+Listing takes at most a few minutes: a friend not finished by then,
+and one named with --skip, is listed by the daemon instead.
+
 Run it on a fresh machine (empty config and data directories), then
 start the daemon with ` + "`lendisk serve`" + `.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.runRecover(cmd.Context(), args[0])
+			skipped := map[string]bool{}
+			for _, s := range skip {
+				id, err := identity.ParseNodeID(s)
+				if err != nil {
+					return usageError{fmt.Errorf("--skip %q: not a friend's node ID: %w", s, err)}
+				}
+				skipped[id.String()] = true
+			}
+			return a.runRecover(cmd.Context(), args[0], skipped)
 		},
 	}
+	cmd.Flags().StringSliceVar(&skip, "skip", nil, "a friend's node ID not to ask what it holds now; the daemon asks it later (repeatable)")
+	return cmd
 }
 
-func (a *app) runRecover(ctx context.Context, addr string) error {
+// defaultListBudget is how long recover lists what friends hold before
+// it leaves the rest to the daemon.
+const defaultListBudget = 3 * time.Minute
+
+func (a *app) runRecover(ctx context.Context, addr string, skip map[string]bool) error {
 	lenderID, err := transport.KeyOf(addr)
 	if err != nil {
 		return usageError{fmt.Errorf("the lender's address: %w; give the tc… string from the recovery sheet", err)}
@@ -152,9 +170,13 @@ func (a *app) runRecover(ctx context.Context, addr string) error {
 		return err
 	}
 	lister := &recovery.Lister{DB: db, Self: id, Dial: dl.Dial, Profiles: profiles, Now: a.clock,
-		Timeout: a.redeemTimeout(), Log: log}
-	fmt.Fprintln(w, "Asking each friend what it holds…")
-	results, err := lister.Round(ctx)
+		Timeout: a.redeemTimeout(), Skip: skip, Log: log}
+	budget := a.listBudget
+	if budget <= 0 {
+		budget = defaultListBudget
+	}
+	fmt.Fprintf(w, "Asking each friend what it holds (for at most %s)…\n", budget)
+	results, err := lister.RoundWithin(ctx, budget)
 	if err != nil {
 		return err
 	}
@@ -270,8 +292,12 @@ func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Resto
 				continue
 			}
 			switch {
+			case errors.Is(res.Err, recovery.ErrOutOfTime):
+				fmt.Fprintf(w, "    at %s: not finished in time; `lendisk serve` lists the rest\n", res.Place)
+			case errors.Is(res.Err, recovery.ErrSkipped):
+				fmt.Fprintf(w, "    at %s: skipped; `lendisk serve` lists it\n", res.Place)
 			case res.Err != nil:
-				fmt.Fprintf(w, "    at %s: not reachable now; listed when it answers, while `lendisk serve` runs\n", res.Place)
+				fmt.Fprintf(w, "    at %s: not listed (%v); `lendisk serve` tries again\n", res.Place, shortErr(res.Err))
 			default:
 				fmt.Fprintf(w, "    at %s: %d objects", res.Place, held[b.Name][res.Place])
 				if d := int64(res.Listed) - held[b.Name][res.Place]; d > 0 {
@@ -298,6 +324,15 @@ func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Resto
 	}
 	fmt.Fprintln(w, "\nNext: start the daemon with")
 	fmt.Fprintln(w, "\n  lendisk serve")
+}
+
+// shortErr is an error's message cut to one short line.
+func shortErr(err error) string {
+	s := err.Error()
+	if len(s) > 120 {
+		s = s[:117] + "..."
+	}
+	return s
 }
 
 // printOverflow shows the overflow targets the manifest carries, with

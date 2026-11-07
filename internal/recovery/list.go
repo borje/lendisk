@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/borje/lendisk/internal/control"
@@ -43,17 +44,38 @@ type Lister struct {
 	// per failure to at most MaxBackoff (defaults 1 min and 1 h).
 	Timeout, Poll          time.Duration
 	MinBackoff, MaxBackoff time.Duration
-	// MaxKeys bounds one place's list of one bucket, in entries and
-	// pages read (default DefaultMaxKeys): past it the list is abandoned,
-	// so a friend that lists without end cannot keep recovery listing.
-	MaxKeys int64
-	Log     *slog.Logger
+	// MaxKeys and MaxPages bound one place's list of one bucket, in
+	// entries and in pages read (defaults DefaultMaxKeys and
+	// DefaultMaxPages): past either the list is abandoned, so a friend
+	// that lists without end cannot keep recovery listing.
+	MaxKeys, MaxPages int64
+	// Parallel is how many places are listed at once (default 4), so a
+	// slow friend holds up no other.
+	Parallel int
+	// Skip are friends not to ask in a round: their lists stay pending,
+	// untried, for the daemon (recover --skip).
+	Skip map[string]bool
+	Log  *slog.Logger
 }
 
 // DefaultMaxKeys is Lister.MaxKeys's default: far above any backup
 // repository's object count (restic's 16 MiB packs make 10 million
 // objects 160 TB).
 const DefaultMaxKeys = 10_000_000
+
+// DefaultMaxPages is Lister.MaxPages's default. An honest lender fills
+// its pages (gateway.MaxListPage keys), so a list of DefaultMaxKeys
+// takes 10,000 pages; twice that and 1,000 more leave room for short
+// pages (keys a lender skips) and still end a list of empty pages
+// within hours, not years.
+const DefaultMaxPages = 2*DefaultMaxKeys/1000 + 1000
+
+// ErrOutOfTime is a list RoundWithin's budget ended before it was read:
+// it stays pending, untried, with what it recorded.
+var ErrOutOfTime = errors.New("not finished within the time allowed; the daemon lists the rest")
+
+// ErrSkipped is a list of a friend in Skip: it stays pending, untried.
+var ErrSkipped = errors.New("skipped; the daemon lists it")
 
 // Result is a list read in a round, whole or until it failed.
 type Result struct {
@@ -97,11 +119,18 @@ func (l *Lister) Pending(ctx context.Context) (int, error) {
 	return len(rs), err
 }
 
-// Round reads every list that is due, place by place. A place that
-// fails one list is not asked for its others in this round: each is
-// recorded as failed, and tried again after the backoff. A list past
-// MaxKeys is abandoned (its result says so) and not tried again.
-func (l *Lister) Round(ctx context.Context) ([]Result, error) {
+// Round reads every list that is due, with no time budget.
+func (l *Lister) Round(ctx context.Context) ([]Result, error) { return l.RoundWithin(ctx, 0) }
+
+// RoundWithin reads every list that is due, Parallel places at a time,
+// each place's lists one after another, for at most budget (0: no
+// limit). A place that fails one list is not asked for its others in
+// this round: each is recorded as failed, and tried again after the
+// backoff. A list past MaxKeys or MaxPages is abandoned (its result says
+// so) and not read again. A list the budget cut short (ErrOutOfTime) or
+// of a friend in Skip (ErrSkipped) stays pending, untried. Results are
+// by place and bucket.
+func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Result, error) {
 	rs, err := l.DB.Relists(ctx)
 	if err != nil {
 		return nil, err
@@ -112,19 +141,75 @@ func (l *Lister) Round(ctx context.Context) ([]Result, error) {
 			return nil, err
 		}
 	}
+	listCtx, cancel := ctx, context.CancelFunc(func() {})
+	if budget > 0 {
+		listCtx, cancel = context.WithTimeout(ctx, budget)
+	}
+	defer cancel()
 	now := l.now()
-	var out []Result
-	failed := map[string]error{}
+	var places []string
+	byPlace := map[string][]state.Relist{}
 	for _, r := range rs {
 		if !l.due(r, now) {
 			continue
 		}
+		if _, ok := byPlace[r.Place]; !ok {
+			places = append(places, r.Place)
+		}
+		byPlace[r.Place] = append(byPlace[r.Place], r)
+	}
+	results := make([][]Result, len(places))
+	errs := make([]error, len(places))
+	parallel := l.Parallel
+	if parallel <= 0 {
+		parallel = 4
+	}
+	sem := make(chan struct{}, parallel)
+	var wg sync.WaitGroup
+	for i, place := range places {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if l.Skip[place] {
+				for _, r := range byPlace[place] {
+					results[i] = append(results[i], Result{Place: r.Place, Bucket: r.Bucket, Err: ErrSkipped})
+				}
+				return
+			}
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i], errs[i] = l.listPlace(ctx, listCtx, byPlace[place], profiles)
+		}()
+	}
+	wg.Wait()
+	var out []Result
+	for i := range places {
+		out = append(out, results[i]...)
+		if errs[i] != nil && err == nil {
+			err = errs[i]
+		}
+	}
+	if ctx.Err() != nil {
+		return out, ctx.Err()
+	}
+	return out, err
+}
+
+// listPlace reads one place's due lists, one after another: listCtx
+// bounds the listing (the budget), ctx the recording.
+func (l *Lister) listPlace(ctx, listCtx context.Context, rs []state.Relist, profiles profile.Set) ([]Result, error) {
+	var out []Result
+	var failed error
+	for _, r := range rs {
 		res := Result{Place: r.Place, Bucket: r.Bucket}
 		var abandoned bool
-		if err, ok := failed[r.Place]; ok {
-			res.Err = err
-		} else {
-			abandoned, res.Err = l.listOne(ctx, r, profiles, &res)
+		switch {
+		case failed != nil:
+			res.Err = failed
+		case listCtx.Err() != nil:
+			res.Err = ErrOutOfTime
+		default:
+			abandoned, res.Err = l.listOne(listCtx, ctx, r, profiles, &res)
 		}
 		if ctx.Err() != nil {
 			return out, ctx.Err()
@@ -136,8 +221,10 @@ func (l *Lister) Round(ctx context.Context) ([]Result, error) {
 			}
 			l.logger().Warn("recovery: a place's list is longer than any list may be; abandoned",
 				"place", r.Place, "bucket", r.Bucket, "err", res.Err)
+		case res.Err != nil && listCtx.Err() != nil:
+			res.Err = ErrOutOfTime // left pending, untried
 		case res.Err != nil:
-			failed[r.Place] = res.Err
+			failed = res.Err
 			if err := l.DB.RelistFailed(ctx, r.Place, r.Bucket, res.Err.Error(), l.now()); err != nil {
 				return out, err
 			}
@@ -154,16 +241,10 @@ func (l *Lister) logger() *slog.Logger {
 	return l.Log
 }
 
-// errNoMoreThan is a list past MaxKeys.
-type errNoMoreThan int64
-
-func (e errNoMoreThan) Error() string {
-	return fmt.Sprintf("the place lists more than %d keys and pages; its list was abandoned", int64(e))
-}
-
 // listOne reads one list from its resume point to its end, counting in
-// res; abandoned reports a list past MaxKeys.
-func (l *Lister) listOne(ctx context.Context, r state.Relist, profiles profile.Set, res *Result) (abandoned bool, err error) {
+// res; abandoned reports a list past MaxKeys or MaxPages. listCtx bounds
+// the calls to the place, ctx the recording.
+func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles profile.Set, res *Result) (abandoned bool, err error) {
 	f, err := l.DB.GetFriendship(ctx, r.Place)
 	if errors.Is(err, state.ErrNotFound) {
 		// No longer a friend: nothing to list there.
@@ -184,13 +265,16 @@ func (l *Lister) listOne(ctx context.Context, r state.Relist, profiles profile.S
 		page, done = l.controlPage(f)
 		defer done()
 	}
-	maxKeys := l.MaxKeys
+	maxKeys, maxPages := l.MaxKeys, l.MaxPages
 	if maxKeys <= 0 {
 		maxKeys = DefaultMaxKeys
 	}
-	sealed, after, seen := l.Self.SealedName(r.Bucket), r.After, r.Seen
+	if maxPages <= 0 {
+		maxPages = DefaultMaxPages
+	}
+	sealed, after, seen, pages := l.Self.SealedName(r.Bucket), r.After, r.Seen, r.Pages
 	for {
-		pctx, cancel := context.WithTimeout(ctx, or(l.Timeout, time.Minute))
+		pctx, cancel := context.WithTimeout(listCtx, or(l.Timeout, time.Minute))
 		p, err := page(pctx, f, sealed, after)
 		cancel()
 		var ce *control.CallError
@@ -202,10 +286,13 @@ func (l *Lister) listOne(ctx context.Context, r state.Relist, profiles profile.S
 		if err != nil {
 			return false, err
 		}
-		// Every page counts, an empty one too, so a list ends.
-		seen += int64(max(len(p.Objects), 1))
-		if seen > maxKeys {
-			return true, errNoMoreThan(maxKeys)
+		seen += int64(len(p.Objects))
+		pages++
+		switch {
+		case seen > maxKeys:
+			return true, fmt.Errorf("the place lists more than %d keys; its list was abandoned", maxKeys)
+		case pages > maxPages:
+			return true, fmt.Errorf("the place's list runs to more than %d pages; it was abandoned", maxPages)
 		}
 		objs := make([]state.Listed, 0, len(p.Objects))
 		last := after
@@ -230,7 +317,7 @@ func (l *Lister) listOne(ctx context.Context, r state.Relist, profiles profile.S
 		if p.Next != "" && (p.Next <= after || p.Next < last) {
 			return false, fmt.Errorf("the place's list does not move on from %q", after)
 		}
-		n, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, objs, max(len(p.Objects), 1), p.Next, p.Next == "")
+		n, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, objs, len(p.Objects), p.Next, p.Next == "")
 		if err != nil {
 			return false, err
 		}
@@ -298,7 +385,10 @@ func (l *Lister) Run(ctx context.Context) {
 			l.Log.Error("recovery: reading the lists still to read failed", "err", err)
 		}
 		if n > 0 {
-			rs, err := l.Round(ctx)
+			// A round lasts at most 10 min: a list it cuts short goes on
+			// from where it stopped in the next, so a friend that lists
+			// slowly delays no other friend's retry for long.
+			rs, err := l.RoundWithin(ctx, 10*time.Minute)
 			if err != nil && ctx.Err() == nil {
 				l.Log.Error("recovery: recording a place's list failed", "err", err)
 			}

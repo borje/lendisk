@@ -1087,10 +1087,15 @@ upstream bucket is Q-V.
   not 64 lower-case hex digits, or, for a key the bucket's profile
   names by its hash (`hash_named`), a hash that is not the name:
   that friend's entry for the key counts as not held, whatever order
-  the friends are listed in. Every entry and every page counts toward
-  a cap per bucket and place (10 million, `relist.seen`); a list past
-  it is abandoned with what it recorded, so a friend that lists
-  without end cannot keep recovery listing. Only the lender's
+  the friends are listed in. A list is capped per bucket and place at
+  10 million entries (`relist.seen`) and, apart from that, at 21,000
+  pages (`relist.pages`, migration 17): an honest lender fills its
+  pages (1,000 keys), so 10 million keys take 10,000 pages, and twice
+  that plus 1,000 leaves room for short pages while a friend serving
+  empty pages without end is stopped within hours. A list past either
+  cap is abandoned (`relist.abandoned`): it is no longer read, what it
+  recorded is dropped, and a key only it listed is forgotten rather
+  than left a conflict nobody could resolve. Only the lender's
   `NoSuchBucket` code means it holds nothing of the bucket; any other
   refusal, a 404 from a node without the call included, is a failure
   tried again.
@@ -1102,9 +1107,14 @@ upstream bucket is Q-V.
   again from all places' entries: the hash most places list counts
   (`held`); a tie between hashes is a `conflict`; a key one place
   lists is a `single` source and counts, except a metadata or snapshot
-  key not named by its hash that another place, listed to its end,
-  lacks, which is a conflict too, since REPL-12 puts metadata at every
-  friend (a hash-named key is that object whoever holds it). The
+  key not named by its hash that another place lacks although it
+  listed the bucket to its end, which is a conflict too, since REPL-12
+  puts metadata at every friend (a hash-named key is that object
+  whoever holds it). Only lists read normally to their end count for
+  that: a pending or abandoned friend's silence is no evidence. For a
+  key not named by its hash, a colluding majority of friends therefore
+  wins: that is the rule decided, and #70 covers restic's `config` and
+  `keys/*`. The
   verdict is made again as each further list arrives (a friend
   returning breaks a tie 2 to 1), and whenever a list ends. Only the
   version that counts has a queue row (`put`, `done`, with the listed
@@ -1121,18 +1131,30 @@ upstream bucket is Q-V.
   catches a forged object), the count of single-source objects as
   unverified (`recovery.unverified`). `lendisk bucket resolve <bucket>
   <key> <friend>` picks that friend's version (`state.ResolveKey`):
-  it counts from then on, at every friend holding it. Restic's
+  it counts from then on, at every friend holding it. It refuses a key
+  that is not in conflict ("not a conflict; nothing to resolve"),
+  including one this node has written since recovery, which is no
+  conflict any more and is not shown as one. Restic's
   `config` and `keys/*` are not named by their hash, so one friend's
   stale but genuine copy is accepted; verifying them against hashes in
   the manifest is #70 (post-v1).
   The lists still to read are the table
   `relist` (migration 15: place, bucket, the key to resume after, the
-  last failure and failures in a row; migration 16 adds `seen`),
+  last failure and failures in a row; migration 16 adds `seen`,
+  migration 17 `pages` and `abandoned`),
   filled by `Restore` for every
   friend and bucket; the last page of a list drops its row in its
-  transaction, a page before it moves the resume key. A place that
-  fails is skipped for the rest of the round, and `recover` says it is
-  not reachable now. When a friend did not serve its manifest,
+  transaction, a page before it moves the resume key. Places are
+  listed side by side (4 at a time), each place's buckets one after
+  another, so a slow friend holds up no other. A place that fails is
+  skipped for the rest of the round, and `recover` says it is not
+  listed. `recover`'s round has a time budget (3 min, injectable):
+  what is not finished by then, and every list of a friend named with
+  `recover --skip <node ID>`, stays pending, untried, with what it
+  recorded; `recover` says so, saves the identity and finishes, and
+  the daemon's lister reads the rest. The daemon's rounds have a
+  budget of 10 min, so a slow friend delays other friends' retries by
+  that at most. When a friend did not serve its manifest,
   `recover` warns that it may hold a newer version and names it. A
   floor at the lender (refusing a manifest push below the stored
   `seq`) is not possible as things stand: the lender cannot read `seq`

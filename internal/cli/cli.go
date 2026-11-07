@@ -74,6 +74,9 @@ type app struct {
 	// the lost-answer and crash windows (#51); tests only.
 	redeemTransport  func(http.RoundTripper) http.RoundTripper
 	beforeFriendship func() error
+	// listBudget is how long recover lists before leaving the rest to
+	// the daemon; zero means defaultListBudget. Tests set it.
+	listBudget time.Duration
 	// afterFetch, if set, runs in recover once the manifests are
 	// fetched and before the places are listed; tests only.
 	afterFetch func()

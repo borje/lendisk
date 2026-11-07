@@ -114,10 +114,13 @@ holds, and counts every friend holding that version as holding it.`,
 			defer db.Close()
 			db.Clock = a.clock
 			err = db.ResolveKey(cmd.Context(), args[0], args[1], args[2])
-			if errors.Is(err, state.ErrNotFound) {
+			switch {
+			case errors.Is(err, state.ErrNotConflict):
+				return fmt.Errorf("%s in %s is not a conflict; nothing to resolve", args[1], args[0])
+			case errors.Is(err, state.ErrNotFound):
 				return fmt.Errorf("friend %s does not list %s in bucket %s, or recovery found no such object; `lendisk status` lists the conflicts",
 					args[2], args[1], args[0])
-			} else if err != nil {
+			case err != nil:
 				return err
 			}
 			fmt.Fprintf(a.out, "%s in %s: using the version friend %s holds.\n", args[1], args[0], args[2])

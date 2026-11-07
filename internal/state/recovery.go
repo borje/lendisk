@@ -72,11 +72,16 @@ func (c *ListedCount) Add(n ListedCount) {
 type Relist struct {
 	Place, Bucket string
 	After         string    // the next page starts after this key
-	Seen          int64     // keys and pages read so far
+	Seen          int64     // entries read so far
+	Pages         int64     // pages read so far
 	TriedAt       time.Time // the last failed attempt; zero if none
 	Error         string    // its failure
 	Failures      int64     // failed attempts in a row
 }
+
+// ErrNotConflict means ResolveKey was asked to settle a key that is not
+// in conflict: nothing to resolve.
+var ErrNotConflict = errors.New("not a conflict; nothing to resolve")
 
 // RecoveredKey is recovery's verdict on a key: which version counts
 // (SHA256, empty for a conflict), why (Reason), and what each place
@@ -109,8 +114,9 @@ func (db *DB) AddRelists(ctx context.Context, places, buckets []string) error {
 
 // Relists returns the lists still to read, by place and bucket.
 func (db *DB) Relists(ctx context.Context) ([]Relist, error) {
-	rows, err := db.QueryContext(ctx, `SELECT place, bucket, after, coalesce(seen, 0), tried_at, coalesce(error, ''), failures
-		FROM relist ORDER BY place, bucket`)
+	rows, err := db.QueryContext(ctx, `SELECT place, bucket, after, coalesce(seen, 0), coalesce(pages, 0), tried_at,
+		coalesce(error, ''), failures
+		FROM relist WHERE abandoned IS NULL ORDER BY place, bucket`)
 	if err != nil {
 		return nil, err
 	}
@@ -119,7 +125,7 @@ func (db *DB) Relists(ctx context.Context) ([]Relist, error) {
 	for rows.Next() {
 		var r Relist
 		var tried sql.NullInt64
-		if err := rows.Scan(&r.Place, &r.Bucket, &r.After, &r.Seen, &tried, &r.Error, &r.Failures); err != nil {
+		if err := rows.Scan(&r.Place, &r.Bucket, &r.After, &r.Seen, &r.Pages, &tried, &r.Error, &r.Failures); err != nil {
 			return nil, err
 		}
 		if tried.Valid {
@@ -138,15 +144,16 @@ func (db *DB) RelistFailed(ctx context.Context, place, bucket, msg string, now t
 }
 
 // AbandonRelist gives up on place's list of bucket (it listed more than
-// a list may hold): the list is dropped with what it recorded, and the
-// bucket's keys are decided again without it.
+// a list may hold): what it recorded is dropped, the list is no longer
+// read, and the bucket's keys are decided again without it. The place
+// does not count as listed to its end.
 func (db *DB) AbandonRelist(ctx context.Context, place, bucket string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	for _, q := range []string{`DELETE FROM relist WHERE place = ? AND bucket = ?`,
+	for _, q := range []string{`UPDATE relist SET abandoned = 1 WHERE place = ? AND bucket = ?`,
 		`DELETE FROM listed WHERE place = ? AND bucket = ?`} {
 		if _, err := tx.ExecContext(ctx, q, place, bucket); err != nil {
 			return err
@@ -197,7 +204,8 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 		}
 		return c, tx.Commit()
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE relist SET after = ?, seen = coalesce(seen, 0) + ?, tried_at = NULL, error = NULL, failures = 0
+	if _, err := tx.ExecContext(ctx, `UPDATE relist SET after = ?, seen = coalesce(seen, 0) + ?, pages = coalesce(pages, 0) + 1,
+		tried_at = NULL, error = NULL, failures = 0
 		WHERE place = ? AND bucket = ?`, next, seen, place, bucket); err != nil {
 		return c, err
 	}
@@ -213,8 +221,8 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 	return c, tx.Commit()
 }
 
-// listedPlaces are the friends whose list of bucket was read to its end
-// (none is pending).
+// listedPlaces are the friends whose list of bucket was read to its end:
+// none is pending, and none was abandoned.
 func listedPlaces(ctx context.Context, tx *sql.Tx, bucket string) (map[string]bool, error) {
 	ps, err := column(ctx, tx, `SELECT peer_key FROM friendship
 		WHERE peer_key NOT IN (SELECT place FROM relist WHERE bucket = ?)`, bucket)
@@ -281,6 +289,7 @@ func (db *DB) settleKey(ctx context.Context, tx *sql.Tx, bucket, key string, don
 		return err
 	}
 	verdict, reason, winner := decide(ls, picked.String, done)
+	gone := len(ls) == 0
 
 	// The node wrote the key itself since recovery: that version is its
 	// own; the lists only add the places that hold it.
@@ -306,6 +315,19 @@ func (db *DB) settleKey(ctx context.Context, tx *sql.Tx, bucket, key string, don
 		return saveVerdict(ctx, tx, bucket, key, verdict, reason, winner, own, picked)
 	}
 
+	if gone {
+		// No place lists it any more (its only lister was abandoned), and
+		// the node did not write it: recovery knows nothing of it.
+		if own.Valid {
+			for _, q := range []string{`DELETE FROM placement WHERE seq = ?`, `DELETE FROM queue WHERE seq = ?`} {
+				if _, err := tx.ExecContext(ctx, q, own.Int64); err != nil {
+					return err
+				}
+			}
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM recovered_key WHERE bucket = ? AND key = ?`, bucket, key)
+		return err
+	}
 	if own.Valid {
 		var ownSHA sql.NullString
 		if err := tx.QueryRowContext(ctx, `SELECT sha256 FROM queue WHERE seq = ?`, own.Int64).Scan(&ownSHA); err != nil &&
@@ -406,8 +428,8 @@ func decide(ls []listedRow, picked string, done map[string]bool) (verdict, reaso
 			}
 			if len(lacking) > 0 {
 				sort.Strings(lacking)
-				return VerdictConflict, fmt.Sprintf("only %s lists this metadata key; %s, which should hold it too, does not",
-					r.place, strings.Join(lacking, ", ")), ""
+				return VerdictConflict, fmt.Sprintf("only %s lists this metadata key; %s listed this bucket to its end without it, "+
+					"though every friend should hold metadata", r.place, strings.Join(lacking, ", ")), ""
 			}
 		}
 		return VerdictSingle, "one place lists it", r.sha
@@ -438,14 +460,19 @@ func (db *DB) RecoveredKeys(ctx context.Context, bucket string) ([]RecoveredKey,
 
 // Conflicts returns every recovered key in conflict.
 func (db *DB) Conflicts(ctx context.Context) ([]RecoveredKey, error) {
-	return db.recoveredKeys(ctx, `k.verdict = '`+VerdictConflict+`'`)
+	return db.recoveredKeys(ctx, inConflict)
 }
+
+// inConflict selects recovered keys k in conflict that this node has
+// not written since recovery: a write of its own settles the key.
+const inConflict = `k.verdict = '` + VerdictConflict + `' AND NOT EXISTS (SELECT 1 FROM queue q
+	WHERE q.bucket = k.bucket AND q.key = k.key AND q.state = 'done' AND (k.seq IS NULL OR q.seq > k.seq))`
 
 // KeyConflict reports whether key of bucket is a recovered key in
 // conflict, and the verdict: the read-through (#30) must refuse it,
 // saying why, until the user picks a place (ResolveKey).
 func (db *DB) KeyConflict(ctx context.Context, bucket, key string) (RecoveredKey, bool, error) {
-	ks, err := db.recoveredKeys(ctx, `k.bucket = ? AND k.key = ? AND k.verdict = '`+VerdictConflict+`'`, bucket, key)
+	ks, err := db.recoveredKeys(ctx, `k.bucket = ? AND k.key = ? AND `+inConflict, bucket, key)
 	if err != nil || len(ks) == 0 {
 		return RecoveredKey{}, false, err
 	}
@@ -499,18 +526,32 @@ func (db *DB) recoveredKeys(ctx context.Context, where string, args ...any) ([]R
 	return out, rows.Err()
 }
 
-// ResolveKey settles a recovered key with the version place listed:
-// the user's pick, which stands until the key is written again.
-// ErrNotFound if recovery knows no such key or place does not list it.
+// ResolveKey settles a recovered key in conflict with the version place
+// listed: the user's pick, which stands until the key is written again.
+// ErrNotFound if recovery knows no such key or place does not list it;
+// ErrNotConflict if the key is not in conflict (held, a single source,
+// or written on this node since recovery).
 func (db *DB) ResolveKey(ctx context.Context, bucket, key, place string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var known, conflict bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM recovered_key WHERE bucket = ?1 AND key = ?2),
+		EXISTS (SELECT 1 FROM recovered_key k WHERE k.bucket = ?1 AND k.key = ?2 AND `+inConflict+`)`,
+		bucket, key).Scan(&known, &conflict)
+	switch {
+	case err != nil:
+		return err
+	case !known:
+		return ErrNotFound
+	case !conflict:
+		return ErrNotConflict
+	}
 	var sha string
-	err = tx.QueryRowContext(ctx, `SELECT l.sha256 FROM listed l JOIN recovered_key k ON k.bucket = l.bucket AND k.key = l.key
-		WHERE l.bucket = ? AND l.key = ? AND l.place = ?`, bucket, key, place).Scan(&sha)
+	err = tx.QueryRowContext(ctx, `SELECT sha256 FROM listed WHERE bucket = ? AND key = ? AND place = ?`,
+		bucket, key, place).Scan(&sha)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {

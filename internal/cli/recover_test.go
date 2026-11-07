@@ -190,7 +190,7 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 		bKey + ": version " + strconv.FormatInt(old.Seq, 10) + ", older",
 		cKey + ": version " + strconv.FormatInt(newer.Seq, 10) + " (newest)",
 		"Friends: 2", "laptop (restic, copies 2)",
-		"at " + bKey + ": 6 objects", "at " + cKey + ": not reachable now",
+		"at " + bKey + ": 6 objects", "at " + cKey + ": not listed",
 		overflowSecret, "nothing was downloaded", "lendisk serve", "lendisk bucket show",
 	} {
 		if !strings.Contains(out, s) {
