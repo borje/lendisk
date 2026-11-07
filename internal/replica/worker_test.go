@@ -328,9 +328,7 @@ func TestQuotaAndRemovalPauseThePlace(t *testing.T) {
 			refuse = false
 			mu.Unlock()
 			fx.drained("B")
-			if c := fx.condition("B"); c.Condition != state.ConditionOK {
-				t.Fatalf("condition %+v", c)
-			}
+			waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
 		})
 	}
 }
@@ -815,9 +813,8 @@ func TestEmptyFIFOKeepsThePlacesOwnAnswer(t *testing.T) {
 		offline.Store(false)
 		fx.write("laptop", "data/2", "two")
 		fx.drained("B")
-		if c := fx.condition("B"); c.Condition != state.ConditionOK || c.LastOK.IsZero() {
-			t.Fatalf("condition %+v after the place answered", c)
-		}
+		// The condition is recorded after the FIFO drains, not with it.
+		waitFor(t, "ok", func() bool { c := fx.condition("B"); return c.Condition == state.ConditionOK && !c.LastOK.IsZero() })
 	})
 	t.Run("at daemon start", func(t *testing.T) {
 		fx := newFixture(t, "B", "C")
