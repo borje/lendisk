@@ -215,7 +215,11 @@ func (a *app) runRecover(ctx context.Context, addr string, skip map[string]bool)
 	if err != nil {
 		return err
 	}
-	a.printRecovered(w, m, restored, results, nodeAddress(ctx, cfg, id, log), held, conflicts)
+	unsettled, err := db.Unsettled(ctx)
+	if err != nil {
+		return err
+	}
+	a.printRecovered(w, m, restored, results, nodeAddress(ctx, cfg, id, log), held, conflicts, unsettled)
 	return nil
 }
 
@@ -280,7 +284,7 @@ func printFetched(w io.Writer, tried []recovery.Fetched, m *manifest.Manifest) {
 
 // printRecovered says what recover restored and what to run next.
 func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Restored, results []recovery.Result, addr string,
-	held map[string]map[string]int64, conflicts []state.RecoveredKey) {
+	held map[string]map[string]int64, conflicts []state.RecoveredKey, unsettled int) {
 	fmt.Fprintf(w, "\nRecovered from manifest version %d.\n", m.Seq)
 	if addr != "" {
 		fmt.Fprintf(w, "Address: %s\n", addr)
@@ -327,6 +331,11 @@ func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Resto
 	if len(conflicts) > 0 {
 		fmt.Fprintf(w, "\n%d objects are in conflict: the friends disagree about them, and none is used until you pick.\n", len(conflicts))
 		fmt.Fprintln(w, "`lendisk status` lists them; `lendisk bucket resolve <bucket> <key> <friend>` picks a friend's version.")
+	}
+	if unsettled > 0 {
+		// The counts above can still change: the final settling ran out
+		// of time or failed, and the daemon finishes it (#29 review).
+		fmt.Fprintln(w, "\nDeciding which friends' versions count is not finished yet, so the counts above may change; `lendisk serve` finishes it.")
 	}
 	printOverflow(w, m.Overflow)
 	fmt.Fprintln(w, "\nThe local store is empty: nothing was downloaded.")

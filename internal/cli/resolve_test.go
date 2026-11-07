@@ -137,9 +137,9 @@ func TestRecoverSaysWhatItLeftPending(t *testing.T) {
 		{Place: "SLOW", Bucket: "laptop", Err: recovery.ErrOutOfTime},
 		{Place: "SKIP", Bucket: "laptop", Err: recovery.ErrSkipped},
 		{Place: "B", Bucket: "laptop", ListedCount: state.ListedCount{Listed: 1}},
-	}, "", map[string]map[string]int64{"laptop": {"B": 1}}, nil)
+	}, "", map[string]map[string]int64{"laptop": {"B": 1}}, nil, 1)
 	out := w.String()
-	for _, s := range []string{"at SLOW: not finished in time", "at SKIP: skipped", "at B: 1 objects", "lendisk serve"} {
+	for _, s := range []string{"at SLOW: not finished in time", "at SKIP: skipped", "at B: 1 objects", "lendisk serve", "is not finished yet, so the counts above may change"} {
 		if !strings.Contains(out, s) {
 			t.Errorf("lacks %q:\n%s", s, out)
 		}
