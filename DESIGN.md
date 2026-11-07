@@ -1381,8 +1381,10 @@ upstream bucket is Q-V.
   ownership-control writes, `PutObjectAcl`, `ChangeBucketOwner`,
   `ListBucketsAndOwners`, `CopyObject` and `UploadPartCopy` (their
   source is a bucket inside a string), and `DeleteBucket` (its row and
-  quota count would go stale). The rest of NET-7's narrowing is the
-  gate's (§3.7 NET-7, SEC-9). `CreateBucket` creates the bucket with lendisk's own
+  quota count would go stale). Beyond those it refuses, as its first
+  step, every other method SEC-9's table classifies Refused or
+  Unreachable (#15 review), so NET-7's narrowing does not rest on the
+  gate alone (§3.7 NET-7, §3.9 SEC-9). `CreateBucket` creates the bucket with lendisk's own
   private ACL owned by the borrower's account and `BucketOwnerEnforced`,
   whatever ACL headers came with it, then inserts the row; a retry that
   finds `BucketAlreadyOwnedByYou` inserts it too, so a crash between
@@ -3142,9 +3144,12 @@ capture decorator, so nothing stands between that and posix (#62).
   | Unreachable | none | `ChangeBucketOwner`, `ListBucketsAndOwners`: the admin API only, whose every route is a `PATCH` the gate refuses (SEC-8) |
 
   Every class but Admitted is decided at the gate, before versitygw
-  routes or authenticates and before the backend is touched; `Lending`
-  refuses the ownership-weakening calls, copies, `DeleteObjects` and
-  `DeleteBucket` a second time. The table is re-reviewed on every
+  routes or authenticates and before the backend is touched. `Lending`
+  then refuses every Refused and Unreachable backend method a second
+  time, keyed on the account versitygw authenticated rather than the
+  gate's unverified reading of the key, as its first step
+  (`TestLendingRefusesEveryRefusedMethodToABorrower` calls each one
+  directly as a borrower, with no store and no database behind it). The table is re-reviewed on every
   versitygw upgrade, together with the replication-hole review (Q-H),
   and the two tests above fail when an upgrade adds an action or a
   method.

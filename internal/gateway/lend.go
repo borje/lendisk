@@ -52,11 +52,11 @@ func borrowerOf(access string) (identity.NodeID, bool) {
 //
 // Every backend.Backend method is written out here, none embedded, so a
 // method added by a versitygw upgrade fails to compile instead of
-// passing a borrower's sealed name through unmapped. For a borrower,
-// calls that would weaken the ownership wall (ACLs, policies, ownership
-// controls, bucket owner), copies (their source names a bucket in a
-// string), DeleteBucket and DeleteObjects are refused; the NET-7 allow-list in the gate
-// (Gate, Surface) narrows the rest.
+// passing a borrower's sealed name through unmapped. For a borrower's
+// authenticated account, every method BackendMethods classifies Refused
+// or Unreachable is refused (AccessDenied) before anything else, so the
+// gate's allow-list (Gate, Surface), which reads the access key
+// unverified, is not the only wall (SEC-9).
 //
 // For a borrower it also enforces quota, the free-space floor, object
 // integrity and key names on every write (quota.go: LEND-1, LEND-2,
@@ -284,6 +284,9 @@ func (l *Lending) DeleteBucket(ctx context.Context, bucket string) error {
 }
 
 func (l *Lending) PutBucketVersioning(ctx context.Context, bucket string, status types.BucketVersioningStatus) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -329,6 +332,9 @@ func (l *Lending) PutBucketOwnershipControls(ctx context.Context, bucket string,
 }
 
 func (l *Lending) GetBucketOwnershipControls(ctx context.Context, bucket string) (types.ObjectOwnership, error) {
+	if refused(ctx) {
+		return "", errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return "", err
@@ -344,6 +350,9 @@ func (l *Lending) DeleteBucketOwnershipControls(ctx context.Context, bucket stri
 }
 
 func (l *Lending) PutBucketCors(ctx context.Context, bucket string, cors []byte) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -360,6 +369,9 @@ func (l *Lending) GetBucketCors(ctx context.Context, bucket string) ([]byte, err
 }
 
 func (l *Lending) DeleteBucketCors(ctx context.Context, bucket string) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -368,6 +380,9 @@ func (l *Lending) DeleteBucketCors(ctx context.Context, bucket string) error {
 }
 
 func (l *Lending) PutBucketWebsite(ctx context.Context, bucket string, website []byte) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -376,6 +391,9 @@ func (l *Lending) PutBucketWebsite(ctx context.Context, bucket string, website [
 }
 
 func (l *Lending) GetBucketWebsite(ctx context.Context, bucket string) ([]byte, error) {
+	if refused(ctx) {
+		return nil, errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return nil, err
@@ -384,6 +402,9 @@ func (l *Lending) GetBucketWebsite(ctx context.Context, bucket string) ([]byte, 
 }
 
 func (l *Lending) DeleteBucketWebsite(ctx context.Context, bucket string) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -440,6 +461,9 @@ func (l *Lending) AbortMultipartUpload(ctx context.Context, in *s3.AbortMultipar
 }
 
 func (l *Lending) ListMultipartUploads(ctx context.Context, in *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error) {
+	if refused(ctx) {
+		return s3response.ListMultipartUploadsResult{}, errNotForBorrower
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.ListMultipartUploadsResult{}, err
@@ -531,6 +555,9 @@ func (l *Lending) GetObject(ctx context.Context, in *s3.GetObjectInput) (*s3.Get
 }
 
 func (l *Lending) GetObjectAcl(ctx context.Context, in *s3.GetObjectAclInput) (*s3.GetObjectAclOutput, error) {
+	if refused(ctx) {
+		return nil, errNotForBorrower
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return nil, err
@@ -544,6 +571,9 @@ func (l *Lending) GetObjectAcl(ctx context.Context, in *s3.GetObjectAclInput) (*
 }
 
 func (l *Lending) GetObjectAttributes(ctx context.Context, in *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
+	if refused(ctx) {
+		return s3response.GetObjectAttributesResponse{}, errNotForBorrower
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.GetObjectAttributesResponse{}, err
@@ -565,6 +595,9 @@ func (l *Lending) CopyObject(ctx context.Context, in s3response.CopyObjectInput)
 }
 
 func (l *Lending) ListObjects(ctx context.Context, in *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
+	if refused(ctx) {
+		return s3response.ListObjectsResult{}, errNotForBorrower
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.ListObjectsResult{}, err
@@ -624,6 +657,9 @@ func (l *Lending) PutObjectAcl(ctx context.Context, in *s3.PutObjectAclInput) er
 }
 
 func (l *Lending) ListObjectVersions(ctx context.Context, in *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
+	if refused(ctx) {
+		return s3response.ListVersionsResult{}, errNotForBorrower
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return s3response.ListVersionsResult{}, err
@@ -636,6 +672,9 @@ func (l *Lending) ListObjectVersions(ctx context.Context, in *s3.ListObjectVersi
 }
 
 func (l *Lending) RestoreObject(ctx context.Context, in *s3.RestoreObjectInput) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil {
 		return err
@@ -649,6 +688,9 @@ func (l *Lending) RestoreObject(ctx context.Context, in *s3.RestoreObjectInput) 
 }
 
 func (l *Lending) SelectObjectContent(ctx context.Context, in *s3.SelectObjectContentInput) func(w *bufio.Writer) {
+	if refused(ctx) {
+		return func(*bufio.Writer) {}
+	}
 	b, err := l.ptr(ctx, in.Bucket)
 	if err != nil || borrowerKey(ctx, in.Key) != nil {
 		return func(*bufio.Writer) {} // not on posix anyway; answer nothing
@@ -659,6 +701,9 @@ func (l *Lending) SelectObjectContent(ctx context.Context, in *s3.SelectObjectCo
 }
 
 func (l *Lending) GetBucketTagging(ctx context.Context, bucket string) (map[string]string, error) {
+	if refused(ctx) {
+		return nil, errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return nil, err
@@ -667,6 +712,9 @@ func (l *Lending) GetBucketTagging(ctx context.Context, bucket string) (map[stri
 }
 
 func (l *Lending) PutBucketTagging(ctx context.Context, bucket string, tags map[string]string) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -675,6 +723,9 @@ func (l *Lending) PutBucketTagging(ctx context.Context, bucket string, tags map[
 }
 
 func (l *Lending) DeleteBucketTagging(ctx context.Context, bucket string) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -683,6 +734,9 @@ func (l *Lending) DeleteBucketTagging(ctx context.Context, bucket string) error 
 }
 
 func (l *Lending) GetObjectTagging(ctx context.Context, bucket, object, versionID string) (map[string]string, error) {
+	if refused(ctx) {
+		return nil, errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return nil, err
@@ -694,6 +748,9 @@ func (l *Lending) GetObjectTagging(ctx context.Context, bucket, object, versionI
 }
 
 func (l *Lending) PutObjectTagging(ctx context.Context, bucket, object, versionID string, tags map[string]string) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -705,6 +762,9 @@ func (l *Lending) PutObjectTagging(ctx context.Context, bucket, object, versionI
 }
 
 func (l *Lending) DeleteObjectTagging(ctx context.Context, bucket, object, versionID string) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -716,6 +776,9 @@ func (l *Lending) DeleteObjectTagging(ctx context.Context, bucket, object, versi
 }
 
 func (l *Lending) PutObjectLockConfiguration(ctx context.Context, bucket string, config []byte) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -732,6 +795,9 @@ func (l *Lending) GetObjectLockConfiguration(ctx context.Context, bucket string)
 }
 
 func (l *Lending) PutObjectRetention(ctx context.Context, bucket, object, versionID string, retention []byte) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
@@ -754,6 +820,9 @@ func (l *Lending) GetObjectRetention(ctx context.Context, bucket, object, versio
 }
 
 func (l *Lending) PutObjectLegalHold(ctx context.Context, bucket, object, versionID string, status bool) error {
+	if refused(ctx) {
+		return errNotForBorrower
+	}
 	b, err := l.name(ctx, bucket)
 	if err != nil {
 		return err
