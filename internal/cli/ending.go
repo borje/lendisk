@@ -35,11 +35,6 @@ import (
 //     tellRefusals tries in a row that never connect, the friend has
 //     probably ended it too (its notify_error says so), and is asked
 //     every tellProbablyEvery until it answers (#84);
-//   - ends, as ended by the friend, a friendship whose friend has
-//     refused this node as no friend of it at every answer for its
-//     retention window (state.DB.EndRefused, #83): it ended the
-//     friendship without this node hearing, so the next steps revoke it
-//     and raise friend_removed, and nothing is told back;
 //   - at the end of the retention window purges the friend's replica
 //     here (Purge: its lent buckets and its manifest) and forgets it, on
 //     a goroutine of its own, one friend at a time, so a slow purge
@@ -161,15 +156,6 @@ func (f *farewell) wait() { f.wg.Wait() }
 
 // pass makes one pass over the former friends (type comment).
 func (f *farewell) pass(ctx context.Context) {
-	ended, err := f.DB.EndRefused(ctx, f.now())
-	if err != nil && ctx.Err() == nil {
-		f.Log.Error("ending friendships: ending those a friend has refused for its retention window failed; trying again", "err", err)
-	}
-	for _, ff := range ended {
-		f.Log.Warn("friendship ended here too: the friend has refused this node as no friend of it for longer than the retention window, "+
-			"so it ended the friendship without this node hearing; its replica here is kept until the purge",
-			"peer", ff.Peer, "purge_after", ff.PurgeAfter.UTC().Format(time.RFC3339))
-	}
 	fs, err := f.DB.FormerFriends(ctx)
 	if err != nil {
 		if ctx.Err() == nil {

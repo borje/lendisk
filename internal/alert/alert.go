@@ -100,6 +100,14 @@ const (
 	// Subject: the former friend. It clears at the purge, or when the
 	// two become friends again.
 	KindFriendRemoved = "friend_removed"
+	// KindFriendRefuses: a friend keeps refusing this node as no friend
+	// of it (its place `removed`, repeated over at least MinRefusing and
+	// again within RefusedRecent): it has probably ended the friendship
+	// without this node hearing (PEER-5, #83). Nothing ends by itself;
+	// the message says to run `lendisk peer remove` if it did. Subject:
+	// the friend. It clears when the friend answers otherwise, or the
+	// refusals stop being repeated.
+	KindFriendRefuses = "friend_refuses"
 	// KindPurgeSoon: an ended friendship's replicas, the former friend's
 	// here and this node's there, are purged within PurgeWarning (PEER-5,
 	// #25). Subject: the former friend.
@@ -183,7 +191,7 @@ const PurgeWarning = 7 * 24 * time.Hour
 
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
-	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindPurgeSoon,
+	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindFriendRefuses, KindPurgeSoon,
 	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
 	KindReplicaUnchecked}
 
@@ -225,6 +233,14 @@ type Service struct {
 	// one-minute blip 24h after the last answer would alert at once.
 	// The reachability probe (#65) may let this be revisited.
 	MinRetrying time.Duration
+	// MinRefusing is how long a friend must have kept refusing this
+	// node as no friend, from its first refusal to its last, before
+	// KindFriendRefuses (default 1 hour): one stray refusal is not
+	// enough. RefusedRecent is how recent the last refusal must be
+	// (default 2 hours, twice the worker's hourly re-ask of a removed
+	// place): a condition no longer being asked again does not count.
+	MinRefusing   time.Duration
+	RefusedRecent time.Duration
 	// BelowAfter is how long a bucket's objects may stay below its
 	// copies before KindBelowCopies is raised (default 7 days, REPL-13's
 	// replication.replace_after).
@@ -440,6 +456,19 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		msg := fmt.Sprintf("friend %s has not answered since %s (longer than %v); replication to it waits: %s",
 			f.Peer, from.UTC().Format(time.RFC3339), after, c.Detail)
 		out = append(out, alertOf(KindFriendUnreachable, f.Peer, msg))
+	}
+	minRefusing, recent := orDefault(s.MinRefusing, time.Hour), orDefault(s.RefusedRecent, 2*time.Hour)
+	for _, f := range fs {
+		c := conds[f.Peer]
+		// Refused at more than one ask, over at least minRefusing, the
+		// last one recent, all within this friendship (#83).
+		if c.Condition != state.ConditionRemoved || c.RefusedAt.Sub(c.Since) < minRefusing ||
+			now.Sub(c.RefusedAt) > recent || c.Since.Before(f.CreatedAt) {
+			continue
+		}
+		msg := fmt.Sprintf("friend %s has refused this node as no friend of it since %s (last at %s): it has probably ended the friendship without this node hearing. Nothing new is placed there, and its copies of this node's data are being placed at other friends. If it ended the friendship, end it here too: lendisk peer remove %s; if not, ask its owner to check its lendisk",
+			f.Peer, c.Since.UTC().Format(time.RFC3339), c.RefusedAt.UTC().Format(time.RFC3339), f.Peer)
+		out = append(out, alertOf(KindFriendRefuses, f.Peer, msg))
 	}
 	var store []string
 	for p, c := range conds {

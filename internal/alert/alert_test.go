@@ -161,6 +161,52 @@ func TestFriendUnreachablePastThresholdRaisesAlert(t *testing.T) {
 	}
 }
 
+// PEER-5, OPS-2 (#83): a friend that keeps refusing this node as no
+// friend of it (its place `removed`) has probably ended the friendship
+// without this node hearing: friend_refuses says so and how to end it
+// here. One stray refusal raises nothing, nor does a refusal that is no
+// longer being repeated (the worker stopped asking), and the alert
+// clears when the friend answers.
+func TestAFriendThatKeepsRefusingIsAlerted(t *testing.T) {
+	db := openDB(t)
+	for _, p := range []string{"B", "C", "D"} {
+		addFriend(t, db, p)
+	}
+	t0 := time.Unix(1_800_000_000, 0)
+	refuse := func(peer string, at time.Time) {
+		t.Helper()
+		if err := db.SetPlaceCondition(t.Context(), peer, state.ConditionRemoved, "403 AccessDenied: "+state.NoRelationship, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refuse("B", t0) // refused at every hourly ask since t0
+	refuse("B", t0.Add(time.Hour))
+	refuse("B", t0.Add(2*time.Hour))
+	refuse("C", t0.Add(2*time.Hour)) // one stray refusal
+	refuse("D", t0.Add(-5*time.Hour))
+	refuse("D", t0.Add(-3*time.Hour)) // refused, then never asked again
+	c := &clock{t: t0.Add(2*time.Hour + 10*time.Minute)}
+	s := &Service{DB: db, Log: quiet, Now: c.now}
+	if err := s.evaluate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	as := active(t, db)
+	a, ok := as[KindFriendRefuses+":B"]
+	if len(as) != 1 || !ok || a.Subject != "B" || !strings.Contains(a.Message, "lendisk peer remove B") ||
+		!strings.Contains(a.Message, t0.UTC().Format(time.RFC3339)) {
+		t.Fatalf("alerts %+v; want friend_refuses for B alone, since t0, naming peer remove", as)
+	}
+	if err := db.SetPlaceCondition(t.Context(), "B", state.ConditionOK, "", t0.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.evaluate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if as := active(t, db); len(as) != 0 {
+		t.Fatalf("not cleared once B answered: %v", as)
+	}
+}
+
 // OPS-2, VER-5, EP-11 (#13): what the replication worker records (a
 // store that cannot be read, an object refused for the store, a place's
 // own refusals) raises alerts, and they clear when it ends.

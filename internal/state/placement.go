@@ -439,17 +439,22 @@ type PlaceCondition struct {
 	Detail    string    // the error, for anything but ok
 	Since     time.Time // when the place entered this condition
 	LastOK    time.Time // when it last acknowledged; zero if never
+	// RefusedAt is when it last answered ConditionRemoved; zero if
+	// never (#83).
+	RefusedAt time.Time
 }
 
 // SetPlaceCondition records how place answered at now. Since changes only
-// when the condition does; ConditionOK also sets LastOK.
+// when the condition does; ConditionOK also sets LastOK, and
+// ConditionRemoved RefusedAt.
 func (db *DB) SetPlaceCondition(ctx context.Context, place, condition, detail string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO place (place, condition, detail, since, last_ok)
-		VALUES (?1, ?2, ?3, ?4, CASE WHEN ?2 = 'ok' THEN ?4 END)
+	_, err := db.ExecContext(ctx, `INSERT INTO place (place, condition, detail, since, last_ok, refused_at)
+		VALUES (?1, ?2, ?3, ?4, CASE WHEN ?2 = 'ok' THEN ?4 END, CASE WHEN ?2 = 'removed' THEN ?4 END)
 		ON CONFLICT (place) DO UPDATE SET
 			since = CASE WHEN place.condition = excluded.condition THEN place.since ELSE excluded.since END,
 			condition = excluded.condition, detail = excluded.detail,
-			last_ok = coalesce(excluded.last_ok, place.last_ok)`,
+			last_ok = coalesce(excluded.last_ok, place.last_ok),
+			refused_at = coalesce(excluded.refused_at, place.refused_at)`,
 		place, condition, nullStr(detail), now.Unix())
 	return err
 }
@@ -469,7 +474,7 @@ func (db *DB) ResetPlaceCondition(ctx context.Context, place string, now time.Ti
 
 // PlaceConditions returns every place's last condition.
 func (db *DB) PlaceConditions(ctx context.Context) (map[string]PlaceCondition, error) {
-	rows, err := db.QueryContext(ctx, `SELECT place, condition, coalesce(detail, ''), since, last_ok FROM place`)
+	rows, err := db.QueryContext(ctx, `SELECT place, condition, coalesce(detail, ''), since, last_ok, refused_at FROM place`)
 	if err != nil {
 		return nil, err
 	}
@@ -479,13 +484,16 @@ func (db *DB) PlaceConditions(ctx context.Context) (map[string]PlaceCondition, e
 		var place string
 		var c PlaceCondition
 		var since int64
-		var lastOK sql.NullInt64
-		if err := rows.Scan(&place, &c.Condition, &c.Detail, &since, &lastOK); err != nil {
+		var lastOK, refused sql.NullInt64
+		if err := rows.Scan(&place, &c.Condition, &c.Detail, &since, &lastOK, &refused); err != nil {
 			return nil, err
 		}
 		c.Since = time.Unix(since, 0)
 		if lastOK.Valid {
 			c.LastOK = time.Unix(lastOK.Int64, 0)
+		}
+		if refused.Valid {
+			c.RefusedAt = time.Unix(refused.Int64, 0)
 		}
 		out[place] = c
 	}
