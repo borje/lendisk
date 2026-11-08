@@ -103,6 +103,7 @@ func tail(b []byte) string {
 // queued. LENDISK_CRASH_ROUNDS and LENDISK_CRASH_MB (per round) make it
 // larger.
 func TestCrashDuringResticBackup(t *testing.T) {
+	parallel(t, 1)
 	restic, err := exec.LookPath("restic")
 	if err != nil {
 		t.Skip("restic not installed")

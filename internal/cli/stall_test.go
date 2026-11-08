@@ -22,6 +22,7 @@ import (
 // lender serves the next request as usual. Run with -race: nothing reads
 // the body behind the store's back.
 func TestTunnelEndsStalledBodies(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	const stall, minProgress = time.Second, 1000
 	a.tuneBridge = func(br *bridge.Bridge) { br.Stall, br.MinProgress = stall, minProgress }

@@ -19,6 +19,7 @@ import (
 // no refusal and no alert. The upgraded repository on B's disk is a
 // version 2 repository restic checks.
 func TestResticMigrateReplicatesTheNewConfig(t *testing.T) {
+	parallel(t, 2)
 	restic, err := exec.LookPath("restic")
 	if err != nil {
 		t.Skip("restic not installed")

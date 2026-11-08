@@ -28,6 +28,7 @@ import (
 //     version A wrote: the first snapshot's packs were never fetched, so
 //     less than the whole repository is downloaded.
 func TestResticRestoreThroughFriendsAfterRecovery(t *testing.T) {
+	parallel(t, 4)
 	restic, err := exec.LookPath("restic")
 	if err != nil {
 		t.Skip("restic not installed")

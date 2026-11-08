@@ -136,6 +136,7 @@ const (
 // the earlier one that is offsite. status --json carries the same under
 // buckets[].offsite.
 func TestStatusSaysWhichResticSnapshotIsOffsite(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "laptop", "restic")
 	if _, text, _ := o.run("", "", "status"); !strings.Contains(text, "    nothing written yet\n") {
 		t.Fatalf("status of an empty bucket:\n%s", text)
@@ -184,6 +185,7 @@ func TestStatusSaysWhichResticSnapshotIsOffsite(t *testing.T) {
 // claims are strictly before a second that may also hold a write that
 // is not offsite (#20 review).
 func TestStatusNamesATimeForKopiaAndGenericBuckets(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "kopia", "kopia")
 	o.addBucket(t, "files", "generic")
 	idx := "xn0_044bfd62a9837c42e60a1084b0fc2482-sa69963c6d5b144b1146-c1"
@@ -223,6 +225,7 @@ func TestStatusNamesATimeForKopiaAndGenericBuckets(t *testing.T) {
 // as its last read of the watermark took, and never less than 2 s, so a
 // large bucket does not keep a small machine busy.
 func TestStatusWaitBacksOffOnASlowRead(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "laptop", "restic")
 	o.daemonUp()
 	s1 := o.put("laptop", snapA, "snapshot", 100)
@@ -257,6 +260,7 @@ func TestStatusWaitBacksOffOnASlowRead(t *testing.T) {
 // captured before the wait started is offsite at copies, printing which;
 // a snapshot captured during the wait is not waited for.
 func TestStatusWaitExitsOnceTheSnapshotIsOffsite(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "laptop", "restic")
 	o.daemonUp()
 	d := o.put("laptop", "data/1", "data", 1000)
@@ -290,6 +294,7 @@ func TestStatusWaitExitsOnceTheSnapshotIsOffsite(t *testing.T) {
 // REPL-5 (#20): on timeout status --wait exits 3 and says what is still
 // short; the timeout runs on the injected clock.
 func TestStatusWaitTimesOut(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "laptop", "restic")
 	o.daemonUp()
 	o.put("laptop", "data/1", "data", 1000)
@@ -321,6 +326,7 @@ func TestStatusWaitTimesOut(t *testing.T) {
 // to make up copies. status --wait does not wait silently for what
 // cannot come: it exits 4 with the same reason.
 func TestStatusWaitStopsWhenAFriendRefusesEverything(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "laptop", "restic")
 	o.daemonUp()
 	var seqs []int64
@@ -365,6 +371,7 @@ func TestStatusWaitStopsWhenAFriendRefusesEverything(t *testing.T) {
 // never settle. status says so, with what to do, rather than "still
 // being written"; status --wait exits 4.
 func TestStatusWaitStopsOnAnUnmatchableUpload(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "laptop", "restic")
 	o.daemonUp()
 	seqs, err := o.db.BeginCaptures(t.Context(), []state.Capture{{Bucket: "laptop", Key: "data/big", Op: state.OpPut, Class: "data"}})
@@ -395,6 +402,7 @@ func TestStatusWaitStopsOnAnUnmatchableUpload(t *testing.T) {
 // make progress, so with none answering it says so and exits 1 at once
 // rather than wait for nothing.
 func TestStatusWaitWithNoDaemon(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "laptop", "restic")
 	o.put("laptop", snapA, "snapshot", 100)
 	o.node.sleep = func(context.Context, time.Duration) error { t.Fatal("waited"); return nil }

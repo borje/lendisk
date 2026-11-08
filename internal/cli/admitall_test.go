@@ -16,6 +16,7 @@ import (
 // and every control call), on a node with zero peers and on one with a
 // friend. Run with `go test -tags admitall ./internal/cli`.
 func TestMiddlewareAloneRefusesStranger(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	stranger := strangerID(t)

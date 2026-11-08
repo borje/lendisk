@@ -64,6 +64,7 @@ func borrowOver(t *testing.T, key, borrower *identity.Identity, lender identity.
 //     remove call and the manifest included; once the daemon's pass has
 //     cut them, neither key connects.
 func TestHostilePeer(t *testing.T) {
+	serving(t, 0)
 	a, b, c := friendNode(t), friendNode(t), friendNode(t)
 	if code, _, errOut := a.run("", "", "bucket", "add", "photos", "--profile", "restic"); code != 0 {
 		t.Fatal(errOut)

@@ -152,6 +152,7 @@ func randomFiles(t *testing.T, dir, prefix string, count, size int) {
 //
 // A and B share one relay, as two households in one region would.
 func TestReplicateResticBackupToFriend(t *testing.T) {
+	parallel(t, 2)
 	restic, err := exec.LookPath("restic")
 	if err != nil {
 		t.Skip("restic not installed")
@@ -230,7 +231,9 @@ func TestReplicateResticBackupToFriend(t *testing.T) {
 
 	// REPL-3: restarts mid-transfer. B is off while a third backup
 	// runs, so A has a queue; then A sends slowly and kills itself
-	// mid-object at random, and B is killed now and then too.
+	// mid-object at random, and B is killed now and then too. At one
+	// crash in fifty reads the queue seldom drains, so the crashing ends
+	// after five deaths of A (or two minutes) and a plain A drains it.
 	b.p.kill()
 	randomFiles(t, src, "three", 8, 1<<20)
 	backup()
@@ -243,6 +246,9 @@ func TestReplicateResticBackupToFriend(t *testing.T) {
 	for i, end := 0, time.Now().Add(2*time.Minute); time.Now().Before(end); i++ {
 		if a.p.exited() {
 			selfKills++
+			if selfKills >= 5 && bKills == 2 {
+				break
+			}
 			a.start()
 		}
 		if p := an.place(bKey); p.Queue.Objects == 0 {
@@ -311,6 +317,7 @@ func TestReplicateResticBackupToFriend(t *testing.T) {
 // packets meant for its server at the relay, and the second node to
 // dial never got through.
 func TestFriendsReplicateToEachOtherAtOnce(t *testing.T) {
+	parallel(t, 2)
 	if testing.Short() {
 		t.Skip("long")
 	}
@@ -402,6 +409,7 @@ func TestFriendsReplicateToEachOtherAtOnce(t *testing.T) {
 // shows against its bucket in `status`, not against the friend, whose
 // own refusals and condition stay its own.
 func TestStatusShowsStoreRefusalsAgainstTheBucket(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	n.addBucket(t, "laptop", "generic")
@@ -450,6 +458,7 @@ func TestStatusShowsStoreRefusalsAgainstTheBucket(t *testing.T) {
 // REPL-3 (#57): while this node's store cannot be read, each place
 // waiting on it shows the store as the cause, not the friend.
 func TestStatusShowsAnUnreadableStoreAsTheCause(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	ctx := context.Background()

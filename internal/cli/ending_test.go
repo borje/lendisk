@@ -40,6 +40,7 @@ func (s *steps) take() []string {
 // a time, and one that finds the peer a friend again (state.ErrNotFormer)
 // forgets nothing.
 func TestABlockedPurgeDoesNotHoldUpARevocation(t *testing.T) {
+	parallel(t, 0)
 	ctx := t.Context()
 	db, err := state.Open(ctx, t.TempDir(), slog.New(slog.DiscardHandler))
 	if err != nil {
@@ -136,6 +137,7 @@ func TestABlockedPurgeDoesNotHoldUpARevocation(t *testing.T) {
 // the retention window its replica is purged and the former friend
 // forgotten. A friend that ended it itself is not told back.
 func TestFarewellRevokesInOrderTellsAndPurges(t *testing.T) {
+	parallel(t, 0)
 	ctx := t.Context()
 	db, err := state.Open(ctx, t.TempDir(), slog.New(slog.DiscardHandler))
 	if err != nil {

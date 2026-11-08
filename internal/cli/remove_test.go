@@ -59,6 +59,7 @@ func reachable(t *testing.T, hc *http.Client) bool {
 // the daemon's next pass cuts its connections, nothing of it is stored,
 // and neither of B's keys connects again.
 func TestRemovingAFriendEndsItsRunningTransfer(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -174,6 +175,10 @@ func TestRemovingAFriendEndsItsRunningTransfer(t *testing.T) {
 // as told. A–C is untouched: both still list each other, and C's open
 // connection at A is still served.
 func TestEndingAFriendshipTellsTheFriendAndLeavesTheOthers(t *testing.T) {
+	// Not parallel: under load B's answer to the remove call is lost
+	// at times, when B's ending cuts the connection carrying it, and A
+	// then never records B as told (B refuses its retries before any
+	// data); see parallel_test.go.
 	a, b, c := friendNode(t), friendNode(t), friendNode(t)
 	a.tuneEnding = func(f *farewell) { f.Interval = 200 * time.Millisecond }
 	stop := a.serveLogged()
@@ -234,6 +239,7 @@ func TestEndingAFriendshipTellsTheFriendAndLeavesTheOthers(t *testing.T) {
 // seven days before, replica_purge_soon is raised; at the end, B's lent
 // bucket, its manifest file and every row of B are gone.
 func TestAFormerFriendsReplicaIsKeptForTheWindowThenPurged(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	var mu sync.Mutex
 	var ahead time.Duration

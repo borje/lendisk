@@ -19,6 +19,7 @@ import (
 // EP-8: a generic bucket is refused without --i-understand-no-encryption,
 // and nothing is created; with it, the bucket is made.
 func TestGenericBucketRefusedWithoutNoEncryptionFlag(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	code, _, errOut := n.run("", "", "bucket", "add", "tools", "--profile", "generic")
@@ -46,6 +47,7 @@ func TestGenericBucketRefusedWithoutNoEncryptionFlag(t *testing.T) {
 // that --backup-dir and --suffix, which rclone allows only with a
 // server-side copy, cannot be used; at add and at show.
 func TestGenericLinesGiveRcloneFlags(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	_, added, _ := n.run("", "", "bucket", "add", "tools", "--profile", "generic", "--i-understand-no-encryption")
@@ -67,6 +69,7 @@ func TestGenericLinesGiveRcloneFlags(t *testing.T) {
 // EP-8: status marks a generic bucket as outside the trust guarantee,
 // in --json and in text; restic and Kopia buckets are inside it.
 func TestStatusMarksGenericBucketOutsideTrust(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	n.addBucket(t, "tools", "generic")
@@ -119,6 +122,7 @@ func rcloneRun(t *testing.T, rclone string, want int, args ...string) string {
 // with --checksum), and an `rclone move` all succeed; the bucket ends up
 // as the source; and every object in the store is captured.
 func TestRcloneSyncWithAdvisedFlags(t *testing.T) {
+	serving(t, 0)
 	rclone, err := exec.LookPath("rclone")
 	if err != nil {
 		t.Skip("rclone not installed")
@@ -185,6 +189,7 @@ func TestRcloneSyncWithAdvisedFlags(t *testing.T) {
 // neither overwrites nor deletes anything. Either way the bucket is
 // unchanged, never half-synced.
 func TestRcloneBackupDirRefusedWithoutHarm(t *testing.T) {
+	serving(t, 0)
 	rclone, err := exec.LookPath("rclone")
 	if err != nil {
 		t.Skip("rclone not installed")
@@ -250,6 +255,7 @@ func latestCaptures(t *testing.T, n *node, bucket string) map[string]state.Entry
 // COMPAT-1: Duplicacy's S3 storage against a generic bucket: init,
 // backup, a second backup after a change, check and restore.
 func TestDuplicacySmoke(t *testing.T) {
+	serving(t, 0)
 	duplicacy, err := exec.LookPath("duplicacy")
 	if err != nil {
 		t.Skip("duplicacy not installed")

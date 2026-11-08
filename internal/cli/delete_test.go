@@ -92,6 +92,7 @@ func mergeReplicas(t *testing.T, dirs ...string) string {
 //     recovers none of the deleted keys (REPL-2 with ID-5: a tomb is not
 //     resurrected).
 func TestResticPruneTombstonesAtEveryFriend(t *testing.T) {
+	parallel(t, 4)
 	restic, err := exec.LookPath("restic")
 	if err != nil {
 		t.Skip("restic not installed")

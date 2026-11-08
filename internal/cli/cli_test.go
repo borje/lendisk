@@ -98,6 +98,7 @@ func (n *node) status() Status {
 }
 
 func TestInitConfirmsAndStatusShowsID(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	// Words 1, 12 and 24, the second with sloppy case and spacing.
 	code, out, errOut := n.run("abandon\n  ABANDON \nart\n", testPhrase, "init")
@@ -170,6 +171,7 @@ func assertNoPhrase(t *testing.T, root, phrase string) {
 }
 
 func TestInitWrongWordsWritesNothing(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	code, _, errOut := n.run("abandon\nwrong\nwrong\nwrong\n", testPhrase, "init")
 	if code == 0 || !strings.Contains(errOut, "confirmation failed") {
@@ -190,6 +192,7 @@ func TestInitWrongWordsWritesNothing(t *testing.T) {
 // #53: init never chmods a directory the user keeps other things in,
 // such as $HOME when the config is ./lendisk.toml; it refuses instead.
 func TestInitRefusesSharedDirectory(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	home := filepath.Dir(n.config)
 	os.MkdirAll(home, 0o755)
@@ -211,6 +214,7 @@ func TestInitRefusesSharedDirectory(t *testing.T) {
 // such as a fresh compose bind mount or the example config, is
 // tightened to 0700.
 func TestInitTightensItsOwnDirectories(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	for _, d := range []string{filepath.Dir(n.config), n.data} {
 		os.MkdirAll(d, 0o755)
@@ -228,6 +232,7 @@ func TestInitTightensItsOwnDirectories(t *testing.T) {
 }
 
 func TestRestoreOnSecondMachineGivesSameID(t *testing.T) {
+	parallel(t, 0)
 	// ID-1 AC through the CLI: a second machine restored from the phrase
 	// has the same node ID.
 	a, b := newNode(t), newNode(t)
@@ -247,6 +252,7 @@ func TestRestoreOnSecondMachineGivesSameID(t *testing.T) {
 }
 
 func TestInitRefusesForeignDatabase(t *testing.T) {
+	parallel(t, 0)
 	a := newNode(t)
 	if code, _, e := a.run("abandon\nabandon\nart\n", testPhrase, "init"); code != 0 {
 		t.Fatal(e)
@@ -265,6 +271,7 @@ func TestInitRefusesForeignDatabase(t *testing.T) {
 }
 
 func TestServeLogsStructuredAndStops(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	if code, _, e := n.run("abandon\nabandon\nart\n", testPhrase, "init"); code != 0 {
 		t.Fatal(e)
@@ -299,6 +306,7 @@ func TestServeLogsStructuredAndStops(t *testing.T) {
 // #53: when the loopback endpoint cannot bind, serve stops the gateway
 // before it returns, so the database is never closed under it.
 func TestServeBindFailureStopsGateway(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	taken, err := net.Listen("tcp", "127.0.0.1:0")
@@ -324,6 +332,7 @@ func TestServeBindFailureStopsGateway(t *testing.T) {
 }
 
 func TestUsageErrorExitCode(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	if code, _, _ := n.run("", "", "status", "--no-such-flag"); code != 2 {
 		t.Fatalf("exit %d, want 2", code)
@@ -336,6 +345,7 @@ func TestUsageErrorExitCode(t *testing.T) {
 // AGENTS.md: cobra's own usage errors (a missing or extra argument, an
 // unknown subcommand) exit 2, like a bad flag.
 func TestCobraUsageErrorsExitTwo(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	for _, args := range [][]string{
 		{"bucket", "add"},          // missing argument
@@ -362,6 +372,7 @@ func TestCobraUsageErrorsExitTwo(t *testing.T) {
 // EP-12: status reports the linked versitygw and tailcat versions, as
 // go.sum pins them.
 func TestStatusReportsVersitygwAndTailcatVersions(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	st := n.status()
@@ -380,6 +391,7 @@ func TestStatusReportsVersitygwAndTailcatVersions(t *testing.T) {
 // SEC-16's search (filesHolding) finds a needle in a file's contents,
 // in a file's name and in a directory's name.
 func TestFileSearchFindsNamesAndContents(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	if err := os.MkdirAll(filepath.Join(n.data, "store", "lent-NEEDLEDIR"), 0o700); err != nil {

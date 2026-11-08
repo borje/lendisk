@@ -85,6 +85,7 @@ func tunnelClient(t *testing.T, key *identity.Identity, addr string) *control.Cl
 // invite carries A's address, number and retention; a replay is refused
 // (PEER-2 AC) and changes nothing.
 func TestInviteAndRedeemMakeFriends(t *testing.T) {
+	serving(t, 0)
 	a, b, c := friendNode(t), friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -164,6 +165,7 @@ func assertHealed(t *testing.T, a, b *node, bNumber int64) {
 // Running the same peer add again repeats B's terms without asking and
 // both sides end with the friendship. Another node is still refused.
 func TestLostRedeemAnswerHealsOnRerun(t *testing.T) {
+	serving(t, 0)
 	a, b, c := friendNode(t), friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -200,6 +202,7 @@ func TestLostRedeemAnswerHealsOnRerun(t *testing.T) {
 // PEER-2, #51: B crashes after A's answer and before writing its row;
 // running peer add again heals the same way.
 func TestCrashBeforeFriendshipWriteHealsOnRerun(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -224,6 +227,7 @@ func TestCrashBeforeFriendshipWriteHealsOnRerun(t *testing.T) {
 
 // Enter keeps the inviter's number; a bad invite is a usage error.
 func TestPeerAddDefaultsAndRefusals(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -244,6 +248,7 @@ func TestPeerAddDefaultsAndRefusals(t *testing.T) {
 
 // SEC-6: an expired invite is refused, and its row is purged.
 func TestExpiredInviteRefusedAndPurged(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -276,6 +281,7 @@ func TestExpiredInviteRefusedAndPurged(t *testing.T) {
 // SEC-13 AC over the tunnel: a connection holding an unredeemed invite
 // is refused every call but redeem, before routing.
 func TestInviteConnectionMayOnlyRedeem(t *testing.T) {
+	serving(t, 0)
 	a := friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -311,6 +317,7 @@ func TestInviteConnectionMayOnlyRedeem(t *testing.T) {
 // list. Nothing on the wire names them either: A and D never connect,
 // and B's control API answers carry only B's own terms.
 func TestFriendsOfFriendsUnknown(t *testing.T) {
+	serving(t, 0)
 	a, b, d := friendNode(t), friendNode(t), friendNode(t)
 	// One gateway per process, so the daemons take turns.
 	stopA := a.serveLogged()
@@ -430,6 +437,7 @@ func loseAnswer(t *testing.T, a, b *node, s, number string) {
 // friend already and to ask for a new invite, keeping its record. A
 // new invite then heals both sides and clears every record.
 func TestExpiredInviteRerunAsksForNewInviteWhichHeals(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -479,6 +487,7 @@ func TestExpiredInviteRerunAsksForNewInviteWhichHeals(t *testing.T) {
 // friendship it holds (not the new invite's terms) and consumes the new
 // invite, and B writes the friendship and drops every pending redeem.
 func TestLostAnswerHealsWithNewInvite(t *testing.T) {
+	serving(t, 0)
 	a, b, c := friendNode(t), friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -516,6 +525,7 @@ func TestLostAnswerHealsWithNewInvite(t *testing.T) {
 // redeem at all. The refused attempts leave the new invite unused, and
 // B then heals with it.
 func TestThirdKeyWithNewInviteRefused(t *testing.T) {
+	serving(t, 0)
 	a, b, c, d := friendNode(t), friendNode(t), friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -609,6 +619,7 @@ func (r *inProgress) Read(p []byte) (int, error) {
 // #56: two peer adds of one invite at once; the one that finds the
 // redeem started under it while it asked says so.
 func TestConcurrentPeerAddSaysInProgress(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -655,6 +666,7 @@ func (c countDials) RoundTrip(r *http.Request) (*http.Response, error) {
 // invite, which finds its redeem record and would resume at once,
 // refuses without dialling with the same invite key (#52).
 func TestSecondPeerAddOfInviteRefusesWithoutDialling(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()

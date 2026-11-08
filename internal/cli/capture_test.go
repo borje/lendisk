@@ -14,6 +14,7 @@ import (
 // EP-7 through serve: a profile in <config>/profiles/ overrides the
 // compiled-in one. REPL-3: status shows each bucket's queue.
 func TestStatusShowsQueueAndProfilesOverride(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	laptop := n.addBucket(t, "laptop", "restic")

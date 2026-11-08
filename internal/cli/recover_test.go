@@ -76,6 +76,7 @@ func heldManifest(t *testing.T, lender *node, borrower *identity.Identity) (*man
 //     manifest version, above every copy they held), C is listed, and B
 //     dialling A with its dial key is admitted as A's friend.
 func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
+	parallel(t, 4)
 	if testing.Short() {
 		t.Skip("long")
 	}
@@ -296,6 +297,7 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 // ID-5 (#29): recover is for a fresh machine, and only once the old node
 // is confirmed stopped; a damaged address is a usage error.
 func TestRecoverRefusals(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	other := newNode(t)
 	other.mustInit(t)
@@ -321,6 +323,7 @@ func TestRecoverRefusals(t *testing.T) {
 // their credential, for the user to put in the environment; with none,
 // nothing is said.
 func TestOverflowCredentialsShown(t *testing.T) {
+	parallel(t, 0)
 	var w bytes.Buffer
 	printOverflow(&w, nil)
 	if w.Len() != 0 {

@@ -22,6 +22,7 @@ import (
 // still saves the identity and config and finishes, leaving both lists
 // pending, and `lendisk serve` lists both to the end.
 func TestRecoverWithinBudgetAndSkip(t *testing.T) {
+	parallel(t, 4)
 	if testing.Short() {
 		t.Skip("long")
 	}

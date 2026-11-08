@@ -32,7 +32,7 @@ Commit subject: what the user can now do, then `(#N)`. Body: short bullets of wh
 - **Errors:** wrap with `%w`; messages say what is wrong and what to do (`no identity: run \`lendisk init\` first`). Usage errors exit 2, other failures 1.
 - **Files:** secrets and the database are created at 0600, their directories at 0700, from the first byte.
 - **Testability through injection:** randomness, clocks, stdin and contexts are fields on the owning struct (see `cli.app`); tests set them. Use real files under `t.TempDir()` and real SQLite, not mocks.
-- **Tests** are named for the behaviour (`TestMistypedNodeIDRejected`). CLI tests drive `app.run` through the `node` helper in `internal/cli/cli_test.go`, one `node` per simulated machine.
+- **Tests** are named for the behaviour (`TestMistypedNodeIDRejected`). CLI tests drive `app.run` through the `node` helper in `internal/cli/cli_test.go`, one `node` per simulated machine. Every CLI test starts with `serving(t, daemons)` if it serves in-process (`serve`, `serveLogged`; versitygw runs once per process), else `parallel(t, daemons)`, giving the daemon processes it runs at once; a test that needs a quiet process (one reading its own sockets) stays serial and says why (`internal/cli/parallel_test.go`).
 
 ## Spikes
 

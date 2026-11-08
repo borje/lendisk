@@ -48,6 +48,7 @@ func sha256Hex(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToStri
 //     (ErrRejected) and not kept.
 //   - LEND-4: a put without the hash metadata is refused.
 func TestLenderPolicyAsTheBorrowerSeesIt(t *testing.T) {
+	serving(t, 0)
 	a, b := friendNode(t), friendNode(t)
 	stop := a.serveLogged()
 	defer stop()
@@ -178,6 +179,7 @@ func s3Code(err error) string {
 //   - SEC-16 AC: A's store, database and logs never hold "laptop"; the
 //     store holds lent-<id16>-<sealed>.
 func TestFriendBorrowsOverTunnel(t *testing.T) {
+	serving(t, 0)
 	a, b, c := friendNode(t), friendNode(t), friendNode(t)
 	if code, _, errOut := a.run("", "", "bucket", "add", "photos", "--profile", "restic"); code != 0 {
 		t.Fatal(errOut)

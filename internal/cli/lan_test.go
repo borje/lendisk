@@ -77,6 +77,8 @@ func (n *node) listenOn(t *testing.T, entry string) {
 // request to the TLS port, a request without a valid credential and the
 // control API are refused; status lists the listener.
 func TestBackupFromAnotherMachine(t *testing.T) {
+	// Not parallel: it reads this process's sockets, which a parallel
+	// test would add to (see parallel_test.go).
 	restic, err := exec.LookPath("restic")
 	if err != nil {
 		t.Skip("restic not installed")
@@ -248,6 +250,7 @@ func tlsClientFor(t *testing.T, certFile string) *http.Client {
 // EP-17: an interface entry is listed with its addresses; status lists
 // one line per address, and bucket add prints lines for each.
 func TestInterfaceEntryListed(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	_, port, _ := net.SplitHostPort(freeAddr(t, "127.0.0.1"))
@@ -275,6 +278,7 @@ func TestInterfaceEntryListed(t *testing.T) {
 
 // `endpoint cert` before serve has made one says what to do.
 func TestEndpointCertMissing(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	code, _, errOut := n.run("", "", "endpoint", "cert")
