@@ -399,7 +399,7 @@ func column(ctx context.Context, tx querier, q string, args ...any) ([]string, e
 	return out, rows.Err()
 }
 
-// Held reports whether row seq is a metadata row the barrier holds back
+// Held reports whether row seq is a row the barrier holds back
 // (REPL-1): a metadata or snapshot row, put or delete, is sent to any
 // place only when no data put of its bucket before it has a queued
 // placement row left, each acked at every place it is placed at. Rows
@@ -409,14 +409,45 @@ func column(ctx context.Context, tx querier, q string, args ...any) ([]string, e
 // the metadata replaced will be cancelled, not sent, so it does not hold
 // it either; one replaced only after the metadata still does, as the
 // metadata was written while it was the key's bytes.
+//
+// The mirror holds a data delete (#21 review): it is sent to any place
+// only when no metadata or snapshot row of its bucket before it, put
+// or delete, is still queued at a place that answers, so no place
+// deletes a pack while another still holds live, or has yet to
+// replace or delete, metadata naming it. A place unreachable for
+// reroute_after, or full (507) for that long, does not hold deletes:
+// it would stop every place's FIFO for as long as it stays away (its
+// replica is behind until it returns, and its FIFO then brings it
+// level).
 func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
+	ps, err := poolPlaces(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	now := db.now()
+	answering := []string{}
+	for _, p := range ps {
+		if !p.unreachable(db, now) && !p.fullForLong(db, now) {
+			answering = append(answering, p.peer)
+		}
+	}
+	list, err := json.Marshal(answering)
+	if err != nil {
+		return false, err
+	}
 	var held bool
-	err := db.QueryRowContext(ctx, `SELECT q.class IN ('metadata', 'snapshot') AND EXISTS (
-		SELECT 1 FROM placement p JOIN queue d ON d.seq = p.seq
-		WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND p.op = 'put' AND d.class = 'data'
-		AND NOT EXISTS (SELECT 1 FROM queue l
-			WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.seq < q.seq AND l.state = 'done'))
-		FROM queue q WHERE q.seq = ?`, seq).Scan(&held)
+	err = db.QueryRowContext(ctx, `SELECT CASE
+		WHEN q.class IN ('metadata', 'snapshot') THEN EXISTS (
+			SELECT 1 FROM placement p JOIN queue d ON d.seq = p.seq
+			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND p.op = 'put' AND d.class = 'data'
+			AND NOT EXISTS (SELECT 1 FROM queue l
+				WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.seq < q.seq AND l.state = 'done'))
+		WHEN q.op = 'delete' THEN EXISTS (
+			SELECT 1 FROM placement p JOIN queue m ON m.seq = p.seq
+			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND m.class IN ('metadata', 'snapshot')
+			AND p.place IN (SELECT value FROM json_each(?2)))
+		ELSE 0 END
+		FROM queue q WHERE q.seq = ?1`, seq, string(list)).Scan(&held)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}

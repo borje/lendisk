@@ -261,3 +261,71 @@ func TestARowBeingSentIsNotRerouted(t *testing.T) {
 		t.Fatal("C keeps a copy of data/1 that no delete reached")
 	}
 }
+
+// REPL-1 AC, REPL-2 (#21 review): at copies 1, B and C each hold some
+// of the first backup's packs and both hold its index and snapshot. A
+// prune then writes a new index, deletes the old snapshot and index,
+// and deletes the packs. B is slow to take the new index. C must not
+// delete a pack while B still holds the old snapshot and index live
+// that name it: together B and C would hold a snapshot whose packs
+// are nowhere. Once B has the new index and has deleted the old
+// metadata, C deletes its packs.
+func TestPackDeleteWaitsForTheMetadataBeforeIt(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	fx.bucket("repo", 1)
+	p1 := fx.put("repo", "data/1", "data", "pack one")
+	p2 := fx.put("repo", "data/2", "data", "pack two")
+	fx.put("repo", "index/1", "metadata", "index one")
+	fx.put("repo", "snapshots/1", "snapshot", "snapshot one")
+	fx.run()
+	fx.drained("B")
+	fx.drained("C")
+	at := map[string]string{} // pack -> its place
+	for k, seq := range map[string]int64{"data/1": p1, "data/2": p2} {
+		var place string
+		if err := fx.db.QueryRow(`SELECT place FROM placement WHERE seq = ?`, seq).Scan(&place); err != nil {
+			t.Fatal(err)
+		}
+		at[k] = place
+	}
+	if at["data/1"] == at["data/2"] {
+		t.Fatalf("both packs at %s", at["data/1"])
+	}
+	cPack := "data/1"
+	if at[cPack] != "C" {
+		cPack = "data/2"
+	}
+
+	b, c := fx.places["B"], fx.places["C"]
+	b.mu.Lock()
+	b.hold, b.holdKey = make(chan struct{}), "index/2" // B is slow to take the new index
+	b.mu.Unlock()
+	var release sync.Once
+	t.Cleanup(func() { release.Do(func() { close(b.hold) }) }) // before the worker stops (cleanups run last first)
+	fx.put("repo", "data/3", "data", "repacked")
+	fx.put("repo", "index/2", "metadata", "index two")
+	fx.removeAs("repo", "snapshots/1", "snapshot")
+	fx.removeAs("repo", "index/1", "metadata")
+	fx.remove("repo", "data/1")
+	fx.remove("repo", "data/2")
+	sent := func(pl *place, what string) bool {
+		log, _, _, _ := pl.snapshot()
+		return slices.Contains(log, what)
+	}
+	waitFor(t, "C to take the new index and delete the old metadata", func() bool {
+		return sent(c, "delete repo/index/1") && sent(c, "delete repo/snapshots/1")
+	})
+	time.Sleep(200 * time.Millisecond) // twenty polls
+	if sent(c, "delete repo/"+cPack) {
+		t.Fatalf("C deleted %s while B still holds the old snapshot naming it live", cPack)
+	}
+	release.Do(func() { close(b.hold) })
+	fx.drained("B")
+	fx.drained("C")
+	if !sent(c, "delete repo/"+cPack) || fx.holds("C", "repo", cPack) {
+		t.Fatalf("C did not delete %s once B caught up", cPack)
+	}
+	if fx.holds("B", "repo", "snapshots/1") || fx.holds("B", "repo", "index/1") {
+		t.Fatal("B keeps the old metadata")
+	}
+}

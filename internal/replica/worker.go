@@ -342,9 +342,10 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			sleep(ctx, poll)
 			continue
 		}
-		if p.Class == "metadata" || p.Class == "snapshot" {
-			// The barrier (REPL-1): not before every earlier data object
-			// of the bucket is acknowledged wherever it is placed.
+		if p.Class == "metadata" || p.Class == "snapshot" || p.Op == state.OpDelete {
+			// The barrier (REPL-1): metadata not before every earlier data object
+			// of the bucket is acknowledged wherever it is placed; a data
+			// delete not before the metadata before it (#21).
 			held, err := w.DB.Held(ctx, p.Seq)
 			if err != nil || held {
 				if err != nil && ctx.Err() == nil {

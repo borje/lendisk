@@ -270,3 +270,58 @@ func TestRowsQueuedBeforeTheUpgradeCountAsTaken(t *testing.T) {
 		t.Fatalf("%d of the put and its delete queued at B, want both", n)
 	}
 }
+
+// REPL-1, REPL-2 (#21 review): a data delete waits until every metadata
+// row of its bucket before it is acknowledged wherever it is placed,
+// except at a friend unreachable, or full, for reroute_after: one away
+// would otherwise stop every place's deletes, and the rows behind them,
+// for as long as it stays away.
+func TestDataDeleteWaitsForEarlierMetadataAtFriendsThatAnswer(t *testing.T) {
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 1)
+	d := p.put("laptop", "data/1", "data", 1)
+	for _, f := range p.places(d) {
+		p.ack(f, d)
+	}
+	m := p.put("laptop", "index/1", "metadata", 0.1)
+	del := p.del("laptop", "data/1", "data")
+	if p.held(d) {
+		t.Fatal("a data put is held")
+	}
+	if !p.held(del) {
+		t.Fatal("a data delete not held with index/1 queued at B and C")
+	}
+	p.ack("C", m)
+	if !p.held(del) {
+		t.Fatal("a data delete not held with index/1 queued at B")
+	}
+	p.condition("B", ConditionQuota, p.now.Add(-time.Minute), p.now)
+	if !p.held(del) {
+		t.Fatal("a brief 507 at B released the delete")
+	}
+	p.condition("B", ConditionQuota, p.now.Add(-2*time.Hour), p.now)
+	if p.held(del) {
+		t.Fatal("a delete held by a friend full for two hours")
+	}
+	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	if p.held(del) {
+		t.Fatal("a delete held by a friend unreachable for two hours")
+	}
+	p.condition("B", ConditionOK, p.now, p.now)
+	p.ack("B", m)
+	if p.held(del) {
+		t.Fatal("a delete held with the metadata before it acknowledged everywhere")
+	}
+	// A delete written before the metadata does not wait for it.
+	d2 := p.put("laptop", "data/2", "data", 1)
+	for _, f := range p.places(d2) {
+		p.ack(f, d2)
+	}
+	del2 := p.del("laptop", "data/2", "data")
+	p.put("laptop", "index/2", "metadata", 0.1)
+	if p.held(del2) {
+		t.Fatal("a delete held by metadata written after it")
+	}
+}

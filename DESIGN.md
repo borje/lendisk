@@ -2266,6 +2266,8 @@ upstream bucket is Q-V.
   is sent there too; it is not a target for a healing re-upload.
   `dropped` is a copy never sent; it is not REPL-13's `dropping`, a
   copy the place holds that re-placement is deleting.
+  Data deletes have the mirror barrier: they wait for the metadata
+  before them (*Deletes*, below, #21).
   Restic and Kopia write packs, then indexes, then the snapshot or
   manifest, so the barrier costs one round of acknowledgements per
   backup run, not per object.
@@ -2314,15 +2316,36 @@ upstream bucket is Q-V.
     put taken but superseded by the delete is abandoned at its next
     try (`Superseded`), and the delete is sent after it; a key the
     friend lacks counts as deleted.
-  - *Ordering across places* needs nothing more: a data delete is not
-    held by the metadata barrier, but every friend gets the bucket's
-    metadata, and a prune writes its new index before it deletes, so
-    at every friend the new index (held until every repacked pack is
-    acknowledged where it is placed) precedes each pack delete in that
-    friend's FIFO. No friend therefore deletes a pruned pack before the
-    pool holds the repacked data and that friend holds the index that
-    no longer lists the pack. Metadata and snapshot deletes are held
-    like metadata puts.
+  - *Ordering across places: the delete barrier.* Per-place FIFO is not
+    enough. At copies 1 with friends B and C, a prune's new index, the
+    deletes of the old snapshot and index, and the pack deletes reach C
+    while B is still behind the new index: C deletes packs only it held
+    while B still holds, live, the old snapshot and index naming them,
+    so B and C together hold a snapshot whose packs are nowhere (REPL-1
+    AC). So the barrier has a mirror: a data delete at sequence `d` is
+    sent to any place only once no metadata or snapshot row of its
+    bucket before `d`, put or delete, is `queued` at any place
+    (`state.DB.Held`, which the sender checks for every delete at the
+    head of its FIFO, polling every second while it holds;
+    `TestPackDeleteWaitsForTheMetadataBeforeIt`,
+    `TestDataDeleteWaitsForEarlierMetadataAtFriendsThatAnswer`). A
+    prune's pack deletes thus wait until every friend holds the new
+    index and has deleted the old metadata. It cannot deadlock: a data
+    put is never held, a metadata row waits only for data puts before
+    it, and a data delete only for metadata before it, so the queued
+    row with the lowest sequence is always free to go.
+    *Decision (#21 review): a friend that is away does not hold
+    deletes.* Metadata queued at a friend unreachable for
+    `replication.reroute_after`, or full (`507`) for that long, is not
+    waited for, as `Reroute` does not wait for it either: otherwise one
+    friend away for days would hold every other friend's deletes, and,
+    since FIFOs are strict, every row behind them, new backups
+    included. The cost is the AC while it is away: its replica keeps
+    the old snapshot and index, while the packs they name may be
+    deleted elsewhere; once it returns its FIFO sends it the new index
+    and the deletes, in order. A friend that answers, however slowly,
+    holds them. Metadata and snapshot deletes are held like metadata
+    puts.
   - *Bookkeeping.* A delete's row counts minus what the place
     acknowledged of the key since its last delete there, from the
     moment it is queued; its acknowledgement changes nothing more. The

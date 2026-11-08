@@ -184,10 +184,13 @@ func (fx *fixture) capture(bucket, key string, size int64, content string) int64
 	return seqs[0]
 }
 
-func (fx *fixture) remove(bucket, key string) {
+func (fx *fixture) remove(bucket, key string) { fx.removeAs(bucket, key, "data") }
+
+// removeAs deletes key, captured in class, as the decorator does.
+func (fx *fixture) removeAs(bucket, key, class string) {
 	fx.t.Helper()
 	os.Remove(filepath.Join(fx.store, bucket, filepath.FromSlash(key)))
-	seqs, err := fx.db.BeginCaptures(fx.t.Context(), []state.Capture{{Bucket: bucket, Key: key, Op: state.OpDelete, Class: "data"}})
+	seqs, err := fx.db.BeginCaptures(fx.t.Context(), []state.Capture{{Bucket: bucket, Key: key, Op: state.OpDelete, Class: class}})
 	if err != nil {
 		fx.t.Fatal(err)
 	}
