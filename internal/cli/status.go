@@ -284,6 +284,10 @@ type StatusBucket struct {
 	// SingleCopy is true when copies is 1: each object is held by one
 	// friend, so losing that friend's disk loses the offsite copy (EP-6).
 	SingleCopy bool `json:"single_copy"`
+	// OutsideTrust is true when the bucket's tool does not encrypt
+	// (the generic profile): friends hold its objects in the clear, so
+	// it is outside lendisk's trust guarantee (EP-8, P-3).
+	OutsideTrust bool `json:"outside_trust"`
 }
 
 // StatusPool is the pool of friends that hold copies (D6).
@@ -394,11 +398,16 @@ func (a *app) statusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			profiles, err := profile.Load(filepath.Join(cfg.ConfigDir(), "profiles"))
+			if err != nil {
+				return err
+			}
 			for _, b := range bs {
 				q, bc := queues[b.Name], below[b.Name]
 				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
-					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1})
+					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1,
+					OutsideTrust: !profiles.Get(b.Profile).Encrypted})
 			}
 			db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
 			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
@@ -442,10 +451,6 @@ func (a *app) statusCmd() *cobra.Command {
 			}
 			st.Recovery.Unverified = []StatusUnverified{}
 			if len(singles) > 0 {
-				profiles, err := profile.Load(filepath.Join(cfg.ConfigDir(), "profiles"))
-				if err != nil {
-					return err
-				}
 				for _, b := range bs {
 					if n := singles[b.Name]; n > 0 && !profiles.Get(b.Profile).Encrypted {
 						st.Recovery.Unverified = append(st.Recovery.Unverified, StatusUnverified{Bucket: b.Name, Objects: n})
@@ -483,6 +488,9 @@ func (a *app) statusCmd() *cobra.Command {
 						b.BelowCopies.Bytes, b.Copies)
 				}
 				fmt.Fprintln(a.out)
+				if b.OutsideTrust {
+					fmt.Fprintf(a.out, "    %s\n", outsideTrustLine)
+				}
 				if b.SingleCopy {
 					fmt.Fprintf(a.out, "    %s\n", singleCopyLine)
 				}

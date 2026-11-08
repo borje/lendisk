@@ -38,6 +38,50 @@ func TestResticClassifiesKeys(t *testing.T) {
 	}
 }
 
+// EP-7: the kopia profile's four classes, as REQUIREMENTS lists them.
+// The index blobs n* and the epoch index blobs xn* are snapshot keys
+// (Kopia keeps its manifests in pack blobs, so a snapshot exists once
+// the index that references it does); the other epoch blobs, sessions
+// and the three format blobs are metadata; packs are data; the logs
+// are local-only.
+func TestKopiaClassifiesKeys(t *testing.T) {
+	set, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := set.Get("kopia")
+	if p.Name != "kopia" || !p.Encrypted {
+		t.Fatalf("kopia is a compiled-in profile inside the encryption guarantee: %+v", p)
+	}
+	cases := map[string]Class{
+		"kopia.repository":  Metadata,
+		"kopia.blobcfg":     Metadata,
+		"kopia.maintenance": Metadata,
+		"n0123456789abcdef0123456789abcdef-s0123456789abcdef-c1": Snapshot,
+		"xn0_0123456789abcdef0123456789abcdef-s01-c1":            Snapshot,
+		"xs0_0123456789abcdef0123456789abcdef":                   Metadata,
+		"xr0_4_0123456789abcdef0123456789abcdef":                 Metadata,
+		"xe0":                                                    Metadata,
+		"xw1":                                                    Metadata,
+		"s0123456789abcdef-c1":                                   Metadata,
+		"p0123456789abcdef0123456789abcdef-s0123":                Data,
+		"q0123456789abcdef0123456789abcdef-s0123":                Data,
+		"_log_20261108000000_0123_1699999999_1699999999_1_0123456789abcdef": LocalOnly,
+		"kopia.repository.f": Data,
+		"other/key":          Data,
+	}
+	for key, want := range cases {
+		if got := p.Classify(key); got != want {
+			t.Errorf("Classify(%q) = %s, want %s", key, got, want)
+		}
+	}
+	// Kopia names its blobs by a keyed hash or at random, never by the
+	// plain SHA-256 of their content: recovery cannot check a name.
+	if p.HashNamed("p" + strings.Repeat("ab", 32)) {
+		t.Error("a kopia blob is not named by its SHA-256")
+	}
+}
+
 // EP-7: generic has no snapshot, metadata or local-only keys, and is
 // outside the encryption guarantee.
 func TestGenericIsAllData(t *testing.T) {

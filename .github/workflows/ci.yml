@@ -19,11 +19,27 @@ jobs:
         run: |
           out=$(gofmt -l cmd internal)
           if [ -n "$out" ]; then echo "not gofmt'ed:"; echo "$out"; exit 1; fi
-      - name: backup tools for the end-to-end tests (EP-1)
+      - name: backup tools for the end-to-end tests (EP-1, COMPAT-1)
+        env:
+          # Pinned releases, checked against the SHA-256 each project
+          # publishes (Kopia's checksums.txt; GitHub's asset digest for
+          # Duplicacy, which publishes none of its own).
+          KOPIA_VERSION: 0.23.1
+          KOPIA_SHA256: 416d0f84a3dbb321a8b2d8f0997b1a0a6e915babe79ee76fa6e4d2bd1e1c5178
+          DUPLICACY_VERSION: 3.3.0
+          DUPLICACY_SHA256: a2ac4db7018633b116506e081a029dd6635e9619cf24b85c33144640613416ee
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq restic rclone
-          restic version; rclone version | head -1; aws --version
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          curl -fsSLo kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-x64.tar.gz"
+          echo "${KOPIA_SHA256}  kopia.tar.gz" | sha256sum -c -
+          tar xzf kopia.tar.gz
+          sudo install -m 0755 "kopia-${KOPIA_VERSION}-linux-x64/kopia" /usr/local/bin/kopia
+          curl -fsSLo duplicacy "https://github.com/gilbertchen/duplicacy/releases/download/v${DUPLICACY_VERSION}/duplicacy_linux_x64_${DUPLICACY_VERSION}"
+          echo "${DUPLICACY_SHA256}  duplicacy" | sha256sum -c -
+          sudo install -m 0755 duplicacy /usr/local/bin/duplicacy
+          restic version; rclone version | head -1; aws --version; kopia --version; duplicacy 2>&1 | grep -A1 VERSION
       - run: go vet ./...
       - run: go test -race ./...
       - name: SEC-11 test build (admission admits everyone; the middleware alone refuses)

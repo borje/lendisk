@@ -1,0 +1,32 @@
+# The Kopia profile (EP-7). Kopia keeps its repository as flat blobs
+# whose first letter says what they hold. Patterns are globs in which *
+# matches any run of characters, slashes included, and ? matches one. A
+# key is local-only, else snapshot, else metadata, else data, by the
+# first list it matches; a key no rule matches is data.
+
+# Kopia encrypts every blob it writes, the three format blobs' payloads
+# included (EP-8).
+encrypted = true
+
+# Stored and served, never replicated: Kopia's logs of its own runs are
+# no use to a replica, and a Kopia that reads one writes its own.
+local_only = ["_log*"]
+
+# Kopia keeps snapshot manifests inside pack blobs (q*), so a snapshot
+# exists once the index that references them does: the index blobs n*
+# and the epoch manager's uncompacted index blobs xn*.
+snapshot = ["n*", "xn*"]
+
+# Placed at every friend (REPL-12, D6): the format, blob-storage and
+# maintenance-schedule blobs, the index and epoch blobs (xn uncompacted,
+# xs/xr compacted, xe epoch markers, xw deletion watermarks) and the
+# session blobs.
+metadata = ["kopia.repository", "kopia.blobcfg", "kopia.maintenance", "n*", "x*", "s*"]
+
+# Placed at `copies` places: data packs (p*) and metadata packs (q*,
+# directory listings and manifests).
+data = ["p*", "q*"]
+
+# Kopia names blobs by a keyed hash (HMAC) of their content or at random,
+# never by the plain SHA-256, so recovery has no name to check (ID-5).
+hash_named = []
