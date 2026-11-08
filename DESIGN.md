@@ -2106,7 +2106,7 @@ upstream bucket is Q-V.
   repository writes `n*` blobs at `create` and with every snapshot,
   `m*` and `l*` only when maintenance compacts indexes.
   Two profile lists say this as data: `format1_keys = ["n*", "m*",
-  "l*"]` and `upgraded_keys` = the poison blob's name, checked first
+  "l*"]` and `upgraded_keys` = the poison blob's name and `x*`, checked first
   (`profile.Profile.Format`); only `kopia` has them. They change no
   class (`n*` stays a snapshot key, `m*` and `l*` data, so these reach
   `copies` friends only: why format 1 is unsupported), and no write is
@@ -2122,7 +2122,15 @@ upstream bucket is Q-V.
   blobs, from marking it. So the warning ends at the upgrade itself,
   not after a quiet period or on a `kopia.repository` rewrite (which a
   format-1 `set-parameters` also does, and whose format version is
-  encrypted), and when the bucket is deleted with its row. `status`
+  encrypted), and when the bucket is deleted with its row. `x*` is in
+  `upgraded_keys` because the poison blob is only Kopia 0.12's: 0.9 to
+  0.11 upgraded without it (#79 review), and Kopia only logs a failed
+  poison write. Format 1 never writes the epoch manager's `x*`, so any of
+  them means format 2 or later, whatever the order an import brings the
+  blobs in. Once `upgraded_at` is set nothing marks the bucket again, so
+  a bucket emptied by hand and reused for a new format-1 repository, or
+  an experimental `kopia repository upgrade rollback`, is not warned
+  about; deleting and re-adding the bucket resets it. `status`
   prints "! Kopia repository in format version 1, which lendisk does
   not support" under the bucket with the first such blob, its time and
   `kopia repository set-parameters --upgrade` (Kopia 0.9 or later);

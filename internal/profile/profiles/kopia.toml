@@ -50,4 +50,8 @@ rewritable = ["kopia.repository", "kopia.blobcfg", "kopia.maintenance"]
 # --upgrade` writes one n* blob of its own, the legacy-index poison blob
 # (repo/format/upgrade_lock.go:19), which ends the warning.
 format1_keys = ["n*", "m*", "l*"]
-upgraded_keys = ["n00000000000000000000000000000000-repository_unreadable_by_this_kopia_version_upgrade_required"]
+# The epoch manager's blobs (x*) are never written in format 1, so any of
+# them means format 2 or later: a repository upgraded by Kopia 0.9-0.11,
+# which wrote no poison blob, or one whose poison write failed (#79
+# review).
+upgraded_keys = ["n00000000000000000000000000000000-repository_unreadable_by_this_kopia_version_upgrade_required", "x*"]

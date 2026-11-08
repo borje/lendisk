@@ -34,11 +34,10 @@ func TestFormat1BlobMarksTheBucketWithoutRefusingIt(t *testing.T) {
 			t.Fatalf("put %s/%s: %v", bucket, key, err)
 		}
 	}
-	put("vault", "xn0_0123-s01-c1")
 	put("vault", "p0123-s01")
 	put("laptop", "n0123")
 	if b, _ := h.db.GetBucket(ctx, "vault"); b.Format1() {
-		t.Fatalf("marked by format-2 blobs: %+v", b)
+		t.Fatalf("marked by a pack: %+v", b)
 	}
 	if b, _ := h.db.GetBucket(ctx, "laptop"); b.Format1() {
 		t.Fatalf("restic bucket marked: %+v", b)
@@ -87,5 +86,17 @@ func TestFormat1BlobMarksTheBucketWithoutRefusingIt(t *testing.T) {
 	b, _ = h.db.GetBucket(ctx, "vault")
 	if b.Format1() || !b.UpgradedAt.Equal(now()) {
 		t.Fatalf("after the upgrade's marker: %+v", b)
+	}
+
+	// Kopia 0.9-0.11 upgraded without the marker: its first epoch blob
+	// (x*), which format 1 never writes, ends the mark too.
+	clock.Add(60)
+	h.db.ExecContext(ctx, `UPDATE buckets SET upgraded_at = NULL WHERE name = 'vault'`)
+	if b, _ := h.db.GetBucket(ctx, "vault"); !b.Format1() {
+		t.Fatalf("not format 1 again: %+v", b)
+	}
+	put("vault", "xn0_0123-s01-c1")
+	if b, _ := h.db.GetBucket(ctx, "vault"); b.Format1() || !b.UpgradedAt.Equal(now()) {
+		t.Fatalf("after an epoch blob: %+v", b)
 	}
 }
