@@ -192,10 +192,10 @@ func TestUnknownIdentityRefusedOnNodeWithZeroPeers(t *testing.T) {
 	if lookups.Load() == 0 {
 		t.Fatal("admission was never consulted")
 	}
-	// The client retries about once a second; the negative cache keeps
-	// the database out of it.
-	if n := lookups.Load(); n != 1 {
-		t.Errorf("database looked up %d times; want 1 (negative cache)", n)
+	// The client retries about once a second over the 5 s; the negative
+	// cache keeps the database out of all but one retry per DeniedFor.
+	if n, most := lookups.Load(), 1+int64(5*time.Second/DeniedFor); n > most {
+		t.Errorf("database looked up %d times; want at most %d (negative cache)", n, most)
 	}
 	if _, ok := srv.server.Status().Peer[stranger.PublicKey()]; ok {
 		t.Fatal("stranger became a WireGuard peer")
