@@ -69,6 +69,9 @@ const (
 	// envQuotaHold is the alert service's QuotaHold (a Go duration),
 	// read with envAlertInterval.
 	envQuotaHold = "LENDISK_TEST_QUOTA_HOLD"
+	// envFarewellInterval is the farewell's time between passes (a Go
+	// duration).
+	envFarewellInterval = "LENDISK_TEST_FAREWELL_INTERVAL"
 )
 
 // offsetClock is real time plus the duration in the file at path, read
@@ -122,6 +125,9 @@ func TestMain(m *testing.M) {
 					s.QuotaHold = h
 				}
 			}
+		}
+		if d, err := time.ParseDuration(os.Getenv(envFarewellInterval)); err == nil {
+			a.tuneEnding = func(f *farewell) { f.Interval = d }
 		}
 		a.tuneManifest = func(p *manifest.Pusher) {
 			if os.Getenv(envReplFast) == "1" {

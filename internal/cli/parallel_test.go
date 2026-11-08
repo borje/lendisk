@@ -21,8 +21,7 @@ import (
 // (parallelDefault) and these two bound the work instead. A test that
 // needs a quiet process stays serial, saying why: go test runs the
 // serial tests before the parallel ones. Two read the process's own
-// sockets; TestEndingAFriendshipTellsTheFriendAndLeavesTheOthers loses
-// the remove call's answer under load.
+// sockets.
 
 var (
 	gatewayHeld sync.Mutex

@@ -187,6 +187,12 @@ func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, caps *Caps
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       5 * time.Minute,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelDebug),
+		// A hijacked connection's reads are its handler's (Conns.Cut).
+		ConnState: func(c net.Conn, st http.ConnState) {
+			if pc, ok := c.(*peerConn); ok && st == http.StateHijacked {
+				pc.hijack()
+			}
+		},
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			if pc, ok := c.(*peerConn); ok {
 				return context.WithValue(context.WithValue(pc.context(ctx), peerKey{}, pc.peer), connKey{}, pc)

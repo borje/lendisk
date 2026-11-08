@@ -1,12 +1,14 @@
 package bridge
 
 import (
+	"bufio"
 	"context"
 	"io"
 	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,7 +50,9 @@ func blockingGateway(t *testing.T) (sock string, arrived, cancelled chan struct{
 // friend's connection is untouched.
 func TestCutCancelsInFlightRequestsAndClosesTheKeysConnections(t *testing.T) {
 	sock, arrived, cancelled := blockingGateway(t)
-	conns := &Conns{}
+	// Bob's client keeps sending its body, so it closes nothing and
+	// gets the removed answer once the connection closes after Linger.
+	conns := &Conns{Linger: time.Second}
 	l := startLenderConns(t, New(sock, quiet).TunnelS3Handler(), nil, conns)
 	lenderKey := l.self.NodeID()
 	bob, carol := newID(t), newID(t)
@@ -246,5 +250,203 @@ func TestCutThenDisconnect(t *testing.T) {
 	if conn, err := c2.Dial(rctx, srvID.NodeID(), srv.Address()); err == nil {
 		conn.Close()
 		t.Fatal("the removed friend's dial key dialled again")
+	}
+}
+
+// SEC-15, PEER-5 (#84): a handler that hijacked its connection, as the
+// remove call does to wait for the caller to close it after the answer,
+// keeps its reads when the connection is cut: Cut neither ends them
+// nor closes the connection before the handler does, within Grace. So
+// the remove call's answer is not lost to a farewell pass that cuts
+// the caller meanwhile.
+func TestCutLeavesAHijackedConnectionsReadsToItsHandler(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tun := &fakeTunnel{keys: map[string]identity.NodeID{}, ln: ln}
+	conns := &Conns{Grace: 10 * time.Second}
+	hijacked, readEnd := make(chan struct{}), make(chan error, 1)
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusOK)
+		rc := http.NewResponseController(w)
+		rc.Flush()
+		c, brw, err := rc.Hijack()
+		if err != nil {
+			readEnd <- err
+			return
+		}
+		defer c.Close()
+		c.SetReadDeadline(time.Now().Add(10 * time.Second))
+		close(hijacked)
+		_, err = io.Copy(io.Discard, brw)
+		readEnd <- err
+	})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error)
+	go func() { done <- ServeTunnel(ctx, ln, tun.peerOf, nil, conns, h, quiet) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	bob := newID(t)
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	tun.mu.Lock()
+	tun.keys[conn.LocalAddr().String()] = bob.NodeID()
+	tun.mu.Unlock()
+	io.WriteString(conn, "POST /_lendisk/remove HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n")
+	select {
+	case <-hijacked:
+	case err := <-readEnd:
+		t.Fatalf("hijack: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never hijacked")
+	}
+	cut := make(chan int, 1)
+	go func() { cut <- conns.Cut(bob.NodeID()) }()
+	select {
+	case err := <-readEnd:
+		t.Fatalf("the cut ended the hijacked connection's read: %v", err)
+	case n := <-cut:
+		t.Fatalf("Cut returned (%d) before the handler closed its connection", n)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// The client reads its answer and closes the connection.
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if resp, err := http.ReadResponse(bufio.NewReader(conn), nil); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("the answer: %v %v", resp, err)
+	}
+	conn.Close()
+	select {
+	case err := <-readEnd:
+		if err != nil {
+			t.Fatalf("the handler's read ended with %v, want the client's close", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler's read did not end at the client's close")
+	}
+	select {
+	case n := <-cut:
+		if n != 1 {
+			t.Fatalf("Cut: %d connections, want 1", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Cut did not return after the handler closed its connection")
+	}
+}
+
+// SEC-15, PEER-5 (#84, CI on 2b1f67e): the removed answer to a request
+// in flight is written and flushed, but a connection closed at once may
+// still hold it in the tunnel's send buffer when the disconnect after
+// Cut drops the tunnel, and the client then waits for an answer that
+// never comes. So Cut closes the connection only once the client read
+// the answer and closed it, waiting Linger from when the answer was
+// written, past the grace.
+func TestCutClosesOnlyOnceTheClientHasTheRemovedAnswer(t *testing.T) {
+	sock, arrived, _ := blockingGateway(t)
+	conns := &Conns{}
+	l := startLenderConns(t, New(sock, quiet).TunnelS3Handler(), nil, conns)
+	bob := newID(t)
+	if err := l.db.AddFriendship(t.Context(), state.Friendship{Peer: bob.NodeID().String(), CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", l.tun.ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	l.tun.mu.Lock()
+	l.tun.keys[conn.LocalAddr().String()] = bob.NodeID()
+	l.tun.mu.Unlock()
+	// A PUT whose body trickles in until the connection closes.
+	io.WriteString(conn, "PUT /sbucket/key HTTP/1.1\r\nHost: lender:9000\r\nAuthorization: "+sigv4(bob.NodeID().String())+
+		"\r\nContent-Length: 104857600\r\n\r\n")
+	go func() {
+		chunk := []byte(strings.Repeat("x", 1024))
+		for {
+			if _, err := conn.Write(chunk); err != nil {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the PUT never reached the gateway")
+	}
+	if _, err := l.db.RemoveFriendship(t.Context(), bob.NodeID().String(), false, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	cut := make(chan int, 1)
+	go func() { cut <- conns.Cut(bob.NodeID()) }()
+	time.Sleep(500 * time.Millisecond) // the answer is written meanwhile
+	select {
+	case n := <-cut:
+		t.Fatalf("Cut closed the connection (%d) before the client read the removed answer", n)
+	default:
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("the removed answer: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(string(body), state.NoRelationship) {
+		t.Fatalf("the answer: %d %s", resp.StatusCode, body)
+	}
+	conn.Close()
+	select {
+	case n := <-cut:
+		if n != 1 {
+			t.Fatalf("Cut: %d connections, want 1", n)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Cut did not return once the client closed the connection")
+	}
+}
+
+// deadlineConn records the last read deadline set; setting readEnded
+// signals entering and then waits a moment, widening the window between
+// a cut's check and its deadline.
+type deadlineConn struct {
+	net.Conn
+	mu      sync.Mutex
+	last    time.Time
+	cutting chan struct{}
+}
+
+func (d *deadlineConn) SetReadDeadline(t time.Time) error {
+	if t.Equal(readEnded) {
+		close(d.cutting)
+		time.Sleep(50 * time.Millisecond)
+	}
+	d.mu.Lock()
+	d.last = t
+	d.mu.Unlock()
+	return nil
+}
+
+// #84 review: a cut that checked the connection was not hijacked must
+// not then overwrite the deadline its handler set once it hijacked it,
+// which would end the wait for the client and drop the answer again.
+func TestCutDoesNotOverwriteAHijackersDeadline(t *testing.T) {
+	dc := &deadlineConn{cutting: make(chan struct{})}
+	pc := &peerConn{Conn: dc}
+	done := make(chan struct{})
+	go func() { pc.cutNow(); close(done) }()
+	<-dc.cutting
+	pc.hijack()
+	want := time.Now().Add(5 * time.Second)
+	pc.SetReadDeadline(want)
+	<-done
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if !dc.last.Equal(want) {
+		t.Fatalf("the read deadline after the hijacker set it: %v, want %v", dc.last, want)
 	}
 }

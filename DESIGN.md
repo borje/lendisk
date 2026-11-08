@@ -1572,8 +1572,51 @@ upstream bucket is Q-V.
   retried with a backoff of a minute doubling to an hour while the
   window lasts; a 403 means it holds no friendship either and counts
   as told. The callee, in the `peer` role, ends the friendship on its
-  side with `by_peer` set (and so told), answers before its own cut
-  closes that very connection, and raises `friend_removed` (§3.8).
+  side with `by_peer` set (and so told), answers, and raises
+  `friend_removed` (§3.8). Its daemon cuts and disconnects the caller
+  (`Server.Ended`, which kicks the farewell) only once the caller has
+  the answer (#84): an answer written and flushed is still in the
+  tunnel's send buffer, and dropping the tunnel loses it, so the
+  caller's tell timed out and its retries met a key refused at
+  connect. The answer carries its length and `Connection: close`; the
+  handler then hijacks the connection and reads it until the caller
+  closes it, as a client does after such an answer, or for
+  `Server.AnswerWait` (5 s) at the most, and only then calls `Ended`.
+  A farewell pass that cuts the caller meanwhile leaves a hijacked
+  connection's reads to its handler and waits for it to close: until
+  `Conns.Grace` (2 s) after the cut or `Conns.Linger` after the hijack,
+  whichever is later, then closes it anyway. `Linger` defaults to
+  `AnswerWait` (`bridge.DefaultLinger` is `control.DefaultAnswerWait`),
+  so the cut never closes the remove call's connection while its
+  handler still waits (§3.9 SEC-15;
+  `TestRemoveCallEndsOnlyOnceTheCallerHasTheAnswer`,
+  `TestCutLeavesAHijackedConnectionsReadsToItsHandler`).
+  *Decision (#84, review): a refusal at connect after the call was
+  sent makes the friend "probably told", and it is still asked until it
+  answers.* A friend that ended it refuses the caller's key at
+  connect, and tailcat ignores a refused key's handshake, so the
+  caller cannot tell that from an offline friend: both are a dial that
+  never connects. `control.Client` marks a failed call with how far it
+  got, `control.ErrNotConnected` (no connection) or
+  `control.ErrNoAnswer` (the request written whole, no answer), traced
+  with `net/http/httptrace`. But "written whole" means only that the
+  local end of the tunnel took it: a friend that fell asleep just then
+  (a laptop closed) looks the same as one that ended it. So after a
+  try that ended `ErrNoAnswer` and three tries in a row that never
+  connect (`tellRefusals`; with the backoff, about seven minutes), the
+  friend is not recorded as told. Its `notify_error` says it has
+  probably ended the friendship too, and it is asked again every
+  6 hours, give or take a tenth (`tellProbablyEvery`, jitter from
+  `farewell.Rand`), until it answers 200 or 403, which records it as
+  told at once, or the purge forgets the former friend. Any other
+  answer (a 500) starts over on the backoff; a dial that never
+  connects without such a try never makes it probable. *Precedent:*
+  the farewell's own rule, like the manifest pusher's and the quota
+  call's, that a notification is retried until it is confirmed or
+  moot; a friend that only ever saw "A offline" would keep the
+  friendship and A's replica. The mark is kept in memory only: after
+  a restart the farewell retries on the backoff again, so no migration
+  (`TestAFriendThatRefusesAfterTheRemoveCallIsAskedUntilItAnswers`).
   `status` lists ended friendships (`former_friends`, with who ended
   it, whether the friend was told and the purge time).
   *Decision (#25): the other side ends it too, automatically, and is
@@ -4471,8 +4514,29 @@ the handler's own reads and is never cancelled; nothing below
   client). A request whose answer had not started gets the removed
   answer (403 `AccessDenied`, `state.NoRelationship`, `Connection:
   close`, with its length) and the connection is then hijacked and
-  closed; an idle connection is closed at once; a busy one that does
-  not end within `Conns.Grace` (2 s) is closed anyway
+  closed once the client has the answer (below); an idle connection is
+  closed at once; a busy one that does not end within `Conns.Grace`
+  (2 s), or the linger below when it was hijacked, is closed anyway.
+  The cut sets the read deadline under the connection's lock, which a
+  hijack and every deadline set take too, so a hijack comes wholly
+  before the cut or after it and its handler's deadline is never
+  overwritten (`TestCutDoesNotOverwriteAHijackersDeadline`). A connection
+  its handler hijacked (`http.StateHijacked`, seen by `ServeTunnel`'s
+  ConnState) keeps its read deadline: the remove call reads it until
+  its caller closes it after the answer (§3.2 PEER-5, #84), and `Cut`
+  waits for the handler to close it, until the grace after the cut or
+  `Conns.Linger` after the hijack, whichever is later. The removed
+  answer is delivered the same way (#84, CI on 2b1f67e: B's transfer
+  timed out with no answer): `writeCut` writes it with `Connection:
+  close`, hijacks the connection and reads it until the client closes
+  it, for `Conns.Linger` (5 s) at the most, and only then closes it, so
+  neither a close with unread body bytes (a reset) nor the disconnect
+  after `Cut` discards an answer still in the tunnel's send buffer.
+  `Cut` waits for such a connection for the grace from the cut or
+  `Linger` from the hijack, whichever ends later. A client still
+  sending its body keeps sending until its write fails, so it gets the
+  answer when the connection closes after `Linger`
+  (`TestCutClosesOnlyOnceTheClientHasTheRemovedAnswer`)
   (`TestCutCancelsInFlightRequestsAndClosesTheKeysConnections`; over
   the real tunnel, spike #3's order, `TestCutThenDisconnect`;
   `TestFarewellRevokesInOrderTellsAndPurges`). The SEC-15 AC,
