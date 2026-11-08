@@ -90,6 +90,29 @@ func TestReplacementRunsHourly(t *testing.T) {
 	waitFor(t, "data/1 at C", func() bool { return fx.holds("C", "laptop", "data/1") })
 }
 
+// REPL-13 (#26 review): a pass that failed is run again at the next
+// re-routing tick, not an hour later.
+func TestAFailedPassIsRetriedAtTheNextTick(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	fx.bucket("laptop", 1)
+	fx.w.RerouteEvery = 20 * time.Millisecond
+	fx.put("laptop", "data/1", "data", "pack one")
+	if _, err := fx.db.Exec(`CREATE TRIGGER fail BEFORE INSERT ON placement WHEN NEW.place = 'C'
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	fx.run()
+	waitFor(t, "data/1 at B", func() bool { return fx.holds("B", "laptop", "data/1") })
+	if err := fx.db.SetCopies(t.Context(), "laptop", 2); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // the pass for the change fails
+	if _, err := fx.db.Exec(`DROP TRIGGER fail`); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "data/1 at C", func() bool { return fx.holds("C", "laptop", "data/1") })
+}
+
 // REPL-13 (#26): a pass and the worker's sending set share the worker's
 // lock, so a row being sent is never cancelled as surplus.
 func TestASurplusCopyBeingSentIsNotCancelled(t *testing.T) {

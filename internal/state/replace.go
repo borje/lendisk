@@ -479,8 +479,12 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 		}
 	}
 	// Data: read in pages, decided again in each batch's transaction.
+	type job struct {
+		seq, size int64
+		short     bool // below copies even with what the scan would place
+	}
 	var after int64
-	var work []int64
+	var work []job
 	var below, belowBytes int64
 	for ctx.Err() == nil {
 		objs, err := m.page(ctx, bucket, after)
@@ -498,7 +502,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 			}
 			switch {
 			case len(ops) > 0:
-				work = append(work, o.seq)
+				work = append(work, job{o.seq, o.size, short})
 			case short:
 				below++
 				belowBytes += o.size
@@ -507,9 +511,21 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 	}
 	for len(work) > 0 && ctx.Err() == nil {
 		n := min(len(work), replaceBatch)
-		s, err := m.apply(ctx, bucket, copies, work[:n], false)
+		var seqs []int64
+		for _, j := range work[:n] {
+			seqs = append(seqs, j.seq)
+		}
+		s, err := m.apply(ctx, bucket, copies, seqs, false)
 		if err != nil {
-			errs = append(errs, fmt.Errorf("data rows %d to %d: %w", work[0], work[n-1], err))
+			errs = append(errs, fmt.Errorf("data rows %d to %d: %w", seqs[0], seqs[n-1], err))
+			// Its objects are as they were: those the scan found short
+			// stay so (below_copies is recorded all the same).
+			for _, j := range work[:n] {
+				if j.short {
+					below++
+					belowBytes += j.size
+				}
+			}
 		} else {
 			st.add(s)
 			below += s.Below
@@ -518,7 +534,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 		work = work[n:]
 	}
 	st.Below, st.BelowBytes = below, belowBytes
-	if ctx.Err() == nil && len(errs) == 0 {
+	if ctx.Err() == nil {
 		if err := m.recordBelow(ctx, bucket, below, belowBytes); err != nil {
 			errs = append(errs, err)
 		}

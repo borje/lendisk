@@ -73,6 +73,27 @@ func TestASurplusCopyAtAnUnreachableFriendGoesFirst(t *testing.T) {
 	p.wantPlaces("data/1", d1, "B", "D")
 }
 
+// OPS-2 (#26 review): a batch that fails does not keep the pass from
+// recording what is below copies.
+func TestBelowCopiesIsRecordedWhenABatchFails(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.bucket("laptop", 3)
+	p.put("laptop", "data/1", "data", 1)
+	p.friend("C", 10)
+	if _, err := p.db.Exec(`CREATE TRIGGER fail BEFORE INSERT ON placement WHEN NEW.place = 'C'
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.db.Replace(ctx, nil, nil); err == nil {
+		t.Fatal("no error from a failing batch")
+	}
+	if below, err := p.db.BelowCopiesSince(ctx); err != nil || below["laptop"].Objects != 1 {
+		t.Fatalf("below copies %+v %v", below, err)
+	}
+}
+
 // replace runs one re-placement pass and fails the test on an error.
 func (p *pool) replace() ReplaceStats {
 	p.t.Helper()

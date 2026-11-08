@@ -2838,7 +2838,11 @@ upstream bucket is Q-V.
     before their transaction, `DB.lockBucket`), and the worker's
     sending lock, so neither decides about an object while the other
     does, and no capture waits behind a pass for long. A batch that
-    fails is rolled back and the pass goes on, returning the errors.
+    fails is rolled back and the pass goes on, returning the errors;
+    what is below copies is recorded all the same, and the worker runs
+    the pass again at its next re-routing tick rather than an hour later
+    (`TestBelowCopiesIsRecordedWhenABatchFails`,
+    `TestAFailedPassIsRetriedAtTheNextTick`).
     `TestReplaceOfManyObjectsIsFast` (3000 objects to re-place in a
     bucket with 1200 metadata objects) bounds a pass at 4 s without
     `-race` and, under it, at 8 times a pass over a quarter of the

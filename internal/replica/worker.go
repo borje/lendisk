@@ -337,7 +337,7 @@ func (w *Worker) reroute(ctx context.Context) {
 // replace runs a re-placement pass (REPL-13, state.DB.Replace): copies
 // of a pool that changed are placed elsewhere, surplus copies removed.
 // It reports whether the pass left a copy alone because it was being
-// sent, so the next re-routing tick looks again.
+// sent, or failed, so the next re-routing tick looks again.
 func (w *Worker) replace(ctx context.Context) bool {
 	// Called with w.flight held, as Replace applies its batches.
 	sending := func(place string, seq int64) bool {
@@ -357,7 +357,7 @@ func (w *Worker) replace(ctx context.Context) bool {
 		w.Log.Info("replication: re-placed copies after the pool changed",
 			"placed", st.Placed, "deleting", st.Dropping, "cancelled", st.Cancelled, "below_copies", st.Below)
 	}
-	return st.Skipped > 0
+	return st.Skipped > 0 || err != nil // a failed batch is tried again at the next tick
 }
 
 func (w *Worker) connect(f state.Friendship) (Replica, error) {
