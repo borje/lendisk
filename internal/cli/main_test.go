@@ -135,6 +135,7 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(a.run(os.Args[1:]))
 	}
+	raiseParallel()
 	os.Exit(m.Run())
 }
 

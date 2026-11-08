@@ -15,6 +15,7 @@ import (
 // the flag or from the setting, bucket add warns, always. When the pool
 // has fewer places than copies, bucket add says so (OPS-2).
 func TestBucketAddCopiesAndTheCopiesOneWarning(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	code, out, errOut := n.run("", "", "bucket", "add", "three", "--profile", "restic", "--copies", "3")
@@ -70,6 +71,7 @@ func TestBucketAddCopiesAndTheCopiesOneWarning(t *testing.T) {
 // status --json says so under pool; not with two, and a friend gone
 // past replace_after is not counted. It is not an alert.
 func TestStatusWarnsOfAOneFriendPool(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	ctx := context.Background()
@@ -128,6 +130,7 @@ func TestStatusWarnsOfAOneFriendPool(t *testing.T) {
 // REPL-4, OPS-1 (#19): status shows the bytes held at fewer than copies
 // places: here the one friend is the only place for a copies-2 bucket.
 func TestStatusShowsBytesBelowCopies(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	if code, _, errOut := n.run("", "", "bucket", "add", "laptop", "--profile", "restic"); code != 0 {

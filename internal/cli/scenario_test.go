@@ -172,6 +172,7 @@ func (f *fourFriends) placedAsSpecified() {
 // object is at two of B, C and D and the metadata at all three. The
 // protectable size of about 120 GB is LEND-7's, #37.
 func TestScenarioFirstBackupIsOffsiteAtTwoCopies(t *testing.T) {
+	parallel(t, 4)
 	f := newFourFriends(t)
 	id := f.backup("one", 8)
 	f.waitOffsite(id)
@@ -196,6 +197,7 @@ func TestScenarioFirstBackupIsOffsiteAtTwoCopies(t *testing.T) {
 // friend_unreachable alert fires, and not before. When it returns its
 // queue drains: the metadata, and the objects still placed there.
 func TestScenarioFriendOfflineForThreeDays(t *testing.T) {
+	parallel(t, 4)
 	clock := filepath.Join(t.TempDir(), "clock")
 	f := newFourFriends(t, envClock+"="+clock, envAlertInterval+"=200ms", envRerouteEvery+"=200ms")
 	f.an.clock = offsetClock(clock)
@@ -321,6 +323,7 @@ func TestScenarioFriendOfflineForThreeDays(t *testing.T) {
 // multipart upload (§3.3), so a stock S3 client writes the backup in
 // restic's layout to the restic bucket, between real daemons.
 func TestStatusWaitWaitsForAMultipartPack(t *testing.T) {
+	parallel(t, 4)
 	f := newFourFriends(t, envHashDelay+"=4s")
 	ctx := t.Context()
 	cl := s3client(f.a.addr, f.creds)

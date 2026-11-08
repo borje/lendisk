@@ -24,6 +24,7 @@ import (
 // never logging the webhook's secret; `status` and `status --json` show
 // it, also once the daemon has stopped.
 func TestUnreachableFriendAlertedThroughHookWebhookAndStatus(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	ctx := context.Background()
@@ -102,6 +103,7 @@ func TestUnreachableFriendAlertedThroughHookWebhookAndStatus(t *testing.T) {
 // executable program: a command line with arguments, or a file that
 // cannot be run, says what to do instead.
 func TestServeRefusesAnAlertCommandItCannotRun(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	dir := t.TempDir()
@@ -123,6 +125,7 @@ func TestServeRefusesAnAlertCommandItCannotRun(t *testing.T) {
 
 // OPS-1 (#13): with nothing wrong, status says so.
 func TestStatusShowsNoAlerts(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	if st := n.status(); st.Alerts == nil || len(st.Alerts) != 0 {

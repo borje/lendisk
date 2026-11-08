@@ -15,6 +15,7 @@ import (
 // #29 review: when a friend did not serve its manifest, a newer version
 // may be there; recover says so, naming it.
 func TestRecoverWarnsOfLendersNotHeard(t *testing.T) {
+	parallel(t, 0)
 	b, c := identity.NodeID{1}, identity.NodeID{2}
 	var w bytes.Buffer
 	printFetched(&w, []recovery.Fetched{{Peer: b, Seq: 4}, {Peer: c, Err: errors.New("offline")}}, &manifest.Manifest{Seq: 4})
@@ -35,6 +36,7 @@ func TestRecoverWarnsOfLendersNotHeard(t *testing.T) {
 // place's version; a key only one place lists is marked unverified in a
 // generic bucket only, since restic's own MAC catches a forged one.
 func TestStatusShowsConflictsAndBucketResolvePicks(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	n.addBucket(t, "laptop", "restic")
@@ -118,6 +120,7 @@ func TestStatusShowsConflictsAndBucketResolvePicks(t *testing.T) {
 
 // #29 re-review: recover takes friends to skip by node ID.
 func TestRecoverSkipNeedsNodeIDs(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	other := newNode(t)
 	other.mustInit(t)
@@ -130,6 +133,7 @@ func TestRecoverSkipNeedsNodeIDs(t *testing.T) {
 // #29 re-review: recover says which friends' lists it left for the
 // daemon, out of time or skipped.
 func TestRecoverSaysWhatItLeftPending(t *testing.T) {
+	parallel(t, 0)
 	var w bytes.Buffer
 	a := &app{}
 	m := &manifest.Manifest{Content: manifest.Content{Buckets: []manifest.Bucket{{Name: "laptop", Profile: "restic", Copies: 2}}}}

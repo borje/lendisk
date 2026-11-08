@@ -19,6 +19,7 @@ import (
 // buckets[].changed. The key is stuck (reason immutable), so the bucket
 // is not claimed offsite with the new bytes and status --wait exits 4.
 func TestStatusShowsAChangedAcknowledgedKey(t *testing.T) {
+	parallel(t, 0)
 	o := newOffsiteNode(t, "files", "generic")
 	o.daemonUp()
 	if b := bucketOf(t, o.status(), "files"); b.Changed == nil || len(b.Changed) != 0 {
@@ -88,6 +89,7 @@ func TestStatusShowsAChangedAcknowledgedKey(t *testing.T) {
 // version as a tomb, and A shows no changed key, no key_changed alert
 // and no refusal.
 func TestDeleteAndWriteAgainReplacesTheTombedVersion(t *testing.T) {
+	parallel(t, 2)
 	if testing.Short() {
 		t.Skip("long")
 	}

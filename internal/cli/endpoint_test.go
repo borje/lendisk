@@ -117,6 +117,7 @@ func apiCode(err error) string {
 
 // EP-6: one credential per bucket, scoped to it; EP-1 over the bridge.
 func TestBucketCredentialsAreScoped(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	laptop := n.addBucket(t, "laptop", "restic")
@@ -169,6 +170,7 @@ func TestBucketCredentialsAreScoped(t *testing.T) {
 
 // SEC-8 and §3.7: the admin API and the control API path are refused.
 func TestAdminAndControlPathsRefused(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	n.addBucket(t, "laptop", "restic")
@@ -197,6 +199,8 @@ func TestAdminAndControlPathsRefused(t *testing.T) {
 // nothing else. Sockets that exist before serve starts (the test relay in
 // this process) are not the daemon's.
 func TestOnlyLoopbackListener(t *testing.T) {
+	// Not parallel: it reads this process's sockets, which a parallel
+	// test would add to (see parallel_test.go).
 	n := newNode(t)
 	n.mustInit(t)
 	before, err := ownSockets()
@@ -237,6 +241,7 @@ func TestOnlyLoopbackListener(t *testing.T) {
 }
 
 func TestBucketNamesRefused(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	for _, name := range []string{"lent-abc", "lendisk-manifests", "UPPER", "ab", "a..b", "-x-", "a_b", "a--b"} {
@@ -267,6 +272,7 @@ func TestBucketNamesRefused(t *testing.T) {
 // EP-12 AC through init: a store the filesystem cannot hold is refused,
 // naming the filesystem and the property, and nothing is written.
 func TestInitRefusesUnfitStore(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	var out, errOut bytes.Buffer
 	a := &app{
@@ -293,6 +299,7 @@ func TestInitRefusesUnfitStore(t *testing.T) {
 // EP-1 AC with the real tools, when installed: restic (init, backup,
 // check --read-data, restore), then EP-15/P-5 with the daemon stopped.
 func TestResticEndToEnd(t *testing.T) {
+	serving(t, 0)
 	restic, err := exec.LookPath("restic")
 	if err != nil {
 		t.Skip("restic not installed")
@@ -346,6 +353,7 @@ func TestResticEndToEnd(t *testing.T) {
 
 // EP-1 AC: the AWS CLI and rclone, path-style, when installed.
 func TestAWSCLIAndRclone(t *testing.T) {
+	serving(t, 0)
 	aws, awsErr := exec.LookPath("aws")
 	rclone, rcErr := exec.LookPath("rclone")
 	if awsErr != nil && rcErr != nil {

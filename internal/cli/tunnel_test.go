@@ -86,6 +86,7 @@ func (n *node) init() {
 // carries the identity's public key and no pre-shared key, and the
 // region it embeds is saved in lendisk.db, not the config file.
 func TestStatusShowsStableAddress(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	n.init()
 	conf, err := os.ReadFile(n.config)
@@ -133,6 +134,7 @@ func nodeKeyText(id *identity.Identity) []byte {
 // SEC-10 AC, first state: on a node with zero peers, an unknown identity
 // holding only the address is refused before any application data.
 func TestServeRefusesStrangerOnFreshNode(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	n.init()
 	stop := n.serveLogged("--log-level", "debug")
@@ -167,6 +169,7 @@ func (failingRelays) Pick(context.Context, *tailcfg.DERPMap) (tailcfg.DERPRegion
 
 // init works offline; the region is chosen when the relays are reachable.
 func TestInitOfflineDefersRegion(t *testing.T) {
+	serving(t, 0)
 	n := newNode(t)
 	online := n.regions
 	n.regions = failingRelays{}

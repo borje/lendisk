@@ -50,6 +50,7 @@ func (n *node) delivered(after int64) int64 {
 // ID-4 (#28 review): a friend whose last push failed, the daily one
 // included, is not shown as holding the manifest: it may have lost it.
 func TestStatusCountsAFailedRepushAsNotHeld(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	db := openDB(t, n)
@@ -85,6 +86,7 @@ func TestStatusCountsAFailedRepushAsNotHeld(t *testing.T) {
 // its next poll: with an hour between rounds, it tries the new friend
 // within seconds.
 func TestRedeemPushesManifestAtOnce(t *testing.T) {
+	parallel(t, 2)
 	if testing.Short() {
 		t.Skip("long")
 	}
@@ -137,6 +139,7 @@ func TestRedeemPushesManifestAtOnce(t *testing.T) {
 //     fetches it from B and opens it: every bucket with its sealed name
 //     and copies, B with its address, A's own address.
 func TestManifestOnLenderSurvivesItsDatabaseLoss(t *testing.T) {
+	parallel(t, 2)
 	if testing.Short() {
 		t.Skip("long")
 	}

@@ -107,6 +107,7 @@ func sameFiles(t *testing.T, src, dst string) {
 // succeed. Every key is captured in the class the kopia profile gives
 // it, and the logs (_log*) are stored but never queued.
 func TestKopiaEndToEnd(t *testing.T) {
+	serving(t, 0)
 	k := newKopia(t)
 	n := newNode(t)
 	n.mustInit(t)
@@ -120,7 +121,9 @@ func TestKopiaEndToEnd(t *testing.T) {
 	d := n.serve(t)
 
 	k.run(kopiaLines(t, out, d.addr)...)
-	k.run("repository", "validate-provider")
+	// Its concurrency test runs 30 s by default; 5 s still has every
+	// worker writing, listing and deleting at once.
+	k.run("repository", "validate-provider", "--concurrency-test-duration=5s")
 	src := t.TempDir()
 	randomFiles(t, src, "f", 8, 256<<10)
 	k.run("snapshot", "create", src)
@@ -196,6 +199,7 @@ func TestKopiaEndToEnd(t *testing.T) {
 //   - B's tombs of the replaced versions are purged once the window has
 //     passed (B started with its clock 31 days on), and not before.
 func TestReplicateKopiaToFriend(t *testing.T) {
+	serving(t, 3)
 	k := newKopia(t)
 	if testing.Short() {
 		t.Skip("long")

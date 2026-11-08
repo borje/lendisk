@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -277,12 +278,19 @@ func (h *hostile) mustRefuse(as []attack) {
 
 // mustNotConnect sends each attack, each bounded by 5 seconds, and fails
 // on any that is answered at all: the tunnel must refuse the connection
-// before any application data (SEC-10).
+// before any application data (SEC-10). The attacks are sent at once, so
+// the bounds run together rather than one after another.
 func (h *hostile) mustNotConnect(as []attack) {
 	h.t.Helper()
 	h.wait = 5 * time.Second
-	for _, a := range as {
-		if r := h.send(a); r.err == nil {
+	replies := make([]reply, len(as))
+	var wg sync.WaitGroup
+	for i, a := range as {
+		wg.Go(func() { replies[i] = h.send(a) })
+	}
+	wg.Wait()
+	for i, a := range as {
+		if r := replies[i]; r.err == nil {
 			h.t.Errorf("%s: %s (%s %s) was answered: %v", h.label, a.name, a.method, a.target, r)
 		}
 	}

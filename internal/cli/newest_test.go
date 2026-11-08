@@ -17,6 +17,7 @@ import (
 // whose replaced versions decided it, and how to pick another with
 // `bucket resolve`.
 func TestStatusAndRecoverShowNewestVerdicts(t *testing.T) {
+	parallel(t, 0)
 	n := newNode(t)
 	n.mustInit(t)
 	n.addBucket(t, "vault", "kopia")
