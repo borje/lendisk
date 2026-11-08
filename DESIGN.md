@@ -2030,7 +2030,8 @@ upstream bucket is Q-V.
     key is a put, in any state (REPL-2): every place that holds or may
     hold it, and one that refused it, which may hold older bytes;
   - a healing re-upload of a data key (*Healing*, below) goes where the
-    row it heals was placed, topped up to `copies` by the choice.
+    row it heals was placed, except where that row was `dropped` or
+    `abandoned`, topped up to `copies` by the choice.
 
   *Decision (#19, the user, 2026-11-06): data leaves headroom for
   metadata.* The metadata reserve at a friend is the larger of

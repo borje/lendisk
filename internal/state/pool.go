@@ -313,7 +313,7 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 	default:
 		if heal {
 			targets, err = column(ctx, tx, `SELECT p.place FROM placement p JOIN friendship f ON f.peer_key = p.place
-				WHERE coalesce(f.address, '') != '' AND p.state != '`+PlacementDropped+`' AND p.seq = (SELECT max(l.seq) FROM queue l
+				WHERE coalesce(f.address, '') != '' AND p.state NOT IN ('`+PlacementDropped+`', '`+PlacementAbandoned+`') AND p.seq = (SELECT max(l.seq) FROM queue l
 					WHERE l.bucket = ?1 AND l.key = ?2 AND l.seq < ?3 AND l.state = 'done')
 				ORDER BY p.place`, bucket, key, seq)
 			if err != nil {

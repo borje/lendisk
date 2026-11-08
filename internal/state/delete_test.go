@@ -348,3 +348,26 @@ func TestAPutAcknowledgedAfterItsDeleteIsFreed(t *testing.T) {
 		t.Fatalf("use %v after a write after the delete", use)
 	}
 }
+
+// #21 review: a healing re-upload does not count a place whose put was
+// abandoned (taken, then re-routed away): at copies 1 it goes only where
+// the healed row was re-routed to, not there as well.
+func TestHealingSkipsAnAbandonedPlace(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 1)
+	d := p.put("laptop", "data/1", "data", 1)
+	p.wantPlaces("data/1", d, "B")
+	p.start("B", d)
+	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	if moved, _, err := p.db.Reroute(ctx, nil, nil); err != nil || moved != 1 {
+		t.Fatalf("moved %d %v", moved, err)
+	}
+	if err := p.db.RefusePlacement(ctx, "C", d, "BadDigest"); err != nil {
+		t.Fatal(err)
+	}
+	h := p.put("laptop", "data/1", "data", 1)
+	p.wantPlaces("the heal", h, "C")
+}
