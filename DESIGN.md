@@ -1136,7 +1136,13 @@ upstream bucket is Q-V.
   one. If exactly one listed version is replaced by no place, it
   counts (`state.VerdictNewest`, "newest"), held where it is listed,
   and the read-through serves it; `bucket resolve` may still pick
-  another. If none or more than one is left, the tie is a conflict as
+  another. The user sees each such key: `recover` prints them, naming
+  the friend whose replaced versions decided it, and `status` lists
+  them with every friend's hash and the `bucket resolve` command for
+  each other version (`recovery.newest` in `status --json`: bucket,
+  key, `sha256` used, `decided_by`, reason, places;
+  `state.NewestKeys`; `TestStatusAndRecoverShowNewestVerdicts`). If
+  none or more than one is left, the tie is a conflict as
   before: a friend that lagged by more than the retention window (its
   version's tomb is purged at the others), or places naming each
   other's version, which only a lying friend does. Only ties are

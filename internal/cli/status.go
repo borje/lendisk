@@ -57,6 +57,11 @@ type StatusRecovery struct {
 	// many for one version as for another (or a metadata object one
 	// friend alone holds): none is used until `bucket resolve` picks.
 	Conflicts []StatusConflict `json:"conflicts"`
+	// Newest are recovered objects of rewritable keys (EP-7) the friends
+	// disagreed about where one friend's rewrites had replaced the
+	// others' version: that newest version is used, and `bucket
+	// resolve` may pick another (#74).
+	Newest []StatusNewest `json:"newest"`
 	// Unverified counts, per bucket outside the encryption guarantee
 	// (EP-8), the recovered objects one friend alone listed: nothing
 	// checked them. Encrypted tools check their own objects.
@@ -68,6 +73,19 @@ type StatusConflict struct {
 	Bucket string `json:"bucket"`
 	Key    string `json:"key"`
 	Reason string `json:"reason"`
+	// Places maps each friend that lists it to the SHA-256 it holds.
+	Places map[string]string `json:"places"`
+}
+
+// StatusNewest is one recovered object decided as the newest version.
+type StatusNewest struct {
+	Bucket string `json:"bucket"`
+	Key    string `json:"key"`
+	SHA256 string `json:"sha256"` // the version used
+	// DecidedBy is the friend whose replaced versions named the others'
+	// version older.
+	DecidedBy string `json:"decided_by"`
+	Reason    string `json:"reason"`
 	// Places maps each friend that lists it to the SHA-256 it holds.
 	Places map[string]string `json:"places"`
 }
@@ -445,6 +463,15 @@ func (a *app) statusCmd() *cobra.Command {
 				st.Recovery.Conflicts = append(st.Recovery.Conflicts, StatusConflict{Bucket: c.Bucket, Key: c.Key,
 					Reason: c.Reason, Places: c.Places})
 			}
+			ns, err := db.NewestKeys(cmd.Context())
+			if err != nil {
+				return err
+			}
+			st.Recovery.Newest = []StatusNewest{}
+			for _, k := range ns {
+				st.Recovery.Newest = append(st.Recovery.Newest, StatusNewest{Bucket: k.Bucket, Key: k.Key, SHA256: k.SHA256,
+					DecidedBy: k.DecidedBy, Reason: k.Reason, Places: k.Places})
+			}
 			singles, err := db.SingleSources(cmd.Context())
 			if err != nil {
 				return err
@@ -545,6 +572,17 @@ func (a *app) statusCmd() *cobra.Command {
 					fmt.Fprintf(a.out, "  %s %s: %s\n", c.Bucket, c.Key, c.Reason)
 					for _, p := range slices.Sorted(maps.Keys(c.Places)) {
 						fmt.Fprintf(a.out, "    %s holds %s: `lendisk bucket resolve %s %s %s`\n", p, c.Places[p], c.Bucket, c.Key, p)
+					}
+				}
+			}
+			if n := len(st.Recovery.Newest); n > 0 {
+				fmt.Fprintf(a.out, "Recovery: %d objects the friends disagreed about; the newest version is used:\n", n)
+				for _, k := range st.Recovery.Newest {
+					fmt.Fprintf(a.out, "  %s %s: %s\n", k.Bucket, k.Key, k.Reason)
+					for _, p := range slices.Sorted(maps.Keys(k.Places)) {
+						if k.Places[p] != k.SHA256 {
+							fmt.Fprintf(a.out, "    to use %s's %s instead: `lendisk bucket resolve %s %s %s`\n", p, k.Places[p], k.Bucket, k.Key, p)
+						}
 					}
 				}
 			}

@@ -107,6 +107,9 @@ type RecoveredKey struct {
 	Reason      string
 	SHA256      string
 	Places      map[string]string
+	// DecidedBy is, for VerdictNewest (NewestKeys), the place whose
+	// replaced versions named the others' version older (#74).
+	DecidedBy string
 }
 
 // AddRelists records that every place's copy of every bucket is to be
@@ -395,24 +398,8 @@ type listedRow struct {
 // listed, and makes the queue and placement rows say so; done are the
 // places listed to their end.
 func (db *DB) settleKey(ctx context.Context, tx *sql.Tx, bucket, key string, done map[string]bool) error {
-	rows, err := tx.QueryContext(ctx, `SELECT place, sha256, class, size, named, coalesce(rewritable, 0), coalesce(replaced, '')
-		FROM listed WHERE bucket = ? AND key = ? ORDER BY place`, bucket, key)
+	ls, err := listedRows(ctx, tx, bucket, key)
 	if err != nil {
-		return err
-	}
-	var ls []listedRow
-	for rows.Next() {
-		var r listedRow
-		var replaced string
-		if err := rows.Scan(&r.place, &r.sha, &r.class, &r.size, &r.named, &r.rewritable, &replaced); err != nil {
-			rows.Close()
-			return err
-		}
-		r.replaced = strings.Fields(replaced)
-		ls = append(ls, r)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
 		return err
 	}
 	var own sql.NullInt64
@@ -587,6 +574,48 @@ func decide(ls []listedRow, picked string, done map[string]bool) (verdict, reaso
 		return VerdictHeld, "every place that lists it agrees", best
 	}
 	return VerdictHeld, fmt.Sprintf("%d places agree; the others list another version", n), best
+}
+
+// listedRows is what every place listed of key.
+func listedRows(ctx context.Context, q querier, bucket, key string) ([]listedRow, error) {
+	rows, err := q.QueryContext(ctx, `SELECT place, sha256, class, size, named, coalesce(rewritable, 0), coalesce(replaced, '')
+		FROM listed WHERE bucket = ? AND key = ? ORDER BY place`, bucket, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ls []listedRow
+	for rows.Next() {
+		var r listedRow
+		var replaced string
+		if err := rows.Scan(&r.place, &r.sha, &r.class, &r.size, &r.named, &r.rewritable, &replaced); err != nil {
+			return nil, err
+		}
+		r.replaced = strings.Fields(replaced)
+		ls = append(ls, r)
+	}
+	return ls, rows.Err()
+}
+
+// NewestKeys returns every recovered key decided as the newest of the
+// versions its friends disagreed on (VerdictNewest, #74) that this node
+// has not written since, with the place whose replaced versions decided
+// it: the user may still pick another (ResolveKey).
+func (db *DB) NewestKeys(ctx context.Context) ([]RecoveredKey, error) {
+	ks, err := db.recoveredKeys(ctx, byNewest)
+	if err != nil {
+		return nil, err
+	}
+	for i, k := range ks {
+		ls, err := listedRows(ctx, db, k.Bucket, k.Key)
+		if err != nil {
+			return nil, err
+		}
+		if _, by, ok := newest(ls); ok {
+			ks[i].DecidedBy = by
+		}
+	}
+	return ks, nil
 }
 
 // newest finds, for a rewritable key (#74), the one listed version that
