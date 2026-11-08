@@ -29,7 +29,12 @@ func TestTheWorkerAddsAndRemovesCopiesWhenCopiesChange(t *testing.T) {
 	if err := fx.db.SetCopies(t.Context(), "laptop", 2); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "a second copy at C", func() bool { return fx.holds("C", "laptop", "data/1") })
+	// Acknowledged, not only stored: a pass leaves a row its sender
+	// still holds alone until the next re-routing tick, a minute away
+	// (TestASurplusCopyBeingSentIsNotCancelled).
+	waitFor(t, "a second copy acknowledged at C", func() bool {
+		return fx.holds("C", "laptop", "data/1") && fx.rowState("C", seq) == state.PlacementAcked
+	})
 	if err := fx.db.SetCopies(t.Context(), "laptop", 1); err != nil {
 		t.Fatal(err)
 	}

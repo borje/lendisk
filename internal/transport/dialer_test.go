@@ -88,6 +88,11 @@ func TestAdmissionRejectionExpires(t *testing.T) {
 	if !adm.Admit(k) || calls != 2 {
 		t.Fatalf("rejection not forgotten after DeniedFor: calls %d", calls)
 	}
+	// Forgotten, and asked again at the client's next retry, within the
+	// try it was refused in (cli's TestAFriendRemovedJustAfterBefriendingIsTold).
+	if DeniedFor+time.Second > clientTry/2 {
+		t.Fatalf("DeniedFor %v: a key refused just before its commit is not admitted within the client's try of %v", DeniedFor, clientTry)
+	}
 }
 
 // A friend whose daemon restarts has forgotten every client: tailcat

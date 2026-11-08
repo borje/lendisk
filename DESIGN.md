@@ -4828,12 +4828,19 @@ the handler's own reads and is never cancelled; nothing below
   `state.DB.PeerRole`, which the `IAMService` uses, reads node IDs
   only, so a dial key is never an S3 account.
   The cache is `transport.Admission`: it remembers rejections only,
-  never admissions or errors, each for 30 seconds
+  never admissions or errors, each for 3 seconds
   (`transport.DeniedFor`), empties itself at 4096 keys, and
   `Admission.Clear` empties it after a commit. The expiry is for
   changes a one-shot command commits from another process (`peer add`
   writing the invited side's row), which cannot reach the daemon's
-  cache. tailcat keeps a once-admitted key's tunnel, so a used invite
+  cache. It is well under a tailcat client's 10-second try to be
+  admitted (a meow resent every second), because the inviter's daemon
+  calls the invited node as soon as it has stored the friendship,
+  usually before `peer add` has stored its side: the refusal is
+  forgotten and the key admitted within that same try. At 30 seconds
+  the first calls failed, and a remove call made then waited out the
+  farewell's minute of backoff
+  (`TestAFriendRemovedJustAfterBefriendingIsTold`). tailcat keeps a once-admitted key's tunnel, so a used invite
   key may still connect for a while; the middleware refuses it
   (SEC-11). The server starts
   even with zero rows, so the address exists from `init` on and every

@@ -25,7 +25,21 @@ const maxDenied = 4096
 // one-shot command (`peer add`) writes a friendship from another process
 // and cannot call Clear on the daemon's Admission, so a key it adds is
 // admitted at most this long after the commit (SEC-15's 60 seconds).
-const DeniedFor = 30 * time.Second
+//
+// It is well under clientTry, so a key refused just before the commit
+// is admitted within the dialler's try that was refused: the inviter's
+// daemon calls the invited node the moment it has stored the
+// friendship, usually before `peer add` has stored its side, and a
+// refusal remembered past that try failed the call, and a remove call
+// with it waited out the farewell's backoff of a minute (CI on cc6a3c1).
+// A rejected client retries about once a second, so a stranger's key
+// costs a lookup every DeniedFor; a stranger can make a lookup per new
+// key anyway.
+const DeniedFor = 3 * time.Second
+
+// clientTry is how long a tailcat client tries to be admitted: the
+// meow ping, resent every second, times out after 10 seconds.
+const clientTry = 10 * time.Second
 
 // Admission is the admission function (SEC-10). It looks every key up
 // with its Lookup, and admits only on a positive answer without error.
