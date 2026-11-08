@@ -10,10 +10,11 @@ const passLimit = 5 * time.Second
 
 // settleKeys and settleWait size the large-bucket settling test: the
 // race detector makes SQLite about twenty times slower, so it settles a
-// tenth of the keys and allows ten times the wait.
+// tenth of the keys; a batch still ends after SettleBudget, so the wait
+// allowed is the same.
 const (
 	settleKeys = 20_000
-	settleWait = 10 * time.Second
+	settleWait = time.Second
 )
 
 // offsiteObjects sizes the large-bucket watermark test: a fifth of the

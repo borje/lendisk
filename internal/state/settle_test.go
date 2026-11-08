@@ -91,8 +91,9 @@ func TestSettlingLargeBucketKeepsWritersMoving(t *testing.T) {
 	if writeErr != nil {
 		t.Fatalf("a write beside the settling failed: %v", writeErr)
 	}
-	// A write waits one batch at most (about 0.15 s; settleWait allows
-	// several), never the whole bucket (tens of seconds).
+	// A write waits one batch at most (SettleBudget, 0.25 s, or 2,000
+	// keys; settleWait allows several), never the whole bucket (tens of
+	// seconds).
 	if w := time.Duration(worst.Load()); w > settleWait {
 		t.Fatalf("a write waited %v while settling took %v", w, took)
 	}
@@ -102,5 +103,45 @@ func TestSettlingLargeBucketKeepsWritersMoving(t *testing.T) {
 	}
 	if es, _ := db.QueueEntries(ctx, "laptop"); len(es) != 0 {
 		t.Fatalf("%d queue rows left", len(es))
+	}
+}
+
+// #29: a batch ends after SettleBudget, so a slow machine settles fewer
+// keys per write transaction; past its budget at once, a batch still
+// decides one key, and settling finishes.
+func TestSettlingPastItsBudgetStillFinishes(t *testing.T) {
+	budget, pauseFor := SettleBudget, SettlePause
+	SettleBudget, SettlePause = 0, 0
+	t.Cleanup(func() { SettleBudget, SettlePause = budget, pauseFor })
+	ctx := context.Background()
+	db := recoveringWith(t, "B", "X")
+	var only []Listed
+	for i := 0; i < 5; i++ {
+		only = append(only, Listed{Key: fmt.Sprintf("data/%d", i), Size: 1, SHA256: "h", Class: "data"})
+	}
+	if _, err := db.RecordListed(ctx, "X", "laptop", only, len(only), only[len(only)-1].Key, false); err != nil {
+		t.Fatal(err)
+	}
+	lone := []Listed{{Key: "index/1", Size: 1, SHA256: "h1", Class: "metadata"},
+		{Key: "index/2", Size: 1, SHA256: "h2", Class: "metadata"}}
+	if _, err := db.RecordListed(ctx, "B", "laptop", lone, len(lone), "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AbandonRelist(ctx, "X", "laptop"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SettleFinished(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := db.Unsettled(ctx); err != nil || n != 0 {
+		t.Fatalf("%d lists unsettled: %v", n, err)
+	}
+	if ks, _ := db.RecoveredKeys(ctx, "laptop"); len(ks) != 2 {
+		t.Fatalf("abandoned keys left, or lone keys lost: %+v", ks)
+	}
+	for _, k := range []string{"index/1", "index/2"} {
+		if v := verdict(t, db, "laptop", k); v.Verdict != VerdictSingle {
+			t.Fatalf("%s: %+v", k, v)
+		}
 	}
 }

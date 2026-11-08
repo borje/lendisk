@@ -182,9 +182,14 @@ func (db *DB) Unsettled(ctx context.Context) (int, error) {
 }
 
 // SettleBatch is how many keys one write transaction decides again
-// after a list ends: short enough that other writers (the gateway's
-// captures) wait a fraction of a second at most.
-var SettleBatch = 2000
+// after a list ends, at most; SettleBudget is how long it runs, at most
+// (it ends after the key that passes it). Other writers (the gateway's
+// captures) wait one batch at most: a fraction of a second, on a slow
+// machine too, where 2,000 keys would take seconds.
+var (
+	SettleBatch  = 2000
+	SettleBudget = 250 * time.Millisecond
+)
 
 // SettlePause is the pause between batches. SQLite's busy handler polls
 // a waiting writer at most every 100 ms, so a pause at least that long
@@ -204,10 +209,10 @@ func pause(ctx context.Context) error {
 }
 
 // SettleFinished decides again the keys that lists ended since affect,
-// SettleBatch keys per write transaction, and marks each list settled:
-// an abandoned list's keys, without its entries; a finished list's
-// metadata keys one place alone lists (the lone-metadata rule counts
-// the finished list now). It resumes where a crash stopped it, so the
+// in write transactions of SettleBatch keys or SettleBudget, and marks
+// each list settled: an abandoned list's keys, without its entries; a
+// finished list's metadata keys one place alone lists (the
+// lone-metadata rule counts the finished list now). It resumes where a crash stopped it, so the
 // lister calls it at the start of every round.
 func (db *DB) SettleFinished(ctx context.Context) error {
 	type ended struct {
@@ -253,8 +258,8 @@ func (db *DB) SettleFinished(ctx context.Context) error {
 				return err
 			}
 			for len(keys) > 0 {
-				n := min(len(keys), SettleBatch)
-				if err := db.settleKeys(ctx, e.bucket, keys[:n]); err != nil {
+				n, err := db.settleKeys(ctx, e.bucket, keys[:min(len(keys), SettleBatch)])
+				if err != nil {
 					return err
 				}
 				keys = keys[n:]
@@ -271,7 +276,8 @@ func (db *DB) SettleFinished(ctx context.Context) error {
 }
 
 // dropBatch drops up to SettleBatch of an abandoned place's entries for
-// bucket and decides their keys again, in one transaction; n is how many.
+// bucket, stopping once SettleBudget has passed, and decides their keys
+// again, in one transaction; n is how many.
 func (db *DB) dropBatch(ctx context.Context, place, bucket string) (int, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -287,34 +293,50 @@ func (db *DB) dropBatch(ctx context.Context, place, bucket string) (int, error) 
 	if err != nil {
 		return 0, err
 	}
+	p := prepared(tx)
+	start := time.Now()
+	n := 0
 	for _, k := range keys {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM listed WHERE place = ? AND bucket = ? AND key = ?`, place, bucket, k); err != nil {
+		if _, err := p.ExecContext(ctx, `DELETE FROM listed WHERE place = ? AND bucket = ? AND key = ?`, place, bucket, k); err != nil {
 			return 0, err
 		}
-		if err := db.settleKey(ctx, tx, bucket, k, done); err != nil {
+		if err := db.settleKey(ctx, p, bucket, k, done); err != nil {
 			return 0, err
+		}
+		n++
+		if time.Since(start) >= SettleBudget {
+			break
 		}
 	}
-	return len(keys), tx.Commit()
+	return n, tx.Commit()
 }
 
-// settleKeys decides keys of bucket again in one transaction.
-func (db *DB) settleKeys(ctx context.Context, bucket string, keys []string) error {
+// settleKeys decides keys of bucket again in one transaction, stopping
+// once SettleBudget has passed; n is how many of the first keys it
+// decided.
+func (db *DB) settleKeys(ctx context.Context, bucket string, keys []string) (int, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer tx.Rollback()
 	done, err := listedPlaces(ctx, tx, bucket)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	p := prepared(tx)
+	start := time.Now()
+	n := 0
 	for _, k := range keys {
-		if err := db.settleKey(ctx, tx, bucket, k, done); err != nil {
-			return err
+		if err := db.settleKey(ctx, p, bucket, k, done); err != nil {
+			return 0, err
+		}
+		n++
+		if time.Since(start) >= SettleBudget {
+			break
 		}
 	}
-	return tx.Commit()
+	return n, tx.Commit()
 }
 
 // RecordListed records a page of place's list of bucket, in one
@@ -332,13 +354,14 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 		return c, err
 	}
 	defer tx.Rollback()
+	p := prepared(tx)
 	var keys []string
 	for _, o := range objs {
 		if o.Tombstoned {
 			c.Tombstoned++
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO listed (bucket, key, place, size, sha256, class, named, rewritable, replaced)
+		if _, err := p.ExecContext(ctx, `INSERT INTO listed (bucket, key, place, size, sha256, class, named, rewritable, replaced)
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (bucket, key, place) DO UPDATE SET size = excluded.size, sha256 = excluded.sha256, class = excluded.class,
 				named = excluded.named, rewritable = excluded.rewritable, replaced = excluded.replaced`,
@@ -363,7 +386,7 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 		return c, err
 	}
 	for _, k := range keys {
-		if err := db.settleKey(ctx, tx, bucket, k, listed); err != nil {
+		if err := db.settleKey(ctx, p, bucket, k, listed); err != nil {
 			return c, err
 		}
 	}
@@ -394,10 +417,61 @@ type listedRow struct {
 	replaced          []string
 }
 
+// preparedTx runs statements in a transaction, preparing each distinct
+// one once: settling runs the same dozen statements for every key of a
+// batch, and preparing one costs several times what running it does
+// (#29: a 2,000-key batch spent most of its time compiling SQL, which
+// the race detector makes seconds). The statements close with the
+// transaction.
+type preparedTx struct {
+	tx    *sql.Tx
+	stmts map[string]*sql.Stmt
+}
+
+func prepared(tx *sql.Tx) *preparedTx {
+	return &preparedTx{tx: tx, stmts: map[string]*sql.Stmt{}}
+}
+
+func (p *preparedTx) stmt(ctx context.Context, q string) (*sql.Stmt, error) {
+	if s, ok := p.stmts[q]; ok {
+		return s, nil
+	}
+	s, err := p.tx.PrepareContext(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	p.stmts[q] = s
+	return s, nil
+}
+
+func (p *preparedTx) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	s, err := p.stmt(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return s.ExecContext(ctx, args...)
+}
+
+func (p *preparedTx) QueryContext(ctx context.Context, q string, args ...any) (*sql.Rows, error) {
+	s, err := p.stmt(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return s.QueryContext(ctx, args...)
+}
+
+func (p *preparedTx) QueryRowContext(ctx context.Context, q string, args ...any) *sql.Row {
+	s, err := p.stmt(ctx, q)
+	if err != nil {
+		return p.tx.QueryRowContext(ctx, q, args...) // fails again, with the error
+	}
+	return s.QueryRowContext(ctx, args...)
+}
+
 // settleKey decides which version of key counts from what every place
 // listed, and makes the queue and placement rows say so; done are the
 // places listed to their end.
-func (db *DB) settleKey(ctx context.Context, tx *sql.Tx, bucket, key string, done map[string]bool) error {
+func (db *DB) settleKey(ctx context.Context, tx *preparedTx, bucket, key string, done map[string]bool) error {
 	ls, err := listedRows(ctx, tx, bucket, key)
 	if err != nil {
 		return err
@@ -502,14 +576,14 @@ func (db *DB) settleKey(ctx context.Context, tx *sql.Tx, bucket, key string, don
 	return saveVerdict(ctx, tx, bucket, key, verdict, reason, winner, own, picked)
 }
 
-func ackListed(ctx context.Context, tx *sql.Tx, seq int64, bucket, key string, r listedRow, now time.Time) error {
+func ackListed(ctx context.Context, tx *preparedTx, seq int64, bucket, key string, r listedRow, now time.Time) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
 		VALUES (?, ?, ?, ?, 'put', 'acked', ?, ?, ?) ON CONFLICT (place, seq) DO NOTHING`,
 		seq, r.place, bucket, key, r.sha, now.Unix(), r.size+ObjectOverhead)
 	return err
 }
 
-func saveVerdict(ctx context.Context, tx *sql.Tx, bucket, key, verdict, reason, sha string, seq sql.NullInt64, picked sql.NullString) error {
+func saveVerdict(ctx context.Context, tx *preparedTx, bucket, key, verdict, reason, sha string, seq sql.NullInt64, picked sql.NullString) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO recovered_key (bucket, key, verdict, reason, sha256, seq, picked)
 		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (bucket, key) DO UPDATE SET verdict = excluded.verdict, reason = excluded.reason,
@@ -788,7 +862,7 @@ func (db *DB) ResolveKey(ctx context.Context, bucket, key, place string) error {
 	if err != nil {
 		return err
 	}
-	if err := db.settleKey(ctx, tx, bucket, key, done); err != nil {
+	if err := db.settleKey(ctx, prepared(tx), bucket, key, done); err != nil {
 		return err
 	}
 	return tx.Commit()

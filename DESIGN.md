@@ -1208,10 +1208,17 @@ upstream bucket is Q-V.
   beyond its pages (an abandoned list's keys, a finished list's lone
   metadata keys) is decided afterwards by `state.SettleFinished`, which
   the lister runs at the start and the end of every round, in write
-  transactions of 2,000 keys with a 100 ms pause between them, longer
-  than SQLite's busy handler polls, so the gateway's captures wait a
-  fraction of a second, never the whole bucket (200,000 keys abandon in
-  about 25 s with no other write waiting over 0.2 s). `settled` marks a
+  transactions of 2,000 keys or 250 ms (`state.SettleBudget`),
+  whichever ends first, so a slow machine (an armv7 board, the race
+  detector) settles fewer keys per batch rather than holding the writer
+  for seconds, with a 100 ms pause between them, longer than SQLite's
+  busy handler polls, so the gateway's captures wait a fraction of a
+  second, never the whole bucket (200,000 keys abandon in about 16 s
+  with no other write waiting over 0.1 s; under the race detector
+  20,000 take about 26 s with none over 0.35 s). A batch prepares each
+  statement once (`preparedTx`): the same dozen statements run for
+  every key, and compiling them each time cost most of a batch.
+  `settled` marks a
   list's settling finished. Settling is bounded by the round's budget
   like the listing: what it does not finish (or a crash, a shutdown or
   a busy database interrupts) is left, and the daemon's lister counts
