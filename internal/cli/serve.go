@@ -25,6 +25,7 @@ import (
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/verify"
 	"github.com/borje/lendisk/internal/version"
 )
 
@@ -122,7 +123,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 9) // gateway, LAN, loopback, replication, farewell, alerts, quota, manifest, recovery
+			errc := make(chan error, 10) // gateway, LAN, loopback, replication, verification, farewell, alerts, quota, manifest, recovery
 			// The read-through (EP-10, ID-6) fetches what the store lacks
 			// from the friends holding it, over the tunnel.
 			fetch := &replica.Fetcher{DB: db, Self: id, Dial: tun.Dial}
@@ -208,6 +209,18 @@ func (a *app) serveCmd() *cobra.Command {
 				}
 				running++
 				go func() { w.Run(ctx); errc <- nil }()
+
+				// Verification (VER-1, VER-3, #27): the daily challenge of
+				// each friend's replica, and the checks `lendisk verify`
+				// asks for through lendisk.db. A failure marks the replica
+				// unverified, which the worker's next pass re-places.
+				ver := &verify.Verifier{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Now: a.clock, Random: a.random,
+					Alerted: alerts.Check, Log: log}
+				if a.tuneVerify != nil {
+					a.tuneVerify(ver)
+				}
+				running++
+				go func() { ver.Run(ctx); errc <- nil }()
 			}
 			fw.Clear, fw.Cut, fw.Disconnect = tun.Admission.Clear, tun.Conns.Cut, tun.Disconnect
 			fw.Tell = func(ctx context.Context, f state.FormerFriend) error {

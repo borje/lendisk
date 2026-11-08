@@ -220,7 +220,8 @@ func unsentMetadata(ctx context.Context, tx querier, bucket, place string) (int6
 // (free ÷ quota), ties by node ID. A friend gone past replace_after,
 // removed, or full by its last answer is not room, nor is one lacking
 // some of the bucket's live metadata (unsentMetadata: re-placement sends
-// it first, #26); with reachableOnly,
+// it first, #26), nor one whose replica of the bucket failed a challenge
+// (VER-1, #27); with reachableOnly,
 // neither is an unreachable one (re-routing, so rows do not move between
 // friends that both stopped answering). Fewer than n means the pool
 // lacks room: what fits is placed, and the deficit shows as bytes below
@@ -238,6 +239,10 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 	if err != nil {
 		return nil, err
 	}
+	unverified, err := unverifiedAt(ctx, tx, bucket)
+	if err != nil {
+		return nil, err
+	}
 	type cand struct {
 		peer        string
 		reachable   bool
@@ -246,7 +251,7 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 	var cs []cand
 	for _, p := range ps {
 		if slices.Contains(exclude, p.peer) || p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) ||
-			reachableOnly && p.unreachable(db, now) {
+			reachableOnly && p.unreachable(db, now) || unverified[p.peer] {
 			continue
 		}
 		meta, err := unsentMetadata(ctx, tx, bucket, p.peer)
@@ -547,8 +552,20 @@ func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64)
 			targets = append(targets, &target{peer: p.peer, quota: capped(p.quota), use: p.use})
 		}
 	}
-	unsent := map[[2]string]int64{} // bucket, place -> unsentMetadata
+	unsent := map[[2]string]int64{}            // bucket, place -> unsentMetadata
+	unverified := map[string]map[string]bool{} // bucket -> unverifiedAt
 	room := func(t *target, bucket string) (int64, error) {
+		u, ok := unverified[bucket]
+		if !ok {
+			var err error
+			if u, err = unverifiedAt(ctx, db, bucket); err != nil {
+				return 0, err
+			}
+			unverified[bucket] = u
+		}
+		if u[t.peer] {
+			return -1, nil // its replica of the bucket failed a challenge (#27)
+		}
 		k := [2]string{bucket, t.peer}
 		meta, ok := unsent[k]
 		if !ok {

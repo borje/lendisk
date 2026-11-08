@@ -412,10 +412,13 @@ type PeerJSON struct {
 	// call; unknown before the first, online if the path is not known.
 	Reachability string `json:"reachability"`
 	// LastSeen is when the friend last called or answered (RFC 3339);
-	// LastVerified when its replica last passed verification (VER-1,
-	// #27: never yet). Both absent when never.
+	// LastVerified since when every replica it holds of this node's
+	// buckets has passed verification (VER-1, VER-4, #27: the oldest of
+	// their last passes). Both absent when never (a replica not yet
+	// verified). Unverified is set while any of them failed a challenge.
 	LastSeen     *time.Time `json:"last_seen,omitempty"`
 	LastVerified *time.Time `json:"last_verified,omitempty"`
+	Unverified   bool       `json:"unverified,omitempty"`
 	// Protocol is the friend's protocol version (NET-6), "" if unknown.
 	Protocol string `json:"protocol,omitempty"`
 	// RepositorySize is the friend's repository size as it reported it,
@@ -437,6 +440,30 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 	if err != nil {
 		return err
 	}
+	checks, err := db.ReplicaChecks(ctx)
+	if err != nil {
+		return err
+	}
+	type verified struct {
+		oldest     time.Time
+		never, bad bool
+	}
+	vs := map[string]*verified{}
+	for _, c := range checks {
+		v := vs[c.Place]
+		if v == nil {
+			v = &verified{}
+			vs[c.Place] = v
+		}
+		switch {
+		case c.Unverified():
+			v.bad = true
+		case c.VerifiedAt.IsZero():
+			v.never = true
+		case v.oldest.IsZero() || c.VerifiedAt.Before(v.oldest):
+			v.oldest = c.VerifiedAt
+		}
+	}
 	out := []PeerJSON{}
 	for _, f := range fs {
 		here, _, err := db.LentUsage(ctx, f.Peer)
@@ -456,6 +483,13 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 			p.LastSeen = &seen
 			size := f.PeerRepositorySize
 			p.RepositorySize = &size
+		}
+		if v := vs[f.Peer]; v != nil {
+			p.Unverified = v.bad
+			if !v.never && !v.bad && !v.oldest.IsZero() {
+				at := v.oldest.UTC()
+				p.LastVerified = &at
+			}
 		}
 		out = append(out, p)
 	}
@@ -492,8 +526,15 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 		if proto == "" {
 			proto = "unknown"
 		}
+		verified := "never"
+		switch {
+		case p.Unverified:
+			verified = "UNVERIFIED"
+		case p.LastVerified != nil:
+			verified = p.LastVerified.Format(time.RFC3339)
+		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.ID, formatSize(p.Quota), numbers,
-			humanSize(p.UseThere), humanSize(p.UseHere), humanSize(p.Remaining), p.Reachability, seen, "never", proto, repo,
+			humanSize(p.UseThere), humanSize(p.UseHere), humanSize(p.Remaining), p.Reachability, seen, verified, proto, repo,
 			formatDays(time.Duration(p.OwnRetentionSeconds)*time.Second), formatDays(time.Duration(p.PeerRetentionSeconds)*time.Second),
 			p.Since.Format(time.DateOnly))
 	}

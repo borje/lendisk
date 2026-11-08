@@ -1519,7 +1519,10 @@ upstream bucket is Q-V.
   (`lent_usage`); the remaining quota there (LEND-3); reachability
   (`direct` or `relayed` from `Transport.PathInfo` after an answered
   call, `offline` when the last call failed, `unknown` before the
-  first); last seen; last verified (`never` until VER-1, #27); the
+  first); last seen; last verified (VER-4, #27: since when every
+  replica it holds of this node's buckets has passed, the oldest of
+  their last passes; `never` while one has not; `UNVERIFIED`, and
+  `unverified` in JSON, while one failed, §3.6); the
   friend's protocol version; its repository size as reported (rounded
   up to a GiB); both retentions; and since when.
 - **PEER-8** Two walls. The decorator maps every bucket name through
@@ -2716,7 +2719,8 @@ upstream bucket is Q-V.
   (`replica.Worker.replace`) whenever the pool's fingerprint changes
   (`state.DB.PoolFingerprint`: each friend with an address, its quota,
   whether it refuses this node, is gone past `replace_after` or counts
-  more than its quota, and each bucket's `copies`; read every five
+  more than its quota, each bucket's `copies`, and each replica marked
+  unverified (#27); read every five
   polls, so a friend added, removed (`peer remove` or its remove call,
   §3.2), gone, back, or a quota or `copies` changed starts a pass
   within seconds, whichever process wrote the change), and hourly
@@ -2742,9 +2746,9 @@ upstream bucket is Q-V.
   store's local error (`TestARecoveredNodeReplacesFromTheReadThrough`:
   recover, then `peer add` and `peer remove`, with no refusal). This
   heals an object that vanished from the store outside lendisk too, as
-  a read of it would. Verification
-  (#27) and overflow targets (#38, #40) are not built; their cases
-  join the drained places below when they are.
+  a read of it would. Overflow targets (#38, #40) are not built; their
+  cases join the drained places below when they are. A failed
+  verification (#27) is one: see *Unverified replicas* below.
   - *Metadata first.* Each live metadata object gets a row at every
     friend with an address whose row of it is not `queued`, `acked`,
     `refused` or `dropping` (a friend added later, one befriended again
@@ -2829,6 +2833,25 @@ upstream bucket is Q-V.
     `dropping` rows send the deletes; live metadata it lacks is placed
     there as at every friend (REPL-12)
     (`TestARemovedFriendsDroppedRowsAreNotRequeuedWhenBefriendedAgain`).
+  - *Unverified replicas (VER-1, #27).* A friend whose replica of a
+    bucket failed a challenge (`replica_check.unverified_at`, schema
+    29, §3.6) is drained of that bucket's data copies, as a removed
+    friend is of all of them, and of that bucket alone: its
+    acknowledged copies are not good copies, their replacements are
+    placed by D6's choice and name it in `placement.replaces`, and its
+    copies are `dropping` once the replacements are acknowledged, so
+    the object never has fewer copies than it had. Its `queued` rows of
+    the bucket that no sender has taken are cancelled and placed
+    elsewhere. It is no candidate for the bucket's data: not in the
+    pass's `choose`, not in D6's choice at capture (`DB.choose` reads
+    `unverifiedAt`), not a `Reroute` target for the bucket. Its
+    metadata rows stay, and new metadata still goes there (REPL-12):
+    every friend holds the bucket's metadata. The fingerprint carries
+    each unverified mark, so a failed challenge starts a pass within
+    seconds (`TestAFailedVerificationMovesTheReplicasCopies`,
+    `TestUnsentCopiesAtAnUnverifiedFriendGoElsewhere`). A passing
+    `lendisk verify --full` clears the mark, and the friend is a
+    candidate again.
   - *Batched and bounded.* A pass reads each bucket's live data objects
     in pages of 2048 (no transaction), keeps those with something to
     do, and decides about each again in write transactions of at most
@@ -3918,10 +3941,152 @@ the handler's own reads and is never cancelled; nothing below
   makes it current again and leaves the marker to the lifecycle rule.
   Elsewhere it clears the borrower's own client-side tombstones
   (S3-4).
-- **VER-1** The challenge is a control API call: the borrower sends an
-  object key, a byte range and a nonce; the lender reads the range
-  through its decorator and returns HMAC-SHA256(nonce, bytes); the
-  borrower computes the same over its local copy.
+- **VER-1** The challenge is a control API call (#27; §3.7 NET-7):
+  the borrower sends the bucket's sealed name, an object key, a byte
+  range and a fresh 32-byte nonce; the lender reads the range through
+  `Lending` and returns HMAC-SHA256 keyed with the nonce over the bytes
+  (`control.ChallengeMAC`); the borrower computes the same over its
+  local copy. Package `verify` is the borrower's side; `verify.Verifier`
+  runs in `serve` (full role), reading `lendisk.db` and the store and
+  dialling through the tunnel.
+  - *What is challenged.* Per friend and bucket (a *replica*), the
+    objects the friend acknowledged whose latest write is that very row,
+    so the store holds the same bytes, and that are not empty
+    (`state.DB.ChallengeableCount`, `ChallengeableAt`): data and
+    metadata alike. Daily, from the replica's last answer
+    (`replica_check.checked_at`, schema 29; `state.DB.DueReplicas`,
+    looked at every 5 s; a replica with rows of the bucket `queued` or
+    `dropping` there waits until its FIFO is empty, so a backup in
+    progress is not slowed by its challenge, but only until it is more
+    than a day (`state.Overdue`) past due, counted from its last answer
+    or, never answered, from its first acknowledgement: then it is
+    challenged anyway, so a FIFO that never empties, at a friend at
+    quota or behind a slow uplink, does not starve it,
+    `TestAStarvedReplicaIsChallengedOnceOverdue`), up to
+    `verify.DefaultSamples` (8) distinct
+    objects at random, each with a random range of at most
+    `verify.DefaultRange` (64 KiB) and its own nonce. Randomness
+    (`Verifier.Random`) and the clock (`Verifier.Now`) are injected.
+    VER-1 names one object; eight cost at most 512 KiB of reads per
+    replica a day, and catch a friend that lost half of them with
+    probability 1 − 2⁻⁸ each day, which scenario 5's "within a day"
+    needs (one object gives a coin toss). A replica holding eight or
+    fewer is challenged whole every day.
+  - *Verdicts.* Every answer right: verified (`verified_at`). A failed
+    proof is the lender's own word that it lacks the bytes (`404` with
+    code `NoSuchKey` or `NoSuchBucket`, `416` with `InvalidRange`:
+    `control.FailedProof`), or an HMAC that differs from the local
+    copy's while the local copy still hashes to its capture hash. It
+    marks the replica unverified (`unverified_at`, `detail`), logs at
+    error with `alert=true`, calls `Alerted` (the alert service's
+    `Check`), and changes the pool's fingerprint, so re-placement
+    drains that friend's copies of the bucket (§3.4 *Unverified
+    replicas*). Anything else decides nothing: a network error, a
+    timeout, a `503`, a `5xx`, a `404` without a code (a lendisk
+    without the call): recorded in `replica_check.error` and retried an
+    hour later (`DefaultRetry`), never a failure
+    (`TestATransientErrorIsNoFailedProof`). An object whose local copy
+    is gone (a recovered node before the read-through filled it, EP-10)
+    or no longer matches its capture hash (VER-5's business; the HMAC
+    cannot tell whose bytes changed) is skipped; a check that skipped
+    every object is recorded as an error ("nothing to check")
+    (`TestTheLocalCopysOwnFaultsAreNotTheFriends`). The friend is asked
+    first and the local copy read after its answer, after any wait for
+    its pacing. Before a failure is recorded, the object's row is read
+    again (`state.DB.StillChallengeable`): it must still be `acked` at
+    that place and its key's latest done write. A delete, a rewrite
+    (#74's gap) or re-placement's drop (`dropping`, then the delete
+    sent) that reached the friend while the challenge was in flight
+    explains a `404`, a `416` or other bytes, so the object is skipped,
+    not failed (`TestAnObjectThatChangesMidChallengeIsSkipped`, #27
+    review: a full check runs for hours beside backups). An unverified
+    replica is not challenged daily any more; `lendisk verify --full`
+    passing clears the mark (`RecordVerified` with full), a ranged pass
+    does not. A replica's record ends with the friendship
+    (`RemoveFriendship`) and with the bucket (`DeleteBucket`), so a
+    friend befriended again starts unchecked, not unverified
+    (`TestReplicaRecordsEndWithTheFriendshipAndTheBucket`).
+  - *Decision: one failed proof drains the replica (#27).* Precedent:
+    Tahoe-LAFS's verifier (`tahoe check --verify`) downloads and checks
+    every share, and its repairer regenerates only the shares found
+    missing or corrupt, judging no server; Ceph's deep scrub compares
+    replicas, marks the placement group inconsistent and `pg repair`
+    rewrites the bad copy from a good one, an OSD with repeated errors
+    being taken out by the operator; Storj's satellite audits random
+    stripes, counts only definite failures against a node's audit
+    reputation (offline and unknown errors go to separate scores and
+    containment re-asks the same piece), and on disqualification treats
+    every piece the node held as lost and repairs from the others.
+    lendisk's challenge samples a few objects of a replica whose other
+    objects no one is checking, as Storj's audits do, not every share
+    as Tahoe's verifier does; repairing the one object found missing
+    would leave the rest of the replica trusted on a proof it just
+    failed. So, like Storj's disqualification, the whole replica is
+    distrusted and every copy of it re-placed, but at once, since a
+    pool of a few friends has no reputation to average over and the
+    copies stay where they are until their replacements are
+    acknowledged (REPL-13), so acting at once costs only transfer.
+    Like Storj, only a definite answer counts. Unlike it, the scope is
+    the one bucket's replica: the friend's other replicas answer their
+    own challenges, and the friendship stays.
+- **VER-3** `lendisk verify <bucket> --peer <id> [--full]`
+  (`internal/cli/verify.go`) asks the daemon through `lendisk.db`
+  (table `verify_request`, schema 29: `state.DB.RequestVerify`), polls
+  the outcome (`VerifyResult`) every 500 ms, and prints it: exit 0
+  verified, 1 no answer, nothing to check, the daemon not running, an
+  unknown bucket or a stranger, 2 usage, 3 timed out (`--timeout`, 24 h
+  by default), 4 failed. It does not dial the friend itself: one
+  tunnel client per dial key at a relay (§3.7, #69), so a second
+  process dialling with the daemon's key would stall both. The daemon
+  runs requests ahead of the daily challenges. While it waits, the
+  command checks every poll that the daemon still runs (exit 1 when it
+  stopped), and on an interrupt, a timeout or a stopped daemon takes
+  its request back with a context of its own
+  (`TestVerifyStopsWaitingForAGoneDaemon`). A ranged check of a replica
+  marked unverified prints that it passed and stays unverified until
+  `--full` passes. Requests older than a week are dropped at the next
+  one (`state.VerifyKept`). `--full` sends a
+  whole-object challenge for every object the friend acknowledged
+  (`Whole`, no range; `ChallengeablePage` in pages of 256): the lender
+  streams the object into the HMAC and answers 32 bytes, the borrower
+  computes the same from its copy, and no object's bytes cross the
+  tunnel. A `503` from the lender's pacing (§3.7) is waited out during
+  a full check, as long as `Retry-After` says, up to 5 minutes plus
+  what the largest object read so far takes at `verify.DefaultWholeRate`
+  (1 MiB/s, a quarter of the lender's default): a 5 GiB object's debt
+  is waited out, a friend asking for more is no answer
+  (`TestAFullCheckWaitsOutTheFriendsPaceForLargeObjects`, scaled down
+  to 1000 B/s). The daily check counts a `503` as no answer
+  (`TestVerifyOnDemandAndStatus`, `TestAFullCheckCoversEveryObject`).
+  The daemon runs one check at a time, so a long full check holds up
+  the daily challenges until it ends; accepted, as a full check is the
+  user's explicit request and most replicas wait a few hours at most.
+- **VER-4** `status` lists under each bucket its replicas (every
+  friend with an address holding an acknowledged object of it, or with
+  a record): "verified at <friend> <time>", "not verified yet at
+  <friend>" (with the last challenge's error, if one got no answer),
+  or "! UNVERIFIED at <friend> since <time>: <what failed>"; `status
+  --json` adds `buckets[].replicas[]` with `peer`, `last_verified`,
+  `last_full`, `unverified`, `unverified_since`, `detail` and `error`.
+  `peer list` shows it per friend (§3.2 PEER-4).
+- *Scenario 5* (`TestScenarioBadLender`, real daemons, restic, A's
+  injected clock): scenario 1's circle, every replica verified; B
+  deletes half the packs it holds of A's in its store; with A's clock
+  a day on, A raises `replica_unverified` for B's replica and every
+  data object ends at both C and D, the snapshot offsite at two copies.
+- *Withheld proofs (SEC-7, #27 review).* SEC-7 has VER-1 detect a
+  friend that loses *or withholds* a replica. One that answers every
+  challenge with an error, never a definite one, is never failed, and a
+  replica whose challenge never runs proves nothing either. So a
+  replica holding acknowledged objects that has not passed a challenge
+  for `alert.DefaultUncheckedAfter` (3 days), counted from its last
+  pass or, never passed, from its first acknowledgement still held
+  (`ReplicaCheck.LastPassOrHeld`), raises `replica_unchecked` (§3.8).
+  It drains nothing: the friend may be right and the network wrong, and
+  REPL-13's unreachable threshold covers a friend that does not answer
+  at all. It says the replica's state is unknown, and what the last
+  challenge got (`TestAReplicaNeverVerifiedIsAlerted`: a friend
+  answering `500`, and one never challenged since its last pass).
 - **VER-2** Samples are whole-object `GetObject` calls by the replica
   client, hashed by lendisk and compared with the index; the method
   for overflow targets (S3-6), and for the evicted part of a bucket if
@@ -4055,7 +4220,42 @@ the handler's own reads and is never cancelled; nothing below
   repository size is a scan of the queue and is reused for a minute
   (`control.SizeCache`). The caller checks the
   answer the same way (`control.QuotaResponse.Check`) and reads the
-  callee's protocol from its header. `list` is served (#29):
+  callee's protocol from its header. `challenge` is served (#27, §3.6
+  VER-1): `POST /_lendisk/challenge` with `{"bucket": <sealed>,
+  "key", "nonce", "offset", "length"}` or `"whole": true` and no
+  range, answered `{"hmac", "size"}` (HMAC-SHA256 keyed with the
+  nonce over the bytes read, and how many). Open to the `peer` role
+  only and keyed by the resolved caller, like `list`; the read goes
+  through `Lending` in the caller's account (`gateway.LentIndex.Read`,
+  `Server.Held`), so the sealed name maps to the caller's own bucket
+  alone (PEER-8) and a tomb or any key under a reserved prefix is
+  unreachable (SEC-5, RET-2). No such bucket is `404` with code
+  `NoSuchBucket`, no such key `404` with `NoSuchKey`, a range starting
+  past the end `416` with `InvalidRange`: the answers the borrower
+  counts as a failed proof. A nonce outside 16 to 64 bytes, a key a
+  borrower may not name, a range not 1 to `control.MaxChallengeRange`
+  (1 MiB) bytes, or a whole challenge with a range is `400`.
+  *Pacing (LEND-5, #27):* a friend may already read any of its bytes
+  by `GetObject`, paying the bandwidth; a challenge returns 32 bytes,
+  so what bounds it is the lender's reads. Per friend, one challenge
+  reads at a time, and two token buckets of bytes admit a call only
+  while its own is not in debt: ranged challenges (`ChallengeBurst`,
+  8 MiB, refilled at `ChallengeRate`, 256 KiB/s) and whole-object ones
+  (`ChallengeWholeBurst`, 32 MiB, `ChallengeWholeRate`, 4 MiB/s;
+  `control.Default…`). The call then takes what it read, at least
+  `ChallengeCallCost` (4 KiB). So a whole-object challenge may
+  overdraw once and the friend waits for the debt; a call refused is
+  answered `503` with `Retry-After` (seconds to refill) and reads
+  nothing, other friends unaffected. A full check's debt never holds up
+  a daily challenge, which reads at most 512 KiB a replica and stays
+  inside the ranged burst (`TestChallengesArePacedPerFriend`).
+  *Decision (#27 review):* the bound is a rate, under 4.3 MiB/s of
+  reads per friend for 32-byte answers, rather than a daily budget
+  proportional to what the friend stores: a full check of a 100 GB
+  replica then takes about 7 hours and needs no budget arithmetic, and
+  a hostile friend gets a sustained read that a disk serves beside
+  backups, below what its own `GetObject`s could ask over a fast link.
+  `control.CallError.RetryAfter` carries the header. `list` is served (#29):
   `GET /_lendisk/list?bucket=<sealed>&after=<key>&limit=<n>` pages the
   lender's index for that borrower's bucket: key, size, SHA-256, if
   tombstoned, when (`tombstoned_at`, §3.6), and for a live key the
@@ -4291,6 +4491,20 @@ the handler's own reads and is never cancelled; nothing below
     finds none (`TestObjectsBelowCopiesPastTheThresholdAreAlerted`).
     Precedent: Ceph's `PG_DEGRADED` health warning becomes "stuck" only
     past `mon_pg_stuck_threshold`;
+  - `replica_unverified`, subject `<friend>/<bucket>`: the friend's
+    replica of the bucket failed a challenge (VER-1, §3.6, #27; a
+    failed verification in OPS-2's list), naming what failed, that its
+    copies are being placed at other friends, and that `lendisk verify
+    <bucket> --peer <friend> --full` passing clears it. Raised at once
+    (the verifier calls `Check`); held while `replica_check.unverified_at`
+    is set; not raised for a former friend
+    (`TestAFailedVerificationIsAlerted`). A challenge that got no answer
+    raises nothing;
+  - `replica_unchecked`, subject `<friend>/<bucket>`: the replica holds
+    acknowledged objects and has not passed a challenge for 3 days
+    (`alert.Service.UncheckedAfter`; §3.6 *Withheld proofs*), with the
+    last challenge's error if it got none; drains nothing, cleared by
+    the next pass;
   - `friend_removed`, subject the former friend: it ended the
     friendship (its remove call, §3.2 PEER-5, #25); raised at once,
     cleared at the purge or when the two are friends again. This
@@ -4442,6 +4656,11 @@ the handler's own reads and is never cancelled; nothing below
   `gateway.Surface` (`s3Attacks`), SigV4-signed with whatever
   credential the attacker chooses, and every control API call
   (`controlAttacks`); a later ticket adds an attack or a phase there.
+  The challenge's attacks (#27) are a malformed body, B's own
+  tombstoned object (`404 NoSuchKey`: a tomb is no live byte), C's
+  live object by C's sealed name (`404 NoSuchBucket`), the tomb's path
+  and a range over `control.MaxChallengeRange` (`400`), and a `GET`
+  (`405`); its pacing is `TestChallengesArePacedPerFriend`'s.
   With friendships A–B and A–C, a hostile B, holding every credential
   its node holds, sends A all of them from its node ID and from its
   dial key: everything outside NET-7's list is refused and A's store is
@@ -4524,7 +4743,14 @@ the handler's own reads and is never cancelled; nothing below
   directly as a borrower, with no store and no database behind it). The table is re-reviewed on every
   versitygw upgrade, together with the replication-hole review (Q-H),
   and the two tests above fail when an upgrade adds an action or a
-  method.
+  method. The control API is not in the S3 table: the middleware
+  admits only the `peer` role to it (redeem aside, SEC-13), and each
+  call checks the role again and answers for `Caller.Peer`. The one
+  call that reaches the store's objects, `challenge` (#27), does so
+  through `Lending.GetObject` in the caller's account, the admitted
+  `GetObject` entry of `gateway.BackendMethods`, so it reaches exactly
+  what the caller's own ranged `GetObject` would, and answers an HMAC
+  instead of the bytes.
 - **SEC-10** `Server.AllowClient` is always set, before `Start`, to a
   lendisk function that looks the key up in `lendisk.db`: a
   relationship row admits it in the `peer` role, an unexpired invite

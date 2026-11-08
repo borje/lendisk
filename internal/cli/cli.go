@@ -29,6 +29,7 @@ import (
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/store"
 	"github.com/borje/lendisk/internal/transport"
+	"github.com/borje/lendisk/internal/verify"
 	"github.com/borje/lendisk/internal/version"
 )
 
@@ -103,6 +104,9 @@ type app struct {
 	// tuneQuota, if set, adjusts the daemon's quota exchanger (#24)
 	// before it starts; tests only.
 	tuneQuota func(*quota.Exchanger)
+	// tuneVerify, if set, adjusts the daemon's verifier (VER-1, #27)
+	// before it starts (its poll); tests only.
+	tuneVerify func(*verify.Verifier)
 	// lendStatfs reads the store's size for the default lending cap
 	// (maxTotal); nil means the store checker's Statfs. Tests set it.
 	lendStatfs func(dir string) (store.Space, error)
@@ -165,7 +169,7 @@ func (a *app) rootCmd() *cobra.Command {
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.recoverCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
 	root.AddCommand(a.endpointCmd())
-	root.AddCommand(a.inviteCmd(), a.peerCmd())
+	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd())
 	usageArgs(root)
 	return root
 }

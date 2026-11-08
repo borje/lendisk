@@ -19,6 +19,12 @@
 //   - quota applies the caller's own number for its friendship with
 //     this node, keyed by the resolved caller, and nothing else; it
 //     answers with this node's figures for that friendship (LEND-8).
+//   - challenge reads the caller's own object only, keyed by the
+//     resolved caller, through Held (Lending: never a tomb or another
+//     friend's bucket), and answers an HMAC over it (VER-1). Each
+//     friend's challenges are read one at a time and paced in bytes
+//     (ChallengeRate, ChallengeBurst), so a friend cannot make this node
+//     read without bound.
 //   - remove ends the caller's friendship on this side (PEER-5): the
 //     caller ended it on its own, and the call only tells this node.
 //   - Nothing here returns another peer, ever (PEER-10).
@@ -48,9 +54,9 @@ const Protocol = "0.1"
 // API request and response.
 const ProtocolHeader = "Lendisk-Protocol"
 
-// Paths of the control API. Only redeem, version, manifest, list, quota
-// (QuotaPath, quota.go) and remove are served so far; the others are
-// refused as not yet served.
+// Paths of the control API: redeem, version, manifest, list, quota
+// (QuotaPath, quota.go), challenge (ChallengePath, challenge.go) and
+// remove. undelete (RET-3) is not served yet.
 const (
 	Prefix       = gateway.ControlPrefix
 	RedeemPath   = Prefix + "redeem"

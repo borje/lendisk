@@ -69,10 +69,21 @@ func (db *DB) AddBucket(ctx context.Context, b Bucket) error {
 	return err
 }
 
-// DeleteBucket removes a bucket row.
+// DeleteBucket removes a bucket row, and its replicas' verification
+// records (#27).
 func (db *DB) DeleteBucket(ctx context.Context, name string) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM buckets WHERE name = ?`, name)
-	return err
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM buckets WHERE name = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM replica_check WHERE bucket = ?`, name); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const bucketCols = `name, profile, copies, access_key, secret_key, created_at, format1_at, format1_key, upgraded_at`

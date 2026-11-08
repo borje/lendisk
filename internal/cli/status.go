@@ -387,6 +387,65 @@ type StatusBucket struct {
 	// format version 1, which lendisk does not support (COMPAT-1, #79):
 	// writes are accepted and replicated as before. Absent otherwise.
 	KopiaFormat1 *StatusKopiaFormat1 `json:"kopia_format1,omitempty"`
+	// Replicas are the friends that hold the bucket's objects, each with
+	// its verification (VER-1, VER-4, #27).
+	Replicas []StatusReplica `json:"replicas"`
+}
+
+// StatusReplica is one friend's replica of a bucket and when it was last
+// verified (VER-4). Times are RFC 3339, UTC, absent when never.
+type StatusReplica struct {
+	Peer string `json:"peer"`
+	// LastVerified is the last challenge it passed; LastFull the last
+	// `lendisk verify --full` it passed.
+	LastVerified string `json:"last_verified,omitempty"`
+	LastFull     string `json:"last_full,omitempty"`
+	// Unverified is set once it failed a challenge, since
+	// UnverifiedSince, Detail saying what failed: re-placement moves its
+	// copies of the bucket to other friends until a full check passes.
+	Unverified      bool   `json:"unverified"`
+	UnverifiedSince string `json:"unverified_since,omitempty"`
+	Detail          string `json:"detail,omitempty"`
+	// Error is why the last challenge got no answer, if it did not: no
+	// failure, tried again within the hour.
+	Error string `json:"error,omitempty"`
+}
+
+// replicaLine is what status prints of replica r.
+func replicaLine(r StatusReplica) string {
+	switch {
+	case r.Unverified:
+		return fmt.Sprintf("! UNVERIFIED at %s since %s: %s; its copies move to other friends until `lendisk verify --full` passes",
+			r.Peer, r.UnverifiedSince, r.Detail)
+	case r.LastVerified == "" && r.Error != "":
+		return fmt.Sprintf("not verified yet at %s (last challenge: %s)", r.Peer, r.Error)
+	case r.LastVerified == "":
+		return fmt.Sprintf("not verified yet at %s", r.Peer)
+	}
+	return fmt.Sprintf("verified at %s %s", r.Peer, r.LastVerified)
+}
+
+// rfc3339 is t in RFC 3339, UTC, or "" for the zero time.
+func rfc3339(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(time.RFC3339)
+}
+
+// replicaStatus is each bucket's replicas.
+func replicaStatus(ctx context.Context, db *state.DB) (map[string][]StatusReplica, error) {
+	cs, err := db.ReplicaChecks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string][]StatusReplica{}
+	for _, c := range cs {
+		out[c.Bucket] = append(out[c.Bucket], StatusReplica{Peer: c.Place, LastVerified: rfc3339(c.VerifiedAt),
+			LastFull: rfc3339(c.FullAt), Unverified: c.Unverified(), UnverifiedSince: rfc3339(c.UnverifiedAt),
+			Detail: c.Detail, Error: c.Error})
+	}
+	return out, nil
 }
 
 // StatusKopiaFormat1 says a bucket holds a Kopia format-1 repository.
@@ -627,6 +686,10 @@ friend, or with no room in the pool), which status shows.`,
 					CapturedAt: c.CapturedAt.UTC().Format(time.RFC3339), Acknowledged: c.Acknowledged, SHA256: c.SHA256,
 					Places: c.Places, ReportedBy: append([]string{}, c.ReportedBy...)})
 			}
+			replicas, err := replicaStatus(cmd.Context(), db)
+			if err != nil {
+				return err
+			}
 			for _, b := range bs {
 				q, bc := queues[b.Name], below[b.Name]
 				off, err := offsiteStatus(cmd.Context(), db, b, profiles.Get(b.Profile))
@@ -635,6 +698,9 @@ friend, or with no room in the pool), which status shows.`,
 				}
 				if changed[b.Name] == nil {
 					changed[b.Name] = []StatusChanged{}
+				}
+				if replicas[b.Name] == nil {
+					replicas[b.Name] = []StatusReplica{}
 				}
 				r := replacing[b.Name]
 				rs := StatusReplacing{Queued: r.Queued, QueuedBytes: r.QueuedBytes, Dropping: r.Dropping}
@@ -645,7 +711,7 @@ friend, or with no room in the pool), which status shows.`,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
 					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1,
 					OutsideTrust: !profiles.Get(b.Profile).Encrypted, Offsite: off,
-					Changed: changed[b.Name], KopiaFormat1: kopiaFormat1(b)})
+					Changed: changed[b.Name], KopiaFormat1: kopiaFormat1(b), Replicas: replicas[b.Name]})
 			}
 			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
 				return err
@@ -772,6 +838,9 @@ friend, or with no room in the pool), which status shows.`,
 				}
 				if l := replacingLine(b); l != "" {
 					fmt.Fprintf(a.out, "    %s\n", l)
+				}
+				for _, r := range b.Replicas {
+					fmt.Fprintf(a.out, "    %s\n", replicaLine(r))
 				}
 			}
 			if st.Pool.SingleFriend {
