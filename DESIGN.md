@@ -1597,6 +1597,8 @@ upstream bucket is Q-V.
   `AnswerWait` (`bridge.DefaultLinger` is `control.DefaultAnswerWait`),
   so the cut never closes the remove call's connection while its
   handler still waits (§3.9 SEC-15;
+  `TestTheRemoveCallOverADialKeyConnectionEndsTheFriendship`, the call
+  on the caller's dial key, resolved to its node ID;
   `TestRemoveCallEndsOnlyOnceTheCallerHasTheAnswer`,
   `TestCutLeavesAHijackedConnectionsReadsToItsHandler`).
   *Decision (#84, review): a refusal at connect after the call was
@@ -1625,6 +1627,10 @@ upstream bucket is Q-V.
   friendship and A's replica. The mark is kept in memory only: after
   a restart the farewell retries on the backoff again, so no migration
   (`TestAFriendThatRefusesAfterTheRemoveCallIsAskedUntilItAnswers`).
+  A `peer remove` run while the daemon is down is all in the database,
+  so the daemon's first farewell pass at its next start revokes the
+  friend, tells it, and keeps the purge time the removal recorded
+  (`TestAPeerRemoveWhileTheDaemonIsDownIsAppliedAtTheNextStart`).
   `status` lists ended friendships (`former_friends`, with who ended
   it, whether the friend was told and the purge time).
   *Decision (#25): the other side ends it too, automatically, and is
@@ -1636,10 +1642,39 @@ upstream bucket is Q-V.
   connect" (syncthing#4086), and an introducer's removals reach other
   devices only when they connect. lendisk takes the opposite course
   for the reason Syncthing's users complain of: one explicit call, and
-  an alert in place of a silent refusal. A side that never receives
-  the call (offline for the whole window) sees the friend as
-  `retrying` and then `friend_unreachable`; a refusal on an open
-  connection does not end anything by itself.
+  an alert in place of a silent refusal.
+  *Decision (#83): a side that never receives the call ends the
+  friendship too once the friend has refused it as no friend for the
+  whole retention window; it is not only alerted.* The worker records
+  a place's 403 "no relationship" (or versitygw not knowing this
+  node's key) as the condition `removed`, kept with `since` while every
+  answer is that refusal (§3.4). Each farewell pass ends, recorded as
+  ended by the friend (`by_peer`, so it raises `friend_removed`, is
+  revoked as any removal and is not told back), every friendship whose
+  place has been `removed` since at least its retention window ago,
+  counted from a refusal after the friendship began, so a refusal of
+  an earlier friendship with the same node does not count
+  (`state.DB.EndRefused`;
+  `TestAFriendRefusingForTheWholeWindowIsEndedHereToo`). Its replica
+  here is then kept for one more window, so a mistaken end can still
+  be undone by a new invite. The refusal is the friend's own word: it
+  comes over the tunnel the friend's key authenticates. By then the
+  friend has purged this node's replica (removal plus the window), so
+  keeping the friendship keeps nothing but the friend's replica here
+  and a dialler of a node that refuses it, which #25 rules out. A
+  refusal for less than the window ends nothing (a lender restoring an
+  old database for a day). Not answering is not refusing: a friend
+  that ended it refuses this node's key at connect, which the worker
+  sees as `retrying`, the same as an offline friend, so that side is
+  still only alerted (`friend_unreachable`), since a laptop away for a
+  month is not a friend gone. A lender-only node sends nothing, so it
+  records no condition and ends nothing this way. *Precedent:* the
+  farewell already takes a 403 to its remove call as the friend's word
+  that it holds no friendship (counted as told); GNU Mailman's bounce
+  processing counts only permanent (5xx) refusals, never temporary
+  failures, and disables then removes a member whose address keeps
+  refusing past its threshold (`bounce_score_threshold`,
+  `bounce_you_are_disabled_warnings`), rather than keep sending to it.
   *Holding and purging.* The lender side keeps the former friend's lent
   buckets, tombs and manifest, refused to it, so read-only, until
   `purge_after`; seven days before, `replica_purge_soon` is raised.
@@ -3040,7 +3075,10 @@ upstream bucket is Q-V.
   call arrives (this node offline, the friend's daemon down) the place
   shows as `retrying` with a dial error, not `removed`; `removed`
   appears only on a connection opened before the removal, which the
-  middleware still refuses request by request (SEC-11). A `412` to a put of a
+  middleware still refuses request by request (SEC-11), or from a
+  lender that admits the key but has no friendship for it. A place
+  `removed` for the friendship's whole retention window ends the
+  friendship here too (§3.2 PEER-5, #83). A `412` to a put of a
   rewritable key is handled as *Rewrites* says, below; any other `412`
   is refused at that place as a changed key, with the hash a `HEAD`
   reports, and raises `key_changed` and `place_refused` (*EP-11*,
@@ -4578,7 +4616,8 @@ the handler's own reads and is never cancelled; nothing below
     last challenge's error if it got none; drains nothing, cleared by
     the next pass;
   - `friend_removed`, subject the former friend: it ended the
-    friendship (its remove call, §3.2 PEER-5, #25); raised at once,
+    friendship (its remove call, §3.2 PEER-5, #25; or it refused this
+    node as no friend for the whole retention window, #83); raised at once,
     cleared at the purge or when the two are friends again. This
     node's own `peer remove` raises nothing: its output says the same;
   - `replica_purge_soon`, subject the former friend: an ended

@@ -74,6 +74,66 @@ func (db *DB) RemoveFriendship(ctx context.Context, peer string, byPeer bool, no
 		return FormerFriend{}, err
 	}
 	defer tx.Rollback()
+	ff, err := removeFriendship(ctx, tx, peer, byPeer, now)
+	if err != nil {
+		return FormerFriend{}, err
+	}
+	return ff, tx.Commit()
+}
+
+// EndRefused ends, as ended by the friend, each friendship whose friend
+// has refused this node as no friend of it (its place's condition
+// ConditionRemoved: the tunnel's 403 "no relationship") at every answer
+// for at least the friendship's retention window, counted from the
+// first refusal after the friendship began (#83). Such a friend ended
+// it without this node hearing, and has purged this node's replica
+// there by now (PEER-5). It returns the friendships ended.
+func (db *DB) EndRefused(ctx context.Context, now time.Time) ([]FormerFriend, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT f.peer_key, f.created_at, p.since, f.own_retention, f.peer_retention
+		FROM friendship f JOIN place p ON p.place = f.peer_key
+		WHERE p.condition = ? AND p.since >= f.created_at`, ConditionRemoved)
+	if err != nil {
+		return nil, err
+	}
+	var due []string
+	for rows.Next() {
+		var peer string
+		var created, since int64
+		var own, theirs sql.NullInt64
+		if err := rows.Scan(&peer, &created, &since, &own, &theirs); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		f := Friendship{OwnRetention: time.Duration(own.Int64) * time.Second, PeerRetention: time.Duration(theirs.Int64) * time.Second}
+		if !now.Before(time.Unix(since, 0).Add(f.Retention())) {
+			due = append(due, peer)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []FormerFriend
+	for _, peer := range due {
+		ff, err := removeFriendship(ctx, tx, peer, true, now)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ff)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, tx.Commit()
+}
+
+// removeFriendship is RemoveFriendship inside tx.
+func removeFriendship(ctx context.Context, tx *sql.Tx, peer string, byPeer bool, now time.Time) (FormerFriend, error) {
 	f, err := scanFriendship(tx.QueryRowContext(ctx, `SELECT `+friendshipCols+` FROM friendship WHERE peer_key = ?`, peer))
 	if err != nil {
 		return FormerFriend{}, err
@@ -111,7 +171,7 @@ func (db *DB) RemoveFriendship(ctx context.Context, peer string, byPeer bool, no
 		WHERE place = ? AND state = 'queued'`, peer); err != nil {
 		return FormerFriend{}, err
 	}
-	return ff, tx.Commit()
+	return ff, nil
 }
 
 const formerCols = `peer_key, coalesce(dial_key, ''), coalesce(address, ''), removed_at, purge_after,

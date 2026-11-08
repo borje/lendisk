@@ -389,3 +389,81 @@ func TestProbablyToldRetryJitter(t *testing.T) {
 		}
 	}
 }
+
+// PEER-5 (#83): a friend whose every answer has been the 403 "no
+// relationship" (the place's condition `removed`) for longer than the
+// friendship's retention window ended it without this node hearing:
+// the farewell ends it here too, as ended by the friend (so it raises
+// friend_removed and is not told back), and revokes it. A refusal for
+// less than the window, a friend unreachable for longer (`retrying`),
+// and a refusal older than the friendship (friends again since) end
+// nothing.
+func TestAFriendRefusingForTheWholeWindowIsEndedHereToo(t *testing.T) {
+	parallel(t, 0)
+	ctx := t.Context()
+	db, err := state.Open(ctx, t.TempDir(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	start := time.Unix(1_800_000_000, 0)
+	b, c, d, e := newID(t).NodeID(), newID(t).NodeID(), newID(t).NodeID(), newID(t).NodeID()
+	name := map[identity.NodeID]string{b: "B", c: "C", d: "D", e: "E"}
+	created := map[identity.NodeID]time.Time{b: start, c: start, d: start, e: start.Add(time.Hour)}
+	for p, at := range created {
+		if err := db.AddFriendship(ctx, state.Friendship{Peer: p.String(), Address: "tc" + p.String(), CreatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	refused := "the friend refuses this node: 403 AccessDenied: lendisk: " + state.NoRelationship
+	for p, cond := range map[identity.NodeID]struct {
+		c     string
+		since time.Time
+	}{
+		b: {state.ConditionRemoved, start.Add(time.Minute)}, // refusing since just after it began
+		c: {state.ConditionRemoved, start.Add(time.Hour)},   // since an hour later: not yet the window
+		d: {state.ConditionRetrying, start.Add(time.Minute)},
+		e: {state.ConditionRemoved, start.Add(time.Minute)}, // refused the friendship before this one
+	} {
+		if err := db.SetPlaceCondition(ctx, p.String(), cond.c, refused, cond.since); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var s steps
+	now := start.Add(time.Minute + state.DefaultRetention)
+	alerted := 0
+	fw := &farewell{DB: db, Log: slog.New(slog.DiscardHandler), Now: func() time.Time { return now },
+		Clear: func() {},
+		Cut: func(keys ...identity.NodeID) int {
+			for _, k := range keys {
+				s.add("cut %s", name[k])
+			}
+			return len(keys)
+		},
+		Disconnect: func(identity.NodeID) bool { return true },
+		Tell:       func(_ context.Context, f state.FormerFriend) error { s.add("tell %s", f.Address); return nil },
+		Purge:      func(context.Context, string) error { return nil },
+		Alerted:    func() { alerted++ },
+	}
+	fw.pass(ctx)
+	fw.wait()
+	if got := s.take(); !slices.Equal(got, []string{"cut B", "cut B"}) {
+		t.Fatalf("the pass did %q; want B revoked and not told", got)
+	}
+	fs, err := db.FormerFriends(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fs) != 1 || fs[0].Peer != b.String() || !fs[0].ByPeer || !fs[0].RemovedAt.Equal(now) ||
+		!fs[0].PurgeAfter.Equal(now.Add(state.DefaultRetention)) {
+		t.Fatalf("former friends: %+v; want B, ended by it now, purged a window later", fs)
+	}
+	if alerted == 0 {
+		t.Fatal("ending B raised no alert")
+	}
+	for _, p := range []identity.NodeID{c, d, e} {
+		if _, err := db.GetFriendship(ctx, p.String()); err != nil {
+			t.Fatalf("%s: %v", name[p], err)
+		}
+	}
+}

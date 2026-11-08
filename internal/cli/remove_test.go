@@ -19,6 +19,7 @@ import (
 
 	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/control"
+	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
@@ -229,6 +230,117 @@ func TestEndingAFriendshipTellsTheFriendAndLeavesTheOthers(t *testing.T) {
 	if _, err := cS3.HeadBucket(ctx, &s3.HeadBucketInput{Bucket: aws.String(cSealed)}); err != nil {
 		t.Fatalf("C at A after B's removal: %v", err)
 	}
+}
+
+// PEER-5 (#83, from the #25 review): the remove call end to end over the
+// friend's dial-key connection, the key a friend's daemon dials with
+// (#69). A resolves the key to B's node ID, ends the friendship as
+// ended by B, answers, and raises friend_removed for B; neither of B's
+// keys connects afterwards.
+func TestTheRemoveCallOverADialKeyConnectionEndsTheFriendship(t *testing.T) {
+	serving(t, 0)
+	a, b := friendNode(t), friendNode(t)
+	a.tuneEnding = func(f *farewell) { f.Interval = 100 * time.Millisecond }
+	a.tuneAlerts = func(s *alert.Service) { s.Interval = 100 * time.Millisecond }
+	stop := a.serveLogged()
+	defer stop()
+	befriend(t, a, b)
+	aAddr := a.status().Node.Address
+	aKey, err := transport.KeyOf(aAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bID := b.identity()
+	bNode := bID.NodeID().String()
+	ctl := tunnelClient(t, bID.DialKeyFor(aKey), aAddr)
+	if err := ctl.Remove(t.Context()); err != nil {
+		t.Fatalf("B's remove call on its dial key: %v", err)
+	}
+	if ps := a.peers(); len(ps) != 0 {
+		t.Fatalf("A's friends after B's remove call: %+v", ps)
+	}
+	if fs := a.status().FormerFriends; len(fs) != 1 || fs[0].Peer != bNode || !fs[0].ByPeer || fs[0].NotifiedAt == "" {
+		t.Fatalf("A's former friends: %+v; want B by its node ID, ended by it", fs)
+	}
+	within(t, 30*time.Second, "A alerted", func() bool {
+		return slices.ContainsFunc(a.status().Alerts, func(al StatusAlert) bool {
+			return al.Kind == alert.KindFriendRemoved && al.Subject == bNode
+		})
+	})
+	within(t, 20*time.Second, "B's dial key disconnected", func() bool { return !reachable(t, ctl.HTTP) })
+	if reachable(t, tunnelHTTP(t, bID, aAddr)) {
+		t.Fatal("B's node ID connects after its remove call")
+	}
+}
+
+// PEER-5, SEC-15 (#83, from the #25 review): `peer remove` run while the
+// daemon is down is applied at its next start: its first farewell pass
+// revokes the friend, tells it (B ends the friendship on its side), and
+// the purge falls due at the time the removal recorded, a retention
+// window after it.
+func TestAPeerRemoveWhileTheDaemonIsDownIsAppliedAtTheNextStart(t *testing.T) {
+	parallel(t, 2)
+	a, b := friendNode(t), friendNode(t)
+	clock := filepath.Join(t.TempDir(), "clock")
+	pa := newProcNode(t, a, envFarewellInterval+"=200ms", envClock+"="+clock)
+	pa.start()
+	pb := newProcNode(t, b, envAlertInterval+"=200ms")
+	pb.start()
+	befriend(t, a, b)
+	aAddr := a.status().Node.Address
+	aKey, err := transport.KeyOf(aAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aID, bID := a.identity().NodeID().String(), b.identity()
+	bNode := bID.NodeID().String()
+
+	pa.p.kill()
+	if code, out, e := a.run("", "", "peer", "remove", bNode); code != 0 {
+		t.Fatalf("peer remove with the daemon down: %d %s%s", code, out, e)
+	}
+	fs := a.status().FormerFriends
+	if len(fs) != 1 || fs[0].NotifiedAt != "" {
+		t.Fatalf("A's former friends before the start: %+v", fs)
+	}
+	removedAt, err := time.Parse(time.RFC3339, fs[0].RemovedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	purgeAt, err := time.Parse(time.RFC3339, fs[0].PurgeAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := removedAt.Add(state.DefaultRetention); !purgeAt.Equal(want) {
+		t.Fatalf("purge at %v, want a retention window after the removal (%v)", purgeAt, want)
+	}
+
+	pa.start()
+	within(t, 60*time.Second, "B told: it ended the friendship on its side", func() bool {
+		fs := b.status().FormerFriends
+		return len(b.peers()) == 0 && len(fs) == 1 && fs[0].Peer == aID && fs[0].ByPeer
+	})
+	within(t, 30*time.Second, "A recording B as told", func() bool {
+		fs := a.status().FormerFriends
+		return len(fs) == 1 && fs[0].Peer == bNode && !fs[0].ByPeer && fs[0].NotifiedAt != "" && fs[0].PurgeAfter == purgeAt.UTC().Format(time.RFC3339)
+	})
+	within(t, 10*time.Second, "A's farewell revoking B", func() bool {
+		log, _ := os.ReadFile(pa.logf)
+		return bytes.Contains(log, []byte("friendship ended: both keys refused")) && bytes.Contains(log, []byte(bNode))
+	})
+	// With B's daemon stopped, the test dials with B's keys: refused.
+	pb.p.kill()
+	for name, key := range map[string]*identity.Identity{"node ID": bID, "dial key": bID.DialKeyFor(aKey)} {
+		hc := tunnelHTTP(t, key, aAddr)
+		if reachable(t, hc) {
+			t.Errorf("B's %s reaches A after the removal", name)
+		}
+	}
+	// The purge falls due at the recorded time.
+	if err := os.WriteFile(clock, []byte((state.DefaultRetention + time.Hour).String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	within(t, 30*time.Second, "B purged and forgotten at A", func() bool { return len(a.status().FormerFriends) == 0 })
 }
 
 // PEER-5 (#25, #28): each side holds the other's replica for the
