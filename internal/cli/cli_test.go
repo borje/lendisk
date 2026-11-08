@@ -53,6 +53,8 @@ type node struct {
 	tuneAlerts func(*alert.Service)
 	// sleep, when set, is every command's pause between polls.
 	sleep func(context.Context, time.Duration) error
+	// tuneEnding, when set, is given to serveLogged's daemon.
+	tuneEnding func(*farewell)
 }
 
 func newNode(t *testing.T) *node {

@@ -61,6 +61,13 @@ func New(socket string, log *slog.Logger) *Bridge {
 		Transport:     tr,
 		FlushInterval: -1, // stream responses as they come
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if wasCut(r) {
+				// The friend was removed mid-request (SEC-15): the
+				// proxied request ended with it.
+				log.Info("tunnel: a request in flight ended with its connection, cut as the friend was removed", "method", r.Method, "path", r.URL.Path)
+				writeCut(w, r)
+				return
+			}
 			if stalledBody(r) {
 				log.Info("tunnel: a request body stalled; ended the request", "method", r.Method, "path", r.URL.Path)
 				writeError(w, errStalled)

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,15 +55,27 @@ func borrowOver(t *testing.T, key, borrower *identity.Identity, lender identity.
 //   - #69: a redeem cannot register another friend's dial key, a friend's
 //     node ID, its own node ID, the invite key or A's node ID as a dial
 //     key.
-//   - SEC-10: an unknown identity, and B at C, which is not B's friend,
-//     are refused the connection.
-//   - After B's friendship is removed (the row, as `peer remove` will,
-//     #25), both of B's keys are refused everything on their open
-//     connections, like a stranger's.
+//   - SEC-10 AC: an unknown identity is refused the connection by A with
+//     zero peers, with two, with one after `peer remove` B, and with zero
+//     after `peer remove` C; B at C, which is not B's friend, is refused
+//     the connection too.
+//   - SEC-15 (#25): after `peer remove` B, both of B's keys are refused
+//     everything on their open connections, like a stranger's, the
+//     remove call and the manifest included; once the daemon's pass has
+//     cut them, neither key connects.
 func TestHostilePeer(t *testing.T) {
 	a, b, c := friendNode(t), friendNode(t), friendNode(t)
 	if code, _, errOut := a.run("", "", "bucket", "add", "photos", "--profile", "restic"); code != 0 {
 		t.Fatal(errOut)
+	}
+	// The daemon's farewell passes when kicked, so the open connections
+	// can be attacked between the removal and the cut.
+	var fw atomic.Pointer[farewell]
+	a.tuneEnding = func(f *farewell) { f.Interval = time.Hour; fw.Store(f) }
+	kick := func() {
+		t.Helper()
+		within(t, 10*time.Second, "the daemon's farewell", func() bool { return fw.Load() != nil })
+		fw.Load().Kick()
 	}
 	stopA := a.serveLogged()
 	stopped := false
@@ -71,14 +84,24 @@ func TestHostilePeer(t *testing.T) {
 			stopA()
 		}
 	}()
-	befriend(t, a, b)
-	befriend(t, a, c)
 	ctx := t.Context()
 	aAddr := a.status().Node.Address
 	aKey, err := transport.KeyOf(aAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
+	stranger := strangerID(t)
+	strangerSecret, _ := stranger.S3Secret(aKey)
+	strangerAt := func(peers string) {
+		t.Helper()
+		h := attacker(t, "a stranger, "+peers, stranger, aAddr, stranger.NodeID().String(), strangerSecret)
+		h.mustNotConnect(append(s3Attacks("x", "data/ab/x", isAdmitted)[:2], controlAttacks("x", "x")[:1]...))
+		h.close() // one client per key at a time
+	}
+	// SEC-10 with zero peers.
+	strangerAt("zero peers")
+	befriend(t, a, b)
+	befriend(t, a, c)
 	bID, cID := b.identity(), c.identity()
 	bDial := bID.DialKeyFor(aKey)
 	bSealed, cSealed := bID.SealedName("laptop"), cID.SealedName("laptop")
@@ -177,14 +200,16 @@ func TestHostilePeer(t *testing.T) {
 	}
 
 	// #69: the dial key is answered exactly as the node ID, for every S3
-	// operation and every control call.
-	for _, at := range append(s3Attacks(bSealed, "data/ab/cd", nil), controlAttacks(bSealed, cSealed)...) {
+	// operation and every control call (but remove, which would end the
+	// friendship: B may, and does below with its own `peer remove`'s
+	// effect from A's side).
+	for _, at := range append(s3Attacks(bSealed, "data/ab/cd", nil), friendlyControl(bSealed, cSealed)...) {
 		onNode, onDial := bNode.send(at), bOnDial.send(at)
 		if onNode.err != nil || onDial.err != nil || onNode.status != onDial.status || onNode.code != onDial.code {
 			t.Errorf("%s (%s %s): on the node ID %v, on the dial key %v", at.name, at.method, at.target, onNode, onDial)
 		}
 	}
-	for _, at := range controlAttacks(bSealed, cSealed) {
+	for _, at := range friendlyControl(bSealed, cSealed) {
 		r := bOnDial.send(at)
 		switch at.name {
 		case "version", "list own":
@@ -246,16 +271,13 @@ func TestHostilePeer(t *testing.T) {
 		t.Fatalf("B's dial key names %q (%v)", p, err)
 	}
 
-	// SEC-10: a stranger is refused the connection.
-	stranger := strangerID(t)
-	strangerSecret, _ := stranger.S3Secret(aKey)
-	attacker(t, "a stranger", stranger, aAddr, stranger.NodeID().String(), strangerSecret).
-		mustNotConnect(append(s3Attacks(bSealed, "data/ab/x", isAdmitted)[:2], controlAttacks(bSealed, cSealed)[:1]...))
+	// SEC-10: a stranger is refused the connection with two peers.
+	strangerAt("two peers")
 
-	// After removal both of B's keys are refused everything on their
-	// open connections.
-	if _, err := aDB.ExecContext(ctx, `DELETE FROM friendship WHERE peer_key = ?`, bID.NodeID().String()); err != nil {
-		t.Fatal(err)
+	// `peer remove` B: until the daemon's pass cuts them, both of B's
+	// keys are refused everything on their open connections (SEC-11).
+	if code, out, e := a.run("", "", "peer", "remove", bID.NodeID().String()); code != 0 {
+		t.Fatalf("peer remove B: %d %s%s", code, out, e)
 	}
 	before := tree(t, store)
 	for _, h := range []*hostile{bNode, bOnDial} {
@@ -263,6 +285,25 @@ func TestHostilePeer(t *testing.T) {
 		h.mustRefuse(append(s3Attacks(bSealed, "data/ab/x", nil), controlAttacks(bSealed, cSealed)...))
 	}
 	sameTree(t, "after removal", before, tree(t, store))
+	tombIntact("B's removal")
+	// The pass cuts both keys' connections and disconnects them: neither
+	// connects again (SEC-15).
+	kick()
+	for _, h := range []*hostile{bNode, bOnDial} {
+		within(t, 30*time.Second, h.label+": cut", func() bool { return !reachable(t, h.hc) })
+		h.label += ", cut"
+		h.mustNotConnect(append(s3Attacks(bSealed, "data/ab/x", isAdmitted)[:2], controlAttacks(bSealed, cSealed)[:1]...))
+	}
+	// SEC-10 with one peer, and with zero after the last is removed.
+	strangerAt("one peer, after B's removal")
+	if code, out, e := a.run("", "", "peer", "remove", cID.NodeID().String()); code != 0 {
+		t.Fatalf("peer remove C: %d %s%s", code, out, e)
+	}
+	kick()
+	if f, err := aDB.Friendships(ctx); err != nil || len(f) != 0 {
+		t.Fatalf("A's friends after removing both: %+v %v", f, err)
+	}
+	strangerAt("zero peers, after the last removal")
 	stopA()
 	bNode.close()
 	bOnDial.close()

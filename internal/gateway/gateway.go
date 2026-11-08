@@ -37,6 +37,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/versity/versitygw/embedgw"
@@ -103,6 +104,8 @@ type Gateway struct {
 	PurgeEvery time.Duration
 
 	lending *Lending // once Run has built it; tests only
+	// running is lending for other goroutines (PurgeFormer), once built.
+	running atomic.Pointer[Lending]
 	// lendingHook, if set, adjusts Lending before anything is served.
 	// Tests only.
 	lendingHook func(*Lending)
@@ -179,6 +182,7 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	lend := &Lending{Next: dec, DB: g.DB, Uploads: be, StoreDir: g.StoreDir, Floor: g.Floor, Statfs: g.Statfs, Log: g.Log,
 		Now: g.Clock}
 	g.lending = lend
+	g.running.Store(lend)
 	if g.lendingHook != nil {
 		g.lendingHook(lend)
 	}

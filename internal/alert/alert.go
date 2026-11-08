@@ -4,7 +4,8 @@
 // An alert is a condition read from lendisk.db: a friend unreachable
 // past alerts.unreachable_after, this node's store unreadable, objects
 // the store could not supply (VER-5), objects a place refused (LEND-4),
-// keys changed after a friend acknowledged them (EP-11).
+// keys changed after a friend acknowledged them (EP-11), a friendship
+// the friend ended and the purge of an ended one (PEER-5).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -88,11 +89,25 @@ const (
 	// refused by a lender (412). Subject: the bucket. It clears when each
 	// such key is written back to the acknowledged bytes or deleted.
 	KindKeyChanged = "key_changed"
+	// KindFriendRemoved: a friend ended the friendship (its remove call,
+	// PEER-5, #25): its copies of this node's data no longer count, and
+	// the two replicas are purged at the end of the retention window.
+	// Subject: the former friend. It clears at the purge, or when the
+	// two become friends again.
+	KindFriendRemoved = "friend_removed"
+	// KindPurgeSoon: an ended friendship's replicas, the former friend's
+	// here and this node's there, are purged within PurgeWarning (PEER-5,
+	// #25). Subject: the former friend.
+	KindPurgeSoon = "replica_purge_soon"
 )
+
+// PurgeWarning is how long before an ended friendship's purge
+// KindPurgeSoon is raised.
+const PurgeWarning = 7 * 24 * time.Hour
 
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
-	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged}
+	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindPurgeSoon}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -373,9 +388,26 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 	}
 	for _, b := range slices.Sorted(maps.Keys(dropped)) {
 		d := dropped[b]
-		msg := fmt.Sprintf("bucket %s has %s (%d bytes) at fewer places than its copies: a friend that is full or no longer answers held them, and no other friend has room; add room or a friend (lendisk invite)",
+		msg := fmt.Sprintf("bucket %s has %s (%d bytes) at fewer places than its copies: a friend that is full, no longer answers or was removed was to hold them, and no other friend has room; add room or a friend (lendisk invite)",
 			b, countObjects(d.Objects), d.Bytes)
 		out = append(out, alertOf(KindCopiesDropped, b, msg))
+	}
+	formers, err := s.DB.FormerFriends(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range formers {
+		purge := f.PurgeAfter.UTC().Format(time.RFC3339)
+		if f.ByPeer {
+			msg := fmt.Sprintf("friend %s ended the friendship on %s: its copies of this node's data no longer count (status shows what is below copies), and it no longer reaches this node. What it stored here is kept until %s, then deleted, and it deletes what it holds of this node's then",
+				f.Peer, f.RemovedAt.UTC().Format(time.RFC3339), purge)
+			out = append(out, alertOf(KindFriendRemoved, f.Peer, msg))
+		}
+		if !now.Before(f.PurgeAfter.Add(-PurgeWarning)) {
+			msg := fmt.Sprintf("the ended friendship with %s is purged at %s: what it stored here is deleted, and it deletes what it holds of this node's. To keep both, become friends again before then (lendisk invite)",
+				f.Peer, purge)
+			out = append(out, alertOf(KindPurgeSoon, f.Peer, msg))
+		}
 	}
 	return out, nil
 }

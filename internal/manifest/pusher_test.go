@@ -187,3 +187,46 @@ func TestKickMakesARoundNow(t *testing.T) {
 		t.Fatal("no push after Kick")
 	}
 }
+
+// ID-4, PEER-5 (#25): once a friendship ends the pusher pushes there no
+// more, its delivery row is gone with the friendship, and a push to it
+// that was in flight records nothing when it ends; the remaining friend
+// gets the manifest that no longer names the former one.
+func TestPusherStopsAtARemovedFriend(t *testing.T) {
+	var n pushes
+	release, started := make(chan struct{}), make(chan struct{}, 1)
+	p, c := pusherWith(t, func(ctx context.Context, f state.Friendship, _ []byte) error {
+		n.note(f.Peer)
+		if f.Peer == "bob" && n.count("bob") == 2 {
+			started <- struct{}{}
+			<-release
+			return errors.New("connection closed")
+		}
+		return nil
+	}, "bob", "carol")
+	ctx := context.Background()
+	round(p)
+	if n.count("bob") != 1 || n.count("carol") != 1 {
+		t.Fatalf("first round: bob %d, carol %d", n.count("bob"), n.count("carol"))
+	}
+	// A daily push to Bob is in flight when the friendship ends.
+	c.add(24 * time.Hour)
+	p.Round(ctx)
+	<-started
+	if _, err := p.DB.RemoveFriendship(ctx, "bob", false, c.now()); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	p.Wait()
+	round(p)
+	if n.count("bob") != 2 {
+		t.Fatalf("pushes to Bob after removal: %d, want none past the one in flight", n.count("bob"))
+	}
+	if n.count("carol") < 3 {
+		t.Fatalf("Carol was not sent the manifest without Bob: %d pushes", n.count("carol"))
+	}
+	ps, _ := p.DB.ManifestPushes(ctx)
+	if _, ok := ps["bob"]; ok {
+		t.Fatalf("Bob's delivery row is back: %+v", ps["bob"])
+	}
+}

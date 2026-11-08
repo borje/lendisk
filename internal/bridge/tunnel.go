@@ -57,7 +57,7 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, caps *Caps, 
 		caps = &Caps{}
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		isControl := strings.HasPrefix(r.URL.Path, control.Prefix)
+		isControl := isControlPath(r)
 		refuse := func(code int, msg string) {
 			// Every refusal says what it speaks (NET-6), so the caller
 			// can tell lendisk refused it from something else answering.
@@ -101,6 +101,13 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, caps *Caps, 
 			refuse(http.StatusForbidden, state.NoRelationship)
 			return
 		}
+		if wasCut(r) {
+			// The connection is being cut (SEC-15): whatever the row says
+			// by now, nothing more is served on it.
+			log.Warn("tunnel request refused: its connection was cut", "peer", key.String())
+			writeCut(w, r)
+			return
+		}
 		if !caps.request(peer) {
 			log.Warn("tunnel request refused: the friend is at its cap of requests in flight", "peer", peer.String())
 			w.Header().Set("Retry-After", "1")
@@ -128,12 +135,15 @@ func TunnelHandler(roles RoleOf, ctl http.Handler, s3 http.Handler, caps *Caps, 
 
 type peerKey struct{}
 
+func isControlPath(r *http.Request) bool { return strings.HasPrefix(r.URL.Path, control.Prefix) }
+
 // peerListener closes, unread, every connection without a peer key, and
-// every connection over its key's cap.
+// every connection over its key's cap; it tracks the rest in conns.
 type peerListener struct {
 	net.Listener
 	peerOf PeerOf
 	caps   *Caps
+	conns  *Conns
 	log    *slog.Logger
 }
 
@@ -156,26 +166,30 @@ func (l *peerListener) Accept() (net.Conn, error) {
 			continue
 		}
 		l.log.Debug("tunnel connection", "peer", p.String())
-		return &peerConn{Conn: c, peer: p, done: func() { l.caps.connDone(friend) }}, nil
+		pc := &peerConn{Conn: c, peer: p, done: func() { l.caps.connDone(friend) }, conns: l.conns}
+		l.conns.add(pc)
+		return pc, nil
 	}
 }
 
 // ServeTunnel serves h on the tunnel listener ln until ctx is cancelled.
 // Each request's context carries the key of its connection (SEC-12),
 // which TunnelHandler reads. caps bounds each key's open connections; it
-// is the Caps given to TunnelHandler, and nil means the defaults.
-func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, caps *Caps, h http.Handler, log *slog.Logger) error {
+// is the Caps given to TunnelHandler, and nil means the defaults. conns
+// tracks the open connections by key, so Conns.Cut can end them
+// (SEC-15); nil tracks nothing.
+func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, caps *Caps, conns *Conns, h http.Handler, log *slog.Logger) error {
 	if caps == nil {
 		caps = &Caps{}
 	}
 	srv := &http.Server{
-		Handler:           h,
+		Handler:           counted(h),
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       5 * time.Minute,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelDebug),
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			if pc, ok := c.(*peerConn); ok {
-				return context.WithValue(ctx, peerKey{}, pc.peer)
+				return context.WithValue(context.WithValue(pc.context(ctx), peerKey{}, pc.peer), connKey{}, pc)
 			}
 			return ctx
 		},
@@ -186,7 +200,7 @@ func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, caps *Caps
 		defer cancel()
 		srv.Shutdown(shut)
 	}()
-	err := srv.Serve(&peerListener{Listener: ln, peerOf: peerOf, caps: caps, log: log})
+	err := srv.Serve(&peerListener{Listener: ln, peerOf: peerOf, caps: caps, conns: conns, log: log})
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

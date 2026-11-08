@@ -283,6 +283,11 @@ func addFriendship(ctx context.Context, x interface {
 	} else if n == 0 {
 		return ErrExists
 	}
+	// Friends again within the retention window: nothing is purged
+	// (PEER-5, #25).
+	if _, err := x.ExecContext(ctx, `DELETE FROM former_friend WHERE peer_key = ?`, f.Peer); err != nil {
+		return err
+	}
 	return forgetManifestPush(ctx, x, f.Peer)
 }
 

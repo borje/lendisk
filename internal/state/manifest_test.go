@@ -38,6 +38,15 @@ func TestManifestDeliveryPerFriend(t *testing.T) {
 	ctx := context.Background()
 	db := openPeers(t)
 	t0 := time.Unix(1_800_000_000, 0)
+	friend(t, db, "bob")
+	friend(t, db, "carol")
+	// A former friend's push in flight records nothing (#25).
+	if err := db.ManifestDelivered(ctx, "dave", 1, t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ManifestPushFailed(ctx, "dave", "closed", t0); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.ManifestDelivered(ctx, "bob", 1, t0); err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +59,9 @@ func TestManifestDeliveryPerFriend(t *testing.T) {
 	ps, err := db.ManifestPushes(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, ok := ps["dave"]; ok {
+		t.Fatalf("a delivery row for a node that is no friend: %+v", ps["dave"])
 	}
 	bob, carol := ps["bob"], ps["carol"]
 	if bob.Seq != 1 || !bob.DeliveredAt.Equal(t0) || bob.Error != "offline" || !bob.TriedAt.Equal(t0.Add(time.Minute)) {
@@ -111,6 +123,7 @@ func TestManifestPushFailuresCounted(t *testing.T) {
 	ctx := context.Background()
 	db := openPeers(t)
 	t0 := time.Unix(1_800_000_000, 0)
+	friend(t, db, "bob")
 	for i := range 3 {
 		if err := db.ManifestPushFailed(ctx, "bob", "offline", t0.Add(time.Duration(i)*time.Minute)); err != nil {
 			t.Fatal(err)

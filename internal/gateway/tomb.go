@@ -57,19 +57,15 @@ const TombDir = ".lendisk/tomb"
 
 // DefaultRetention is the retention window when neither side of a
 // friendship offered one (RET-1).
-const DefaultRetention = 30 * 24 * time.Hour
+const DefaultRetention = state.DefaultRetention
 
 // Retention is how long this node keeps a friend's deletes (RET-1): the
 // longer of its own offer, the lender's minimum, and the friend's offer,
 // both exchanged at redeem (PEER-1, PEER-2), so a borrower can only make
-// the window longer. DefaultRetention when neither was recorded.
-func Retention(f state.Friendship) time.Duration {
-	r := max(f.OwnRetention, f.PeerRetention)
-	if r <= 0 {
-		return DefaultRetention
-	}
-	return r
-}
+// the window longer (state.Friendship.Retention). DefaultRetention when
+// neither was recorded. Ending the friendship keeps the friend's replica
+// as long (PEER-5).
+func Retention(f state.Friendship) time.Duration { return f.Retention() }
 
 // purgePage is how many due tombstones one purge reads at a time.
 const purgePage = 256

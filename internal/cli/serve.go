@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
+	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
@@ -80,7 +82,10 @@ func (a *app) serveCmd() *cobra.Command {
 			// The node manifest (ID-4), pushed to every friend; in both
 			// profiles, since a lender-only node is rebuilt from it too.
 			push := &manifest.Pusher{DB: db, Self: id, Now: a.clock, Random: a.random, Log: log}
-			tun, err := a.startTunnel(ctx, cfg, id, db, log, push.Kick)
+			// Ending friendships (PEER-5, SEC-15, #25): revoked, told and
+			// purged by the farewell, kicked by a friend's remove call.
+			fw := &farewell{DB: db, Log: log, Now: a.clock}
+			tun, err := a.startTunnel(ctx, cfg, id, db, log, push.Kick, fw.Kick)
 			if err != nil {
 				return err
 			}
@@ -95,7 +100,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 7) // gateway, LAN, loopback, replication, alerts, manifest, recovery
+			errc := make(chan error, 8) // gateway, LAN, loopback, replication, farewell, alerts, manifest, recovery
 			// The read-through (EP-10, ID-6) fetches what the store lacks
 			// from the friends holding it, over the tunnel.
 			fetch := &replica.Fetcher{DB: db, Self: id, Dial: tun.Dial}
@@ -181,6 +186,33 @@ func (a *app) serveCmd() *cobra.Command {
 				running++
 				go func() { w.Run(ctx); errc <- nil }()
 			}
+			fw.Clear, fw.Cut, fw.Disconnect = tun.Admission.Clear, tun.Conns.Cut, tun.Disconnect
+			fw.Tell = func(ctx context.Context, f state.FormerFriend) error {
+				peer, err := identity.ParseNodeID(f.Peer)
+				if err != nil {
+					return err
+				}
+				hc := &http.Client{Transport: &http.Transport{DisableKeepAlives: true,
+					DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return tun.Dial(ctx, peer, f.Address) }}}
+				defer hc.CloseIdleConnections()
+				return (&control.Client{HTTP: hc}).Remove(ctx)
+			}
+			fw.Purge = func(ctx context.Context, peer string) error {
+				pid, err := identity.ParseNodeID(peer)
+				if err != nil {
+					return err
+				}
+				if err := gw.PurgeFormer(ctx, peer); err != nil {
+					return err
+				}
+				return tun.Manifests.Delete(pid)
+			}
+			fw.Alerted = alerts.Check
+			if a.tuneEnding != nil {
+				a.tuneEnding(fw)
+			}
+			running++
+			go func() { fw.Run(ctx); errc <- nil }()
 			running++
 			go func() { alerts.Run(ctx); errc <- nil }()
 			running++

@@ -793,9 +793,10 @@ type BelowStat struct {
 
 // BelowCopies returns, per bucket, the live objects (the key's latest
 // done write is a put) that fewer than the bucket's `copies` places hold
-// or will hold (acked or queued rows): the deficit the pool lacks room
-// for, refusals, and copies dropped at a friend gone past replace_after
-// (REPL-4). Buckets with none are absent.
+// or will hold (acked or queued rows at a friend): the deficit the pool
+// lacks room for, refusals, copies dropped at a friend gone past
+// replace_after (REPL-4), and copies at a friend removed since (PEER-5,
+// #25), until re-placement (#26). Buckets with none are absent.
 func (db *DB) BelowCopies(ctx context.Context) (map[string]BelowStat, error) {
 	return db.below(ctx, "")
 }
@@ -805,7 +806,8 @@ func (db *DB) below(ctx context.Context, and string) (map[string]BelowStat, erro
 		WHERE q.state = 'done' AND q.op = 'put'
 		AND NOT EXISTS (SELECT 1 FROM queue l
 			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
-		AND (SELECT count(*) FROM placement p WHERE p.seq = q.seq AND p.state IN ('queued', 'acked'))
+		AND (SELECT count(*) FROM placement p WHERE p.seq = q.seq AND p.state IN ('queued', 'acked')
+			AND p.place IN (SELECT peer_key FROM friendship))
 			< coalesce((SELECT copies FROM buckets WHERE name = q.bucket), ?) `+and+`
 		GROUP BY q.bucket`, DefaultCopies)
 	if err != nil {

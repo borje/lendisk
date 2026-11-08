@@ -91,7 +91,16 @@ func controlAttacks(own, other string) []attack {
 		{name: "quota", method: "POST", target: control.Prefix + "quota", body: []byte("{}")},
 		{name: "undelete", method: "POST", target: control.Prefix + "undelete", body: []byte("{}")},
 		{name: "an unknown call", method: "GET", target: control.Prefix + "admin"},
+		// Last: from a friend it ends the friendship (PEER-5, #25).
+		{name: "remove", method: "POST", target: control.RemovePath, body: []byte("{}")},
 	}
+}
+
+// friendlyControl is controlAttacks but remove, which a friend may call
+// and which ends its friendship.
+func friendlyControl(own, other string) []attack {
+	as := controlAttacks(own, other)
+	return as[:len(as)-1]
 }
 
 // hostile is one attacker at one target: an HTTP client over the tunnel

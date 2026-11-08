@@ -2,7 +2,6 @@ package bridge
 
 import (
 	"context"
-	"net"
 	"sync"
 	"time"
 
@@ -110,17 +109,3 @@ func (c *Caps) request(peer identity.NodeID) bool {
 }
 
 func (c *Caps) requestDone(peer identity.NodeID) { c.give(c.reqs, peer) }
-
-// peerConn is an accepted tunnel connection with its key. It gives its
-// place under Caps back once, when it is closed.
-type peerConn struct {
-	net.Conn
-	peer identity.NodeID
-	once sync.Once
-	done func()
-}
-
-func (c *peerConn) Close() error {
-	c.once.Do(c.done)
-	return c.Conn.Close()
-}

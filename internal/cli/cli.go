@@ -96,6 +96,9 @@ type app struct {
 	// tuneRecovery, if set, adjusts the daemon's recovery lister before
 	// it starts (its timings); tests only.
 	tuneRecovery func(*recovery.Lister)
+	// tuneEnding, if set, adjusts the daemon's farewell (ending
+	// friendships, #25) before it starts; tests only.
+	tuneEnding func(*farewell)
 }
 
 func (a *app) checker() store.Checker {
