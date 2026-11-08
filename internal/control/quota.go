@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/borje/lendisk/internal/state"
 )
@@ -118,9 +120,14 @@ func (s *Server) quota(w http.ResponseWriter, r *http.Request, c Caller) {
 		Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	ctx, peer := r.Context(), c.Peer.String()
+	ctx, peer, now := r.Context(), c.Peer.String(), s.now()
+	if !s.admitQuota(peer, now) {
+		w.Header().Set("Retry-After", "1")
+		Error(w, http.StatusServiceUnavailable, "quota: called again too soon; retry shortly")
+		return
+	}
 	f, err := s.DB.QuotaReported(ctx, peer, state.QuotaReport{Number: req.Number, Use: req.Use,
-		RepositorySize: req.RepositorySize, Protocol: r.Header.Get(ProtocolHeader)}, s.now())
+		RepositorySize: req.RepositorySize, Protocol: r.Header.Get(ProtocolHeader)}, now)
 	if errors.Is(err, state.ErrNotFound) {
 		Error(w, http.StatusForbidden, state.NoRelationship)
 		return
@@ -134,7 +141,7 @@ func (s *Server) quota(w http.ResponseWriter, r *http.Request, c Caller) {
 		use, err = s.DB.PlaceUse(ctx)
 	}
 	if err == nil {
-		size, err = s.DB.RepositorySize(ctx)
+		size, err = s.repositorySize(ctx, now)
 	}
 	if err != nil {
 		s.Log.Error("quota: applying a friend's number failed", "peer", peer, "err", err)
@@ -147,4 +154,65 @@ func (s *Server) quota(w http.ResponseWriter, r *http.Request, c Caller) {
 	s.Log.Debug("quota call answered", "peer", peer, "their_number", req.Number, "quota", f.Quota())
 	writeJSON(w, http.StatusOK, QuotaResponse{Number: f.OwnNumber, Quota: f.Quota(),
 		Use: min(max(use[peer], 0), MaxNumber-1), Lent: min(lent, MaxNumber-1), RepositorySize: RoundSize(size)})
+}
+
+const (
+	// DefaultQuotaEvery is how often a friend's quota call is applied at
+	// most (Server.QuotaEvery, LEND-5, #24 review): each applied call
+	// writes lendisk.db and may change the quota, its alerts and the
+	// writes in flight. A legitimate friend calls hourly, or once per
+	// change, and retries a 503 after its backoff (10 s and up).
+	DefaultQuotaEvery = 10 * time.Second
+	// SizeCache is how long the answered repository size is reused: it
+	// is a scan of the queue.
+	SizeCache = time.Minute
+)
+
+// quotaLimits are the quota call's per-friend window and the cached
+// repository size.
+type quotaLimits struct {
+	mu     sync.Mutex
+	last   map[string]time.Time // peer -> its last applied call
+	size   int64
+	sizeAt time.Time
+}
+
+// admit reports whether peer's call at now is outside its window, and
+// if so starts a new one.
+func (s *Server) admitQuota(peer string, now time.Time) bool {
+	s.quotaLimits.mu.Lock()
+	defer s.quotaLimits.mu.Unlock()
+	if s.quotaLimits.last == nil {
+		s.quotaLimits.last = map[string]time.Time{}
+	}
+	every := s.QuotaEvery
+	if every <= 0 {
+		every = DefaultQuotaEvery
+	}
+	if t, ok := s.quotaLimits.last[peer]; ok && now.Sub(t) < every && !now.Before(t) {
+		return false
+	}
+	s.quotaLimits.last[peer] = now
+	for p, t := range s.quotaLimits.last {
+		if now.Sub(t) >= every {
+			delete(s.quotaLimits.last, p)
+		}
+	}
+	return true
+}
+
+// repositorySize is this node's repository size, read at most once per
+// SizeCache.
+func (s *Server) repositorySize(ctx context.Context, now time.Time) (int64, error) {
+	s.quotaLimits.mu.Lock()
+	defer s.quotaLimits.mu.Unlock()
+	if !s.quotaLimits.sizeAt.IsZero() && now.Sub(s.quotaLimits.sizeAt) < SizeCache && !now.Before(s.quotaLimits.sizeAt) {
+		return s.quotaLimits.size, nil
+	}
+	n, err := s.DB.RepositorySize(ctx)
+	if err != nil {
+		return 0, err
+	}
+	s.quotaLimits.size, s.quotaLimits.sizeAt = n, now
+	return n, nil
 }

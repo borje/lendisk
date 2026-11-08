@@ -119,6 +119,19 @@ const (
 // raised (OPS-2).
 const QuotaHighPercent = 90
 
+// DefaultQuotaHold is how long a quota alert stays raised after its condition
+// ends (#24 review): a friend can flip a quota alert's condition with
+// every quota call, and each raise is a delivery, so a quota alert
+// clears only once its condition has been false this long.
+const DefaultQuotaHold = 10 * time.Minute
+
+func (s *Service) quotaHold() time.Duration { return orDefault(s.QuotaHold, DefaultQuotaHold) }
+
+// quotaKind reports whether kind is a quota alert (hysteresis, QuotaHold).
+func quotaKind(kind string) bool {
+	return kind == KindQuotaHigh || kind == KindQuotaExhausted || kind == KindLentOverQuota
+}
+
 // PurgeWarning is how long before an ended friendship's purge
 // KindPurgeSoon is raised.
 const PurgeWarning = 7 * 24 * time.Hour
@@ -178,6 +191,9 @@ type Service struct {
 	MinBackoff, MaxBackoff time.Duration
 	// Timeout bounds one delivery attempt (default 30 s).
 	Timeout time.Duration
+	// QuotaHold is how long a quota alert stays raised after its
+	// condition ends (default DefaultQuotaHold).
+	QuotaHold time.Duration
 	// RunCommand runs the hook; nil means exec. Tests set it.
 	RunCommand func(ctx context.Context, command string, stdin []byte) error
 	// HTTP posts to the webhook; nil means a plain http.Client.
@@ -185,6 +201,9 @@ type Service struct {
 
 	once           sync.Once
 	wake, delivery chan struct{}
+	// held is, per quota alert's key, when its condition last held
+	// (QuotaHold); only evaluate touches it.
+	held map[string]time.Time
 }
 
 func (s *Service) init() {
@@ -254,6 +273,9 @@ func (s *Service) evaluate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if current, err = s.hold(ctx, current, now); err != nil {
+		return err
+	}
 	raised, cleared, err := s.DB.SyncAlerts(ctx, kinds, current, now)
 	if err != nil {
 		return err
@@ -268,6 +290,45 @@ func (s *Service) evaluate(ctx context.Context) error {
 		poke(s.delivery)
 	}
 	return nil
+}
+
+// hold keeps each raised quota alert whose condition held within
+// QuotaHold of now in current, as it stands, and notes when the quota
+// alerts in current hold.
+func (s *Service) hold(ctx context.Context, current []state.Alert, now time.Time) ([]state.Alert, error) {
+	if s.held == nil {
+		s.held = map[string]time.Time{}
+	}
+	in := map[string]bool{}
+	for _, a := range current {
+		in[a.Key] = true
+		if quotaKind(a.Kind) {
+			s.held[a.Key] = now
+		}
+	}
+	active, err := s.DB.ActiveAlerts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// quota_high and quota_exhausted of one friend are one condition at
+	// two levels: the current one replaces the other.
+	other := map[string]string{KindQuotaHigh: KindQuotaExhausted, KindQuotaExhausted: KindQuotaHigh}
+	for _, a := range active {
+		t, ok := s.held[a.Key]
+		if !ok || in[a.Key] || !quotaKind(a.Kind) || now.Sub(t) >= s.quotaHold() {
+			continue
+		}
+		if o, paired := other[a.Kind]; paired && in[o+":"+a.Subject] {
+			continue
+		}
+		current = append(current, a)
+	}
+	for k, t := range s.held {
+		if now.Sub(t) >= s.quotaHold() {
+			delete(s.held, k)
+		}
+	}
+	return current, nil
 }
 
 func alertOf(kind, subject, message string) state.Alert {

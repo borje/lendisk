@@ -45,7 +45,7 @@ func TestBothNumbersRaisedResumeCopiesWithNoFurtherAction(t *testing.T) {
 	if ak == nil || sk == nil {
 		t.Fatalf("no credential in:\n%s", out)
 	}
-	env := []string{envReplFast + "=1", envPauseRetry + "=1h", envAlertInterval + "=300ms"}
+	env := []string{envReplFast + "=1", envPauseRetry + "=1h", envAlertInterval + "=300ms", envQuotaHold + "=1s"}
 	a, b := newProcNode(t, an, env...), newProcNode(t, bn, env...)
 	b.start()
 	a.start()

@@ -44,9 +44,14 @@ type Server struct {
 	// its number (LEND-8, #24), so the daemon applies a changed quota
 	// (the quota exchanger's Kick). It must not block.
 	Reported func(peer string)
+	// QuotaEvery is the least time between two applied quota calls of
+	// one friend (default DefaultQuotaEvery); one sooner is answered 503.
+	QuotaEvery time.Duration
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
+
+	quotaLimits quotaLimits
 }
 
 func (s *Server) now() time.Time {

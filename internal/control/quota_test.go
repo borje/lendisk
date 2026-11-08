@@ -107,6 +107,81 @@ func TestQuotaCallAppliesTheCallersNumber(t *testing.T) {
 	}
 }
 
+// LEND-5 (#24 review): a friend's number is applied at most once per
+// QuotaEvery; a call inside the window is answered 503 with
+// Retry-After and changes nothing, and calls Reported for nothing. The
+// repository size answered is read at most once per SizeCache.
+func TestQuotaCallsAreRateLimitedPerFriend(t *testing.T) {
+	ctx := t.Context()
+	db, err := state.Open(ctx, t.TempDir(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	bob, carol := newID(t), newID(t)
+	for _, f := range []string{bob.NodeID().String(), carol.NodeID().String()} {
+		if err := db.AddFriendship(ctx, state.Friendship{Peer: f, Address: "tc" + f, OwnNumber: 80 << 30,
+			PeerNumber: 80 << 30, CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Unix(1_800_000_000, 0)
+	var reported atomic.Int32
+	l := newLender(t)
+	l.srv.DB, l.srv.Now = db, func() time.Time { return now }
+	l.srv.Reported = func(string) { reported.Add(1) }
+	asBob := l.client(t, control.Caller{Peer: bob.NodeID(), Role: state.RolePeer})
+	asCarol := l.client(t, control.Caller{Peer: carol.NodeID(), Role: state.RolePeer})
+	if _, err := asBob.Quota(ctx, control.QuotaRequest{Number: 50 << 30}); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(control.DefaultQuotaEvery - time.Second)
+	_, err = asBob.Quota(ctx, control.QuotaRequest{Number: 10 << 30})
+	var ce *control.CallError
+	if !errors.As(err, &ce) || ce.Status != http.StatusServiceUnavailable {
+		t.Fatalf("a second call inside the window: %v", err)
+	}
+	resp, err := asBob.Do(ctx, http.MethodPost, control.QuotaPath, bytes.NewReader([]byte(`{"number":1073741824}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") != "1" {
+		t.Fatalf("inside the window: %d, Retry-After %q", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	if f, _ := db.GetFriendship(ctx, bob.NodeID().String()); f.PeerNumber != 50<<30 || reported.Load() != 1 {
+		t.Fatalf("a refused call changed the number or was reported: %+v, %d", f, reported.Load())
+	}
+	// Another friend has its own window.
+	if _, err := asCarol.Quota(ctx, control.QuotaRequest{Number: 40 << 30}); err != nil {
+		t.Fatalf("Carol inside Bob's window: %v", err)
+	}
+	// A bucket's object appears: the size answered is the cached one
+	// until the window passes.
+	if err := db.AddBucket(ctx, state.Bucket{Name: "laptop", Profile: "restic", Copies: 1, AccessKey: "AK", SecretKey: "s", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "data/1", Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FinishPut(ctx, seqs[0], 1000, "h"); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(time.Second)
+	got, err := asBob.Quota(ctx, control.QuotaRequest{Number: 10 << 30})
+	if err != nil || got.RepositorySize != 0 {
+		t.Fatalf("after the window: %+v %v (the size read %v ago is cached)", got, err, time.Second)
+	}
+	if f, _ := db.GetFriendship(ctx, bob.NodeID().String()); f.PeerNumber != 10<<30 {
+		t.Fatalf("after the window: %+v", f)
+	}
+	now = now.Add(control.SizeCache)
+	if got, _ := asBob.Quota(ctx, control.QuotaRequest{Number: 10 << 30}); got.RepositorySize != 1<<30 {
+		t.Fatalf("the size after its cache expired: %+v", got)
+	}
+}
+
 // LEND-7 (#24): the repository size crosses the tunnel rounded up to a
 // whole GiB.
 func TestRepositorySizeRoundsUpToAGiB(t *testing.T) {

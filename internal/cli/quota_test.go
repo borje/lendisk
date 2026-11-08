@@ -144,8 +144,9 @@ func TestLoweringAQuotaEndsARunningTransfer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The running transfer: 2 MiB, 32 KiB at a time, over half a minute.
-	body := bytes.Repeat([]byte("pack"), 1<<19)
+	// The running transfer: 4 MiB, 32 KiB at a time, over a minute, so it
+	// cannot end by itself within the 30 s the test allows.
+	body := bytes.Repeat([]byte("pack"), 1<<20)
 	pr, pw := io.Pipe()
 	var sent sync.WaitGroup
 	sent.Add(1)

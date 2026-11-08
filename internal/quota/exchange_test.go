@@ -81,7 +81,8 @@ func newSetup(t *testing.T) *setup {
 		t.Fatal(err)
 	}
 	s.x = &Exchanger{DB: db, Call: s.b.call, Now: s.c.now, Log: slog.New(slog.DiscardHandler),
-		Path: func(context.Context, string) string { return "relayed" },
+		Path:   func(context.Context, string) string { return "relayed" },
+		Jitter: func(time.Duration) time.Duration { return 0 },
 		Changed: func(peer string, before, after int64) {
 			s.mu.Lock()
 			s.changes = append(s.changes, change{peer, before, after})
@@ -220,6 +221,29 @@ func TestTheQuotaCallIsRepeatedPeriodicallyAndOnDemand(t *testing.T) {
 	}
 }
 
+// #24 review: the hourly call comes up to a tenth of Refresh early, by
+// Jitter, so friends' calls spread out rather than meet each hour.
+func TestThePeriodicCallIsJittered(t *testing.T) {
+	s := newSetup(t)
+	s.x.Jitter = func(max time.Duration) time.Duration {
+		if max != defaultRefresh/10 {
+			t.Errorf("jitter up to %v", max)
+		}
+		return 5 * time.Minute
+	}
+	s.pass()
+	s.c.add(defaultRefresh - 5*time.Minute - time.Second)
+	s.pass()
+	if s.b.count() != 1 {
+		t.Fatal("called before the jittered refresh")
+	}
+	s.c.add(time.Second)
+	s.pass()
+	if s.b.count() != 2 {
+		t.Fatal("not called at the jittered refresh")
+	}
+}
+
 // LEND-8 (#24): a quota the friend raised or lowered with its own call
 // reaches Changed at the next pass; raising is in force only as far as
 // this node's own number allows.
@@ -237,8 +261,8 @@ func TestTheFriendsNumberReachesChanged(t *testing.T) {
 	}
 	s.b.number = 80 << 30
 	s.c.add(time.Second) // the call goes out after the friend's report
-	s.pass() // tells 80G; the answer raises the friend's number to 80G
-	s.pass() // sees the raised quota
+	s.pass()             // tells 80G; the answer raises the friend's number to 80G
+	s.pass()             // sees the raised quota
 	want := []change{{"B", -1, 50 << 30}, {"B", 50 << 30, 20 << 30}, {"B", 20 << 30, 80 << 30}}
 	got := s.takeChanges()
 	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {

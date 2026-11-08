@@ -66,6 +66,9 @@ const (
 	// duration), overriding envReplFast's: how long a place paused for
 	// quota waits unless the quota rises.
 	envPauseRetry = "LENDISK_TEST_PAUSE_RETRY"
+	// envQuotaHold is the alert service's QuotaHold (a Go duration),
+	// read with envAlertInterval.
+	envQuotaHold = "LENDISK_TEST_QUOTA_HOLD"
 )
 
 // offsetClock is real time plus the duration in the file at path, read
@@ -113,7 +116,12 @@ func TestMain(m *testing.M) {
 			a.clock = offsetClock(f)
 		}
 		if d, err := time.ParseDuration(os.Getenv(envAlertInterval)); err == nil {
-			a.tuneAlerts = func(s *alert.Service) { s.Interval = d }
+			a.tuneAlerts = func(s *alert.Service) {
+				s.Interval = d
+				if h, err := time.ParseDuration(os.Getenv(envQuotaHold)); err == nil {
+					s.QuotaHold = h
+				}
+			}
 		}
 		a.tuneManifest = func(p *manifest.Pusher) {
 			if os.Getenv(envReplFast) == "1" {
@@ -124,8 +132,13 @@ func TestMain(m *testing.M) {
 				p.Poll = d
 			}
 		}
-		if d, err := time.ParseDuration(os.Getenv(envListDelay)); err == nil {
-			a.tuneControl = func(s *control.Server) { s.Lent = slowList{LentLister: s.Lent, delay: d} }
+		a.tuneControl = func(s *control.Server) {
+			if d, err := time.ParseDuration(os.Getenv(envListDelay)); err == nil {
+				s.Lent = slowList{LentLister: s.Lent, delay: d}
+			}
+			if os.Getenv(envReplFast) == "1" {
+				s.QuotaEvery = 200 * time.Millisecond
+			}
 		}
 		a.tuneFetch = func(f *replica.Fetcher) {
 			if os.Getenv(envReplFast) == "1" {

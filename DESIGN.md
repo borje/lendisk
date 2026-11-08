@@ -1460,8 +1460,10 @@ upstream bucket is Q-V.
   quota` in another process, is seen within the exchanger's 10 s poll,
   or at once after a friend's call or a redeem in this process), on
   `Exchanger.Due` (the replication worker's `Full`, on a `507`, #68),
-  and otherwise an hour after its last answer. A failed call is
-  repeated after 10 s, doubling to 5 minutes, until answered.
+  and otherwise an hour after its last answer, less a random jitter of
+  up to a tenth of that (`Exchanger.Jitter`), so friends' calls spread
+  out. A failed call is repeated after 10 s, doubling to 5 minutes,
+  until answered.
   *Decision (#24): the call is also the periodic exchange.* An hourly
   call per friend is one small request and keeps the friend's number,
   use, repository size, protocol and reachability fresh for `peer list`
@@ -3756,7 +3758,16 @@ the handler's own reads and is never cancelled; nothing below
   "repository_size"}` after the callee applied the caller's number
   (§3.2); open to the `peer` role only, keyed by the resolved caller; a
   number outside 1 to 2^62, a negative or oversized use, or a size not
-  in whole GiB is `400`, an invite key `403`. The caller checks the
+  in whole GiB is `400`, an invite key `403`. *Rate limit (#24 review,
+  LEND-5):* a friend's call is applied at most once per
+  `Server.QuotaEvery` (`control.DefaultQuotaEvery`, 10 s); one sooner
+  is answered `503` with `Retry-After: 1` and changes nothing. Each
+  applied call writes `lendisk.db` and may change the quota, its
+  alerts and the writes in flight, so a hostile friend toggling its
+  number does so at most every 10 s; an honest one calls hourly or
+  once per change and retries after its backoff. The answered
+  repository size is a scan of the queue and is reused for a minute
+  (`control.SizeCache`). The caller checks the
   answer the same way (`control.QuotaResponse.Check`) and reads the
   callee's protocol from its header. `list` is served (#29):
   `GET /_lendisk/list?bucket=<sealed>&after=<key>&limit=<n>` pages the
@@ -4009,6 +4020,13 @@ the handler's own reads and is never cancelled; nothing below
     are accepted from it and nothing is deleted. With the friend's
     `quota_exhausted` this is PEER-6's "notifies both", as is `peer
     quota`'s own output (`TestQuotaUseRaisesAlerts`).
+  The three quota alerts have hysteresis (#24 review): one stays raised
+  until its condition has been false for `alert.Service.QuotaHold`
+  (`DefaultQuotaHold`, 10 minutes), so a friend flipping it with every
+  quota call gets one delivery per window, not one per call
+  (`TestToggledNumbersRaiseAQuotaAlertOnce`); `quota_high` and
+  `quota_exhausted` of one friend are one condition at two levels, the
+  current one replacing the other at once.
   Later tickets add a kind to `alert.kinds` and its condition to the
   evaluator. Each raise is delivered at least once to each configured
   channel: success is recorded in `hook_at` or `webhook_at` against

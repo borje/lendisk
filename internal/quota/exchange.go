@@ -23,6 +23,7 @@ package quota
 import (
 	"context"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"sync"
@@ -73,6 +74,10 @@ type Exchanger struct {
 	// MinBackoff and MaxBackoff bound the wait after failed calls in a
 	// row (defaults 10 s and 5 minutes).
 	MinBackoff, MaxBackoff time.Duration
+	// Jitter returns how much earlier than Refresh, up to max (a tenth
+	// of Refresh), a friend is next called after an answer, so friends'
+	// calls spread out (#24 review); nil means uniformly random.
+	Jitter func(max time.Duration) time.Duration
 	// Timeout bounds one call (default 30 s).
 	Timeout time.Duration
 	Log     *slog.Logger
@@ -82,6 +87,7 @@ type Exchanger struct {
 	mu       sync.Mutex
 	quotas   map[string]int64         // peer -> quota last seen
 	answered map[string]time.Time     // peer -> last answer
+	early    map[string]time.Duration // peer -> how much earlier than Refresh it is next due
 	next     map[string]time.Time     // peer -> not before, after a failure
 	backoff  map[string]time.Duration // peer -> the wait after its next failure
 	due      map[string]bool          // peer -> asked for by Due
@@ -100,6 +106,7 @@ func (x *Exchanger) init() {
 	x.once.Do(func() {
 		x.kick = make(chan struct{}, 1)
 		x.quotas, x.answered, x.next = map[string]int64{}, map[string]time.Time{}, map[string]time.Time{}
+		x.early = map[string]time.Duration{}
 		x.backoff, x.due, x.inflight = map[string]time.Duration{}, map[string]bool{}, map[string]bool{}
 	})
 }
@@ -182,7 +189,7 @@ func (x *Exchanger) Pass(ctx context.Context) {
 			continue
 		}
 		last, ok := x.answered[f.Peer]
-		if f.OwnNumber != f.ToldNumber || x.due[f.Peer] || !ok || now.Sub(last) >= or(x.Refresh, defaultRefresh) {
+		if f.OwnNumber != f.ToldNumber || x.due[f.Peer] || !ok || now.Sub(last) >= or(x.Refresh, defaultRefresh)-x.early[f.Peer] {
 			delete(x.due, f.Peer)
 			x.inflight[f.Peer] = true
 			todo = append(todo, f)
@@ -192,6 +199,7 @@ func (x *Exchanger) Pass(ctx context.Context) {
 		if !seen[p] { // removed
 			delete(x.quotas, p)
 			delete(x.answered, p)
+			delete(x.early, p)
 			delete(x.next, p)
 			delete(x.backoff, p)
 			delete(x.due, p)
@@ -272,6 +280,7 @@ func (x *Exchanger) exchange(ctx context.Context, f state.Friendship, req contro
 	delete(x.inflight, f.Peer)
 	if err == nil {
 		x.answered[f.Peer] = now
+		x.early[f.Peer] = x.jitter()
 		delete(x.backoff, f.Peer)
 		delete(x.next, f.Peer)
 	}
@@ -285,6 +294,15 @@ func (x *Exchanger) exchange(ctx context.Context, f state.Friendship, req contro
 			"their_number", resp.Number, "quota", resp.Quota)
 	}
 	x.Kick() // a changed quota reaches Changed
+}
+
+// jitter is how much earlier than Refresh the next call is due.
+func (x *Exchanger) jitter() time.Duration {
+	upTo := or(x.Refresh, defaultRefresh) / 10
+	if x.Jitter != nil {
+		return min(max(x.Jitter(upTo), 0), upTo)
+	}
+	return rand.N(upTo + 1)
 }
 
 func (x *Exchanger) call(ctx context.Context, f state.Friendship, req control.QuotaRequest) (control.QuotaResponse, error) {
