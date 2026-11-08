@@ -2026,8 +2026,7 @@ upstream bucket is Q-V.
     that is `removed`, whose last answer was `507` (condition `quota`,
     below), or that is gone past `replace_after` is not a candidate;
   - a delete first cancels the key's `queued` puts that no sender has
-    taken and no metadata written since waits for (*Deletes*, below,
-    #21), then goes to every friend whose latest remaining row of the
+    taken (*Deletes*, below, #21), then goes to every friend whose latest remaining row of the
     key is a put, in any state (REPL-2): every place that holds or may
     hold it, and one that refused it, which may hold older bytes;
   - a healing re-upload of a data key (*Healing*, below) goes where the
@@ -2280,17 +2279,17 @@ upstream bucket is Q-V.
     never both. A taken row stays taken, through a failed send, a
     retry and a restart: a send whose answer was lost may have landed,
     so the delete must follow it (`TestDeleteFollowsAPutInFlightAndPrecedesARewrite`).
-  - *Except what metadata waits for.* A put is not cancelled when a
-    metadata or snapshot row of its bucket was captured between it and
-    the delete: that metadata was written while the put was the key's
-    bytes and waits for it (the barrier, REPL-1, keeps holding it), so
-    the put is sent, then the metadata, then the delete, and the lender
-    keeps the bytes as a tomb (RET-1). Cancelling it instead would send
-    metadata that references data no place ever got, and leave nothing
-    for `undelete` (RET-3) to restore. In practice this covers every
-    prune: restic and Kopia delete only packs that earlier indexes
-    listed, so a backlog's packs are sent and tombstoned, not dropped;
-    the cancel serves a write deleted before any metadata named it.
+  - *Even what metadata waits for.* The cancel applies when metadata of
+    the bucket was captured between the put and the delete too: the
+    store no longer holds the put's bytes, so it could never be sent
+    (its sender would find it `Superseded` and cancel it). The barrier
+    then no longer waits for it, so that metadata can go offsite naming
+    a pack no friend got, until the prune's new index and the
+    metadata's own delete follow it; locally those bytes are gone
+    already. And RET-3's `undelete` can restore only what reached a
+    lender: a pack deleted before it was sent, a backlog's packs pruned
+    during an outage among them, is lost to it. Keeping the local bytes
+    until every place has them is a follow-up the coordinator files.
   - *Then follow what remains.* The delete is queued at each friend
     whose latest remaining row of the key is a put (taken, acked,
     refused or dropped), at its sequence, so it is behind every
@@ -2322,7 +2321,7 @@ upstream bucket is Q-V.
     listed (`TestKeyTombstonedAtEveryPlaceIsNotRecovered`); `restic
     forget --prune` and Kopia's full maintenance end to end:
     `TestResticPruneTombstonesAtEveryFriend`, `TestReplicateKopiaToFriend`.
-  *Decision (#21): cancel only what never left, and follow metadata.*
+  *Decision (#21): cancel only what never left, and follow the rest.*
   Replicators differ here. rclone `sync` deletes on the destination
   after its transfers by default (`--delete-after`), so a delete never
   precedes the copies that replace what it removes. S3 Replication
@@ -2335,8 +2334,7 @@ upstream bucket is Q-V.
   rclone's deletes follow its transfers; and the lender keeps what it
   held, as S3's destination does, in a tomb for the window. A put the
   place never saw has nothing to keep, so it is cancelled, which a
-  sender's claim makes safe against a send in flight, unless metadata
-  already waits for it.
+  sender's claim makes safe against a send in flight.
 - **REPL-13, the re-placement worker.** It runs after every change to
   the pool (friend added or removed, quota changed, a verification
   failed, an overflow target added) and hourly. It computes for each

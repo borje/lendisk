@@ -55,17 +55,17 @@ func TestDeleteCancelsAnUnstartedPutInsteadOfFollowingIt(t *testing.T) {
 	p.wantPlaces("index/1's unsent second version", m2)
 	p.wantPlaces("delete of index/1", mdel, "B", "C", "D")
 
-	// A put that metadata written after it waits for (REPL-1) is not
-	// cancelled: the metadata was written while the put was the key's
-	// bytes, so they go first and the delete follows.
+	// Metadata written between the put and its delete does not keep the
+	// put: the store no longer holds its bytes, so it could only be
+	// cancelled when its turn came (#21 review). It is cancelled now,
+	// and the index no longer waits for it.
 	w := p.put("laptop", "data/3", "data", 1)
-	at := p.places(w)
 	idx := p.put("laptop", "index/2", "metadata", 0.1)
 	wdel := p.del("laptop", "data/3", "data")
-	p.wantPlaces("data/3 after an index and its delete", w, at...)
-	p.wantPlaces("delete of data/3", wdel, at...)
-	if !p.held(idx) {
-		t.Fatal("the index written before the delete no longer waits for data/3")
+	p.wantPlaces("data/3 after an index and its delete", w)
+	p.wantPlaces("delete of data/3", wdel)
+	if p.held(idx) {
+		t.Fatal("the index waits for a put its delete cancelled")
 	}
 
 	// A put cancelled by a delete is no longer the sender's to send.

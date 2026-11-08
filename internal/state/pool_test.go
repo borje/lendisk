@@ -62,6 +62,20 @@ func (p *pool) put(bucket, key, class string, units float64) int64 {
 	return seqs[0]
 }
 
+// rewrite captures a completed put of key with other bytes than put's.
+func (p *pool) rewrite(bucket, key, class string, units float64) int64 {
+	p.t.Helper()
+	ctx := context.Background()
+	seqs, err := p.db.BeginCaptures(ctx, []Capture{{Bucket: bucket, Key: key, Op: OpPut, Class: class}})
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	if _, err := p.db.FinishPut(ctx, seqs[0], int64(units*float64(unit))-ObjectOverhead, "h2-"+key); err != nil {
+		p.t.Fatal(err)
+	}
+	return seqs[0]
+}
+
 func (p *pool) del(bucket, key, class string) int64 {
 	p.t.Helper()
 	ctx := context.Background()
@@ -367,15 +381,19 @@ func TestMetadataBarrier(t *testing.T) {
 	if !p.held(dm) {
 		t.Fatal("metadata delete not held with data/2 queued")
 	}
-	// data/2 is deleted: its queued rows will be cancelled, so metadata
-	// written after the delete is not held by them. The snapshot written
-	// before the delete still is (#19 review).
-	p.del("laptop", "data/2", "data")
+	// data/2 is written again (acknowledged at once): its first
+	// version's queued rows will be cancelled, so metadata written after
+	// the new write is not held by them. The snapshot written before it
+	// still is (#19 review).
+	r := p.rewrite("laptop", "data/2", "data", 1)
+	for _, f := range p.places(r) {
+		p.ack(f, r)
+	}
 	if s2 := p.put("laptop", "snapshots/2", "snapshot", 0.1); p.held(s2) {
 		t.Fatal("a put superseded before the metadata holds it")
 	}
 	if !p.held(s) {
-		t.Fatal("a delete written after the snapshot released it")
+		t.Fatal("a write after the snapshot released it")
 	}
 }
 
@@ -616,16 +634,22 @@ func TestAFullFriendWithNowhereElseDoesNotHoldTheBarrier(t *testing.T) {
 
 // REPL-1 (#19 review): a queued data put superseded only by a write
 // after the metadata still holds that metadata: the metadata was
-// written while the put was the key's bytes.
+// written while the put was the key's bytes. A delete after the
+// metadata cancels an unsent put at once, which then holds nothing:
+// its bytes are gone from the store (#21 review).
 func TestASupersedingWriteAfterTheMetadataDoesNotReleaseIt(t *testing.T) {
 	p := newPool(t)
 	p.friend("B", 10)
 	p.bucket("laptop", 1)
 	p.put("laptop", "data/1", "data", 1)
 	m := p.put("laptop", "index/1", "metadata", 0.5)
-	p.del("laptop", "data/1", "data")
+	p.rewrite("laptop", "data/1", "data", 1)
 	if !p.held(m) {
-		t.Fatal("index/1 released by a delete of data/1 written after it")
+		t.Fatal("index/1 released by a write of data/1 after it")
+	}
+	p.del("laptop", "data/1", "data")
+	if p.held(m) {
+		t.Fatal("index/1 held by puts a delete cancelled")
 	}
 }
 

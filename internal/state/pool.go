@@ -267,10 +267,9 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 // placeTx places the completed queue row seq (REPL-12), in the
 // transaction that completes it:
 //   - a delete first cancels every queued put of the key that no
-//     sender has taken (StartPlacement) and no metadata written since
-//     waits for (Held), then goes to every friend whose latest row of
-//     the key is still a put (REPL-2, #21): every place that holds or
-//     may hold it;
+//     sender has taken (StartPlacement), then goes to every friend
+//     whose latest row of the key is still a put (REPL-2, #21): every
+//     place that holds or may hold it;
 //   - a metadata or snapshot put goes to every friend;
 //   - a data put goes to `copies` friends by choose. A healing re-upload
 //     (heal, #57) goes where the row it heals was placed, topped up to
@@ -297,17 +296,11 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 	switch {
 	case op == OpDelete:
 		// A put no sender has taken is cancelled, not followed: nothing
-		// of it reached the place (REPL-2, #21). One taken may have
-		// landed, and stays ahead of the delete in its FIFO. So does one
-		// that metadata of the bucket written after it waits for (Held):
-		// that metadata was written while the put was the key's bytes,
-		// and goes offsite only after them (REPL-1); the lender then
-		// keeps them as a tomb (RET-1).
-		if _, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE bucket = ?1 AND key = ?2 AND op = 'put'
-			AND state = 'queued' AND started_at IS NULL AND seq < ?3
-			AND NOT EXISTS (SELECT 1 FROM queue m WHERE m.seq > placement.seq AND m.seq < ?3
-				AND m.bucket = ?1 AND m.class IN ('metadata', 'snapshot') AND m.state = 'done')`,
-			bucket, key, seq); err != nil {
+		// of it reached the place (REPL-2, #21), and the store no longer
+		// holds its bytes. One taken may have landed, and stays ahead of
+		// the delete in its FIFO.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE bucket = ? AND key = ? AND op = 'put'
+			AND state = 'queued' AND started_at IS NULL AND seq < ?`, bucket, key, seq); err != nil {
 			return err
 		}
 		targets, err = column(ctx, tx, `SELECT DISTINCT p.place FROM placement p JOIN friendship f ON f.peer_key = p.place
