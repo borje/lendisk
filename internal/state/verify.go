@@ -285,9 +285,17 @@ type VerifyOutcome struct {
 	Detail           string
 }
 
+// VerifyKept is how long a verify request is kept: requests older are
+// dropped at the next one.
+const VerifyKept = 7 * 24 * time.Hour
+
 // RequestVerify records a request for the daemon to check place's
-// replica of bucket (VER-3), and returns its ID.
+// replica of bucket (VER-3), and returns its ID. Requests older than
+// VerifyKept, done or not, are dropped.
 func (db *DB) RequestVerify(ctx context.Context, place, bucket string, full bool, now time.Time) (int64, error) {
+	if _, err := db.ExecContext(ctx, `DELETE FROM verify_request WHERE requested_at < ?`, now.Add(-VerifyKept).Unix()); err != nil {
+		return 0, err
+	}
 	r, err := db.ExecContext(ctx, `INSERT INTO verify_request (place, bucket, full, requested_at) VALUES (?, ?, ?, ?)`,
 		place, bucket, full, now.Unix())
 	if err != nil {

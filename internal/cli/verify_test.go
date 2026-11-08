@@ -127,6 +127,29 @@ func TestVerifyOnDemandAndStatus(t *testing.T) {
 		t.Fatalf("status:\n%s", text)
 	}
 
+	// B gets the object back. A ranged check passes but leaves the mark
+	// (#27 review); a full one clears it.
+	lost, err := os.ReadFile(filepath.Join(an.data, "store", "laptop", "data", "03"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "data", "03"), lost, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, e = an.run("", "", "verify", "laptop", "--peer", bKey)
+	if code != 0 || strings.Contains(out, " verified:") || !strings.Contains(out, "stays unverified") {
+		t.Fatalf("a ranged verify of an unverified replica: %d %s%s", code, out, e)
+	}
+	if !replicaOf(t, an, "laptop", bKey).Unverified {
+		t.Fatal("a ranged pass cleared the mark")
+	}
+	if code, out, e = an.run("", "", "verify", "laptop", "--peer", bKey, "--full"); code != 0 || !strings.Contains(out, " verified:") {
+		t.Fatalf("a full verify after the object came back: %d %s%s", code, out, e)
+	}
+	if replicaOf(t, an, "laptop", bKey).Unverified {
+		t.Fatal("a full pass left the mark")
+	}
+
 	// With the daemon stopped, verify says so.
 	a.p.kill()
 	if code, _, e := an.run("", "", "verify", "laptop", "--peer", bKey); code != 1 || !strings.Contains(e, "daemon is not running") {

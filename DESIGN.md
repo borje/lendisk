@@ -4038,7 +4038,14 @@ the handler's own reads and is never cancelled; nothing below
   by default), 4 failed. It does not dial the friend itself: one
   tunnel client per dial key at a relay (§3.7, #69), so a second
   process dialling with the daemon's key would stall both. The daemon
-  runs requests ahead of the daily challenges. `--full` sends a
+  runs requests ahead of the daily challenges. While it waits, the
+  command checks every poll that the daemon still runs (exit 1 when it
+  stopped), and on an interrupt, a timeout or a stopped daemon takes
+  its request back with a context of its own
+  (`TestVerifyStopsWaitingForAGoneDaemon`). A ranged check of a replica
+  marked unverified prints that it passed and stays unverified until
+  `--full` passes. Requests older than a week are dropped at the next
+  one (`state.VerifyKept`). `--full` sends a
   whole-object challenge for every object the friend acknowledged
   (`Whole`, no range; `ChallengeablePage` in pages of 256): the lender
   streams the object into the HMAC and answers 32 bytes, the borrower

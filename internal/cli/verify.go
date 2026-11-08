@@ -1,8 +1,12 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -31,8 +35,11 @@ With --full, every object the friend acknowledged is checked whole by the
 same HMAC: the friend reads every byte, none crosses the network, and a
 replica marked unverified is marked verified again once it passes.
 
-The daemon runs the check, so it must be running. Exit codes: 0
-verified; 1 an error, no answer from the friend, or nothing to check;
+The daemon runs the check, so it must be running; one check runs at a
+time, so a long --full check holds up the daily ones. A ranged check of
+a replica marked unverified says it passed, and the replica stays
+unverified until --full passes. Exit codes: 0 verified or passed; 1 an
+error, no answer from the friend, nothing to check, or the daemon stopped;
 2 a usage error; 3 timed out; 4 verification failed: the friend does not
 hold what it acknowledged, its replica is marked unverified, and its
 copies move to other friends.`,
@@ -48,7 +55,9 @@ copies move to other friends.`,
 			if timeout < 0 {
 				return usageError{fmt.Errorf("--timeout %v is negative; 0 waits without a limit", timeout)}
 			}
-			ctx := cmd.Context()
+			// An interrupt ends the wait and takes the request back.
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
 			cfg, db, err := a.openState(ctx)
 			if err != nil {
 				return err
@@ -77,6 +86,13 @@ copies move to other friends.`,
 			if err != nil {
 				return err
 			}
+			// Taking the request back must work once ctx has ended (an
+			// interrupt), so it gets a context of its own.
+			takeBack := func() {
+				cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+				defer cancel()
+				db.CancelVerify(cctx, id)
+			}
 			start := a.now()
 			for {
 				o, done, err := db.VerifyResult(ctx, id)
@@ -84,15 +100,19 @@ copies move to other friends.`,
 					return err
 				}
 				if done {
-					return a.verifyOutcome(bucket, peer, full, o)
+					return a.verifyOutcome(ctx, db, bucket, peer, full, o)
 				}
 				if timeout > 0 && a.now().Sub(start) >= timeout {
-					db.CancelVerify(ctx, id)
+					takeBack()
 					return codeError{fmt.Errorf("timed out after %v waiting for the daemon's check of %s at %s", timeout, bucket, peer), 3}
 				}
 				if err := a.pause(ctx, verifyPoll); err != nil {
-					db.CancelVerify(ctx, id)
+					takeBack()
 					return err
+				}
+				if !daemonRunning(cfg.DataDir) {
+					takeBack()
+					return errors.New("the daemon stopped before it ran the check: start `lendisk serve`, then verify again")
 				}
 			}
 		},
@@ -105,10 +125,11 @@ copies move to other friends.`,
 
 // verifyOutcome prints o, the check of bucket's replica at peer, or
 // returns it as an error with its exit code.
-func (a *app) verifyOutcome(bucket, peer string, full bool, o state.VerifyOutcome) error {
+func (a *app) verifyOutcome(ctx context.Context, db *state.DB, bucket, peer string, full bool, o state.VerifyOutcome) error {
 	skipped := ""
 	if o.Skipped > 0 {
-		skipped = fmt.Sprintf("; %s skipped, with no local copy as captured to compare with", plural(o.Skipped, "object", "objects"))
+		skipped = fmt.Sprintf("; %s skipped, with no local copy as captured to compare with, or changed while challenged",
+			plural(o.Skipped, "object", "objects"))
 	}
 	switch o.Outcome {
 	case state.VerifyPassed:
@@ -116,7 +137,22 @@ func (a *app) verifyOutcome(bucket, peer string, full bool, o state.VerifyOutcom
 		if full {
 			how = "whole, by hash"
 		}
-		fmt.Fprintf(a.out, "%s at %s verified: %s checked %s%s\n", bucket, peer, plural(o.Checked, "object", "objects"), how, skipped)
+		checked := plural(o.Checked, "object", "objects")
+		if !full {
+			// A ranged pass leaves an unverified mark (§3.6): say so.
+			cs, err := db.ReplicaChecks(ctx)
+			if err != nil {
+				return err
+			}
+			for _, c := range cs {
+				if c.Place == peer && c.Bucket == bucket && c.Unverified() {
+					fmt.Fprintf(a.out, "%s at %s passed: %s checked %s%s; it stays unverified until `lendisk verify %s --peer %s --full` passes\n",
+						bucket, peer, checked, how, skipped, bucket, peer)
+					return nil
+				}
+			}
+		}
+		fmt.Fprintf(a.out, "%s at %s verified: %s checked %s%s\n", bucket, peer, checked, how, skipped)
 		return nil
 	case state.VerifyFailed:
 		return codeError{fmt.Errorf("verification of %s at %s failed: %s; the replica is marked unverified and its copies move to other friends",

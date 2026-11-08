@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"testing"
 	"time"
@@ -298,6 +299,14 @@ func TestVerifyRequestsRoundTrip(t *testing.T) {
 	r, done, err := p.db.VerifyResult(ctx, id)
 	if err != nil || !done || r.Outcome != VerifyFailed || r.Checked != 3 || r.Skipped != 1 || r.Detail != "lost" {
 		t.Fatalf("result %+v %v %v", r, done, err)
+	}
+	// Requests older than a week are dropped at the next one (#27 review).
+	p.now = p.now.Add(8 * 24 * time.Hour)
+	if _, err := p.db.RequestVerify(ctx, "B", "laptop", false, p.now); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := p.db.VerifyResult(ctx, id); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a week-old request: %v", err)
 	}
 }
 
