@@ -175,14 +175,13 @@ func TestRemovingAFriendEndsItsRunningTransfer(t *testing.T) {
 // as told. A–C is untouched: both still list each other, and C's open
 // connection at A is still served.
 func TestEndingAFriendshipTellsTheFriendAndLeavesTheOthers(t *testing.T) {
-	// Not parallel: under load B's answer to the remove call is lost
-	// at times, when B's ending cuts the connection carrying it, and A
-	// then never records B as told (B refuses its retries before any
-	// data); see parallel_test.go.
+	// Both daemons run as processes, so the test holds no gateway and
+	// runs beside the others; B answers the remove call before its
+	// ending cuts the connection (#84).
+	parallel(t, 2)
 	a, b, c := friendNode(t), friendNode(t), friendNode(t)
-	a.tuneEnding = func(f *farewell) { f.Interval = 200 * time.Millisecond }
-	stop := a.serveLogged()
-	defer stop()
+	pa := newProcNode(t, a, envFarewellInterval+"=200ms")
+	pa.start()
 	pb := newProcNode(t, b, envAlertInterval+"=200ms")
 	pb.start()
 	befriend(t, a, b)

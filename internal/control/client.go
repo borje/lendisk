@@ -6,11 +6,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/borje/lendisk/internal/gateway"
 )
@@ -41,6 +44,24 @@ type CallError struct {
 func (e *CallError) Error() string {
 	return fmt.Sprintf("the peer refused (%d): %s", e.Status, e.Message)
 }
+
+// ErrNotConnected is in the chain of a call's error when no connection
+// to the peer's tunnel port was made: the peer is unreachable, or its
+// tunnel refuses this node's key. tailcat ignores a refused key's
+// handshake, so the two look alike to the caller (#84).
+var ErrNotConnected = errors.New("no connection to the peer")
+
+// ErrNoAnswer is in the chain of a call's error when the request was
+// written whole on a connection to the peer and no answer came: the
+// peer received it, or the connection broke on the way (#84).
+var ErrNoAnswer = errors.New("the request was sent and no answer came")
+
+// stageError is err, marked with how far the call got (ErrNotConnected
+// or ErrNoAnswer); its message is err's.
+type stageError struct{ stage, err error }
+
+func (e *stageError) Error() string   { return e.err.Error() }
+func (e *stageError) Unwrap() []error { return []error{e.stage, e.err} }
 
 // Redeem completes the invite handshake (PEER-2) on a connection dialled
 // with the invite key.
@@ -180,8 +201,19 @@ func (c *Client) sendProto(ctx context.Context, method, path string, body io.Rea
 	if body != nil {
 		r.Header.Set("Content-Type", contentType)
 	}
+	var connected, wrote atomic.Bool
+	r = r.WithContext(httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn:      func(httptrace.GotConnInfo) { connected.Store(true) },
+		WroteRequest: func(w httptrace.WroteRequestInfo) { wrote.Store(w.Err == nil) },
+	}))
 	resp, err := c.HTTP.Do(r)
 	if err != nil {
+		switch {
+		case !connected.Load():
+			err = &stageError{ErrNotConnected, err}
+		case wrote.Load():
+			err = &stageError{ErrNoAnswer, err}
+		}
 		return nil, "", err
 	}
 	defer resp.Body.Close()

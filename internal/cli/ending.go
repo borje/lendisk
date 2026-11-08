@@ -29,6 +29,9 @@ import (
 //     a connection closed after the disconnect never tells the client;
 //   - tells a friend that this node ended it (Tell, the remove call),
 //     retried with a backoff from a minute to an hour until it answers;
+//     an answer that it holds no friendship (403) counts as told, and
+//     so do tellRefusals tries in a row that never connect after a try
+//     whose request was sent whole and got no answer (#84);
 //   - at the end of the retention window purges the friend's replica
 //     here (Purge: its lent buckets and its manifest) and forgets it, on
 //     a goroutine of its own, one friend at a time, so a slow purge
@@ -60,14 +63,27 @@ type farewell struct {
 	next    map[string]time.Time     // peer -> when to tell it next
 	backoff map[string]time.Duration // peer -> the wait after its next failure
 	telling map[string]bool
-	purging bool // purges are running (startPurges)
-	wg      sync.WaitGroup
+	// sent marks a peer whose remove call was sent whole and got no
+	// answer; refusals counts the tries since that never connected.
+	sent     map[string]bool
+	refusals map[string]int
+	purging  bool // purges are running (startPurges)
+	wg       sync.WaitGroup
 }
 
 const (
 	tellMinBackoff = time.Minute
 	tellMaxBackoff = time.Hour
 	tellTimeout    = 30 * time.Second
+	// tellRefusals is how many tries in a row that never connect, after
+	// a remove call sent whole and unanswered, count as told (#84). A
+	// friend that got the call ends the friendship and refuses this
+	// node's key at connect, which tailcat shows as no connection, the
+	// same as an offline friend; a friend still holding the friendship
+	// admits the key. Three tries span the backoff's first seven minutes:
+	// a friend that went offline just as it got the call, without
+	// ending it, would have to stay offline that long.
+	tellRefusals = 3
 )
 
 func (f *farewell) init() {
@@ -127,6 +143,7 @@ func (f *farewell) pass(ctx context.Context) {
 	f.mu.Lock()
 	if f.cut == nil {
 		f.cut, f.next, f.backoff, f.telling = map[string]time.Time{}, map[string]time.Time{}, map[string]time.Duration{}, map[string]bool{}
+		f.sent, f.refusals = map[string]bool{}, map[string]int{}
 	}
 	seen := map[string]bool{}
 	var revoke []state.FormerFriend
@@ -142,6 +159,8 @@ func (f *farewell) pass(ctx context.Context) {
 			delete(f.cut, p)
 			delete(f.next, p)
 			delete(f.backoff, p)
+			delete(f.sent, p)
+			delete(f.refusals, p)
 		}
 	}
 	f.mu.Unlock()
@@ -259,11 +278,24 @@ func (f *farewell) tell(ctx context.Context, ff state.FormerFriend, now time.Tim
 		err := f.Tell(tctx, ff)
 		cancel()
 		var ce *control.CallError
-		if errors.As(err, &ce) && ce.Status == http.StatusForbidden {
-			err = nil // it holds no friendship with this node either
-		}
 		f.mu.Lock()
 		delete(f.telling, ff.Peer)
+		refusing := false
+		switch {
+		case err == nil:
+		case errors.As(err, &ce) && ce.Status == http.StatusForbidden:
+			err = nil // it holds no friendship with this node either
+		case errors.Is(err, control.ErrNoAnswer):
+			f.sent[ff.Peer], f.refusals[ff.Peer] = true, 0
+		case errors.Is(err, control.ErrNotConnected) && f.sent[ff.Peer]:
+			f.refusals[ff.Peer]++
+			if f.refusals[ff.Peer] >= tellRefusals {
+				refusing, err = true, nil
+			}
+		default: // it answered, or the try failed some other way
+			delete(f.sent, ff.Peer)
+			delete(f.refusals, ff.Peer)
+		}
 		if err != nil {
 			b := f.backoff[ff.Peer]
 			if b == 0 {
@@ -280,6 +312,9 @@ func (f *farewell) tell(ctx context.Context, ff state.FormerFriend, now time.Tim
 		if err != nil {
 			msg = err.Error()
 			f.Log.Warn("ending friendships: telling the former friend failed; trying again later", "peer", ff.Peer, "err", err)
+		} else if refusing {
+			f.Log.Info("ending friendships: the former friend got the remove call and refuses this node's key since; counted as told",
+				"peer", ff.Peer, "tries", tellRefusals)
 		} else {
 			f.Log.Info("ending friendships: the former friend was told", "peer", ff.Peer)
 		}

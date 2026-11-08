@@ -31,9 +31,14 @@ type Server struct {
 	// admission forgets its rejections (Admission.Clear, SEC-15).
 	Changed func()
 	// Ended is called after the remove call ended a friendship, so the
-	// daemon cuts the former friend's connections (SEC-15) at once. It
-	// must not block.
+	// daemon cuts the former friend's connections (SEC-15) at once, but
+	// only once the caller has the answer (remove, #84). It must not
+	// block.
 	Ended func()
+	// AnswerWait bounds how long the remove call waits, after its
+	// answer, for the caller to close the connection before Ended runs
+	// (#84); zero means DefaultAnswerWait.
+	AnswerWait time.Duration
 	// Manifests keeps the manifests friends push (ID-4); nil answers
 	// the manifest call 404.
 	Manifests ManifestStore
@@ -320,13 +325,24 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, c Caller) {
 	writeJSON(w, http.StatusOK, page)
 }
 
+// DefaultAnswerWait is Server.AnswerWait when it is zero.
+const DefaultAnswerWait = 5 * time.Second
+
 // remove is the remove call (PEER-5, #25): the caller ended the
 // friendship on its side and tells this node, which ends it here too,
 // recorded as ended by the friend. It is keyed by the resolved caller
-// alone. The answer is written, with its length and Connection: close,
-// before Ended runs: ending the friendship cuts this very connection
-// (SEC-15). A caller that is no friend by now is answered as told; the
+// alone. A caller that is no friend by now is answered as told; the
 // middleware refuses it before it gets here in any case.
+//
+// Ending the friendship cuts this very connection and drops the
+// caller's tunnel (Ended, SEC-15), and an answer written and flushed is
+// not yet delivered: the tunnel's send buffer and retransmissions go
+// with the tunnel (#84). So the answer carries its length and
+// Connection: close, and Ended runs only once the caller has it: the
+// connection is hijacked and read until the caller closes it, as a
+// client does after such an answer, or for AnswerWait at the most.
+// The bridge leaves a hijacked connection's reads to its handler when
+// it cuts it, closing it after its grace at the latest.
 func (s *Server) remove(w http.ResponseWriter, r *http.Request, c Caller) {
 	if c.Role != state.RolePeer {
 		Error(w, http.StatusForbidden, "the remove call is only for a friend")
@@ -352,10 +368,29 @@ func (s *Server) remove(w http.ResponseWriter, r *http.Request, c Caller) {
 	w.Header().Set("Connection", "close")
 	w.WriteHeader(http.StatusOK)
 	w.Write(body)
-	http.NewResponseController(w).Flush()
+	rc := http.NewResponseController(w)
+	rc.Flush()
 	if err == nil && s.Ended != nil {
+		s.awaitClose(rc)
 		s.Ended()
 	}
+}
+
+// awaitClose hijacks the connection of an answer already flushed and
+// reads it until the client closes it, or for AnswerWait at the most,
+// then closes it (remove).
+func (s *Server) awaitClose(rc *http.ResponseController) {
+	conn, brw, err := rc.Hijack()
+	if err != nil {
+		return // not hijackable: nothing to wait on
+	}
+	defer conn.Close()
+	wait := s.AnswerWait
+	if wait <= 0 {
+		wait = DefaultAnswerWait
+	}
+	conn.SetReadDeadline(time.Now().Add(wait))
+	io.Copy(io.Discard, io.LimitReader(brw, maxBody))
 }
 
 // Error writes a control API error.

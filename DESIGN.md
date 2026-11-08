@@ -1569,8 +1569,37 @@ upstream bucket is Q-V.
   retried with a backoff of a minute doubling to an hour while the
   window lasts; a 403 means it holds no friendship either and counts
   as told. The callee, in the `peer` role, ends the friendship on its
-  side with `by_peer` set (and so told), answers before its own cut
-  closes that very connection, and raises `friend_removed` (§3.8).
+  side with `by_peer` set (and so told), answers, and raises
+  `friend_removed` (§3.8). Its own cut and disconnect (`Server.Ended`,
+  the farewell's Kick) wait until the caller has the answer (#84): an
+  answer written and flushed is still in the tunnel's send buffer, and
+  dropping the tunnel loses it, so the caller's tell timed out and its
+  retries met a key refused at connect. The answer carries its length
+  and `Connection: close`; the handler then hijacks the connection
+  and reads it until the caller closes it, as a client does after such
+  an answer, or for `Server.AnswerWait` (5 s) at the most, and only then
+  calls `Ended`. A farewell pass that cuts the caller meanwhile leaves
+  a hijacked connection's reads to its handler and waits for it to
+  close, for `Conns.Grace` at the most (§3.9 SEC-15;
+  `TestRemoveCallEndsOnlyOnceTheCallerHasTheAnswer`,
+  `TestCutLeavesAHijackedConnectionsReadsToItsHandler`).
+  *Decision (#84): a refusal at connect counts as told only after the
+  call was sent.* A friend that ended it refuses the caller's key at
+  connect, and tailcat ignores a refused key's handshake, so the
+  caller cannot tell that from an offline friend: both are a dial that
+  never connects. `control.Client` marks a failed call with how far it
+  got, `control.ErrNotConnected` (no connection) or
+  `control.ErrNoAnswer` (the request written whole on a connection,
+  no answer), traced with `net/http/httptrace`. The farewell counts
+  the friend as told after a try that ended `ErrNoAnswer` followed by
+  three tries in a row that never connect (`tellRefusals`; with the
+  backoff, about seven minutes): a friend still holding the friendship
+  admits the key, so it would have to go offline just as the call
+  reached it and stay offline that long. Any other outcome in between
+  (an answer, a 500) starts over; a dial that never connects without
+  such a try never counts. The mark is kept in memory only: after a
+  restart the farewell keeps retrying as before, so no migration
+  (`TestAFriendThatRefusesAfterTheRemoveCallCountsAsTold`).
   `status` lists ended friendships (`former_friends`, with who ended
   it, whether the friend was told and the purge time).
   *Decision (#25): the other side ends it too, automatically, and is
@@ -4398,7 +4427,22 @@ the handler's own reads and is never cancelled; nothing below
   answer (403 `AccessDenied`, `state.NoRelationship`, `Connection:
   close`, with its length) and the connection is then hijacked and
   closed; an idle connection is closed at once; a busy one that does
-  not end within `Conns.Grace` (2 s) is closed anyway
+  not end within `Conns.Grace` (2 s) is closed anyway. A connection
+  its handler hijacked (`http.StateHijacked`, seen by `ServeTunnel`'s
+  ConnState) keeps its read deadline: the remove call reads it until
+  its caller closes it after the answer (§3.2 PEER-5, #84), and `Cut`
+  waits for the handler to close it, within the grace. The removed
+  answer is delivered the same way (#84, CI on 2b1f67e: B's transfer
+  timed out with no answer): `writeCut` writes it with `Connection:
+  close`, hijacks the connection and reads it until the client closes
+  it, for `Conns.Linger` (5 s) at the most, and only then closes it, so
+  neither a close with unread body bytes (a reset) nor the disconnect
+  after `Cut` discards an answer still in the tunnel's send buffer.
+  `Cut` waits for such a connection for the grace from the cut or
+  `Linger` from the hijack, whichever ends later. A client still
+  sending its body keeps sending until its write fails, so it gets the
+  answer when the connection closes after `Linger`
+  (`TestCutClosesOnlyOnceTheClientHasTheRemovedAnswer`)
   (`TestCutCancelsInFlightRequestsAndClosesTheKeysConnections`; over
   the real tunnel, spike #3's order, `TestCutThenDisconnect`;
   `TestFarewellRevokesInOrderTellsAndPurges`). The SEC-15 AC,

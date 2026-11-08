@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
 )
@@ -251,5 +253,110 @@ func TestFarewellRevokesInOrderTellsAndPurges(t *testing.T) {
 	fw2.wait()
 	if got := s.take(); !slices.Equal(got, []string{"clear (B committed: true)", "cut [C]", "disconnect C", "cut [C]"}) {
 		t.Fatalf("after a restart: %q", got)
+	}
+}
+
+// PEER-5 (#84): a friend that got the remove call ends the friendship
+// and from then refuses this node's key at connect, which looks like
+// being unreachable (control.ErrNotConnected). So after a try whose
+// request was sent whole and got no answer (control.ErrNoAnswer),
+// tellRefusals tries in a row that never connect count as told. Without
+// such a try, failing to connect never counts: the friend may just be
+// offline. Any answer in between starts the count over, and an answer
+// that it holds no friendship (403) counts as told at once.
+func TestAFriendThatRefusesAfterTheRemoveCallCountsAsTold(t *testing.T) {
+	parallel(t, 0)
+	ctx := t.Context()
+	db, err := state.Open(ctx, t.TempDir(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	b, c, d := newID(t).NodeID(), newID(t).NodeID(), newID(t).NodeID()
+	now := time.Unix(1_800_000_000, 0)
+	for _, p := range []identity.NodeID{b, c, d} {
+		if err := db.AddFriendship(ctx, state.Friendship{Peer: p.String(), Address: "tc" + p.String(), CreatedAt: now}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.RemoveFriendship(ctx, p.String(), false, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	answers := map[identity.NodeID][]error{}
+	tries := map[identity.NodeID]int{}
+	set := func(p identity.NodeID, errs ...error) { mu.Lock(); answers[p] = errs; mu.Unlock() }
+	wrap := func(stage error) error { return fmt.Errorf("%w: %w", stage, context.DeadlineExceeded) }
+	noAnswer, notConnected := wrap(control.ErrNoAnswer), wrap(control.ErrNotConnected)
+	refused := &control.CallError{Status: http.StatusInternalServerError, Message: "try again"}
+	// B got the call and lost the answer, then refuses at connect. C is
+	// offline throughout. D lost the answer, then answered 500 (it failed
+	// to end it), so the count starts over at its next lost answer.
+	set(b, noAnswer, notConnected, notConnected, notConnected)
+	set(c, notConnected, notConnected, notConnected, notConnected, notConnected, notConnected)
+	set(d, noAnswer, notConnected, refused, noAnswer, notConnected, notConnected, notConnected)
+	fw := &farewell{DB: db, Log: slog.New(slog.DiscardHandler), Now: func() time.Time { return now },
+		Clear: func() {}, Cut: func(...identity.NodeID) int { return 0 }, Disconnect: func(identity.NodeID) bool { return false },
+		Tell: func(_ context.Context, f state.FormerFriend) error {
+			p, _ := identity.ParseNodeID(f.Peer)
+			mu.Lock()
+			defer mu.Unlock()
+			i := tries[p]
+			tries[p]++
+			if i >= len(answers[p]) {
+				return notConnected
+			}
+			return answers[p][i]
+		},
+		Purge: func(context.Context, string) error { return nil },
+	}
+	told := func(p identity.NodeID) bool {
+		fs, err := db.FormerFriends(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range fs {
+			if f.Peer == p.String() {
+				return !f.NotifiedAt.IsZero()
+			}
+		}
+		t.Fatalf("%s is no former friend", p)
+		return false
+	}
+	// Each pass is past every backoff.
+	for i := range 7 {
+		fw.pass(ctx)
+		fw.wait()
+		now = now.Add(2 * tellMaxBackoff)
+		mu.Lock()
+		tb, tc, td := tries[b], tries[c], tries[d]
+		mu.Unlock()
+		if want := min(i+1, 4); tb != want {
+			t.Fatalf("pass %d: B tried %d times, want %d", i, tb, want)
+		}
+		if got := told(b); got != (i >= 3) {
+			t.Fatalf("pass %d: B told %v", i, got)
+		}
+		if tc != i+1 || told(c) {
+			t.Fatalf("pass %d: C, never reached, tried %d times, told %v", i, tc, told(c))
+		}
+		if got := told(d); got != (i >= 6) || td != i+1 {
+			t.Fatalf("pass %d: D tried %d times, told %v", i, td, got)
+		}
+	}
+
+	// A 403 (no relationship) counts at once.
+	e := newID(t).NodeID()
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: e.String(), Address: "tcE", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RemoveFriendship(ctx, e.String(), false, now); err != nil {
+		t.Fatal(err)
+	}
+	set(e, &control.CallError{Status: http.StatusForbidden, Message: state.NoRelationship})
+	fw.pass(ctx)
+	fw.wait()
+	if !told(e) {
+		t.Fatal("E answered 403 and is not told")
 	}
 }
