@@ -204,3 +204,51 @@ func TestResticKeysNamedByTheirHash(t *testing.T) {
 		t.Error("the name's hash is its last segment")
 	}
 }
+
+// EP-7 (v0.11.3, #74): a profile names the few keys its tool rewrites in
+// place in normal use. Kopia rewrites its three format blobs, restic
+// its config; nothing else, and a generic bucket none. A rewritable key
+// keeps its class.
+func TestRewritableKeysKeepTheirClass(t *testing.T) {
+	set, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, cases := range map[string]map[string]bool{
+		"kopia": {"kopia.repository": true, "kopia.blobcfg": true, "kopia.maintenance": true,
+			"kopia.maintenance.x": false, "n0123": false, "p0123": false, "xe0": false, "_log_1": false},
+		"restic":  {"config": true, "keys/0123": false, "index/ab": false, "data/01/ab": false, "config.bak": false},
+		"generic": {"config": false, "kopia.maintenance": false},
+		"none":    {"config": false},
+	} {
+		p := set.Get(name)
+		for key, want := range cases {
+			if got := p.Rewritable(key); got != want {
+				t.Errorf("%s: Rewritable(%q) = %v, want %v", name, key, got, want)
+			}
+		}
+	}
+	for name, key := range map[string]string{"kopia": "kopia.maintenance", "restic": "config"} {
+		if c := set.Get(name).Classify(key); c != Metadata {
+			t.Errorf("%s %s is %s; a rewritable key keeps its class", name, key, c)
+		}
+	}
+}
+
+// A profile file may name rewritable keys; an empty pattern stops the
+// start like any other.
+func TestRewritableReadFromProfileFile(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "mytool.toml"), []byte("metadata = [\"meta/*\"]\nrewritable = [\"meta/head\"]\n"), 0o600)
+	set, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := set.Get("mytool"); !p.Rewritable("meta/head") || p.Rewritable("meta/other") {
+		t.Fatalf("mytool: %+v", p)
+	}
+	os.WriteFile(filepath.Join(dir, "bad.toml"), []byte(`rewritable = [""]`), 0o600)
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "empty pattern") {
+		t.Fatalf("empty rewritable pattern: %v", err)
+	}
+}

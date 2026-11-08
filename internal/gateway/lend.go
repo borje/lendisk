@@ -87,6 +87,10 @@ type Lending struct {
 	afterList       func()
 	afterPartStored func(part int32, size int64)
 	beforeTombMove  func() // a tombstone is recorded and its object not yet moved
+	// afterRewriteMove runs when a rewrite has moved the replaced version
+	// into its tomb and the new one is not yet published; an error fails
+	// the rewrite there, as the store failing would.
+	afterRewriteMove func() error
 
 	tombDirs sync.Mutex // creating and removing directories for tombs and revivals
 

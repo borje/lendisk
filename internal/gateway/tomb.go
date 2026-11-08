@@ -40,7 +40,11 @@ import (
 //     depth (OpenBackend), so no S3 call reads, writes, lists or deletes
 //     there, and checkKey refuses the name besides.
 //   - A put of the same hash to a tombstoned key revives the object; a
-//     put or multipart upload of another hash is refused (LEND-4).
+//     put or multipart upload of another hash is refused (LEND-4), a
+//     rewrite's included: a rewrite replaces only a live version.
+//   - A rewrite's replaced version is tombstoned the same way
+//     (rewrite.go, #74), its row marked Rewrite; settleTombs moves a
+//     pending one back if the key holds nothing.
 //
 // Every tomb step on a key holds that key's lock (Lending.keys) and the
 // borrower's publication lock shared, so the reconcile sees each object
@@ -318,9 +322,11 @@ func (l *Lending) putOverTomb(ctx context.Context, peer, bucket string, b *body,
 // settleTombs settles the tombstones a crash left pending, before
 // anything is served. A row whose tomb does not exist was never moved,
 // or was revived to its end: dropped, the object live. A tomb beside a
-// live object of the same hash was being revived: the tomb goes. A tomb
-// alone, or beside other bytes, stands: kept. The reconcile that
-// follows at start sets the counts.
+// live object of the same hash was being revived: the tomb goes. A
+// rewrite's tomb alone was moved by a rewrite whose new version was never
+// published: moved back to its key (#74). Any other tomb alone, or beside
+// other bytes, stands: kept. The reconcile that follows at start sets the
+// counts.
 func (l *Lending) settleTombs(ctx context.Context) error {
 	ts, err := l.DB.PendingTombstones(ctx)
 	if err != nil {
@@ -351,6 +357,14 @@ func (l *Lending) settleTombs(ctx context.Context) error {
 				continue
 			}
 			l.dropTomb(t.ID)
+			continue
+		}
+		if !has && t.Rewrite {
+			// A rewrite moved the version it replaces and never published
+			// the new one (#74): the old version goes back to its key.
+			if _, err := l.revive(ctx, bucket, t); err != nil {
+				l.log().Error("lending: moving a rewrite's replaced version back failed; it stays in its tomb", "bucket", bucket, "key", t.Key, "err", err)
+			}
 			continue
 		}
 		if err := l.DB.KeepTombstone(ctx, t.ID); err != nil {

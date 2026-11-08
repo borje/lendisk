@@ -485,6 +485,17 @@ func (w *Worker) rewriting(ctx context.Context, p state.Placement) bool {
 }
 
 // send sends one row to the place.
+//
+// A put of a key the bucket's profile names rewritable (EP-7, #74) is
+// sent as a rewrite of the version the place acknowledged, when that is
+// another (Object.Replaces). If the place refuses it all the same, it
+// holds a version the index does not show it acknowledged: a rewrite
+// stored there whose answer was lost before a later write superseded it,
+// or, after recovery, another friend's version. The worker then asks the
+// place which version it holds and sends the rewrite once more, marked
+// with that hash; a place that holds the row's bytes already has it.
+// Only the key's latest capture is ever sent (a superseded row is
+// cancelled first), so a rewrite never replaces a newer version.
 func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Placement) error {
 	if p.Op == state.OpDelete {
 		return r.Delete(ctx, p.Bucket, p.Key)
@@ -494,6 +505,35 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	} else if sup {
 		return errSuperseded
 	}
+	replaces := ""
+	if p.Rewritable {
+		h, ok, err := w.DB.AckedHash(ctx, place, p.Bucket, p.Key)
+		if err != nil {
+			return err
+		}
+		if ok && h != p.SHA256 {
+			replaces = h
+		}
+	}
+	err := w.put(ctx, place, r, p, replaces)
+	if !p.Rewritable || !errors.Is(err, ErrImmutable) || ctx.Err() != nil {
+		return err
+	}
+	held, ok, herr := r.Head(ctx, p.Bucket, p.Key)
+	switch {
+	case herr != nil:
+		return herr // retried with backoff
+	case ok && held == p.SHA256:
+		return nil
+	case ok && held != replaces:
+		return w.put(ctx, place, r, p, held)
+	}
+	return err
+}
+
+// put sends the row's object from the store, marked as a rewrite of the
+// version with hash replaces if that is set.
+func (w *Worker) put(ctx context.Context, place string, r Replica, p state.Placement, replaces string) error {
 	body, done, err := w.openCaptured(ctx, p)
 	if err != nil {
 		return err
@@ -508,7 +548,7 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	if w.OnRead != nil {
 		body = &observed{r: body, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
 	}
-	err = r.Put(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Body: body})
+	err = r.Put(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Replaces: replaces, Body: body})
 	if ctx.Err() != nil || err == nil {
 		return err
 	}

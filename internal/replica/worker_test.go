@@ -102,6 +102,17 @@ func (p *place) Delete(ctx context.Context, bucket, key string) error {
 	return nil
 }
 
+func (p *place) Head(ctx context.Context, bucket, key string) (string, bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	b, ok := p.objs[bucket+"/"+key]
+	if !ok {
+		return "", false, nil
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), true, nil
+}
+
 func (p *place) snapshot() (log []string, objs int, maxInFlight int, read int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

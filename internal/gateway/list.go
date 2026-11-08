@@ -26,6 +26,11 @@ const MaxObjectSize = 5 << 40
 // a list from a lender may carry, too.
 func CheckKey(key string) error { return checkKey(key) }
 
+// MaxReplaced is the most replaced versions one listed key carries
+// (LentObject.Replaced), the newest; recovery ignores a key listed with
+// more.
+const MaxReplaced = 1000
+
 // LentObject is one key of a borrower's bucket as this lender holds it
 // (NET-7 list): its size, the SHA-256 it was stored with (REPL-10,
 // LEND-4) and, if it is tombstoned (RET-1), when.
@@ -34,6 +39,11 @@ type LentObject struct {
 	Size         int64
 	SHA256       string    // hex; "" if the object carries none
 	TombstonedAt time.Time // zero while live
+	// Replaced are, for a live key, the hashes of the versions the
+	// borrower's rewrites replaced here and whose tombs are kept, newest
+	// first, at most MaxReplaced (#74): recovery reads them as evidence
+	// of which version is newer where friends disagree.
+	Replaced []string
 }
 
 // ErrNoLentBucket means the borrower has no bucket of that sealed name
@@ -125,6 +135,17 @@ func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, 
 		}
 		live[key] = true
 		out = append(out, lo)
+	}
+	if n := len(out); n > 0 {
+		rs, err := x.DB.ReplacedVersions(ctx, borrower.String(), sealed, after, out[n-1].Key)
+		if err != nil {
+			return nil, "", err
+		}
+		for i := range out {
+			if r := rs[out[i].Key]; len(r) > 0 {
+				out[i].Replaced = r[:min(len(r), MaxReplaced)]
+			}
+		}
 	}
 	for _, t := range tombs {
 		if bounded && t.Key > bound || live[t.Key] {

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -30,7 +31,13 @@ import (
 //   - places that tie are a conflict: no version counts, so no place
 //     counts as holding it and the read-through refuses it (KeyConflict)
 //     until the user picks a place (ResolveKey) or a later list breaks
-//     the tie.
+//     the tie;
+//   - except a tie on a key the bucket's profile names rewritable (EP-7,
+//     #74), where a place lists the versions it replaced by rewrites
+//     (its tombstones, kept for the retention window): if exactly one
+//     of the tied versions is one no other place replaced, it is the
+//     newest and counts (VerdictNewest), and the user may still pick
+//     another.
 //
 // Only the version that counts has a queue row and acked placement rows,
 // at the places that list that hash.
@@ -40,6 +47,9 @@ const (
 	VerdictHeld     = "held"
 	VerdictSingle   = "single"
 	VerdictConflict = "conflict"
+	// VerdictNewest: the places tie on a rewritable key, and one version
+	// is the only one no other place replaced by a rewrite (#74).
+	VerdictNewest = "newest"
 )
 
 // Listed is one entry of a place's list of a bucket: a key it holds,
@@ -54,6 +64,11 @@ type Listed struct {
 	// HashNamed: the key is named by its hash, and the caller checked
 	// that the hash is the name, so this place's copy is the object.
 	HashNamed bool
+	// Rewritable: the bucket's profile names the key rewritable (EP-7).
+	Rewritable bool
+	// Replaced are the hashes of the versions of the key this place
+	// replaced by rewrites and still keeps as tombstones (#74).
+	Replaced []string
 }
 
 // ListedCount is what a page of a list held: live keys recorded, and
@@ -320,10 +335,12 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 			c.Tombstoned++
 			continue
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO listed (bucket, key, place, size, sha256, class, named) VALUES (?, ?, ?, ?, ?, ?, ?)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO listed (bucket, key, place, size, sha256, class, named, rewritable, replaced)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (bucket, key, place) DO UPDATE SET size = excluded.size, sha256 = excluded.sha256, class = excluded.class,
-				named = excluded.named`,
-			bucket, o.Key, place, o.Size, o.SHA256, o.Class, o.HashNamed); err != nil {
+				named = excluded.named, rewritable = excluded.rewritable, replaced = excluded.replaced`,
+			bucket, o.Key, place, o.Size, o.SHA256, o.Class, o.HashNamed, nullTrue(o.Rewritable),
+			nullString(strings.Join(o.Replaced, " "))); err != nil {
 			return c, err
 		}
 		keys = append(keys, o.Key)
@@ -370,25 +387,28 @@ func listedPlaces(ctx context.Context, tx *sql.Tx, bucket string) (map[string]bo
 type listedRow struct {
 	place, sha, class string
 	size              int64
-	named             bool
+	named, rewritable bool
+	replaced          []string
 }
 
 // settleKey decides which version of key counts from what every place
 // listed, and makes the queue and placement rows say so; done are the
 // places listed to their end.
 func (db *DB) settleKey(ctx context.Context, tx *sql.Tx, bucket, key string, done map[string]bool) error {
-	rows, err := tx.QueryContext(ctx, `SELECT place, sha256, class, size, named FROM listed WHERE bucket = ? AND key = ? ORDER BY place`,
-		bucket, key)
+	rows, err := tx.QueryContext(ctx, `SELECT place, sha256, class, size, named, coalesce(rewritable, 0), coalesce(replaced, '')
+		FROM listed WHERE bucket = ? AND key = ? ORDER BY place`, bucket, key)
 	if err != nil {
 		return err
 	}
 	var ls []listedRow
 	for rows.Next() {
 		var r listedRow
-		if err := rows.Scan(&r.place, &r.sha, &r.class, &r.size, &r.named); err != nil {
+		var replaced string
+		if err := rows.Scan(&r.place, &r.sha, &r.class, &r.size, &r.named, &r.rewritable, &replaced); err != nil {
 			rows.Close()
 			return err
 		}
+		r.replaced = strings.Fields(replaced)
 		ls = append(ls, r)
 	}
 	rows.Close()
@@ -465,8 +485,8 @@ func (db *DB) settleKey(ctx context.Context, tx *sql.Tx, bucket, key string, don
 			}
 		}
 		if !own.Valid {
-			res, err := tx.ExecContext(ctx, `INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
-				VALUES (?, ?, 'put', ?, 'done', ?, ?, ?)`, bucket, key, w.class, w.size, winner, db.now().Unix())
+			res, err := tx.ExecContext(ctx, `INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at, rewritable)
+				VALUES (?, ?, 'put', ?, 'done', ?, ?, ?, ?)`, bucket, key, w.class, w.size, winner, db.now().Unix(), nullTrue(w.rewritable))
 			if err != nil {
 				return err
 			}
@@ -557,12 +577,67 @@ func decide(ls []listedRow, picked string, done map[string]bool) (verdict, reaso
 		}
 	}
 	if tie {
+		if h, by, ok := newest(ls); ok {
+			return VerdictNewest, fmt.Sprintf("the places that list it disagree, %d to %d; %s replaced the others' version "+
+				"there by a rewrite, so its version is the newest", n, n, by), h
+		}
 		return VerdictConflict, fmt.Sprintf("the places that list it disagree, %d to %d", n, n), ""
 	}
 	if len(count) == 1 {
 		return VerdictHeld, "every place that lists it agrees", best
 	}
 	return VerdictHeld, fmt.Sprintf("%d places agree; the others list another version", n), best
+}
+
+// newest finds, for a rewritable key (#74), the one listed version that
+// no place listing another version replaced by a rewrite: by is a place
+// that replaced another's version, and lists it. ok is false for a key
+// that is not rewritable, or when no version, or more than one, is
+// left.
+func newest(ls []listedRow) (winner, by string, ok bool) {
+	replaced := map[string]bool{} // a version some place replaced, listing another
+	var rewritable bool
+	for _, r := range ls {
+		rewritable = rewritable || r.rewritable
+		for _, h := range r.replaced {
+			if h != r.sha {
+				replaced[h] = true
+			}
+		}
+	}
+	if !rewritable {
+		return "", "", false
+	}
+	left := map[string]bool{}
+	for _, r := range ls {
+		if !replaced[r.sha] {
+			left[r.sha] = true
+		}
+	}
+	if len(left) != 1 {
+		return "", "", false
+	}
+	for h := range left {
+		winner = h
+	}
+	for _, r := range ls {
+		if r.sha != winner {
+			continue
+		}
+		for _, h := range r.replaced {
+			if h != winner && slices.ContainsFunc(ls, func(o listedRow) bool { return o.sha == h }) {
+				return winner, r.place, true
+			}
+		}
+	}
+	// The newest version's places replaced none of the others directly;
+	// another place's chain did (it replaced them and was replaced too).
+	for _, r := range ls {
+		if r.sha == winner {
+			return winner, r.place, true
+		}
+	}
+	return "", "", false
 }
 
 // RecoveredKeys returns recovery's verdict on every key of bucket ("":
@@ -579,6 +654,12 @@ func (db *DB) Conflicts(ctx context.Context) ([]RecoveredKey, error) {
 // inConflict selects recovered keys k in conflict that this node has
 // not written since recovery: a write of its own settles the key.
 const inConflict = `k.verdict = '` + VerdictConflict + `' AND NOT EXISTS (SELECT 1 FROM queue q
+	WHERE q.bucket = k.bucket AND q.key = k.key AND q.state = 'done' AND (k.seq IS NULL OR q.seq > k.seq))`
+
+// byNewest selects recovered keys k decided as the newest of tied
+// versions (VerdictNewest) that this node has not written since
+// recovery: the user may still pick another (ResolveKey).
+const byNewest = `k.verdict = '` + VerdictNewest + `' AND NOT EXISTS (SELECT 1 FROM queue q
 	WHERE q.bucket = k.bucket AND q.key = k.key AND q.state = 'done' AND (k.seq IS NULL OR q.seq > k.seq))`
 
 // KeyConflict reports whether key of bucket is a recovered key in
@@ -639,8 +720,9 @@ func (db *DB) recoveredKeys(ctx context.Context, where string, args ...any) ([]R
 	return out, rows.Err()
 }
 
-// ResolveKey settles a recovered key in conflict with the version place
-// listed: the user's pick, which stands until the key is written again.
+// ResolveKey settles a recovered key in conflict, or one decided as the
+// newest of tied versions (#74), with the version place listed: the
+// user's pick, which stands until the key is written again.
 // ErrNotFound if recovery knows no such key or place does not list it;
 // ErrNotConflict if the key is not in conflict (held, a single source,
 // or written on this node since recovery).
@@ -652,7 +734,7 @@ func (db *DB) ResolveKey(ctx context.Context, bucket, key, place string) error {
 	defer tx.Rollback()
 	var known, conflict bool
 	err = tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM recovered_key WHERE bucket = ?1 AND key = ?2),
-		EXISTS (SELECT 1 FROM recovered_key k WHERE k.bucket = ?1 AND k.key = ?2 AND `+inConflict+`)`,
+		EXISTS (SELECT 1 FROM recovered_key k WHERE k.bucket = ?1 AND k.key = ?2 AND (`+inConflict+` OR `+byNewest+`))`,
 		bucket, key).Scan(&known, &conflict)
 	switch {
 	case err != nil:

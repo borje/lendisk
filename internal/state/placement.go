@@ -64,8 +64,12 @@ type Placement struct {
 	Class       string // the key's class (EP-7): metadata rows wait for the barrier (Held)
 	Size        int64
 	SHA256      string // the capture's whole-object SHA-256 (REPL-10)
-	State       string
-	CreatedAt   time.Time // when the write was captured
+	// Rewritable: the key is rewritable in its bucket's profile (EP-7),
+	// so a changed version is sent as a rewrite of the one the place
+	// holds (#74).
+	Rewritable bool
+	State      string
+	CreatedAt  time.Time // when the write was captured
 }
 
 // NextPlacement returns the head of place's FIFO: its queued row with
@@ -73,10 +77,10 @@ type Placement struct {
 func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok bool, err error) {
 	var created int64
 	err = db.QueryRowContext(ctx, `SELECT p.seq, p.place, p.bucket, p.key, p.op, q.class, coalesce(q.size, 0),
-		coalesce(q.sha256, ''), p.state, q.created_at
+		coalesce(q.sha256, ''), p.state, q.created_at, coalesce(q.rewritable, 0)
 		FROM placement p JOIN queue q ON q.seq = p.seq
 		WHERE p.place = ? AND p.state = 'queued' ORDER BY p.seq LIMIT 1`, place).
-		Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Class, &p.Size, &p.SHA256, &p.State, &created)
+		Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Class, &p.Size, &p.SHA256, &p.State, &created, &p.Rewritable)
 	if errors.Is(err, sql.ErrNoRows) {
 		return p, false, nil
 	}

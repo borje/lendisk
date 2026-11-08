@@ -344,7 +344,8 @@ func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles 
 				continue
 			}
 			objs = append(objs, state.Listed{Key: o.Key, Size: o.Size, SHA256: o.SHA256, Class: string(class),
-				Tombstoned: o.TombstonedAt != nil, HashNamed: prof.HashNamed(o.Key)})
+				Tombstoned: o.TombstonedAt != nil, HashNamed: prof.HashNamed(o.Key),
+				Rewritable: prof.Rewritable(o.Key), Replaced: o.Replaced})
 		}
 		if p.Next != "" && (p.Next <= after || p.Next < last) {
 			return false, fmt.Errorf("the place's list does not move on from %q", after)
@@ -373,6 +374,13 @@ func (l *Lister) reject(prof *profile.Profile, o control.ListObject) string {
 		return "not a SHA-256 in lower-case hex"
 	case prof.HashNamed(o.Key) && profile.NameHash(o.Key) != o.SHA256:
 		return "its hash is not the one its name gives"
+	case len(o.Replaced) > gateway.MaxReplaced:
+		return fmt.Sprintf("%d replaced versions, more than %d", len(o.Replaced), gateway.MaxReplaced)
+	}
+	for _, h := range o.Replaced {
+		if !isSHA256(h) {
+			return "a replaced version that is not a SHA-256 in lower-case hex"
+		}
 	}
 	return ""
 }

@@ -38,7 +38,10 @@ import (
 //     it; a multipart object is read whole after completion and removed
 //     on a mismatch.
 //   - A write to a key holding an object with another hash is refused
-//     before any byte is stored; the same hash is accepted unstored. A
+//     before any byte is stored, unless it is a PutObject marked as a
+//     rewrite of that very object (MetaReplaces, rewrite.go, #74), whose
+//     replaced version becomes a tombstone; the same hash is accepted
+//     unstored. A
 //     put of an absent key, and a completion, is published only if the
 //     key is still absent (If-None-Match: *, which posix checks under
 //     its publish lock): puts take no key lock, so a stalled body never
@@ -72,6 +75,14 @@ const DefaultAbandonAfter = 7 * 24 * time.Hour
 // hex (REPL-10; replica.MetaSHA256 on the sending side).
 const metaSHA256 = "lendisk-sha256"
 
+// MetaReplaces is the user metadata key that marks a borrower's put as a
+// rewrite (LEND-4, EP-7, #74): the SHA-256, in hex, of the version it
+// replaces, sent as x-amz-meta-lendisk-replaces (replica.MetaReplaces on
+// the sending side). The put is stored only if the key holds that very
+// version, which then becomes a tombstone (RET-1). The mark is never
+// stored with the object.
+const MetaReplaces = "lendisk-replaces"
+
 // DefaultFloor is the free-space floor when none is configured (LEND-2,
 // store.free_space_floor's default).
 var DefaultFloor = config.Floor{Percent: 5}
@@ -88,7 +99,10 @@ var (
 	errBadDigest = s3err.APIError{Code: "BadDigest", HTTPStatusCode: 400,
 		Description: "lendisk: the bytes received do not match x-amz-meta-lendisk-sha256; nothing was stored"}
 	errKeyChanged = s3err.APIError{Code: "PreconditionFailed", HTTPStatusCode: 412,
-		Description: "lendisk: this key holds an object with another hash; a stored object is never replaced by other bytes"}
+		Description: "lendisk: this key holds an object with another hash; a stored object is replaced by other bytes " +
+			"only by a rewrite marked with its hash (x-amz-meta-lendisk-replaces)"}
+	errBadMark = s3err.APIError{Code: "InvalidRequest", HTTPStatusCode: 400,
+		Description: "lendisk: x-amz-meta-lendisk-replaces must be the SHA-256, in hex, of the version a rewrite replaces"}
 	errBadKey = s3err.APIError{Code: "InvalidArgument", HTTPStatusCode: 400,
 		Description: "lendisk: an object key must be a relative path of non-empty segments, without . or .. segments, " +
 			"control characters, or the reserved .lendisk, .sgwtmp and .vgwlocks directories"}
@@ -147,15 +161,30 @@ func borrowerKey(ctx context.Context, key *string) error {
 }
 
 // declared returns the SHA-256 a borrower declared, in lower-case hex,
-// and the metadata with it so normalised, which is what is stored.
-func declared(meta map[string]string) (string, map[string]string, error) {
-	v := strings.ToLower(meta[metaSHA256])
-	if b, err := hex.DecodeString(v); err != nil || len(b) != sha256.Size {
-		return "", nil, errNoHash
+// the rewrite mark if it sent one (MetaReplaces, also lower case), and
+// the metadata with the hash so normalised and the mark taken out, which
+// is what is stored.
+func declared(meta map[string]string) (want, mark string, stored map[string]string, err error) {
+	want = strings.ToLower(meta[metaSHA256])
+	if !isHash(want) {
+		return "", "", nil, errNoHash
 	}
-	meta = maps.Clone(meta)
-	meta[metaSHA256] = v
-	return v, meta, nil
+	stored = maps.Clone(meta)
+	stored[metaSHA256] = want
+	if m, ok := stored[MetaReplaces]; ok {
+		mark = strings.ToLower(m)
+		if !isHash(mark) {
+			return "", "", nil, errBadMark
+		}
+		delete(stored, MetaReplaces)
+	}
+	return want, mark, stored, nil
+}
+
+// isHash reports whether s is a SHA-256 in hex.
+func isHash(s string) bool {
+	b, err := hex.DecodeString(s)
+	return err == nil && len(b) == sha256.Size
 }
 
 // borrowerUse is one borrower's state. pub is held shared by a write
@@ -339,6 +368,11 @@ type body struct {
 	failed   error
 	ended    bool
 	onEOF    func() error
+	// onFull, if set, runs once when the body has read limit bytes,
+	// before the reader that read them gets them: a rewrite moves the
+	// replaced version then, whether or not the store reads on to EOF.
+	onFull func() error
+	full   bool
 }
 
 func (l *Lending) body(r io.Reader, limit int64) *body {
@@ -364,6 +398,13 @@ func (b *body) Read(p []byte) (int, error) {
 		return 0, errTooLong
 	}
 	b.h.Write(p[:n])
+	if b.onFull != nil && !b.full && b.n == b.limit {
+		b.full = true
+		if e := b.onFull(); e != nil {
+			b.failed = e
+			return 0, e
+		}
+	}
 	if err == io.EOF {
 		b.ended = true
 		if b.onEOF != nil {
@@ -466,7 +507,7 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 	if err := checkKey(key); err != nil {
 		return none, err
 	}
-	want, meta, err := declared(in.Metadata)
+	want, mark, meta, err := declared(in.Metadata)
 	if err != nil {
 		return none, err
 	}
@@ -482,6 +523,9 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 		return none, errInternal
 	}
 	if has {
+		if mark != "" && old.sha256 != want && old.sha256 == mark {
+			return l.rewriteLent(ctx, peer, sealed, in, b, size, want, mark)
+		}
 		return l.putAgain(b, want, old)
 	}
 	ts, err := l.tombsOf(ctx, peer, sealed, key)
@@ -602,7 +646,9 @@ func (l *Lending) createUploadLent(ctx context.Context, peer, sealed string, in 
 	if err := checkKey(key); err != nil {
 		return none, err
 	}
-	want, meta, err := declared(in.Metadata)
+	// A rewrite is a single put (#74): a multipart create's mark is
+	// dropped, and a key holding other bytes refuses it as ever.
+	want, _, meta, err := declared(in.Metadata)
 	if err != nil {
 		return none, err
 	}

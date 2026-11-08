@@ -24,6 +24,9 @@ type Capture struct {
 	Bucket, Key string
 	Op          string // OpPut or OpDelete
 	Class       string // the key's class by the bucket's profile (EP-7)
+	// Rewritable: the bucket's profile names the key rewritable (EP-7),
+	// so a changed version is sent to each place as a rewrite (#74).
+	Rewritable bool
 	// Token is the lendisk-capture metadata a PutObject carries, which
 	// tells startup whether the object on disk is this write's.
 	Token string
@@ -38,6 +41,7 @@ type Entry struct {
 	State                       string
 	Size                        int64
 	SHA256, Token, ETag, Upload string
+	Rewritable                  bool // rewritable in the bucket's profile (EP-7)
 }
 
 // QueueStat is a bucket's queue size for status.
@@ -59,9 +63,9 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 	seqs := make([]int64, 0, len(cs))
 	for _, c := range cs {
 		r, err := tx.ExecContext(ctx, `INSERT INTO queue
-			(bucket, key, op, class, state, token, etag, upload_id, created_at)
-			VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
-			c.Bucket, c.Key, c.Op, c.Class, nullStr(c.Token), nullStr(c.ETag), nullStr(c.UploadID), now)
+			(bucket, key, op, class, state, token, etag, upload_id, created_at, rewritable)
+			VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+			c.Bucket, c.Key, c.Op, c.Class, nullStr(c.Token), nullStr(c.ETag), nullStr(c.UploadID), now, nullTrue(c.Rewritable))
 		if err != nil {
 			return nil, err
 		}
@@ -173,7 +177,7 @@ func (db *DB) eachSeq(ctx context.Context, q string, seqs []int64) error {
 }
 
 const entryCols = `seq, bucket, key, op, class, state, coalesce(size, 0), coalesce(sha256, ''),
-	coalesce(token, ''), coalesce(etag, ''), coalesce(upload_id, '')`
+	coalesce(token, ''), coalesce(etag, ''), coalesce(upload_id, ''), coalesce(rewritable, 0)`
 
 func (db *DB) entries(ctx context.Context, where string, args ...any) ([]Entry, error) {
 	rows, err := db.QueryContext(ctx, `SELECT `+entryCols+` FROM queue WHERE `+where+` ORDER BY seq`, args...)
@@ -185,7 +189,7 @@ func (db *DB) entries(ctx context.Context, where string, args ...any) ([]Entry, 
 	for rows.Next() {
 		var e Entry
 		if err := rows.Scan(&e.Seq, &e.Bucket, &e.Key, &e.Op, &e.Class, &e.State, &e.Size, &e.SHA256,
-			&e.Token, &e.ETag, &e.Upload); err != nil {
+			&e.Token, &e.ETag, &e.Upload, &e.Rewritable); err != nil {
 			return nil, err
 		}
 		out = append(out, e)
@@ -248,6 +252,15 @@ func (db *DB) QueueStats(ctx context.Context) (map[string]QueueStat, error) {
 		out[b] = s
 	}
 	return out, rows.Err()
+}
+
+// nullTrue is 1 for true and NULL for false: a flag column added later
+// is NULL on older rows.
+func nullTrue(b bool) any {
+	if b {
+		return 1
+	}
+	return nil
 }
 
 func nullStr(s string) any {

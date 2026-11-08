@@ -347,7 +347,11 @@ func TestBorrowerCannotPurgeEarly(t *testing.T) {
 		},
 		"overwrite":               func() error { return l.put("data/ef/pack", other, hashMeta(other)) },
 		"overwrite claiming hash": func() error { return l.put("data/ef/pack", other, hashMeta(body)) },
-		"multipart other bytes":   func() error { return l.mpu("data/ef/pack", sum(other), other) },
+		"rewrite marked with the tomb's hash": func() error {
+			return l.put("data/ef/pack", other, rewriteMeta(other, sum(body)))
+		},
+		"rewrite onto the tomb": func() error { return l.put(tomb.Tomb, other, rewriteMeta(other, sum(body))) },
+		"multipart other bytes": func() error { return l.mpu("data/ef/pack", sum(other), other) },
 		"complete an old upload": func() error {
 			p, err := l.part("data/ef/pack", upID, 1, other)
 			if err != nil {
