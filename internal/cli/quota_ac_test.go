@@ -113,9 +113,15 @@ func TestBothNumbersRaisedResumeCopiesWithNoFurtherAction(t *testing.T) {
 	pa, pb := an.peerOf(bKey), bn.peerOf(aKey)
 	for side, p := range map[string]PeerJSON{"A's view of B": pa, "B's view of A": pb} {
 		if (p.Reachability != "direct" && p.Reachability != "relayed") || p.LastSeen == nil || p.Protocol != control.Protocol ||
-			p.RepositorySize == nil || !p.NumberTold || p.OwnNumber != 80<<20 || p.PeerNumber != 80<<20 || p.LastVerified != nil {
+			p.RepositorySize == nil || !p.NumberTold || p.OwnNumber != 80<<20 || p.PeerNumber != 80<<20 || p.Unverified {
 			t.Errorf("%s: %+v", side, p)
 		}
+	}
+	// VER-4 (#27): B holds A's objects, which A's daily challenge
+	// verifies; A holds nothing of B's, which has no bucket.
+	within(t, 30*time.Second, "B's replica verified", func() bool { return an.peerOf(bKey).LastVerified != nil })
+	if pb.LastVerified != nil {
+		t.Errorf("B's view of A, which holds nothing of B's: %+v", pb)
 	}
 	if pa.Remaining != pa.Quota-pa.UseThere || *pa.RepositorySize != 0 {
 		t.Errorf("A's view of B: %+v", pa)
@@ -124,7 +130,7 @@ func TestBothNumbersRaisedResumeCopiesWithNoFurtherAction(t *testing.T) {
 		t.Errorf("B's view of A: %+v (A's repository, 240 KiB, rounds up to 1 GiB)", pb)
 	}
 	_, text, _ := an.run("", "", "peer", "list")
-	if !strings.Contains(text, bKey) || !strings.Contains(text, "never") || !strings.Contains(text, control.Protocol) {
+	if !strings.Contains(text, bKey) || strings.Contains(text, "UNVERIFIED") || !strings.Contains(text, control.Protocol) {
 		t.Errorf("peer list:\n%s", text)
 	}
 }

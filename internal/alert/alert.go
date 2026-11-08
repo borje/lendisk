@@ -7,8 +7,9 @@
 // keys changed after a friend acknowledged them (EP-11), a friendship
 // the friend ended and the purge of an ended one (PEER-5), and a
 // friendship's quota nearly or wholly used either way (PEER-6, #24),
-// a bucket holding a Kopia format-1 repository (COMPAT-1, #79), and
-// objects below copies past replication.replace_after (REPL-13, #26).
+// a bucket holding a Kopia format-1 repository (COMPAT-1, #79),
+// objects below copies past replication.replace_after (REPL-13, #26),
+// and a friend's replica that failed verification (VER-1, #27).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -128,6 +129,13 @@ const (
 	// pool needs a friend, more quota or overflow. Subject: the bucket.
 	// It clears at the first pass that finds none below.
 	KindBelowCopies = "below_copies"
+	// KindReplicaUnverified: a friend failed a challenge of its replica
+	// of a bucket (VER-1, OPS-2, #27): it does not hold bytes it
+	// acknowledged. The replica is unverified and re-placement moves its
+	// copies of the bucket to other friends. Subject: the friend's node
+	// ID and the bucket, as <peer>/<bucket>. It clears when `lendisk
+	// verify <bucket> --peer <id> --full` passes, or the friendship ends.
+	KindReplicaUnverified = "replica_unverified"
 )
 
 // KopiaUpgrade is the command that upgrades a Kopia format-1 repository
@@ -165,7 +173,7 @@ const PurgeWarning = 7 * 24 * time.Hour
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindPurgeSoon,
-	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies}
+	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -522,6 +530,18 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		msg := fmt.Sprintf("bucket %s has %s (%d bytes) at fewer places than its copies: a friend that is full, no longer answers or was removed was to hold them, and no other friend has room; add room or a friend (lendisk invite)",
 			b, countObjects(d.Objects), d.Bytes)
 		out = append(out, alertOf(KindCopiesDropped, b, msg))
+	}
+	checks, err := s.DB.ReplicaChecks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range checks {
+		if !c.Unverified() {
+			continue
+		}
+		msg := fmt.Sprintf("friend %s failed the verification of its replica of bucket %s at %s: %s. The replica is unverified, and its copies of %s are being placed at other friends (REPL-13); `lendisk verify %s --peer %s --full` passing marks it verified again",
+			c.Place, c.Bucket, c.UnverifiedAt.UTC().Format(time.RFC3339), c.Detail, c.Bucket, c.Bucket, c.Place)
+		out = append(out, alertOf(KindReplicaUnverified, c.Place+"/"+c.Bucket, msg))
 	}
 	quota, err := s.quotaConditions(ctx, fs, conds)
 	if err != nil {

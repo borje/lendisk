@@ -19,6 +19,7 @@ import (
 	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/verify"
 )
 
 const (
@@ -155,6 +156,11 @@ func TestMain(m *testing.M) {
 			if os.Getenv(envReplFast) == "1" {
 				x.Poll, x.Timeout = 200*time.Millisecond, 10*time.Second
 				x.MinBackoff, x.MaxBackoff = 200*time.Millisecond, time.Second
+			}
+		}
+		a.tuneVerify = func(v *verify.Verifier) {
+			if os.Getenv(envReplFast) == "1" {
+				v.Poll = 200 * time.Millisecond
 			}
 		}
 		a.tuneRecovery = func(l *recovery.Lister) {

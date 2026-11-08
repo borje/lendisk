@@ -225,9 +225,22 @@ func TestHostilePeer(t *testing.T) {
 			if r.status != http.StatusBadRequest {
 				t.Errorf("B's %s: %v", at.name, r)
 			}
-		case "quota by GET":
+		case "quota by GET", "challenge by GET":
 			if r.status != http.StatusMethodNotAllowed {
 				t.Errorf("B's %s: %v", at.name, r)
+			}
+		case "challenge", "challenge a tomb", "challenge a huge range":
+			if r.status != http.StatusBadRequest {
+				t.Errorf("B's %s: %v", at.name, r)
+			}
+		case "challenge own":
+			// Its only object there is tombstoned: no live bytes to read.
+			if r.status != http.StatusNotFound || r.code != control.CodeNoSuchKey {
+				t.Errorf("B challenges its tombstoned object: %v", r)
+			}
+		case "challenge another's":
+			if r.status != http.StatusNotFound || r.code != control.CodeNoSuchBucket {
+				t.Errorf("B challenges C's object: %v", r)
 			}
 		case "list another's":
 			if r.status != http.StatusNotFound || r.code != control.CodeNoSuchBucket {

@@ -28,7 +28,8 @@ import (
 //     gets the missing copies by D6's choice, excluding the places that
 //     hold it, refused it or are deleting it; a copy at a place being
 //     drained (a friend removed, gone past replace_after, refusing this
-//     node, or above its quota) is counted out, and its replacement
+//     node, above its quota, or whose replica of the bucket failed a
+//     challenge, VER-1, verify.go) is counted out, and its replacement
 //     records which copy it replaces (placement.replaces);
 //   - a copy at a drained place is marked dropping once enough copies
 //     are acknowledged elsewhere: at the acknowledgement of its
@@ -136,8 +137,9 @@ func (db *DB) SetCopies(ctx context.Context, bucket string, copies int) error {
 
 // PoolFingerprint describes what re-placement answers to: each friend
 // with an address, its quota, whether it refuses this node, is gone
-// past replace_after, or counts more than its quota; and each bucket's
-// copies. The worker runs a pass whenever it changes (#26).
+// past replace_after, or counts more than its quota; each bucket's
+// copies; and each replica marked unverified (VER-1, #27). The worker
+// runs a pass whenever it changes (#26).
 func (db *DB) PoolFingerprint(ctx context.Context) (string, error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
@@ -162,7 +164,19 @@ func (db *DB) PoolFingerprint(ctx context.Context) (string, error) {
 		}
 		fmt.Fprintf(&b, "|%s %d", name, copies)
 	}
-	return b.String(), rows.Err()
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	rows.Close()
+	marks, err := column(ctx, db, `SELECT place || ' ' || bucket FROM replica_check
+		WHERE unverified_at IS NOT NULL ORDER BY place, bucket`)
+	if err != nil {
+		return "", err
+	}
+	for _, m := range marks {
+		fmt.Fprintf(&b, "|unverified %s", m)
+	}
+	return b.String(), nil
 }
 
 // BelowSince is a bucket's record of live data objects below copies
@@ -252,6 +266,10 @@ type replacer struct {
 	sending func(place string, seq int64) bool
 	lock    sync.Locker
 	skipped int64
+	// unverified are the friends whose replica of the bucket in hand
+	// failed a challenge (VER-1, #27): drained of its data copies, as a
+	// removed friend is, for that bucket alone.
+	unverified map[string]bool
 }
 
 // Replace runs one re-placement pass over every bucket (REPL-13, file
@@ -445,6 +463,10 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 		AND (abandoned IS NULL AND done IS NULL OR settled IS NULL))`, bucket).Scan(&listing); err != nil || listing {
 		return st, err
 	}
+	var err error
+	if m.unverified, err = unverifiedAt(ctx, m.db, bucket); err != nil {
+		return st, err
+	}
 	// Metadata missing at a friend with an address (REPL-12).
 	meta, err := column(ctx, m.db, `SELECT DISTINCT q.seq FROM queue q, friendship f
 		WHERE q.bucket = ?1 AND q.class IN ('metadata', 'snapshot') AND q.op = 'put' AND q.state = 'done'
@@ -603,13 +625,20 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 		return nil, false, nil // the store cannot supply it: objects_not_replicated says so
 	}
 	var good, drain []prow
+	var ops []rop
 	at := map[string]prow{}
 	replaced := map[string]bool{}
 	for _, r := range o.rows {
 		at[r.place] = r
 		f := m.friends[r.place]
 		switch {
-		case f == nil || f.drainAll || f.drain[o.seq]:
+		case m.unverified[r.place] && r.state == PlacementQueued:
+			// Not sent yet to a replica that failed a challenge: it goes
+			// elsewhere instead, unless its sender holds it (#27).
+			if !r.taken && !(commit && m.sending != nil && m.sending(r.place, o.seq)) {
+				ops = append(ops, rop{kind: opCancel, place: r.place})
+			}
+		case f == nil || f.drainAll || f.drain[o.seq] || m.unverified[r.place]:
 			if r.state == PlacementAcked {
 				drain = append(drain, r)
 			}
@@ -626,7 +655,6 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 			acked++
 		}
 	}
-	var ops []rop
 	below := false
 	switch {
 	case len(good) < copies:
@@ -714,7 +742,7 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 	}
 	var cs []cand
 	for _, f := range m.order {
-		if !f.candidate || f.drain[o.seq] {
+		if !f.candidate || f.drain[o.seq] || m.unverified[f.peer] {
 			continue
 		}
 		if r, ok := at[f.peer]; ok && (r.holds() || r.state == PlacementRefused || r.state == PlacementDropping) {

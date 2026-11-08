@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/borje/lendisk/internal/gateway"
 )
@@ -39,6 +40,9 @@ type CallError struct {
 	Status  int
 	Message string
 	Code    string // the refusal's code, if the peer named one
+	// RetryAfter is how long the peer asked to wait (Retry-After, in
+	// whole seconds); zero if it did not say.
+	RetryAfter time.Duration
 }
 
 func (e *CallError) Error() string {
@@ -237,7 +241,11 @@ func (c *Client) sendProto(ctx context.Context, method, path string, body io.Rea
 		if json.Unmarshal(b, &e) != nil || e.Error == "" {
 			e.Error = http.StatusText(resp.StatusCode)
 		}
-		return nil, v, &CallError{Status: resp.StatusCode, Message: e.Error, Code: e.Code}
+		ce := &CallError{Status: resp.StatusCode, Message: e.Error, Code: e.Code}
+		if n, err := strconv.ParseInt(resp.Header.Get("Retry-After"), 10, 32); err == nil && n > 0 {
+			ce.RetryAfter = time.Duration(n) * time.Second
+		}
+		return nil, v, ce
 	}
 	if int64(len(b)) > max {
 		return nil, "", fmt.Errorf("the peer's answer to %s is over %d bytes", path, max)

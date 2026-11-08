@@ -90,8 +90,9 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 	if err := manifests.Sweep(a.now()); err != nil {
 		log.Warn("sweeping leftover manifest files failed", "dir", manifests.Dir, "err", err)
 	}
-	// The list call reads what this node holds for each friend from the
-	// store (NET-7 list): a second posix view of it, read only.
+	// The list and challenge calls read what this node holds for each
+	// friend from the store (NET-7 list, VER-1): a second posix view of
+	// it, read only, the challenge through Lending.
 	be, err := gateway.OpenBackend(cfg.StorePath())
 	if err != nil {
 		tc.Close()
@@ -101,7 +102,8 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		<-ctx.Done()
 		be.Shutdown()
 	}()
-	ctl := &control.Server{DB: db, Self: id, Log: log, Lent: &gateway.LentIndex{Store: be, DB: db},
+	lent := &gateway.LentIndex{Store: be, DB: db}
+	ctl := &control.Server{DB: db, Self: id, Log: log, Lent: lent, Held: lent,
 		Changed: func() {
 			adm.Clear()
 			if changed != nil {

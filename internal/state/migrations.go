@@ -571,4 +571,43 @@ var migrations = []Migration{
 			checked_at INTEGER NOT NULL  -- unix seconds: the last pass
 		);`,
 	},
+	{
+		Version: 29, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Verification (VER-1, VER-3, VER-4, #27): per friend and bucket,
+		-- the challenges of that friend's replica. checked_at is the last
+		-- answer, passed or failed, from which the next daily challenge is
+		-- due; verified_at the last pass, full_at the last pass of
+		-- verify --full; unverified_at the failure that marked the
+		-- replica unverified (NULL while it is not), detail what failed.
+		-- error and error_at are the last check that got no answer (a
+		-- transient error, never a failure), retried within the hour. Unix
+		-- seconds.
+		CREATE TABLE replica_check (
+			place         TEXT NOT NULL,
+			bucket        TEXT NOT NULL,
+			checked_at    INTEGER,
+			verified_at   INTEGER,
+			full_at       INTEGER,
+			unverified_at INTEGER,
+			detail        TEXT,
+			error         TEXT,
+			error_at      INTEGER,
+			PRIMARY KEY (place, bucket)
+		);
+		-- lendisk verify asks the daemon for a check here and reads the
+		-- outcome back (VER-3): verified, failed, error or nothing.
+		CREATE TABLE verify_request (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			place        TEXT NOT NULL,
+			bucket       TEXT NOT NULL,
+			full         INTEGER NOT NULL,
+			requested_at INTEGER NOT NULL,
+			done_at      INTEGER,
+			outcome      TEXT,
+			checked      INTEGER,
+			skipped      INTEGER,
+			detail       TEXT
+		);`,
+	},
 }

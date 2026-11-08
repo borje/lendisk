@@ -210,7 +210,7 @@ var BackendMethods = map[string]BackendMethod{
 	"UploadPart":              {Admitted, "s3_UploadPart"},
 	"PutObject":               {Admitted, "s3_PutObject: captured (Q-H)"},
 	"HeadObject":              {Admitted, "s3_HeadObject"},
-	"GetObject":               {Admitted, "s3_GetObject"},
+	"GetObject":               {Admitted, "s3_GetObject; also the control API's challenge read, in the caller's account (VER-1, LentIndex.Read)"},
 	"ListObjectsV2":           {Admitted, "s3_ListObjectsV2"},
 	"DeleteObject":            {Admitted, "s3_DeleteObject: captured; a tombstone for a borrower (RET-1)"},
 

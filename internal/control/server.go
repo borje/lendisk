@@ -52,11 +52,19 @@ type Server struct {
 	// QuotaEvery is the least time between two applied quota calls of
 	// one friend (default DefaultQuotaEvery); one sooner is answered 503.
 	QuotaEvery time.Duration
+	// Held reads what this node holds of each friend's objects for the
+	// challenge call (VER-1); nil answers it 404.
+	Held LentReader
+	// ChallengeRate and ChallengeBurst pace what one friend's challenges
+	// read, in bytes per second and bytes (defaults
+	// DefaultChallengeRate and DefaultChallengeBurst).
+	ChallengeRate, ChallengeBurst int64
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
 
-	quotaLimits quotaLimits
+	quotaLimits     quotaLimits
+	challengeLimits challengeLimits
 }
 
 func (s *Server) now() time.Time {
@@ -102,6 +110,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case QuotaPath:
 		if s.method(w, r, http.MethodPost) {
 			s.quota(w, r, c)
+		}
+	case ChallengePath:
+		if s.method(w, r, http.MethodPost) {
+			s.challenge(w, r, c)
 		}
 	case RemovePath:
 		if s.method(w, r, http.MethodPost) {

@@ -78,9 +78,14 @@ func reachesABucket(op gateway.Op) bool {
 }
 
 // controlAttacks is every control API call, named by path, with a body
-// where the call takes one; own and other are sealed names for list.
+// where the call takes one; own and other are sealed names for list and
+// challenge, each holding data/ef/pack (own's tombstoned in
+// TestHostilePeer, other's live).
 func controlAttacks(own, other string) []attack {
 	redeem := []byte(`{"address":"x","number":1,"retention_seconds":1,"dial_key":"x"}`)
+	challenge := func(bucket, key, rng string) []byte {
+		return fmt.Appendf(nil, `{"bucket":%q,"key":%q,"nonce":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",%s}`, bucket, key, rng)
+	}
 	return []attack{
 		{name: "version", method: "GET", target: control.VersionPath},
 		{name: "redeem", method: "POST", target: control.RedeemPath, body: redeem},
@@ -88,7 +93,20 @@ func controlAttacks(own, other string) []attack {
 		{name: "manifest put junk", method: "PUT", target: control.ManifestPath, body: []byte("not a sealed manifest")},
 		{name: "list own", method: "GET", target: control.ListPath + "?bucket=" + own},
 		{name: "list another's", method: "GET", target: control.ListPath + "?bucket=" + other},
-		{name: "challenge", method: "POST", target: control.Prefix + "challenge", body: []byte("{}")},
+		{name: "challenge", method: "POST", target: control.ChallengePath, body: []byte("{}")},
+		// VER-1 (#27): a challenge reads through Lending, so it reaches
+		// the caller's own live objects only: not a tombstoned one, not
+		// a tomb's path, not another friend's bucket, and never more than
+		// control.MaxChallengeRange bytes of a range.
+		{name: "challenge own", method: "POST", target: control.ChallengePath,
+			body: challenge(own, "data/ef/pack", `"length":4`)},
+		{name: "challenge another's", method: "POST", target: control.ChallengePath,
+			body: challenge(other, "data/ef/pack", `"whole":true`)},
+		{name: "challenge a tomb", method: "POST", target: control.ChallengePath,
+			body: challenge(own, ".lendisk/tomb/data/ef/pack/1", `"whole":true`)},
+		{name: "challenge a huge range", method: "POST", target: control.ChallengePath,
+			body: challenge(own, "data/ef/pack", fmt.Sprintf(`"length":%d`, control.MaxChallengeRange+1))},
+		{name: "challenge by GET", method: "GET", target: control.ChallengePath},
 		// From a friend these are refused 400 (#24): a valid number would
 		// change the friendship's quota for the phases after.
 		{name: "quota", method: "POST", target: control.QuotaPath, body: []byte("{}")},
