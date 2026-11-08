@@ -554,7 +554,19 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		return errSuperseded
 	}
 	replaces := ""
-	if p.Rewritable {
+	if !p.Rewritable {
+		// Deleted at the place and written again: a new object to this
+		// node, but the lender keeps the deleted version in a tomb and
+		// stores other bytes over it only marked as replacing it (LEND-4,
+		// RET-1; #22 review).
+		h, ok, err := w.DB.ReplacedHash(ctx, place, p.Bucket, p.Key, p.Seq)
+		if err != nil {
+			return err
+		}
+		if ok && h != p.SHA256 {
+			replaces = h
+		}
+	} else {
 		// The last version the place acknowledged, deleted since or not:
 		// a deleted one is in its lender's tomb, and a rewrite naming it
 		// is stored beside the tomb.
@@ -571,12 +583,15 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		// A key that is not rewritable, held by the place with another
 		// hash the index does not show (EP-11, #22): ask which, for the
 		// alert and status. A place already holding the row's bytes has
-		// it; one whose answer cannot be had is refused all the same.
+		// it. A failed Head is retried with the network's backoff (the
+		// put is sent again first): the hash is what status names.
 		held, ok, herr := r.Head(ctx, p.Bucket, p.Key)
-		if herr == nil && ok && held == p.SHA256 {
+		switch {
+		case herr != nil:
+			return fmt.Errorf("the place refused %s as holding other bytes, and asking which failed: %w", p.Key, herr)
+		case ok && held == p.SHA256:
 			return nil
-		}
-		if herr != nil || !ok {
+		case !ok:
 			held = ""
 		}
 		return &changedError{held: held, err: err}

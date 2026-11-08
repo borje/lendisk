@@ -41,6 +41,11 @@ type ChangedKey struct {
 	// Places maps each place holding another version to its hash, as
 	// Acknowledged.
 	Places map[string]string
+	// ReportedBy are the places in Places that refused the write with a
+	// 412, sorted: their hash is their word, never acknowledged, and a
+	// broken or hostile friend may answer so for every key. Empty when
+	// the change was held back at capture against acknowledged hashes.
+	ReportedBy []string
 }
 
 // ackedOther returns the places whose latest acknowledgement of bucket's
@@ -128,12 +133,14 @@ func (db *DB) ChangedKeys(ctx context.Context) ([]ChangedKey, error) {
 			bySeq[c.Seq] = &c
 		}
 		bySeq[c.Seq].Places[place] = held
+		bySeq[c.Seq].ReportedBy = append(bySeq[c.Seq].ReportedBy, place)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	out := make([]ChangedKey, 0, len(bySeq))
 	for _, c := range bySeq {
+		slices.Sort(c.ReportedBy)
 		if c.Acknowledged == "" {
 			for _, p := range slices.Sorted(maps.Keys(c.Places)) {
 				if c.Acknowledged = c.Places[p]; c.Acknowledged != "" {

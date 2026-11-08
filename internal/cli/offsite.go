@@ -193,7 +193,7 @@ func shortPhrase(waiting, stuck StatusShortfall, copies int) string {
 		what string
 	}{{stuck.Refused, "refused by a friend"}, {stuck.Dropped, "dropped at a full or gone friend"},
 		{stuck.Gone, "held by a friend removed or gone past replace_after"},
-		{stuck.Immutable, "changed after a friend acknowledged them (EP-11): write the acknowledged bytes back, or delete the key"},
+		{stuck.Immutable, "written with other bytes than a friend acknowledged or holds (EP-11; the changed keys are listed under the bucket)"},
 		{stuck.Unmatchable, "cannot be matched to the store: restore the store's xattrs or rewrite the key"},
 		{stuck.Unplaced, "with no room for them in the pool"}} {
 		if r.n > 0 {

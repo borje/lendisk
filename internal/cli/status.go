@@ -329,6 +329,11 @@ type StatusChanged struct {
 	SHA256 string `json:"sha256"`
 	// Places maps each friend holding another version to its SHA-256.
 	Places map[string]string `json:"places"`
+	// ReportedBy are the friends in Places that refused the new bytes
+	// (412) saying they hold their hash: their word, never acknowledged
+	// here, and a broken or hostile friend may say so of every key.
+	// Empty when the change was held back at capture.
+	ReportedBy []string `json:"reported_by"`
 }
 
 // changedShown is how many changed keys status prints per bucket;
@@ -394,16 +399,23 @@ func changedLines(b StatusBucket) []string {
 	if len(b.Changed) == 0 {
 		return nil
 	}
-	out := []string{fmt.Sprintf("! %s changed after a friend acknowledged an earlier version; the local write stands but is not replicated (EP-11):",
+	out := []string{fmt.Sprintf("! %s written with other bytes than a friend acknowledged or holds; the local write stands but is not replicated (EP-11):",
 		plural(int64(len(b.Changed)), "key", "keys"))}
 	for i, c := range b.Changed {
 		if i == changedShown {
 			out = append(out, fmt.Sprintf("  … and %d more (status --json lists them all)", len(b.Changed)-changedShown))
 			break
 		}
+		if len(c.ReportedBy) > 0 {
+			f := c.ReportedBy[0]
+			out = append(out, fmt.Sprintf("  %s: friend %s reports holding other bytes, %s (as reported by %s), now %s",
+				c.Key, f, cmp.Or(c.Places[f], "unknown"), f, c.SHA256))
+			continue
+		}
 		out = append(out, fmt.Sprintf("  %s: acknowledged %s, now %s", c.Key, cmp.Or(c.Acknowledged, "unknown"), c.SHA256))
 	}
-	return append(out, "  write the acknowledged bytes back, or, to keep the new ones, delete the key and write it again")
+	return append(out, "  write the acknowledged bytes back, or, to keep the new ones, delete the key and write it again;",
+		"  a friend that reports other bytes for every key is at fault (see its refusals under Places)")
 }
 
 // StatusSchema is the current `status --json` schema number.
@@ -502,7 +514,7 @@ friend, or with no room in the pool), which status shows.`,
 			for _, c := range cks {
 				changed[c.Bucket] = append(changed[c.Bucket], StatusChanged{Key: c.Key, Seq: c.Seq,
 					CapturedAt: c.CapturedAt.UTC().Format(time.RFC3339), Acknowledged: c.Acknowledged, SHA256: c.SHA256,
-					Places: c.Places})
+					Places: c.Places, ReportedBy: append([]string{}, c.ReportedBy...)})
 			}
 			for _, b := range bs {
 				q, bc := queues[b.Name], below[b.Name]

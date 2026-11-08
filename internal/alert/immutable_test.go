@@ -80,14 +80,25 @@ func TestAChangedKeyRaisesKeyChangedUntilWrittenBackOrDeleted(t *testing.T) {
 		t.Fatalf("after the delete %+v", as)
 	}
 
-	// A lender's 412: the same kind, with the hash it said it holds.
+	// A lender's 412: the same kind, with the hash it said it holds, as
+	// that friend's word, naming it; and place_refused names the friend
+	// too, since one answering 412 to everything is at fault (#22
+	// review). The advice is not the user's write-back.
 	seq := put("laptop", "data/1", "ppp")
 	if err := db.RefuseChanged(ctx, "B", seq, "qqq", "PreconditionFailed"); err != nil {
 		t.Fatal(err)
 	}
 	as = eval()
 	a, ok = as["key_changed:laptop"]
-	if !ok || len(as) != 1 || !strings.Contains(a.Message, "qqq") || !strings.Contains(a.Message, "ppp") {
+	if !ok || len(as) != 2 || as["place_refused:B"].Key == "" {
 		t.Fatalf("after a 412 %+v", as)
+	}
+	for _, want := range []string{"friend B reports holding other bytes", "qqq (as reported by B)", "ppp"} {
+		if !strings.Contains(a.Message, want) {
+			t.Errorf("message %q lacks %q", a.Message, want)
+		}
+	}
+	if strings.Contains(a.Message, "acknowledged") {
+		t.Errorf("message %q calls B's word an acknowledgement", a.Message)
 	}
 }

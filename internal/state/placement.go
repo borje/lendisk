@@ -277,6 +277,31 @@ func (db *DB) AckedPutHash(ctx context.Context, place, bucket, key string) (stri
 	return h.String, err == nil && h.Valid, err
 }
 
+// ReplacedHash returns the version place keeps in a tomb of bucket's
+// key, which a put of row seq must name to be stored over it (LEND-4,
+// RET-1; #22 review): when the place's latest acknowledged row of the
+// key before seq is a delete, the hash of the last put before that
+// delete that the place acknowledged, or refused as holding other bytes
+// (CauseImmutable) with the hash it reported. ok is false when there is
+// no such delete or no such put. A key that is not rewritable deleted
+// and written again is a new object to the borrower; the lender, which
+// still holds the old version in its tomb, takes it only so marked.
+func (db *DB) ReplacedHash(ctx context.Context, place, bucket, key string, seq int64) (string, bool, error) {
+	var h string
+	err := db.QueryRowContext(ctx, `WITH d AS (SELECT max(seq) AS seq FROM placement
+			WHERE place = ?1 AND bucket = ?2 AND key = ?3 AND seq < ?4 AND state = 'acked' AND op = 'delete'
+			AND seq = (SELECT max(x.seq) FROM placement x WHERE x.place = ?1 AND x.bucket = ?2 AND x.key = ?3
+				AND x.seq < ?4 AND x.state = 'acked'))
+		SELECT CASE WHEN p.state = 'acked' THEN p.sha256 ELSE p.held END FROM placement p, d
+		WHERE p.place = ?1 AND p.bucket = ?2 AND p.key = ?3 AND p.seq < d.seq AND p.op = 'put'
+		AND (p.state = 'acked' OR p.state = 'refused' AND p.cause = '`+CauseImmutable+`' AND coalesce(p.held, '') != '')
+		ORDER BY p.seq DESC LIMIT 1`, place, bucket, key, seq).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return h, err == nil && h != "", err
+}
+
 // PlaceStat is a place's FIFO for status.
 type PlaceStat struct {
 	Queued      int64         // rows waiting

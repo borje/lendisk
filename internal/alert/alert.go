@@ -64,7 +64,8 @@ const (
 	// KindPlaceRefused: a place refused objects for good: it keeps
 	// refusing a rewrite of a rewritable key (#74) or rejects bytes that
 	// match their capture hash (#57); the subject is the place. Its 412
-	// to a key that is not rewritable is KindKeyChanged (#22).
+	// to a key that is not rewritable counts too, and raises
+	// KindKeyChanged naming it (#22): a friend may refuse every key.
 	KindPlaceRefused = "place_refused"
 	// KindPoolTooSmall: a bucket's copies exceed the places in the pool
 	// (OPS-2, #19), which re-placement cannot fix: the pool needs a new
@@ -309,7 +310,7 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		out = append(out, alertOf(KindObjectsNotReplicated, b, msg))
 	}
 	for _, p := range sortedKeys(places) {
-		msg := fmt.Sprintf("friend %s refused %s for good: it keeps refusing a rewrite of a rewritable key (a tomb of another version, or an older lendisk), or rejects bytes that match their capture hash (see the log)",
+		msg := fmt.Sprintf("friend %s refused %s for good: it says it holds other bytes at the key (key_changed lists them), keeps refusing a rewrite of a rewritable key (a tomb of another version, or an older lendisk), or rejects bytes that match their capture hash (see the log)",
 			p, objects(places[p]))
 		out = append(out, alertOf(KindPlaceRefused, p, msg))
 	}
@@ -329,6 +330,14 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		}
 		msg := fmt.Sprintf("bucket %s: key %s%s changed after a friend acknowledged it (acknowledged %s, now %s); the local write stands but is not replicated, so friends keep the old version (EP-11). Write the acknowledged bytes back, or, to keep the new ones, delete the key and write it again (friends keep the old version as a tombstone); `lendisk status` lists them",
 			c.Bucket, c.Key, more, cmp.Or(c.Acknowledged, "unknown"), c.SHA256)
+		if len(c.ReportedBy) > 0 {
+			// The friend's word, never acknowledged here: it may be right
+			// (a send whose answer was lost, another friend's version after
+			// recover) or broken (#22 review).
+			f := c.ReportedBy[0]
+			msg = fmt.Sprintf("bucket %s: friend %s reports holding other bytes at key %s%s: %s (as reported by %s), where this node wrote %s; not replicated there (EP-11). If %s refuses every key, it is at fault (see place_refused for it); otherwise delete the key and write it again, which replaces its version (it keeps that as a tombstone); `lendisk status` lists them",
+				c.Bucket, f, c.Key, more, cmp.Or(c.Places[f], "unknown"), f, c.SHA256, f)
+		}
 		out = append(out, alertOf(KindKeyChanged, c.Bucket, msg))
 		i = j
 	}

@@ -2503,7 +2503,8 @@ upstream bucket is Q-V.
   still refuses request by request (SEC-11). A `412` to a put of a
   rewritable key is handled as *Rewrites* says, below; any other `412`
   is refused at that place as a changed key, with the hash a `HEAD`
-  reports, and raises `key_changed` (*EP-11*, below, #22); anything
+  reports, and raises `key_changed` and `place_refused` (*EP-11*,
+  below, #22); anything
   else is a retry with backoff. A `BadDigest` (also
   `InvalidDigest`, `XAmzContentSHA256Mismatch`) says the bytes the
   place received do not match the capture hash (REPL-10); the place's
@@ -2531,8 +2532,9 @@ upstream bucket is Q-V.
   as the user metadata `x-amz-meta-lendisk-replaces` with the
   replaced version's SHA-256 (`replica.MetaReplaces`), signed like
   every header. A first put, a put to a place that acknowledged the
-  same bytes, and every put of a key that is not rewritable carry no
-  mark. If the place refuses the rewrite all the same (`412`), it holds
+  same bytes, and a put of a key that is not rewritable carry no mark,
+  except, for any key, a put after the place acknowledged a delete of
+  it, which names the version in its tomb (*EP-11*, below, #22). If the place refuses the rewrite all the same (`412`), it holds
   a version the index does not show it acknowledged: a rewrite stored
   there whose answer was lost before a later capture superseded and
   cancelled its row, or, after `recover`, another friend's version
@@ -2616,13 +2618,22 @@ upstream bucket is Q-V.
     show: a send whose answer was lost and whose row a later write then
     superseded, or, after `recover`, a version listed by no friend the
     node's own row knows. The worker asks the place what it holds
-    (`Replica.Head`): the row's own bytes are an acknowledgement;
-    otherwise the row is refused at that place with cause `immutable`
-    and `placement.held` the hash it reported (`''` when the `HEAD`
-    failed or found nothing; `state.DB.RefuseChanged`). That is the same
-    condition and the same alert, `key_changed`, not `place_refused`
-    (`RefusedAtPlaces` counts only cause NULL); the place's refused
-    count in `status` still shows it, and `RefusedObjects` counts only
+    (`Replica.Head`): the row's own bytes are an acknowledgement; a
+    failed `HEAD` is a network error, retried with the backoff (the
+    put is sent again first) so the hash can be named; otherwise the
+    row is refused at that place with cause `immutable` and
+    `placement.held` the hash it reported (`''` when it holds nothing
+    live; `state.DB.RefuseChanged`). That is the same condition and the
+    same alert, `key_changed`, but the hash is the friend's word, not an
+    acknowledgement, and a broken or hostile friend may answer `412` to
+    every key. *Decision (#22 review):* so `ChangedKeys` lists such a
+    friend in `ReportedBy` (`reported_by` in `status --json`), the
+    alert and `status` say "friend B reports holding other bytes, <hash>
+    (as reported by B)" and that a friend refusing every key is at
+    fault, and the refusal still counts as the friend's own:
+    `RefusedAtPlaces` counts cause `immutable` with cause NULL, so
+    `place_refused` names the friend too
+    (`TestAFriendRefusingEveryKeyIsNamed`). `RefusedObjects` counts only
     the store's causes. Other places keep the row: the borrower's index
     holds no acknowledged version there, and a send that has landed
     cannot be undone. An identical re-upload does not heal such a
@@ -2655,7 +2666,23 @@ upstream bucket is Q-V.
     is sent. After a delete, which every holder receives, a write is a
     new object, placed as usual; each lender keeps the old version as a
     tombstone for the retention window (RET-1). That is how a user keeps
-    the new bytes: delete the key and write it again. There is no
+    the new bytes: delete the key and write it again. A lender refuses
+    other bytes over a tomb unless the put is marked as replacing it
+    (`putOverTomb`, LEND-4), so the worker marks the put of *any* key,
+    rewritable or not, with `x-amz-meta-lendisk-replaces` when the
+    place's latest acknowledged row of the key is a delete: the hash of
+    the last put before it that the place acknowledged, or refused as
+    `immutable` with the hash it reported (`state.DB.ReplacedHash`; #74's
+    lender takes a marked put of an absent key whose newest tomb holds
+    the named hash; after the tomb's purge, a marked put of a key with
+    no tomb is stored as a plain put)
+    (`TestReplacedHashNamesTheVersionADeleteTombed`,
+    `TestAPutAfterADeleteNamesTheTombedVersion`, and against two real
+    daemons `TestDeleteAndWriteAgainReplacesTheTombedVersion`: the new
+    bytes are stored, the old version stays a tomb, no `key_changed`).
+    The same holds for a friend whose `412` named another version: once
+    it acknowledged the delete, the key written again is marked with the
+    hash it reported. There is no
     acknowledge command. Precedent: ZFS lists files with permanent
     errors in `zpool status -v` for as long as the damaged data is what
     the pool holds; the list goes once the file is deleted or restored
@@ -2672,13 +2699,15 @@ upstream bucket is Q-V.
     it is stuck with reason `immutable` (`state.Shortfall.Immutable`,
     `buckets[].offsite.stuck.immutable`), and `status --wait` exits 4.
     The bucket is never claimed offsite with the new bytes.
-  - *`status`.* Under each bucket, "! N keys changed after a friend
-    acknowledged an earlier version; the local write stands but is not
-    replicated (EP-11):", then each key with its acknowledged and new
-    hash (10 shown) and what to do; `status --json` adds
-    `buckets[].changed` (`key`, `seq`, `captured_at`,
+  - *`status`.* Under each bucket, "! N keys written with other bytes
+    than a friend acknowledged or holds; the local write stands but is
+    not replicated (EP-11):", then each key with its acknowledged and
+    new hash, or "friend B reports holding other bytes, <hash> (as
+    reported by B)" for a `412` (10 shown), and what to do; `status
+    --json` adds `buckets[].changed` (`key`, `seq`, `captured_at`,
     `acknowledged_sha256`, `sha256`, `places`: each friend holding
-    another version and its hash). Additive, schema 1
+    another version and its hash, `reported_by`: those whose hash is
+    their word). Additive, schema 1
     (`TestStatusShowsAChangedAcknowledgedKey`).
   - *Rewritable keys (#74)* are exempt and replicate as rewrites, with
     no alert: `TestARewritableKeyIsPlacedAsARewrite`,
@@ -3681,14 +3710,17 @@ capture decorator, so nothing stands between that and posix (#62).
     again;
   - `place_refused`, subject the place: rows it refused for good (a
     `BadDigest` for bytes that match, #57; a rewrite of a rewritable key
-    it keeps refusing, #74), until written again;
+    it keeps refusing, #74; a `412` saying it holds other bytes, which
+    also raises `key_changed`, #22), until written again;
   - `key_changed`, subject the bucket: keys written with other bytes
     than a friend acknowledged that the profile does not name
     rewritable, held back at capture or refused by a lender's `412`
     (`state.DB.ChangedKeys`, §3.4 *EP-11*, #22), naming the first key,
-    both hashes and how many more; raised at once (`state.DB.KeyChanged`
-    and the worker call `Check`), cleared when each such key is written
-    back to the acknowledged bytes or deleted;
+    both hashes and how many more; for a `412`, it names the friend and
+    gives its hash as that friend's report, not an acknowledgement.
+    Raised at once (`state.DB.KeyChanged` and the worker call `Check`),
+    cleared when each such key is written back to the acknowledged
+    bytes or deleted;
   - `pool_too_small`, subject the bucket: its `copies` exceed the
     places in the pool, friends with an address that do not refuse this
     node and are not gone past `replace_after` (`state.DB.PoolSize`,

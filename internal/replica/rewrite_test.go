@@ -181,8 +181,8 @@ func TestALendersImmutabilityRefusalIsReportedAsAChangedKey(t *testing.T) {
 		cs[0].Places["B"] != hashOf("their bytes") || cs[0].Acknowledged != hashOf("their bytes") {
 		t.Fatalf("changed keys %+v %v", cs, err)
 	}
-	if r, _ := fx.db.RefusedAtPlaces(t.Context()); r["B"] != 0 {
-		t.Fatalf("recorded as place_refused: %v", r)
+	if cs[0].ReportedBy == nil || cs[0].ReportedBy[0] != "B" {
+		t.Fatalf("not reported as B's word: %+v", cs[0])
 	}
 	if n := fx.refusedAt("B"); n != 1 || fx.alerted.Load() == 0 {
 		t.Fatalf("refused %d, alerts %d", n, fx.alerted.Load())

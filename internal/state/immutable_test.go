@@ -247,10 +247,12 @@ func TestAChangedKeyClearsWhenRevertedOrDeleted(t *testing.T) {
 
 // EP-11, LEND-4 (#22): a lender's 412 to a key that is not rewritable
 // is the same condition: ChangedKeys names it, with the hash the place
-// said it holds; it is not a place_refused refusal (RefusedAtPlaces) nor
-// one against the bucket (RefusedObjects), though the place's refused
-// count shows it. The same bytes again do not heal it (the place would
-// refuse them again): dropped as a retry.
+// said it holds and the place that said so (its word, not an
+// acknowledgement). It still counts as the place's refusal
+// (RefusedAtPlaces, so place_refused names the friend, which may be
+// broken or hostile), not against the bucket (RefusedObjects). The same
+// bytes again do not heal it (the place would refuse them again):
+// dropped as a retry.
 func TestALendersImmutabilityRefusalIsAChangedKey(t *testing.T) {
 	ctx := context.Background()
 	p := newPool(t)
@@ -264,11 +266,11 @@ func TestALendersImmutabilityRefusalIsAChangedKey(t *testing.T) {
 	}
 	cs := p.changed()
 	if len(cs) != 1 || cs[0].Key != "doc" || cs[0].SHA256 != "bbb" || cs[0].Acknowledged != "aaa" ||
-		len(cs[0].Places) != 1 || cs[0].Places["B"] != "aaa" {
+		len(cs[0].Places) != 1 || cs[0].Places["B"] != "aaa" || len(cs[0].ReportedBy) != 1 || cs[0].ReportedBy[0] != "B" {
 		t.Fatalf("changed keys %+v", cs)
 	}
-	if r, _ := p.db.RefusedAtPlaces(ctx); r["B"] != 0 {
-		t.Fatalf("place_refused counts it: %v", r)
+	if r, _ := p.db.RefusedAtPlaces(ctx); r["B"] != 1 {
+		t.Fatalf("place_refused does not count it: %v", r)
 	}
 	if r, _ := p.db.RefusedObjects(ctx); r["files"] != 0 {
 		t.Fatalf("counted against the bucket: %v", r)
@@ -322,7 +324,65 @@ func TestAChangedWriteOfARecoveredKeyIsHeldBack(t *testing.T) {
 	}
 	put("data/1", "bbb")
 	cs, err := db.ChangedKeys(ctx)
-	if err != nil || len(cs) != 1 || cs[0].Key != "data/1" || cs[0].Acknowledged != "aaa" || len(cs[0].Places) != 2 {
+	if err != nil || len(cs) != 1 || cs[0].Key != "data/1" || cs[0].Acknowledged != "aaa" || len(cs[0].Places) != 2 ||
+		len(cs[0].ReportedBy) != 0 {
 		t.Fatalf("changed keys %+v %v", cs, err)
+	}
+}
+
+// EP-11, LEND-4, RET-1 (#22 review): after a delete a place
+// acknowledged, a write of the key with other bytes is a new object on
+// the borrower's side, but the lender keeps the deleted version in a
+// tomb and refuses other bytes over it unless they are marked as
+// replacing it. ReplacedHash names that version for any key: the
+// place's last acknowledged put before its acknowledged delete, or the
+// hash it reported holding when it refused a put (412) before that
+// delete. With no acknowledged delete since, or nothing before it,
+// there is nothing to name.
+func TestReplacedHashNamesTheVersionADeleteTombed(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.bucket("files", 1)
+	p.friend("B", 100)
+	replaced := func(key string, seq int64) (string, bool) {
+		t.Helper()
+		h, ok, err := p.db.ReplacedHash(ctx, "B", "files", key, seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h, ok
+	}
+	first, _ := p.capture("files", "doc", "data", "aaa", false)
+	if h, ok := replaced("doc", first); ok {
+		t.Fatalf("a first write names %q", h)
+	}
+	p.ackAll(first)
+	del := p.del("files", "doc", "data")
+	second, _ := p.capture("files", "doc", "data", "bbb", false)
+	if p.rows(second) != 1 || len(p.changed()) != 0 {
+		t.Fatalf("a write after the delete: rows %d, changed %+v", p.rows(second), p.changed())
+	}
+	if h, ok := replaced("doc", second); ok {
+		t.Fatalf("named %q while the delete is unacknowledged", h)
+	}
+	p.ackAll(del)
+	if h, ok := replaced("doc", second); !ok || h != "aaa" {
+		t.Fatalf("after the acknowledged delete: %q %v", h, ok)
+	}
+
+	// The place refused a put as holding other bytes, then took the
+	// delete: its tomb holds what it reported.
+	r, _ := p.capture("files", "theirs", "data", "ours", false)
+	if err := p.db.RefuseChanged(ctx, "B", r, "theirs-hash", "PreconditionFailed"); err != nil {
+		t.Fatal(err)
+	}
+	d2 := p.del("files", "theirs", "data")
+	p.ackAll(d2)
+	again, _ := p.capture("files", "theirs", "data", "ours", false)
+	if h, ok := replaced("theirs", again); !ok || h != "theirs-hash" {
+		t.Fatalf("after a refused put and a delete: %q %v", h, ok)
+	}
+	if cs := p.changed(); len(cs) != 0 {
+		t.Fatalf("changed keys %+v", cs)
 	}
 }
