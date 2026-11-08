@@ -131,7 +131,12 @@ func TestRewritableKeyIsSentAsARewrite(t *testing.T) {
 		t.Fatalf("acked %q %v", h, ok)
 	}
 
-	// Not rewritable: refused at the place, alerted, B keeps the old.
+	if cs, _ := fx.db.ChangedKeys(t.Context()); len(cs) != 0 {
+		t.Fatalf("a rewritable key reported changed: %+v", cs)
+	}
+
+	// Not rewritable: held back at capture (EP-11, #22), never sent; B
+	// keeps the old version, and the change is reported.
 	fx.writeAs("vault", "n0123", "index one", "snapshot", false)
 	fx.drained("B")
 	fx.writeAs("vault", "n0123", "index two", "snapshot", false)
@@ -139,11 +144,54 @@ func TestRewritableKeyIsSentAsARewrite(t *testing.T) {
 	if got := b.held("vault/n0123"); got != "index one" {
 		t.Fatalf("B holds %q of a key that is not rewritable", got)
 	}
-	if n := fx.refusedAt("B"); n != 1 || fx.alerted.Load() == 0 {
-		t.Fatalf("a changed key that is not rewritable: refused %d, alerts %d", n, fx.alerted.Load())
+	if n := len(b.sentMarks()); n != 4 {
+		t.Fatalf("%d puts sent, want 4: the changed index was sent", n)
 	}
-	if strings.Contains(strings.Join(b.sentMarks(), " "), "n0123="+hashOf("index one")) {
-		t.Fatalf("a key that is not rewritable was marked: %v", b.sentMarks())
+	if cs, _ := fx.db.ChangedKeys(t.Context()); len(cs) != 1 || cs[0].Key != "n0123" ||
+		cs[0].Acknowledged != hashOf("index one") || cs[0].SHA256 != hashOf("index two") {
+		t.Fatalf("changed keys %+v", cs)
+	}
+}
+
+// EP-11, LEND-4 (#22): a place may hold a key that is not rewritable
+// with bytes the index does not show it acknowledged (a send whose
+// answer was lost, then superseded; or another friend's version after
+// recover). Its 412 is the immutability alert: the worker asks the place
+// what it holds and records the refusal as a changed key with that hash,
+// not as place_refused, and moves on. A place already holding the row's
+// bytes has it: an acknowledgement.
+func TestALendersImmutabilityRefusalIsReportedAsAChangedKey(t *testing.T) {
+	fx := newFixture(t, "B")
+	b := &immutablePlace{place: fx.places["B"]}
+	fx.w.Connect = func(f state.Friendship) (Replica, error) { return b, nil }
+	b.place.mu.Lock()
+	b.objs["laptop/data/theirs"] = []byte("their bytes")
+	b.objs["laptop/data/same"] = []byte("same bytes")
+	b.place.mu.Unlock()
+	fx.write("laptop", "data/theirs", "our bytes")
+	fx.write("laptop", "data/same", "same bytes")
+	fx.write("laptop", "data/fine", "fine")
+	fx.run()
+	fx.drained("B")
+	if got := b.held("laptop/data/theirs"); got != "their bytes" {
+		t.Fatalf("B holds %q", got)
+	}
+	cs, err := fx.db.ChangedKeys(t.Context())
+	if err != nil || len(cs) != 1 || cs[0].Key != "data/theirs" || cs[0].SHA256 != hashOf("our bytes") ||
+		cs[0].Places["B"] != hashOf("their bytes") || cs[0].Acknowledged != hashOf("their bytes") {
+		t.Fatalf("changed keys %+v %v", cs, err)
+	}
+	if cs[0].ReportedBy == nil || cs[0].ReportedBy[0] != "B" {
+		t.Fatalf("not reported as B's word: %+v", cs[0])
+	}
+	if n := fx.refusedAt("B"); n != 1 || fx.alerted.Load() == 0 {
+		t.Fatalf("refused %d, alerts %d", n, fx.alerted.Load())
+	}
+	if h, ok, _ := fx.db.AckedHash(t.Context(), "B", "laptop", "data/same"); !ok || h != hashOf("same bytes") {
+		t.Fatalf("data/same acked %q %v", h, ok)
+	}
+	if c := fx.condition("B"); c.Condition != state.ConditionOK {
+		t.Fatalf("condition %+v", c)
 	}
 }
 

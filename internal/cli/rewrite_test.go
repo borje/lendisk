@@ -71,10 +71,15 @@ func TestResticMigrateReplicatesTheNewConfig(t *testing.T) {
 	}
 	p := an.drained(bKey, 60*time.Second)
 	sameObjects(t, replicable(t, an, "laptop"), lentObjects(t, bn, aID, "laptop"))
-	for _, al := range an.status().Alerts {
-		if al.Kind == alert.KindPlaceRefused {
+	st := an.status()
+	for _, al := range st.Alerts {
+		if al.Kind == alert.KindPlaceRefused || al.Kind == alert.KindKeyChanged {
 			t.Errorf("alert %s %s: %s", al.Kind, al.Subject, al.Message)
 		}
+	}
+	// EP-11 exempts the rewritable config (#22): no changed key.
+	if b := bucketOf(t, st, "laptop"); len(b.Changed) != 0 || b.Offsite.Stuck.Immutable != 0 {
+		t.Errorf("changed keys %+v, stuck %+v", b.Changed, b.Offsite.Stuck)
 	}
 	if p.Refused != 0 {
 		t.Errorf("place after the migration: %+v", p)

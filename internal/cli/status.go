@@ -311,7 +311,34 @@ type StatusBucket struct {
 	// the watermark, the latest snapshot and whether it is offsite
 	// (REPL-4, REPL-11, #20).
 	Offsite StatusOffsite `json:"offsite"`
+	// Changed are keys written with other bytes than a friend
+	// acknowledged, which the bucket's profile does not name rewritable:
+	// the local write stands, but is not replicated (EP-11, #22).
+	Changed []StatusChanged `json:"changed"`
 }
+
+// StatusChanged is one changed key (EP-11).
+type StatusChanged struct {
+	Key        string `json:"key"`
+	Seq        int64  `json:"seq"`
+	CapturedAt string `json:"captured_at"` // RFC 3339, UTC
+	// Acknowledged is the SHA-256 a friend acknowledged, or said it
+	// holds when it refused the new bytes; empty if it did not say.
+	Acknowledged string `json:"acknowledged_sha256"`
+	// SHA256 is the new bytes', held only in the local store.
+	SHA256 string `json:"sha256"`
+	// Places maps each friend holding another version to its SHA-256.
+	Places map[string]string `json:"places"`
+	// ReportedBy are the friends in Places that refused the new bytes
+	// (412) saying they hold their hash: their word, never acknowledged
+	// here, and a broken or hostile friend may say so of every key.
+	// Empty when the change was held back at capture.
+	ReportedBy []string `json:"reported_by"`
+}
+
+// changedShown is how many changed keys status prints per bucket;
+// status --json lists them all.
+const changedShown = 10
 
 // StatusPool is the pool of friends that hold copies (D6).
 type StatusPool struct {
@@ -363,6 +390,32 @@ func listenerLine(l StatusListener) string {
 	default:
 		return what + " (TLS, your certificate)"
 	}
+}
+
+// changedLines are the lines status prints under bucket b for its
+// changed keys (EP-11): each key with the acknowledged hash and the new
+// one, and what to do.
+func changedLines(b StatusBucket) []string {
+	if len(b.Changed) == 0 {
+		return nil
+	}
+	out := []string{fmt.Sprintf("! %s written with other bytes than a friend acknowledged or holds; the local write stands but is not replicated (EP-11):",
+		plural(int64(len(b.Changed)), "key", "keys"))}
+	for i, c := range b.Changed {
+		if i == changedShown {
+			out = append(out, fmt.Sprintf("  … and %d more (status --json lists them all)", len(b.Changed)-changedShown))
+			break
+		}
+		if len(c.ReportedBy) > 0 {
+			f := c.ReportedBy[0]
+			out = append(out, fmt.Sprintf("  %s: friend %s reports holding other bytes, %s (as reported by %s), now %s",
+				c.Key, f, cmp.Or(c.Places[f], "unknown"), f, c.SHA256))
+			continue
+		}
+		out = append(out, fmt.Sprintf("  %s: acknowledged %s, now %s", c.Key, cmp.Or(c.Acknowledged, "unknown"), c.SHA256))
+	}
+	return append(out, "  write the acknowledged bytes back, or, to keep the new ones, delete the key and write it again;",
+		"  a friend that reports other bytes for every key is at fault (see its refusals under Places)")
 }
 
 // StatusSchema is the current `status --json` schema number.
@@ -453,16 +506,30 @@ friend, or with no room in the pool), which status shows.`,
 			if err != nil {
 				return err
 			}
+			cks, err := db.ChangedKeys(cmd.Context())
+			if err != nil {
+				return err
+			}
+			changed := map[string][]StatusChanged{}
+			for _, c := range cks {
+				changed[c.Bucket] = append(changed[c.Bucket], StatusChanged{Key: c.Key, Seq: c.Seq,
+					CapturedAt: c.CapturedAt.UTC().Format(time.RFC3339), Acknowledged: c.Acknowledged, SHA256: c.SHA256,
+					Places: c.Places, ReportedBy: append([]string{}, c.ReportedBy...)})
+			}
 			for _, b := range bs {
 				q, bc := queues[b.Name], below[b.Name]
 				off, err := offsiteStatus(cmd.Context(), db, b, profiles.Get(b.Profile))
 				if err != nil {
 					return err
 				}
+				if changed[b.Name] == nil {
+					changed[b.Name] = []StatusChanged{}
+				}
 				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
 					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1,
-					OutsideTrust: !profiles.Get(b.Profile).Encrypted, Offsite: off})
+					OutsideTrust: !profiles.Get(b.Profile).Encrypted, Offsite: off,
+					Changed: changed[b.Name]})
 			}
 			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
 				return err
@@ -558,6 +625,9 @@ friend, or with no room in the pool), which status shows.`,
 					fmt.Fprintf(a.out, "    %s\n", singleCopyLine)
 				}
 				for _, l := range offsiteLines(b) {
+					fmt.Fprintf(a.out, "    %s\n", l)
+				}
+				for _, l := range changedLines(b) {
 					fmt.Fprintf(a.out, "    %s\n", l)
 				}
 			}

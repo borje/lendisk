@@ -28,6 +28,10 @@ import (
 //     its hash is taken, or one stranded until the next start, #49) has
 //     no placement yet: no w at or above it is valid.
 //
+// A changed key (EP-11, #22) is such a put: placed nowhere, or refused
+// by a place holding another version; it is stuck, reason immutable,
+// until the key is written back or deleted.
+//
 // Only places in the pool hold copies: friends with an address that do
 // not refuse this node and are not gone past replace_after (REPL-12,
 // REPL-13). An acknowledgement at a removed or gone friend is not
@@ -63,6 +67,10 @@ type Shortfall struct {
 	Refused, Dropped, Gone, Unplaced int64
 	Unmatchable                      int64
 	Pending                          int64
+	// Immutable: changed keys (EP-11, #22), written with other bytes
+	// than a place acknowledged and so replicated nowhere they would
+	// replace them, until written back or deleted.
+	Immutable int64
 }
 
 // Offsite is a bucket's offsite-complete state.
@@ -136,6 +144,7 @@ type short struct {
 	stuck, pending         bool
 	refused, dropped, gone bool
 	unmatchable            bool // pending, and cannot be matched to the store (MarkUnmatchable)
+	immutable              bool // a changed key (EP-11): held back at capture, or refused by a place's 412
 }
 
 // Offsite computes bucket's watermark and what keeps it below target
@@ -215,6 +224,8 @@ func (s *Shortfall) add(r short) {
 		return
 	}
 	switch {
+	case r.immutable:
+		s.Immutable++
 	case r.refused:
 		s.Refused++
 	case r.dropped:
@@ -278,7 +289,7 @@ const holds = `coalesce((SELECT a.state = 'acked' AND a.op = 'put' AND qa.sha256
 // indexed look-up per place (placement_key).
 func (db *DB) shorts(ctx context.Context, bucket string, copies int, holders string) ([]short, error) {
 	rows, err := db.QueryContext(ctx, `WITH places AS (SELECT value AS place FROM json_each(?3)),
-		puts AS (SELECT q.seq, coalesce(q.size, 0) AS size,
+		puts AS (SELECT q.seq, coalesce(q.size, 0) AS size, q.immutable IS NOT NULL AS changed,
 			(SELECT min(l.seq) FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done') AS next,
 			(SELECT count(*) FROM places pl WHERE `+holds+`) AS held,
 			(SELECT count(*) FROM placement w JOIN places pl ON pl.place = w.place
@@ -288,10 +299,12 @@ func (db *DB) shorts(ctx context.Context, bucket string, copies int, holders str
 			EXISTS (SELECT 1 FROM placement r WHERE r.seq = puts.seq AND r.state = 'refused'),
 			EXISTS (SELECT 1 FROM placement d WHERE d.seq = puts.seq AND d.state = 'dropped'),
 			EXISTS (SELECT 1 FROM placement g WHERE g.seq = puts.seq AND g.state = 'acked'
-				AND g.place NOT IN (SELECT place FROM places)), 0, 0
+				AND g.place NOT IN (SELECT place FROM places)), 0, 0,
+			changed OR EXISTS (SELECT 1 FROM placement i WHERE i.seq = puts.seq AND i.state = 'refused'
+				AND i.cause = '`+CauseImmutable+`')
 		FROM puts WHERE held < ?2
 		UNION ALL
-		SELECT seq, 0, 0, unmatchable IS NOT NULL, 0, 0, 0, 1, unmatchable IS NOT NULL FROM queue
+		SELECT seq, 0, 0, unmatchable IS NOT NULL, 0, 0, 0, 1, unmatchable IS NOT NULL, 0 FROM queue
 		WHERE state = 'pending' AND bucket = ?1 AND op = 'put'
 		ORDER BY 1`, bucket, copies, holders)
 	if err != nil {
@@ -301,7 +314,7 @@ func (db *DB) shorts(ctx context.Context, bucket string, copies int, holders str
 	var out []short
 	for rows.Next() {
 		var s short
-		if err := rows.Scan(&s.seq, &s.size, &s.next, &s.stuck, &s.refused, &s.dropped, &s.gone, &s.pending, &s.unmatchable); err != nil {
+		if err := rows.Scan(&s.seq, &s.size, &s.next, &s.stuck, &s.refused, &s.dropped, &s.gone, &s.pending, &s.unmatchable, &s.immutable); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

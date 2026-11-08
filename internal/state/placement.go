@@ -10,10 +10,12 @@ import (
 // Placement row states (D6). A queued row is an entry in its place's
 // FIFO; acked keeps the hash the place verified (REPL-10); refused is a
 // refusal that would repeat, out of the FIFO and shown in status: by
-// the place (EP-11, LEND-4, cause NULL), or because the node's own store
-// cannot supply the object as captured (RefuseObject, #50; cause
+// the place (LEND-4, cause NULL; a 412 to a key that is not rewritable,
+// EP-11, cause CauseImmutable, RefuseChanged), or because the node's own
+// store cannot supply the object as captured (RefuseObject, #50; cause
 // CauseStore or CauseOversize). An identical re-upload of the key heals
-// a refusal: FinishPut queues it again except where the place
+// a refusal, except an immutability refusal, which the place would
+// repeat (#22): FinishPut queues it again except where the place
 // acknowledged the very row it heals, and a refusal a later done write
 // replaced no longer counts (#57, #61). dropped is a copy never sent:
 // unsent at a friend gone past replace_after, or full for
@@ -53,6 +55,12 @@ const (
 	CauseStore    = "store"
 	CauseOversize = "oversize"
 )
+
+// CauseImmutable is a place's 412 to a put of a key that is not
+// rewritable: it holds the key with another hash (EP-11, LEND-4, #22).
+// It is the place's refusal, counted in its refused rows, but reported
+// as a changed key (ChangedKeys) rather than a place_refused one.
+const CauseImmutable = "immutable"
 
 // current keeps placement rows p whose queue row is the key's latest
 // done write: a refusal a later write or delete of the key replaced
@@ -149,6 +157,17 @@ func (db *DB) RefusePlacement(ctx context.Context, place string, seq int64, deta
 	return err
 }
 
+// RefuseChanged takes a queued put out of place's FIFO as refused
+// because the place holds the key with another hash (a 412, EP-11,
+// LEND-4, #22): held is that hash as the place reported it, empty if
+// unknown. ChangedKeys reports it while the row is the key's latest
+// write.
+func (db *DB) RefuseChanged(ctx context.Context, place string, seq int64, held, detail string) error {
+	_, err := db.ExecContext(ctx, `UPDATE placement SET state = 'refused', detail = ?, cause = ?, held = ?
+		WHERE place = ? AND seq = ? AND state = 'queued'`, detail, CauseImmutable, held, place, seq)
+	return err
+}
+
 // RefuseObject takes the queue row seq out of every place's FIFO as
 // refused because the node's own store cannot supply the object as
 // captured (#50), for cause (CauseStore or CauseOversize);
@@ -192,7 +211,7 @@ func (db *DB) RequeueOversize(ctx context.Context, putLimit int64) (int64, error
 // again since; buckets with none are absent.
 func (db *DB) RefusedObjects(ctx context.Context) (map[string]int64, error) {
 	rows, err := db.QueryContext(ctx, `SELECT bucket, count(DISTINCT seq) FROM placement p
-		WHERE state = 'refused' AND cause IS NOT NULL AND `+current+` GROUP BY bucket`)
+		WHERE state = 'refused' AND cause IN ('store', 'oversize') AND `+current+` GROUP BY bucket`)
 	if err != nil {
 		return nil, err
 	}
@@ -258,6 +277,31 @@ func (db *DB) AckedPutHash(ctx context.Context, place, bucket, key string) (stri
 	return h.String, err == nil && h.Valid, err
 }
 
+// ReplacedHash returns the version place keeps in a tomb of bucket's
+// key, which a put of row seq must name to be stored over it (LEND-4,
+// RET-1; #22 review): when the place's latest acknowledged row of the
+// key before seq is a delete, the hash of the last put before that
+// delete that the place acknowledged, or refused as holding other bytes
+// (CauseImmutable) with the hash it reported. ok is false when there is
+// no such delete or no such put. A key that is not rewritable deleted
+// and written again is a new object to the borrower; the lender, which
+// still holds the old version in its tomb, takes it only so marked.
+func (db *DB) ReplacedHash(ctx context.Context, place, bucket, key string, seq int64) (string, bool, error) {
+	var h string
+	err := db.QueryRowContext(ctx, `WITH d AS (SELECT max(seq) AS seq FROM placement
+			WHERE place = ?1 AND bucket = ?2 AND key = ?3 AND seq < ?4 AND state = 'acked' AND op = 'delete'
+			AND seq = (SELECT max(x.seq) FROM placement x WHERE x.place = ?1 AND x.bucket = ?2 AND x.key = ?3
+				AND x.seq < ?4 AND x.state = 'acked'))
+		SELECT CASE WHEN p.state = 'acked' THEN p.sha256 ELSE p.held END FROM placement p, d
+		WHERE p.place = ?1 AND p.bucket = ?2 AND p.key = ?3 AND p.seq < d.seq AND p.op = 'put'
+		AND (p.state = 'acked' OR p.state = 'refused' AND p.cause = '`+CauseImmutable+`' AND coalesce(p.held, '') != '')
+		ORDER BY p.seq DESC LIMIT 1`, place, bucket, key, seq).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return h, err == nil && h != "", err
+}
+
 // PlaceStat is a place's FIFO for status.
 type PlaceStat struct {
 	Queued      int64         // rows waiting
@@ -274,7 +318,7 @@ func (db *DB) PlaceStats(ctx context.Context, now time.Time) (map[string]PlaceSt
 		count(*) FILTER (WHERE p.state = 'queued'),
 		coalesce(sum(q.size) FILTER (WHERE p.state = 'queued' AND p.op = 'put'), 0),
 		min(q.created_at) FILTER (WHERE p.state = 'queued'),
-		count(*) FILTER (WHERE p.state = 'refused' AND p.cause IS NULL AND `+current+`)
+		count(*) FILTER (WHERE p.state = 'refused' AND (p.cause IS NULL OR p.cause = 'immutable') AND `+current+`)
 		FROM placement p JOIN queue q ON q.seq = p.seq GROUP BY p.place`)
 	if err != nil {
 		return nil, err

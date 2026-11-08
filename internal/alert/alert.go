@@ -3,7 +3,8 @@
 //
 // An alert is a condition read from lendisk.db: a friend unreachable
 // past alerts.unreachable_after, this node's store unreadable, objects
-// the store could not supply (VER-5), objects a place refused (EP-11).
+// the store could not supply (VER-5), objects a place refused (LEND-4),
+// keys changed after a friend acknowledged them (EP-11).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -60,9 +61,11 @@ const (
 	// rotted (VER-5), or too large for one PUT (#50); the subject is the
 	// bucket.
 	KindObjectsNotReplicated = "objects_not_replicated"
-	// KindPlaceRefused: a place refused objects for good: it holds the
-	// key with another hash (EP-11) or rejects bytes that match their
-	// capture hash (#57); the subject is the place.
+	// KindPlaceRefused: a place refused objects for good: it keeps
+	// refusing a rewrite of a rewritable key (#74) or rejects bytes that
+	// match their capture hash (#57); the subject is the place. Its 412
+	// to a key that is not rewritable counts too, and raises
+	// KindKeyChanged naming it (#22): a friend may refuse every key.
 	KindPlaceRefused = "place_refused"
 	// KindPoolTooSmall: a bucket's copies exceed the places in the pool
 	// (OPS-2, #19), which re-placement cannot fix: the pool needs a new
@@ -79,11 +82,17 @@ const (
 	// bucket's metadata, and so every friend's queue, until it settles
 	// (#20). Subject: the bucket.
 	KindUploadUnmatchable = "upload_unmatchable"
+	// KindKeyChanged: keys of a bucket were written with other bytes than
+	// a place acknowledged, and are not rewritable in its profile, so the
+	// change is not replicated (EP-11, #22): held back at capture, or
+	// refused by a lender (412). Subject: the bucket. It clears when each
+	// such key is written back to the acknowledged bytes or deleted.
+	KindKeyChanged = "key_changed"
 )
 
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
-	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable}
+	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -301,9 +310,36 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		out = append(out, alertOf(KindObjectsNotReplicated, b, msg))
 	}
 	for _, p := range sortedKeys(places) {
-		msg := fmt.Sprintf("friend %s refused %s for good: it holds the key with another hash, keeps refusing a rewrite of a rewritable key (a tomb of another version, or an older lendisk), or rejects bytes that match their capture hash (see the log)",
+		msg := fmt.Sprintf("friend %s refused %s for good: it says it holds other bytes at the key (key_changed lists them), keeps refusing a rewrite of a rewritable key (a tomb of another version, or an older lendisk), or rejects bytes that match their capture hash (see the log)",
 			p, objects(places[p]))
 		out = append(out, alertOf(KindPlaceRefused, p, msg))
+	}
+	changed, err := s.DB.ChangedKeys(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := 0; i < len(changed); {
+		j := i
+		for j < len(changed) && changed[j].Bucket == changed[i].Bucket {
+			j++
+		}
+		c := changed[i]
+		more := ""
+		if n := j - i - 1; n > 0 {
+			more = fmt.Sprintf(" and %s more", countKeys(int64(n)))
+		}
+		msg := fmt.Sprintf("bucket %s: key %s%s changed after a friend acknowledged it (acknowledged %s, now %s); the local write stands but is not replicated, so friends keep the old version (EP-11). Write the acknowledged bytes back, or, to keep the new ones, delete the key and write it again (friends keep the old version as a tombstone); `lendisk status` lists them",
+			c.Bucket, c.Key, more, cmp.Or(c.Acknowledged, "unknown"), c.SHA256)
+		if len(c.ReportedBy) > 0 {
+			// The friend's word, never acknowledged here: it may be right
+			// (a send whose answer was lost, another friend's version after
+			// recover) or broken (#22 review).
+			f := c.ReportedBy[0]
+			msg = fmt.Sprintf("bucket %s: friend %s reports holding other bytes at key %s%s: %s (as reported by %s), where this node wrote %s; not replicated there (EP-11). If %s refuses every key, it is at fault (see place_refused for it); otherwise delete the key and write it again, which replaces its version (it keeps that as a tombstone); `lendisk status` lists them",
+				c.Bucket, f, c.Key, more, cmp.Or(c.Places[f], "unknown"), f, c.SHA256, f)
+		}
+		out = append(out, alertOf(KindKeyChanged, c.Bucket, msg))
+		i = j
 	}
 	bs, err := s.DB.Buckets(ctx)
 	if err != nil {
@@ -349,6 +385,13 @@ func countObjects(n int64) string {
 		return "1 object"
 	}
 	return fmt.Sprintf("%d objects", n)
+}
+
+func countKeys(n int64) string {
+	if n == 1 {
+		return "1 key"
+	}
+	return fmt.Sprintf("%d keys", n)
 }
 
 func countPlaces(n int) string {

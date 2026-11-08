@@ -1,4 +1,10 @@
 # The generic profile (EP-7): any S3 tool. It has no snapshot, metadata
 # or local-only keys, so every key is data, and it is outside the
 # encryption guarantee (EP-8).
+#
+# It names no rewritable keys either, so overwriting a key a friend has
+# acknowledged with other bytes is an immutability violation (EP-11):
+# the local write stands, the change is not replicated, and key_changed
+# is raised. To replace an object, delete it first and write it again;
+# friends keep the old version as a tombstone (RET-1).
 encrypted = false
