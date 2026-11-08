@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -448,5 +449,21 @@ func TestCutDoesNotOverwriteAHijackersDeadline(t *testing.T) {
 	defer dc.mu.Unlock()
 	if !dc.last.Equal(want) {
 		t.Fatalf("the read deadline after the hijacker set it: %v, want %v", dc.last, want)
+	}
+}
+
+// SEC-15, PEER-5 (CI on 3426550): Cut ends a connection's reads before
+// it cancels its requests, so a proxied body read can fail on the cut's
+// deadline before the request's context says why. The request must
+// still be seen as cut: taken for a stalled body, it got the wrong
+// answer and its connection closed at once, before Cut's wait for the
+// client to read the answer could start.
+func TestARequestWhoseReadsTheCutEndedIsSeenAsCut(t *testing.T) {
+	dc := &deadlineConn{cutting: make(chan struct{})}
+	pc := &peerConn{Conn: dc}
+	pc.cutNow() // as if the cancel that follows had not run yet
+	r := httptest.NewRequestWithContext(context.WithValue(t.Context(), connKey{}, pc), http.MethodPut, "/sbucket/key", nil)
+	if !wasCut(r) {
+		t.Fatal("a request on a connection whose reads the cut ended is not seen as cut")
 	}
 }

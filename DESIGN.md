@@ -4702,7 +4702,13 @@ the handler's own reads and is never cancelled; nothing below
   The cut sets the read deadline under the connection's lock, which a
   hijack and every deadline set take too, so a hijack comes wholly
   before the cut or after it and its handler's deadline is never
-  overwritten (`TestCutDoesNotOverwriteAHijackersDeadline`). A connection
+  overwritten (`TestCutDoesNotOverwriteAHijackersDeadline`). It marks
+  the connection cut in the same step and cancels the context only
+  after, so a proxied body read can fail on the deadline before the
+  context says why; the handler asks the connection's mark first, and
+  such a request still gets the removed answer, not the stalled-body
+  one, which would have closed the connection at once (CI on 3426550,
+  `TestARequestWhoseReadsTheCutEndedIsSeenAsCut`). A connection
   its handler hijacked (`http.StateHijacked`, seen by `ServeTunnel`'s
   ConnState) keeps its read deadline: the remove call reads it until
   its caller closes it after the answer (§3.2 PEER-5, #84), and `Cut`
