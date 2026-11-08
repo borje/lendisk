@@ -220,7 +220,9 @@ func (c *peerConn) hijackedAt() (time.Time, bool) {
 // The deadline is set under mu, as SetReadDeadline and hijack take it,
 // so a hijack comes wholly before the cut (which then leaves the
 // connection's reads alone) or after it (and the handler's own deadline
-// is the last one set, #84 review).
+// is the last one set, #84 review). The mark is set with the deadline,
+// so a read the deadline ends is already on a connection wasCut sees
+// as cut, though the cancel comes after.
 func (c *peerConn) cutNow() bool {
 	c.mu.Lock()
 	c.cut = true
@@ -286,9 +288,23 @@ func counted(h http.Handler) http.Handler {
 	})
 }
 
-// wasCut reports whether r's connection was cut (ErrCut).
+// wasCut reports whether r's connection was cut (ErrCut). It asks the
+// connection first: cutNow marks it cut and ends its reads before it
+// cancels the context, so a body read can fail on the cut's deadline
+// before the context says why, and the request must still get the
+// removed answer, not the stalled one.
 func wasCut(r *http.Request) bool {
+	if pc, ok := r.Context().Value(connKey{}).(*peerConn); ok && pc.wasCut() {
+		return true
+	}
 	return errors.Is(context.Cause(r.Context()), ErrCut)
+}
+
+// wasCut reports whether Cut marked the connection cut.
+func (c *peerConn) wasCut() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cut
 }
 
 // writeCut answers a request whose connection was cut with the removed
