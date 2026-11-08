@@ -610,4 +610,13 @@ var migrations = []Migration{
 			detail       TEXT
 		);`,
 	},
+	{
+		Version: 30, Compat: 1, Release: "0.1",
+		SQL: `
+		-- When a place last answered with the refusal PEER-5 prescribes for
+		-- a removed node (condition removed, #83): with since, it tells a
+		-- friend that keeps refusing from one stray refusal frozen in the
+		-- condition. Unix seconds; NULL before any refusal.
+		ALTER TABLE place ADD COLUMN refused_at INTEGER;`,
+	},
 }

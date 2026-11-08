@@ -1543,7 +1543,9 @@ upstream bucket is Q-V.
   quota count would go stale). Beyond those it refuses, as its first
   step, every other method SEC-9's table classifies Refused or
   Unreachable (#15 review), so NET-7's narrowing does not rest on the
-  gate alone (§3.7 NET-7, §3.9 SEC-9). `CreateBucket` creates the bucket with lendisk's own
+  gate alone (§3.7 NET-7, §3.9 SEC-9;
+  `TestLendingRefusesEveryRefusedMethodToABorrower`,
+  `TestLendingRefusesTheUnreachableMethodsToABorrower`). `CreateBucket` creates the bucket with lendisk's own
   private ACL owned by the borrower's account and `BucketOwnerEnforced`,
   whatever ACL headers came with it, then inserts the row; a retry that
   finds `BucketAlreadyOwnedByYou` inserts it too, so a crash between
@@ -1595,6 +1597,8 @@ upstream bucket is Q-V.
   `AnswerWait` (`bridge.DefaultLinger` is `control.DefaultAnswerWait`),
   so the cut never closes the remove call's connection while its
   handler still waits (§3.9 SEC-15;
+  `TestTheRemoveCallOverADialKeyConnectionEndsTheFriendship`, the call
+  on the caller's dial key, resolved to its node ID;
   `TestRemoveCallEndsOnlyOnceTheCallerHasTheAnswer`,
   `TestCutLeavesAHijackedConnectionsReadsToItsHandler`).
   *Decision (#84, review): a refusal at connect after the call was
@@ -1623,6 +1627,10 @@ upstream bucket is Q-V.
   friendship and A's replica. The mark is kept in memory only: after
   a restart the farewell retries on the backoff again, so no migration
   (`TestAFriendThatRefusesAfterTheRemoveCallIsAskedUntilItAnswers`).
+  A `peer remove` run while the daemon is down is all in the database,
+  so the daemon's first farewell pass at its next start revokes the
+  friend, tells it, and keeps the purge time the removal recorded
+  (`TestAPeerRemoveWhileTheDaemonIsDownIsAppliedAtTheNextStart`).
   `status` lists ended friendships (`former_friends`, with who ended
   it, whether the friend was told and the purge time).
   *Decision (#25): the other side ends it too, automatically, and is
@@ -1634,10 +1642,35 @@ upstream bucket is Q-V.
   connect" (syncthing#4086), and an introducer's removals reach other
   devices only when they connect. lendisk takes the opposite course
   for the reason Syncthing's users complain of: one explicit call, and
-  an alert in place of a silent refusal. A side that never receives
-  the call (offline for the whole window) sees the friend as
-  `retrying` and then `friend_unreachable`; a refusal on an open
-  connection does not end anything by itself.
+  an alert in place of a silent refusal.
+  *Decision (#83, review): a side that never receives the call is
+  alerted, and nothing ends by itself.* The worker records a place's
+  403 "no relationship" (or versitygw not knowing this node's key) as
+  the condition `removed`, with `since` (the first refusal) and
+  `refused_at` (the last; migration 30). `friend_refuses`, subject the
+  friend, is raised while the friend has refused over at least an hour
+  (`refused_at − since ≥ alert.Service.MinRefusing`) and the last
+  refusal is recent (within `RefusedRecent`, 2 hours, twice the
+  worker's hourly re-ask of a `removed` place, `PauseRetry`), counted
+  within this friendship; its message says the friend has probably
+  ended the friendship, that copies are placed elsewhere meanwhile, and
+  to run `lendisk peer remove <friend>` if it did
+  (`TestAFriendThatKeepsRefusingIsAlerted`). A `removed` place keeps
+  being asked as long as rows wait there: metadata goes to every friend
+  and is never re-routed, so a node that still backs up keeps asking.
+  *Why not end it:* `since` changes only with the condition, and a
+  `removed` place's data rows are re-routed away, so one stray 403 (an
+  IAM lookup error, a stale session) could freeze the condition and,
+  a window later, end a working friendship; and a friend that really
+  ended it refuses at connect, which shows as `retrying`, so an
+  automatic end would rarely meet the case it is for. That side is
+  alerted as unreachable (`friend_unreachable`), since a laptop away
+  for a month is not a friend gone. *Precedent:* Syncthing's
+  "device wants to connect" prompt and the remover's unanswered device
+  (syncthing#4086) leave the decision with the user; lendisk adds the
+  alert that names the likely cause and the command, as `pool_too_small`
+  and `below_copies` name theirs, and keeps PEER-5's rule that a
+  friendship ends by a person's `peer remove` or the friend's call.
   *Holding and purging.* The lender side keeps the former friend's lent
   buckets, tombs and manifest, refused to it, so read-only, until
   `purge_after`; seven days before, `replica_purge_soon` is raised.
@@ -2440,8 +2473,7 @@ upstream bucket is Q-V.
   once the sends stop (#85,
   `TestAnAnswerThatCrossedASendIsSettledOnceThePlaceIsIdle`). A place
   whose FIFO never empties (a friend at quota) waits for the hourly
-  call. Left to #68: retrying a
-  failed re-routing batch row by row.
+  call. A failed re-routing batch is retried row by row (#68, below).
   *What each side counts (#85).* Between answers the borrower's count
   of a place (`PlaceUse`: `place_use` plus `place_freed`) follows the
   lender's rule (§3.5 LEND-1: an object's bytes plus 4 KiB until its
@@ -2644,9 +2676,17 @@ upstream bucket is Q-V.
   each under the worker's lock, re-checking that each row is still
   queued and not being sent, so captures never wait behind a long pass
   (3000 waiting rows in a bucket of 1200 metadata objects take tens of
-  milliseconds). A batch that fails is rolled back and the pass goes on
-  with the next, returning the errors with what the others did, so one
-  bad row cannot stop re-routing for the node. With no reachable friend with room the row waits at
+  milliseconds). A batch that fails is rolled back and retried one row
+  at a time, and the pass goes on, returning the failed rows' errors
+  with what the others did, so one bad row holds only itself, never
+  the other 63 of its batch (#68,
+  `TestOneBadRowDoesNotHoldItsReroutingBatch`). A busy or locked
+  database (`SQLITE_BUSY`, `SQLITE_LOCKED`) is not a bad row: the pass
+  stops at the first such error, since each row would wait out
+  `busy_timeout` (30 s) in turn under the worker's lock, and the rest
+  wait for the next pass (`TestABusyDatabaseStopsTheReroutingPass`).
+  The worker logs what a pass moved even when it also failed.
+  With no reachable friend with room the row waits at
   its friend, and the lag shows in `status`. *Decision (#19,
   review):* the row is dropped instead of waiting (state `dropped`:
   out of the FIFO, not counted in `place_use`) when its friend is gone
@@ -3037,7 +3077,10 @@ upstream bucket is Q-V.
   call arrives (this node offline, the friend's daemon down) the place
   shows as `retrying` with a dial error, not `removed`; `removed`
   appears only on a connection opened before the removal, which the
-  middleware still refuses request by request (SEC-11). A `412` to a put of a
+  middleware still refuses request by request (SEC-11), or from a
+  lender that admits the key but has no friendship for it. A place
+  that keeps answering `removed` raises `friend_refuses` (§3.2 PEER-5,
+  §3.8, #83). A `412` to a put of a
   rewritable key is handled as *Rewrites* says, below; any other `412`
   is refused at that place as a changed key, with the hash a `HEAD`
   reports, and raises `key_changed` and `place_refused` (*EP-11*,
@@ -3719,10 +3762,22 @@ the handler's own reads and is never cancelled; nothing below
   answers `RequestTimeout` (400), which the borrower retries. The
   deadline is cleared when the body ends and when the handler returns.
   So a stalled body releases its quota and floor reservation within
-  one stall period, and a body trickling at the minimum rate holds it
-  until it ends (Content-Length ÷ the minimum rate, which can be long,
-  but the reservation is within the borrower's own quota);
-  an honest borrower whose lender's store stops reading for a stall
+  one stall period. A body must also keep a floor rate
+  (`Bridge.FloorRate`, 8 KiB/s, averaged over each `FloorWindow` of
+  10 minutes from its start, #76): the first read after a window that
+  brought less fails, every later read on the connection fails at
+  once (so net/http does not drain the rest at the trickle's pace),
+  and the answer is the same `RequestTimeout`, logged at warning
+  level ("the friend's upload was slower than the floor rate"), so a
+  path that never finishes an upload shows. 8 KiB/s is 64 kbit/s,
+  so a borrower keeping all 16 of its request slots (*Per-friend
+  caps*, §3.9) above it needs 1 Mbit/s of uplink; the window averages
+  out a brief stop. A trickling body thus holds its request slot for
+  at most Content-Length ÷ the floor rate plus one window
+  (`TestABodyTricklingBelowTheFloorRateIsEnded`). The rate is measured
+  as the bridge reads, so a lender's store that reads slower than the
+  floor ends its own requests too; such a store is failing anyway.
+  An honest borrower whose lender's store stops reading for a stall
   period gets `RequestTimeout` and retries. Nothing reads the body but
   the store. A body longer
   than its `Content-Length` ends the write in `Lending` with
@@ -4568,6 +4623,11 @@ the handler's own reads and is never cancelled; nothing below
     friendship (its remove call, §3.2 PEER-5, #25); raised at once,
     cleared at the purge or when the two are friends again. This
     node's own `peer remove` raises nothing: its output says the same;
+  - `friend_refuses`, subject the friend: it has refused this node as
+    no friend (place `removed`) over at least an hour, the last time
+    within 2 hours (§3.2 PEER-5, #83), so it has probably ended the
+    friendship unheard; the message says to run `lendisk peer remove`
+    if it did. Cleared when it answers otherwise or stops being asked;
   - `replica_purge_soon`, subject the former friend: an ended
     friendship's replicas are purged within 7 days
     (`alert.PurgeWarning`), naming the date and that a new invite
@@ -4754,6 +4814,31 @@ the handler's own reads and is never cancelled; nothing below
   borrower's replica client moves one object per bucket at a time over
   a couple of connections (§3.4), well inside both. Loopback and LAN
   listeners are not counted. The caps are constants, not settings.
+  A request holds its slot until its answer is written, so neither
+  direction may hang on the friend (#76): a request body is bounded by
+  the stall bound and the floor rate (§3.5 LEND-2), and each write to
+  the connection gets a deadline `Caps.WriteStall` ahead (2 minutes,
+  the borrower's own stall watchdog), set by the tunnel connection
+  (`peerConn.Write`), so a friend that stops reading an answer loses
+  the connection, and the slot, once one chunk's write has waited that
+  long (`TestAFriendThatStopsReadingAnAnswerLosesItsSlot`). The
+  hijacked connections of the removed answer and the remove call
+  (§3.2) only read after their answer, so the deadline leaves their
+  linger alone. The accept loop only accepts: each connection's key
+  (`PeerOf`) and friend (`Caps.Of`, a database read of up to 5 s) are
+  resolved on a goroutine of their own, which counts it under the cap
+  and hands it to `Accept`, so a slow database holds up that
+  connection, not every tunnel accept
+  (`TestASlowCapLookupDoesNotStallOtherAccepts`). At most 64
+  connections are being admitted at once across every key
+  (`maxAdmits`, #76 review): the accept loop takes a slot before it
+  starts one and waits when none is free, so a burst of connections
+  from a friend or an invite holder waits in the listener's backlog,
+  and holds at most 64 lookups, each with its own SQLite connection,
+  not one per connection (`TestAdmitsInFlightAreBounded`). The
+  database pool itself is left unbounded: a cap there would make any
+  path that reads through the pool while it holds a transaction wait on
+  itself, and nothing audits the daemon for such paths yet.
 - **SEC-8** versitygw's web UI, website, metrics and event endpoints
   are not configured, and versitygw opens no TCP port at all. Its admin
   API cannot be left out: with `AdminPorts` empty, `embedgw` mounts it

@@ -171,6 +171,9 @@ type peerConn struct {
 	once  sync.Once
 	done  func()
 	conns *Conns
+	// writeStall bounds each Write (Caps.WriteStall); zero leaves
+	// writes unbounded.
+	writeStall time.Duration
 
 	active atomic.Int32 // requests being served on it
 
@@ -250,6 +253,21 @@ func (c *peerConn) SetReadDeadline(t time.Time) error {
 		t = readEnded
 	}
 	return c.Conn.SetReadDeadline(t)
+}
+
+// Write sets the write deadline writeStall ahead before each write, so
+// a friend that stops reading an answer holds its request slot for one
+// chunk's writeStall at the most: the write fails, net/http closes the
+// connection, and the proxy abandons the answer (#76). A client
+// reading slowly but steadily meets every deadline. A hijacked
+// connection's writes are bounded the same way.
+func (c *peerConn) Write(p []byte) (int, error) {
+	if c.writeStall > 0 {
+		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeStall)); err != nil {
+			return 0, err
+		}
+	}
+	return c.Conn.Write(p)
 }
 
 // SetDeadline is SetReadDeadline and the write deadline at once.

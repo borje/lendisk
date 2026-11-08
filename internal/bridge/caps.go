@@ -12,9 +12,14 @@ import (
 // Defaults for Caps. A borrower's replica client moves one object per
 // bucket at a time over a couple of connections (§3.4); these leave it
 // room and stop one friend from holding the tunnel port.
+//
+// DefaultWriteStall bounds each write of an answer to a friend that
+// has stopped reading it: the borrower's own stall watchdog (§3.4), as
+// the request body's stall bound (DefaultStall).
 const (
-	DefaultConns    = 32
-	DefaultRequests = 16
+	DefaultConns      = 32
+	DefaultRequests   = 16
+	DefaultWriteStall = DefaultStall
 )
 
 // Caps bounds what one friend may hold open on the tunnel port (SEC-7,
@@ -26,13 +31,21 @@ const (
 // a key Of does not resolve counts on its own. A connection over it is
 // closed unread at accept.
 // Requests bounds the requests in flight per friend, counted on the
-// resolved node ID; one over it is answered 503 SlowDown. Loopback and
-// LAN listeners are not counted. Zero fields take the defaults: there is
-// no unlimited setting. One Caps is shared by ServeTunnel and
-// TunnelHandler.
+// resolved node ID; one over it is answered 503 SlowDown. WriteStall
+// bounds how long a request holds its slot with an answer the friend
+// does not read: each write to the connection gets a deadline that far
+// ahead, and a write that misses it closes the connection (#76).
+// Loopback and LAN listeners are not counted. Zero fields take the
+// defaults: there is no unlimited setting. One Caps is shared by
+// ServeTunnel and TunnelHandler.
+//
+// The connection cap is counted once Of has resolved the key, which
+// ServeTunnel does off its accept loop, so a slow database holds up
+// that one connection, not every accept (#76).
 type Caps struct {
-	Conns    int
-	Requests int
+	Conns      int
+	Requests   int
+	WriteStall time.Duration
 	// Of resolves a connection's key to the friend it speaks for
 	// (RolesIn); nil counts each key on its own.
 	Of RoleOf
@@ -51,6 +64,13 @@ func (c *Caps) limits() (conns, reqs int) {
 		reqs = DefaultRequests
 	}
 	return conns, reqs
+}
+
+func (c *Caps) writeStall() time.Duration {
+	if c.WriteStall <= 0 {
+		return DefaultWriteStall
+	}
+	return c.WriteStall
 }
 
 // take counts one more for key in m, unless it already holds max.

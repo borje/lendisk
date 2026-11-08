@@ -12,11 +12,26 @@ import (
 	"github.com/versity/versitygw/s3err"
 )
 
-// Defaults for the tunnel's request body bound (LEND-2, SEC-5): the
-// borrower's own stall watchdog is 2 minutes (§3.4).
+// Defaults for the tunnel's request body bounds (LEND-2, SEC-5, #76).
+//
+// The stall bound: a body must bring MinProgress bytes in every Stall
+// period, the borrower's own stall watchdog of 2 minutes (§3.4). It
+// ends a body that stops; alone it lets one trickle at 64 KiB per 2
+// minutes and hold its request slot for as long as its length takes.
+//
+// The floor rate: a body must also bring FloorRate bytes a second,
+// averaged over each FloorWindow from its start, or the request ends.
+// 8 KiB/s is 64 kbit/s: a borrower using every one of its 16 request
+// slots (DefaultRequests) needs 1 Mbit/s of uplink to keep them all
+// above it, and an honest replica client uses far fewer (§3.4). The
+// window is long enough that a brief stop (a relay switch, a busy
+// link) is averaged out. So a slot is held for at most a body's length
+// at the floor rate, plus one window.
 const (
 	DefaultStall       = 2 * time.Minute
 	DefaultMinProgress = 64 << 10
+	DefaultFloorRate   = 8 << 10
+	DefaultFloorWindow = 10 * time.Minute
 )
 
 // errStalled answers a request whose body brought too little for too
@@ -38,6 +53,17 @@ func (b *Bridge) minProgress() int64 {
 	return DefaultMinProgress
 }
 
+func (b *Bridge) floor() (rate int64, window time.Duration) {
+	rate, window = b.FloorRate, b.FloorWindow
+	if rate <= 0 {
+		rate = DefaultFloorRate
+	}
+	if window <= 0 {
+		window = DefaultFloorWindow
+	}
+	return rate, window
+}
+
 // boundedBody bounds a request body on the tunnel with the connection's
 // read deadline: set to a stall period before the body starts, and
 // pushed a stall period on each time MinProgress more bytes arrive, so
@@ -46,16 +72,31 @@ func (b *Bridge) minProgress() int64 {
 // gateway, which ends there too. The read happens on the proxy's
 // goroutine, so every deadline change is under mu and none after the
 // handler has returned.
+//
+// It also keeps the floor rate: the first read once a floor window has
+// passed since the window began fails with errBelowFloor when the
+// window brought fewer than rate bytes a second, and starts the next
+// window otherwise. A body that brings nothing at all is ended by the
+// deadline, as before.
 type boundedBody struct {
 	io.ReadCloser
 	rc      *http.ResponseController
 	stall   time.Duration
 	min     int64
+	rate    int64
+	window  time.Duration
 	mu      sync.Mutex
 	win     int64
+	since   time.Time // the floor window's start
+	got     int64     // bytes in the floor window
 	done    bool
 	stalled bool
+	slow    bool // ended for the floor rate
 }
+
+// errBelowFloor ends a body's read when it brought too little over a
+// floor window.
+var errBelowFloor = errors.New("the request body arrives below the floor rate")
 
 // bound wraps r's body, if it has one, and returns the function the
 // handler calls when it returns.
@@ -68,7 +109,9 @@ func (b *Bridge) bound(w http.ResponseWriter, r *http.Request) (finish func()) {
 		b.Log.Warn("tunnel: cannot bound a request body; serving it unbounded", "err", err)
 		return func() {}
 	}
-	bb := &boundedBody{ReadCloser: r.Body, rc: rc, stall: b.stall(), min: b.minProgress()}
+	rate, window := b.floor()
+	bb := &boundedBody{ReadCloser: r.Body, rc: rc, stall: b.stall(), min: b.minProgress(),
+		rate: rate, window: window, since: time.Now()}
 	r.Body = bb
 	return bb.finish
 }
@@ -92,6 +135,18 @@ func (bb *boundedBody) Read(p []byte) (int, error) {
 			bb.win = 0
 			bb.rc.SetReadDeadline(time.Now().Add(bb.stall))
 		}
+		bb.got += int64(n)
+		if el := time.Since(bb.since); el >= bb.window {
+			if float64(bb.got) < float64(bb.rate)*el.Seconds() {
+				// Every later read fails at once too, as a stalled
+				// one's does: net/http would otherwise drain the rest
+				// of the body at the trickle's pace.
+				bb.stalled, bb.slow = true, true
+				bb.rc.SetReadDeadline(readEnded)
+				return 0, errBelowFloor
+			}
+			bb.since, bb.got = time.Now(), 0
+		}
 	}
 	return n, err
 }
@@ -106,13 +161,14 @@ func (bb *boundedBody) finish() {
 	}
 }
 
-// stalledBody reports whether r's body ended for the stall bound.
-func stalledBody(r *http.Request) bool {
+// stalledBody reports whether r's body ended for the stall bound or
+// the floor rate, and whether for the floor rate.
+func stalledBody(r *http.Request) (stalled, slow bool) {
 	bb, ok := r.Body.(*boundedBody)
 	if !ok {
-		return false
+		return false, false
 	}
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
-	return bb.stalled
+	return bb.stalled, bb.slow
 }

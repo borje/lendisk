@@ -74,6 +74,15 @@ func (db *DB) RemoveFriendship(ctx context.Context, peer string, byPeer bool, no
 		return FormerFriend{}, err
 	}
 	defer tx.Rollback()
+	ff, err := removeFriendship(ctx, tx, peer, byPeer, now)
+	if err != nil {
+		return FormerFriend{}, err
+	}
+	return ff, tx.Commit()
+}
+
+// removeFriendship is RemoveFriendship inside tx.
+func removeFriendship(ctx context.Context, tx *sql.Tx, peer string, byPeer bool, now time.Time) (FormerFriend, error) {
 	f, err := scanFriendship(tx.QueryRowContext(ctx, `SELECT `+friendshipCols+` FROM friendship WHERE peer_key = ?`, peer))
 	if err != nil {
 		return FormerFriend{}, err
@@ -111,7 +120,7 @@ func (db *DB) RemoveFriendship(ctx context.Context, peer string, byPeer bool, no
 		WHERE place = ? AND state = 'queued'`, peer); err != nil {
 		return FormerFriend{}, err
 	}
-	return ff, tx.Commit()
+	return ff, nil
 }
 
 const formerCols = `peer_key, coalesce(dial_key, ''), coalesce(address, ''), removed_at, purge_after,

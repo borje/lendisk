@@ -36,6 +36,11 @@ type Bridge struct {
 	// request (defaults DefaultStall, DefaultMinProgress).
 	Stall       time.Duration
 	MinProgress int64
+	// FloorRate and FloorWindow bound it further: one that brings fewer
+	// than FloorRate bytes a second over a FloorWindow ends the request
+	// (defaults DefaultFloorRate, DefaultFloorWindow).
+	FloorRate   int64
+	FloorWindow time.Duration
 	proxy       *httputil.ReverseProxy
 }
 
@@ -68,7 +73,14 @@ func New(socket string, log *slog.Logger) *Bridge {
 				writeCut(w, r)
 				return
 			}
-			if stalledBody(r) {
+			if stalled, slow := stalledBody(r); slow {
+				// Warned: a path that stays below the floor never
+				// finishes an upload, and should show (#76 review).
+				log.Warn("tunnel: the friend's upload was slower than the floor rate; ended the request",
+					"method", r.Method, "path", r.URL.Path)
+				writeError(w, errStalled)
+				return
+			} else if stalled {
 				log.Info("tunnel: a request body stalled; ended the request", "method", r.Method, "path", r.URL.Path)
 				writeError(w, errStalled)
 				return
