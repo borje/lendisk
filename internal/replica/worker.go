@@ -51,6 +51,10 @@ type Worker struct {
 	// RerouteEvery is how often unsent data at friends that stopped
 	// answering is re-routed (state.DB.Reroute, §3.4; default 1 minute).
 	RerouteEvery time.Duration
+	// RewriteRetry is how long a rewrite the place refuses without a
+	// version to name instead is retried before it is refused for good
+	// (default DefaultRewriteRetry, #74).
+	RewriteRetry time.Duration
 	// PauseRetry is how long a place paused for quota or removed waits
 	// before trying again (default an hour, LEND-2).
 	PauseRetry time.Duration
@@ -85,6 +89,9 @@ type Worker struct {
 	// re-routing pass reads the set under it, so neither misses the other.
 	flight  sync.Mutex
 	sending map[string]int64 // place -> seq
+	// rewriteSince is, per place and row, when a refused rewrite with no
+	// version to name instead was first seen (under flight).
+	rewriteSince map[string]map[int64]time.Time
 }
 
 // next takes place's next queued row and marks it being sent.
@@ -379,6 +386,9 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				log.Error("replication: cancelling a superseded row failed", append(row, "err", err)...)
 				sleep(ctx, poll)
 			}
+		case errors.Is(err, ErrImmutable) && p.Rewritable:
+			w.refuse(log, place, p, row, err, "replication alert: the friend keeps refusing a rewrite of this rewritable key; not replicated there")
+			condition(state.ConditionOK, "")
 		case errors.Is(err, ErrImmutable):
 			w.refuse(log, place, p, row, err, "immutability alert: the friend holds this key with another hash; not replicated")
 			condition(state.ConditionOK, "")
@@ -507,7 +517,10 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	}
 	replaces := ""
 	if p.Rewritable {
-		h, ok, err := w.DB.AckedHash(ctx, place, p.Bucket, p.Key)
+		// The last version the place acknowledged, deleted since or not:
+		// a deleted one is in its lender's tomb, and a rewrite naming it
+		// is stored beside the tomb.
+		h, ok, err := w.DB.AckedPutHash(ctx, place, p.Bucket, p.Key)
 		if err != nil {
 			return err
 		}
@@ -517,6 +530,7 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	}
 	err := w.put(ctx, place, r, p, replaces)
 	if !p.Rewritable || !errors.Is(err, ErrImmutable) || ctx.Err() != nil {
+		w.rewriteDone(place, p.Seq)
 		return err
 	}
 	held, ok, herr := r.Head(ctx, p.Bucket, p.Key)
@@ -528,12 +542,57 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	case ok && held != replaces:
 		return w.put(ctx, place, r, p, held)
 	}
-	// The place holds nothing live at the key (a deleted object's tomb,
-	// or the Head fell inside the lender's own rewrite of it), or holds
-	// exactly the version the refused rewrite named (it changed under
-	// the request). Either may pass: the row waits with backoff, as for
-	// a network error, rather than being refused for good (#74 review).
+	// The place holds nothing live at the key (a tomb of another version
+	// than the one named, or the Head fell inside the lender's own
+	// rewrite of it), or holds exactly the version the refused rewrite
+	// named (it changed under the request, or the lender is too old to
+	// read the mark). That may pass: the row waits with backoff, as for a
+	// network error, for Worker.RewriteRetry; past it, it is refused for
+	// good, so the place's FIFO moves on (#74 reviews).
+	if since := w.rewriteWaiting(place, p.Seq); w.now().Sub(since) >= orDefault(w.RewriteRetry, DefaultRewriteRetry) {
+		w.rewriteDone(place, p.Seq)
+		return fmt.Errorf("%w: the friend kept refusing the rewrite of %s for %v while it holds %s "+
+			"(another version's tomb, kept until its retention window ends, or a lendisk too old to accept rewrites): %v",
+			ErrImmutable, p.Key, w.now().Sub(since).Round(time.Second), heldDesc(held, ok), err)
+	}
 	return fmt.Errorf("the place refused a rewrite of %s (%v) but holds %s; trying again", p.Key, err, heldDesc(held, ok))
+}
+
+// DefaultRewriteRetry is how long a rewrite a place refuses without a
+// version to name instead is retried before it is refused for good
+// (#74).
+const DefaultRewriteRetry = time.Hour
+
+// rewriteWaiting returns when the worker first saw place refuse row seq's
+// rewrite with no version to name instead, recording now if this is the
+// first time. It lives in memory: a restart starts the wait again.
+func (w *Worker) rewriteWaiting(place string, seq int64) time.Time {
+	w.flight.Lock()
+	defer w.flight.Unlock()
+	if w.rewriteSince == nil {
+		w.rewriteSince = map[string]map[int64]time.Time{}
+	}
+	if w.rewriteSince[place] == nil {
+		w.rewriteSince[place] = map[int64]time.Time{}
+	}
+	t, ok := w.rewriteSince[place][seq]
+	if !ok {
+		t = w.now()
+		w.rewriteSince[place][seq] = t
+	}
+	return t
+}
+
+// rewriteDone forgets place's wait on row seq, and on any earlier row
+// (the FIFO has moved past them).
+func (w *Worker) rewriteDone(place string, seq int64) {
+	w.flight.Lock()
+	defer w.flight.Unlock()
+	for s := range w.rewriteSince[place] {
+		if s <= seq {
+			delete(w.rewriteSince[place], s)
+		}
+	}
 }
 
 func heldDesc(held string, ok bool) string {

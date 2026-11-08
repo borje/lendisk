@@ -206,6 +206,22 @@ func (db *DB) AckedHash(ctx context.Context, place, bucket, key string) (string,
 	return h.String, err == nil, err
 }
 
+// AckedPutHash returns the hash of the last put place acknowledged for a
+// key, even if a delete acknowledged since followed it: the version a
+// lender keeps in its tomb (RET-1), which a rewritable key written again
+// names as the version it replaces (#74). ok is false when the place
+// never acknowledged a put of it.
+func (db *DB) AckedPutHash(ctx context.Context, place, bucket, key string) (string, bool, error) {
+	var h sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT sha256 FROM placement
+		WHERE place = ? AND bucket = ? AND key = ? AND state = 'acked' AND op = 'put' ORDER BY seq DESC LIMIT 1`,
+		place, bucket, key).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return h.String, err == nil && h.Valid, err
+}
+
 // PlaceStat is a place's FIFO for status.
 type PlaceStat struct {
 	Queued      int64         // rows waiting
