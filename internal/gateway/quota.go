@@ -44,8 +44,10 @@ import (
 //     unstored. A
 //     put of an absent key, and a completion, is published only if the
 //     key is still absent (If-None-Match: *, which posix checks under
-//     its publish lock): puts take no key lock, so a stalled body never
-//     holds up its retry.
+//     its publish lock). A put takes the key's lock only once its body
+//     has ended and matched its hash, until the store answers, so a
+//     stalled body never holds up its retry and no put publishes inside
+//     a rewrite's gap (rewrite.go).
 //   - A borrower's body longer than its Content-Length ends the write.
 //     A body that stalls or trickles is ended by the tunnel bridge's
 //     read deadline (bridge.boundedBody), before it reaches the store.
@@ -542,15 +544,43 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 	defer release()
 	pub := &published{u: l.use(peer)}
 	defer pub.release()
+	// Once the body is verified, the put takes the key's lock (in the
+	// order a rewrite takes it: key, then pub) and holds it until the
+	// store has answered. A rewrite holds the lock from moving the
+	// version it replaces into its tomb until it has published, and
+	// publishes unconditionally; without the lock this put could publish
+	// in that gap and be overwritten with no tomb (#74 review). A body
+	// still streaming holds nothing, so a stalled one never holds up
+	// its retry.
+	var unlock func()
+	defer func() {
+		if unlock != nil {
+			unlock()
+		}
+	}()
+	lockKey := func() error {
+		if unlock != nil {
+			return nil
+		}
+		u, err := l.keys.lock(ctx, *in.Bucket, key)
+		if err != nil {
+			return errInternal
+		}
+		unlock = u
+		pub.take()
+		return nil
+	}
 	b.onEOF = func() error {
 		if b.hex() != want {
 			return errBadDigest
 		}
-		pub.take()
-		return nil
+		return lockKey()
 	}
 	if size == 0 {
-		pub.take() // the store may publish without reading
+		// The store may publish without reading.
+		if err := lockKey(); err != nil {
+			return none, err
+		}
 	}
 	orig := in.Body
 	in.Body = b.reader(orig)

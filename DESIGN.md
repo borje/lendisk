@@ -2663,8 +2663,12 @@ capture decorator, so nothing stands between that and posix (#62).
   is hashed and discarded, so a body that only claims the hash gets
   `BadDigest` and the stored copy is never touched; a completion with
   the same hash aborts the upload and answers with the stored object's
-  ETag. A put takes no key lock, since a body that stalls (a borrower
-  killed mid-transfer) would hold up its own retry. This relies on one
+  ETag. A put takes no key lock while its body streams, since a body
+  that stalls (a borrower killed mid-transfer) would hold up its own
+  retry; a put of an absent key takes the key's lock once its body has
+  ended and matched its hash, before the publication lock, and holds it
+  until the store has answered, so it cannot publish inside a
+  rewrite's gap (*Rewrites*, below; #74 review). This relies on one
   store feature: a put of an absent key, and a completion, is stored
   with `If-None-Match: *`, which posix evaluates under its publish lock
   together with the publication, so of two racing writes of one key
@@ -2701,11 +2705,14 @@ capture decorator, so nothing stands between that and posix (#62).
   20) and left pending, and then the store publishes the new version,
   unconditionally, because posix checks any condition once before the
   body too, while the key still holds the old version. Nothing else can
-  publish at the key in between: deletes, revivals, purges and
-  multipart creates and completions wait for the key's lock, and a
-  plain put that finds the key absent finds the rewrite's tombstone row,
-  written before the move, so it takes the tomb path (a revival of the
-  same bytes, `412` for others), which waits for the lock too. Once
+  publish at the key in between: every write that publishes there
+  holds the key's lock to do so (deletes, revivals, purges, multipart
+  creates and completions, and plain puts from the end of their
+  verified body until the store answers), and the rewrite holds it
+  from the move to its publication. A plain put whose body ends in
+  that gap waits, publishes after the rewrite under `If-None-Match: *`
+  and is refused `412` (or accepted for the same bytes);
+  `TestPlainPutCannotPublishInARewritesGap`. Once
   published, the row is kept and the new bytes are counted. If the
   store does not publish (its checksum check, a full disk), the
   replaced version is moved back (`revive`), and the borrower retries.

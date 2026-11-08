@@ -27,17 +27,21 @@ import (
 //     answer was lost: accepted, nothing moved).
 //   - Order, so a crash loses nothing: the tombstone row is written,
 //     pending and marked a rewrite; the replaced version is renamed into
-//     its tomb; the store publishes the new version (If-None-Match: *,
-//     under posix's publish lock); the row is kept. A failure before the
+//     its tomb; the store publishes the new version, unconditionally
+//     (posix checks a condition once before the body too, while the key
+//     still holds the replaced version); the row is kept. A failure before the
 //     publish moves the old version back (revive), and settleTombs does
 //     the same at startup for a pending rewrite row whose key holds
 //     nothing. A pending row beside a published new version is kept.
 //   - Holding the key's lock from the move to the end serialises the
-//     rewrite with deletes, purges, revivals, multipart creates and
-//     completions of the key; a plain put of an absent key takes no
-//     lock, and if one is published between the move and the publish,
-//     the rewrite fails (412, or success if it holds the same bytes) and
-//     the replaced version stays in its tomb.
+//     rewrite with every other write that could publish at the key:
+//     deletes, purges, revivals, multipart creates and completions, and
+//     plain puts, which take the lock once their body is verified and
+//     hold it until the store answers (putLent). So nothing publishes
+//     between the move and the rewrite's own publication, which is why
+//     that publication needs no condition; a plain put whose body ends
+//     in that gap publishes after it, under If-None-Match: *, and is
+//     refused (#74 review).
 //   - Both versions count against quota until the old one is purged: the
 //     rewrite is admitted like a new object (size plus overhead), and the
 //     old one's count moves from live to tomb unchanged.
@@ -101,11 +105,10 @@ func (l *Lending) rewriteLent(ctx context.Context, peer, sealed string, in s3res
 		// Unconditional: posix checks a condition once before the body
 		// too, when the key still holds the replaced version. No other
 		// write can publish at the key between the move and this
-		// publication: deletes, revivals and multipart writes wait for
-		// the key's lock, held from the move to the end, and a plain put
-		// that finds the key absent finds the rewrite's tombstone row,
-		// written before the move, and so takes the tomb path, which
-		// waits for the lock too.
+		// publication: every write that publishes there (deletes,
+		// revivals, multipart, and plain puts once their body is
+		// verified) holds the key's lock to do so, and this rewrite holds
+		// it from the move to the end.
 		in.IfNoneMatch, in.IfMatch = nil, nil
 	}
 	var out s3response.PutObjectOutput
