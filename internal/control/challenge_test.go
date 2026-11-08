@@ -188,7 +188,8 @@ func TestChallengesArePacedPerFriend(t *testing.T) {
 	}}
 	now := time.Unix(1_800_000_000, 0)
 	var mu sync.Mutex
-	l.srv.Held, l.srv.ChallengeRate, l.srv.ChallengeBurst = h, 1000, 1000
+	l.srv.Held, l.srv.ChallengeWholeRate, l.srv.ChallengeWholeBurst = h, 1000, 1000
+	l.srv.ChallengeRate, l.srv.ChallengeBurst = 1000, 1000 // one call's minimum cost overdraws it
 	l.srv.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	asBob := l.client(t, control.Caller{Peer: bob.NodeID(), Role: state.RolePeer})
 	asCarol := l.client(t, control.Caller{Peer: carol.NodeID(), Role: state.RolePeer})
@@ -211,6 +212,19 @@ func TestChallengesArePacedPerFriend(t *testing.T) {
 	}
 	if err := whole(asCarol, carol); err != nil {
 		t.Fatalf("Carol paced by Bob's calls: %v", err)
+	}
+	// Bob's ranged challenges are paced apart: his full check's debt does
+	// not hold up a daily challenge, and a burst of them runs out too.
+	ranged := func() error {
+		_, err := asBob.Challenge(ctx, control.ChallengeRequest{Bucket: bob.SealedName("laptop"), Key: "k", Nonce: nonce,
+			Offset: 10, Length: 100})
+		return err
+	}
+	if err := ranged(); err != nil {
+		t.Fatalf("a ranged challenge while Bob's whole reads are in debt: %v", err)
+	}
+	if err := ranged(); !isStatus(err, http.StatusServiceUnavailable) {
+		t.Fatalf("a ranged challenge past its own burst: %v", err)
 	}
 	mu.Lock()
 	now = now.Add(4 * time.Second)

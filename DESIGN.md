@@ -4040,10 +4040,17 @@ the handler's own reads and is never cancelled; nothing below
   (`Whole`, no range; `ChallengeablePage` in pages of 256): the lender
   streams the object into the HMAC and answers 32 bytes, the borrower
   computes the same from its copy, and no object's bytes cross the
-  tunnel. A `503` from the lender's pacing (§3.7) is waited out
-  (`Retry-After`, up to 5 minutes, ten times an object) during a full
-  check; the daily check counts it as no answer
+  tunnel. A `503` from the lender's pacing (§3.7) is waited out during
+  a full check, as long as `Retry-After` says, up to 5 minutes plus
+  what the largest object read so far takes at `verify.DefaultWholeRate`
+  (1 MiB/s, a quarter of the lender's default): a 5 GiB object's debt
+  is waited out, a friend asking for more is no answer
+  (`TestAFullCheckWaitsOutTheFriendsPaceForLargeObjects`, scaled down
+  to 1000 B/s). The daily check counts a `503` as no answer
   (`TestVerifyOnDemandAndStatus`, `TestAFullCheckCoversEveryObject`).
+  The daemon runs one check at a time, so a long full check holds up
+  the daily challenges until it ends; accepted, as a full check is the
+  user's explicit request and most replicas wait a few hours at most.
 - **VER-4** `status` lists under each bucket its replicas (every
   friend with an address holding an acknowledged object of it, or with
   a record): "verified at <friend> <time>", "not verified yet at
@@ -4221,17 +4228,24 @@ the handler's own reads and is never cancelled; nothing below
   *Pacing (LEND-5, #27):* a friend may already read any of its bytes
   by `GetObject`, paying the bandwidth; a challenge returns 32 bytes,
   so what bounds it is the lender's reads. Per friend, one challenge
-  reads at a time, and a token bucket of bytes (`ChallengeBurst`,
-  64 MiB, refilled at `ChallengeRate`, 16 MiB/s,
-  `control.DefaultChallenge…`) admits a call only while it is not in
-  debt; the call then takes what it read, at least
+  reads at a time, and two token buckets of bytes admit a call only
+  while its own is not in debt: ranged challenges (`ChallengeBurst`,
+  8 MiB, refilled at `ChallengeRate`, 256 KiB/s) and whole-object ones
+  (`ChallengeWholeBurst`, 32 MiB, `ChallengeWholeRate`, 4 MiB/s;
+  `control.Default…`). The call then takes what it read, at least
   `ChallengeCallCost` (4 KiB). So a whole-object challenge may
   overdraw once and the friend waits for the debt; a call refused is
   answered `503` with `Retry-After` (seconds to refill) and reads
-  nothing, other friends unaffected (`TestChallengesArePacedPerFriend`).
-  The daily challenges stay inside the burst; a full check of a large
-  replica is paced at the rate. `control.CallError.RetryAfter` carries
-  the header. `list` is served (#29):
+  nothing, other friends unaffected. A full check's debt never holds up
+  a daily challenge, which reads at most 512 KiB a replica and stays
+  inside the ranged burst (`TestChallengesArePacedPerFriend`).
+  *Decision (#27 review):* the bound is a rate, under 4.3 MiB/s of
+  reads per friend for 32-byte answers, rather than a daily budget
+  proportional to what the friend stores: a full check of a 100 GB
+  replica then takes about 7 hours and needs no budget arithmetic, and
+  a hostile friend gets a sustained read that a disk serves beside
+  backups, below what its own `GetObject`s could ask over a fast link.
+  `control.CallError.RetryAfter` carries the header. `list` is served (#29):
   `GET /_lendisk/list?bucket=<sealed>&after=<key>&limit=<n>` pages the
   lender's index for that borrower's bucket: key, size, SHA-256, if
   tombstoned, when (`tombstoned_at`, §3.6), and for a live key the

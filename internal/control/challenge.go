@@ -2,6 +2,7 @@ package control
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -34,14 +35,21 @@ const (
 	// MinNonce and MaxNonce bound the nonce's length in bytes.
 	MinNonce = 16
 	MaxNonce = 64
-	// DefaultChallengeRate is how many bytes per second a friend's
+	// DefaultChallengeRate is how many bytes per second a friend's ranged
 	// challenges may make this node read, over time
 	// (Server.ChallengeRate), and DefaultChallengeBurst how many at once
-	// (Server.ChallengeBurst). A full check of a large replica is paced
-	// to the rate; the daily ranged challenges stay far inside the
-	// burst.
-	DefaultChallengeRate  = 16 << 20
-	DefaultChallengeBurst = 64 << 20
+	// (Server.ChallengeBurst): the daily challenges read at most 512 KiB
+	// per replica, far inside the burst.
+	DefaultChallengeRate  = 256 << 10
+	DefaultChallengeBurst = 8 << 20
+	// DefaultWholeRate and DefaultWholeBurst pace a friend's
+	// whole-object challenges (a full check, VER-3) apart from the ranged
+	// ones (Server.ChallengeWholeRate, ChallengeWholeBurst): a full check
+	// of a large replica runs at the rate, and its debt never stalls a
+	// daily challenge. Together they bound what one friend makes this
+	// node read for 32-byte answers to under 4.3 MiB/s.
+	DefaultWholeRate  = 4 << 20
+	DefaultWholeBurst = 32 << 20
 	// ChallengeCallCost is the least a challenge counts against the
 	// pace, however few bytes it reads: it bounds the calls a friend
 	// makes, not only their bytes.
@@ -165,14 +173,14 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, c Caller) {
 		return
 	}
 	peer := c.Peer.String()
-	wait, ok := s.admitChallenge(peer, s.now())
+	wait, ok := s.admitChallenge(peer, req.Whole, s.now())
 	if !ok {
 		w.Header().Set("Retry-After", strconv.FormatInt(int64(math.Ceil(wait.Seconds())), 10))
 		Error(w, http.StatusServiceUnavailable, "challenge: this node reads one challenge of yours at a time, at a bounded pace; retry later")
 		return
 	}
 	var read int64
-	defer func() { s.challengeDone(peer, read, s.now()) }()
+	defer func() { s.challengeDone(peer, req.Whole, read, s.now()) }()
 	offset, length := req.Offset, req.Length
 	if req.Whole {
 		offset, length = 0, -1
@@ -208,48 +216,67 @@ func (s *Server) challenge(w http.ResponseWriter, r *http.Request, c Caller) {
 	writeJSON(w, http.StatusOK, ChallengeResponse{HMAC: m.Sum(nil), Size: read})
 }
 
-// challengeLimits pace each friend's challenges (LEND-5, #27): a token
-// bucket of bytes per friend, ChallengeBurst deep and refilled at
-// ChallengeRate, which a call may enter only when it is not in debt and
-// no other call of the friend's is reading; the call then takes what it
-// read, at least ChallengeCallCost. A whole-object challenge can thus
-// overdraw once, and the friend waits for the debt to refill.
+// challengeLimits pace each friend's challenges (LEND-5, #27): per
+// friend, two token buckets of bytes, one for ranged challenges
+// (ChallengeBurst deep, refilled at ChallengeRate) and one for
+// whole-object ones (ChallengeWholeBurst, ChallengeWholeRate). A call
+// may enter only when its bucket is not in debt and no other call of the
+// friend's is reading; it then takes what it read, at least
+// ChallengeCallCost. A whole-object challenge can thus overdraw once,
+// and the friend waits for the debt to refill, while its daily ranged
+// challenges, paced apart, are not held up by it.
 type challengeLimits struct {
 	mu    sync.Mutex
 	peers map[string]*challengePeer
 }
 
 type challengePeer struct {
-	tokens  float64
-	at      time.Time
-	reading bool
+	ranged, whole bucket
+	reading       bool
 }
 
-func (s *Server) challengeRate() float64 {
-	if s.ChallengeRate > 0 {
-		return float64(s.ChallengeRate)
+type bucket struct {
+	tokens float64
+	at     time.Time
+}
+
+// pace returns the rate and burst of the bucket for whole or ranged
+// challenges.
+func (s *Server) pace(whole bool) (rate, burst float64) {
+	if whole {
+		return float64(cmp.Or(s.ChallengeWholeRate, DefaultWholeRate)), float64(cmp.Or(s.ChallengeWholeBurst, DefaultWholeBurst))
 	}
-	return DefaultChallengeRate
+	return float64(cmp.Or(s.ChallengeRate, DefaultChallengeRate)), float64(cmp.Or(s.ChallengeBurst, DefaultChallengeBurst))
 }
 
-func (s *Server) challengeBurst() float64 {
-	if s.ChallengeBurst > 0 {
-		return float64(s.ChallengeBurst)
+func (p *challengePeer) bucket(whole bool) *bucket {
+	if whole {
+		return &p.whole
 	}
-	return DefaultChallengeBurst
+	return &p.ranged
 }
 
-// refill brings p's tokens to now.
-func (s *Server) refill(p *challengePeer, now time.Time) {
-	if d := now.Sub(p.at); d > 0 {
-		p.tokens = min(p.tokens+d.Seconds()*s.challengeRate(), s.challengeBurst())
+// refill brings b's tokens to now.
+func (s *Server) refill(b *bucket, whole bool, now time.Time) {
+	rate, burst := s.pace(whole)
+	if d := now.Sub(b.at); d > 0 {
+		b.tokens = min(b.tokens+d.Seconds()*rate, burst)
 	}
-	p.at = now
+	b.at = now
 }
 
-// admitChallenge reports whether peer's challenge at now may read; if
-// not, how long until it may.
-func (s *Server) admitChallenge(peer string, now time.Time) (time.Duration, bool) {
+// full reports whether p's buckets are both back at their burst.
+func (s *Server) full(p *challengePeer, now time.Time) bool {
+	s.refill(&p.ranged, false, now)
+	s.refill(&p.whole, true, now)
+	_, rb := s.pace(false)
+	_, wb := s.pace(true)
+	return p.ranged.tokens >= rb && p.whole.tokens >= wb
+}
+
+// admitChallenge reports whether peer's challenge, whole or ranged, at
+// now may read; if not, how long until it may.
+func (s *Server) admitChallenge(peer string, whole bool, now time.Time) (time.Duration, bool) {
 	l := &s.challengeLimits
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -258,30 +285,32 @@ func (s *Server) admitChallenge(peer string, now time.Time) (time.Duration, bool
 	}
 	p := l.peers[peer]
 	if p == nil {
-		p = &challengePeer{tokens: s.challengeBurst(), at: now}
+		_, rb := s.pace(false)
+		_, wb := s.pace(true)
+		p = &challengePeer{ranged: bucket{tokens: rb, at: now}, whole: bucket{tokens: wb, at: now}}
 		l.peers[peer] = p
 	}
-	s.refill(p, now)
+	b := p.bucket(whole)
+	s.refill(b, whole, now)
 	switch {
 	case p.reading:
 		return time.Second, false
-	case p.tokens < 0:
-		return time.Duration(-p.tokens / s.challengeRate() * float64(time.Second)), false
+	case b.tokens < 0:
+		rate, _ := s.pace(whole)
+		return time.Duration(-b.tokens / rate * float64(time.Second)), false
 	}
 	p.reading = true
 	// Friends back at a full burst need no entry: forget them.
 	for k, o := range l.peers {
-		if k != peer && !o.reading {
-			if s.refill(o, now); o.tokens >= s.challengeBurst() {
-				delete(l.peers, k)
-			}
+		if k != peer && !o.reading && s.full(o, now) {
+			delete(l.peers, k)
 		}
 	}
 	return 0, true
 }
 
-// challengeDone takes what peer's challenge read off its tokens.
-func (s *Server) challengeDone(peer string, read int64, now time.Time) {
+// challengeDone takes what peer's challenge read off its bucket.
+func (s *Server) challengeDone(peer string, whole bool, read int64, now time.Time) {
 	l := &s.challengeLimits
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -289,7 +318,8 @@ func (s *Server) challengeDone(peer string, read int64, now time.Time) {
 	if p == nil {
 		return
 	}
-	s.refill(p, now)
-	p.tokens -= float64(max(read, ChallengeCallCost))
+	b := p.bucket(whole)
+	s.refill(b, whole, now)
+	b.tokens -= float64(max(read, ChallengeCallCost))
 	p.reading = false
 }

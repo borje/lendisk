@@ -55,10 +55,13 @@ type Server struct {
 	// Held reads what this node holds of each friend's objects for the
 	// challenge call (VER-1); nil answers it 404.
 	Held LentReader
-	// ChallengeRate and ChallengeBurst pace what one friend's challenges
-	// read, in bytes per second and bytes (defaults
-	// DefaultChallengeRate and DefaultChallengeBurst).
-	ChallengeRate, ChallengeBurst int64
+	// ChallengeRate and ChallengeBurst pace what one friend's ranged
+	// challenges read, in bytes per second and bytes (defaults
+	// DefaultChallengeRate and DefaultChallengeBurst);
+	// ChallengeWholeRate and ChallengeWholeBurst its whole-object ones
+	// (DefaultWholeRate, DefaultWholeBurst).
+	ChallengeRate, ChallengeBurst           int64
+	ChallengeWholeRate, ChallengeWholeBurst int64
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
