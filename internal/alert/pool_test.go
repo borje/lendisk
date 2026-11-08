@@ -118,3 +118,42 @@ func TestDroppedCopiesAreAlerted(t *testing.T) {
 		t.Fatalf("alerts %v", as)
 	}
 }
+
+// OPS-2, REPL-1 (#20 second review): a completed upload whose row
+// cannot be matched to the object in the store holds the bucket's
+// metadata, and so every friend's queue, until it settles: it raises
+// upload_unmatchable for its bucket once, naming what to do, and the
+// alert clears when the row settles.
+func TestAnUnmatchableUploadIsAlertedUntilItSettles(t *testing.T) {
+	ctx := t.Context()
+	db := openDB(t)
+	addFriend(t, db, "B")
+	seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "data/big", Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MarkUnmatchable(ctx, seqs[0], "no upload ID"); err != nil {
+		t.Fatal(err)
+	}
+	s := &Service{DB: db, Log: quiet}
+	for range 2 {
+		if err := s.evaluate(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	as := active(t, db)
+	a, ok := as[KindUploadUnmatchable+":laptop"]
+	if !ok || len(as) != 1 || a.Raise != 1 || !strings.Contains(a.Message, "restore the store's xattrs or rewrite the key") ||
+		!strings.Contains(a.Message, "data/big") {
+		t.Fatalf("alerts %+v", as)
+	}
+	if _, err := db.FinishPut(ctx, seqs[0], 10, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.evaluate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if as := active(t, db); len(as) != 0 {
+		t.Fatalf("alerts after the row settled %+v", as)
+	}
+}

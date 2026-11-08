@@ -61,6 +61,7 @@ type Write struct {
 type Shortfall struct {
 	Objects, Bytes                   int64
 	Refused, Dropped, Gone, Unplaced int64
+	Unmatchable                      int64
 	Pending                          int64
 }
 
@@ -134,6 +135,7 @@ type short struct {
 	seq, next, size        int64 // next: the key's next done write; 0 if none
 	stuck, pending         bool
 	refused, dropped, gone bool
+	unmatchable            bool // pending, and cannot be matched to the store (MarkUnmatchable)
 }
 
 // Offsite computes bucket's watermark and what keeps it below target
@@ -206,7 +208,7 @@ func (db *DB) holders(ctx context.Context) (string, error) {
 func (s *Shortfall) add(r short) {
 	s.Objects++
 	s.Bytes += r.size
-	if r.pending {
+	if r.pending && !r.unmatchable {
 		s.Pending++
 	}
 	if !r.stuck {
@@ -217,6 +219,8 @@ func (s *Shortfall) add(r short) {
 		s.Refused++
 	case r.dropped:
 		s.Dropped++
+	case r.unmatchable:
+		s.Unmatchable++
 	case r.gone:
 		s.Gone++
 	default:
@@ -284,10 +288,11 @@ func (db *DB) shorts(ctx context.Context, bucket string, copies int, holders str
 			EXISTS (SELECT 1 FROM placement r WHERE r.seq = puts.seq AND r.state = 'refused'),
 			EXISTS (SELECT 1 FROM placement d WHERE d.seq = puts.seq AND d.state = 'dropped'),
 			EXISTS (SELECT 1 FROM placement g WHERE g.seq = puts.seq AND g.state = 'acked'
-				AND g.place NOT IN (SELECT place FROM places)), 0
+				AND g.place NOT IN (SELECT place FROM places)), 0, 0
 		FROM puts WHERE held < ?2
 		UNION ALL
-		SELECT seq, 0, 0, 0, 0, 0, 0, 1 FROM queue WHERE state = 'pending' AND bucket = ?1 AND op = 'put'
+		SELECT seq, 0, 0, unmatchable IS NOT NULL, 0, 0, 0, 1, unmatchable IS NOT NULL FROM queue
+		WHERE state = 'pending' AND bucket = ?1 AND op = 'put'
 		ORDER BY 1`, bucket, copies, holders)
 	if err != nil {
 		return nil, err
@@ -296,7 +301,7 @@ func (db *DB) shorts(ctx context.Context, bucket string, copies int, holders str
 	var out []short
 	for rows.Next() {
 		var s short
-		if err := rows.Scan(&s.seq, &s.size, &s.next, &s.stuck, &s.refused, &s.dropped, &s.gone, &s.pending); err != nil {
+		if err := rows.Scan(&s.seq, &s.size, &s.next, &s.stuck, &s.refused, &s.dropped, &s.gone, &s.pending, &s.unmatchable); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

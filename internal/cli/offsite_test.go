@@ -360,6 +360,37 @@ func TestStatusWaitStopsWhenAFriendRefusesEverything(t *testing.T) {
 	}
 }
 
+// REPL-5, REPL-11 (#20 second review): a completed upload whose row
+// cannot be matched to the object in the store (its xattrs lost) may
+// never settle. status says so, with what to do, rather than "still
+// being written"; status --wait exits 4.
+func TestStatusWaitStopsOnAnUnmatchableUpload(t *testing.T) {
+	o := newOffsiteNode(t, "laptop", "restic")
+	o.daemonUp()
+	seqs, err := o.db.BeginCaptures(t.Context(), []state.Capture{{Bucket: "laptop", Key: "data/big", Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := o.db.MarkUnmatchable(t.Context(), seqs[0], "no upload ID"); err != nil {
+		t.Fatal(err)
+	}
+	o.put("laptop", "index/1", "metadata", 100)
+	o.put("laptop", snapA, "snapshot", 100)
+	b := bucketOf(t, o.status(), "laptop")
+	if b.Offsite.Stuck.Unmatchable != 1 || b.Offsite.Waiting.Pending != 0 {
+		t.Fatalf("offsite %+v", b.Offsite)
+	}
+	why := "1 of them have no copy on its way to make up 2 places (1 cannot be matched to the store: restore the store's xattrs or rewrite the key)"
+	_, text, _ := o.run("", "", "status")
+	if !strings.Contains(text, why) || strings.Contains(text, "still being written") {
+		t.Fatalf("status:\n%s", text)
+	}
+	o.node.sleep = func(context.Context, time.Duration) error { t.Fatal("waited for what cannot come"); return nil }
+	if code, out, errOut := o.run("", "", "status", "--wait", "laptop"); code != 4 || out != "" || !strings.Contains(errOut, why) {
+		t.Fatalf("status --wait: exit %d\n%s%s", code, out, errOut)
+	}
+}
+
 // REPL-5 (#20): status --wait reads lendisk.db; it needs the daemon to
 // make progress, so with none answering it says so and exits 1 at once
 // rather than wait for nothing.

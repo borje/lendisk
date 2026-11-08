@@ -418,4 +418,14 @@ var migrations = []Migration{
 		UPDATE placement SET started_at = 0 WHERE state = 'queued';
 		CREATE INDEX placement_queued_key ON placement (bucket, key) WHERE state = 'queued';`,
 	},
+	{
+		Version: 22, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The offsite watermark (REPL-11, #20): a pending row of a
+		-- completed upload that cannot be matched to the object in the
+		-- store (its upload ID unreadable, e.g. xattrs lost in a copy)
+		-- may never settle; the reason, so status and an alert say so.
+		-- Read only while the row is pending.
+		ALTER TABLE queue ADD COLUMN unmatchable TEXT;`,
+	},
 }

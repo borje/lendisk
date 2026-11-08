@@ -73,11 +73,14 @@ type StatusShortfall struct {
 	Dropped  int64 `json:"dropped"`
 	Gone     int64 `json:"gone"`
 	Unplaced int64 `json:"unplaced"`
+	// Unmatchable: completed uploads whose rows cannot be matched to the
+	// object in the store (#62), which may never settle.
+	Unmatchable int64 `json:"unmatchable"`
 }
 
 func shortfall(s state.Shortfall) StatusShortfall {
 	return StatusShortfall{Objects: s.Objects, Bytes: s.Bytes, Pending: s.Pending, Refused: s.Refused,
-		Dropped: s.Dropped, Gone: s.Gone, Unplaced: s.Unplaced}
+		Dropped: s.Dropped, Gone: s.Gone, Unplaced: s.Unplaced, Unmatchable: s.Unmatchable}
 }
 
 // offsiteStatus reads bucket b's offsite state.
@@ -186,6 +189,7 @@ func shortPhrase(waiting, stuck StatusShortfall, copies int) string {
 		what string
 	}{{stuck.Refused, "refused by a friend"}, {stuck.Dropped, "dropped at a full or gone friend"},
 		{stuck.Gone, "held by a friend removed or gone past replace_after"},
+		{stuck.Unmatchable, "cannot be matched to the store: restore the store's xattrs or rewrite the key"},
 		{stuck.Unplaced, "with no room for them in the pool"}} {
 		if r.n > 0 {
 			why = append(why, fmt.Sprintf("%d %s", r.n, r.what))

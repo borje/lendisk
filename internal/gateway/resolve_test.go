@@ -208,6 +208,11 @@ func TestUnreadableUploadIDLeavesTheRowPendingAndReported(t *testing.T) {
 	if !strings.Contains(logs.String(), "cannot be matched") {
 		t.Fatalf("not reported; log:\n%s", logs)
 	}
+	// #20 second review: the mark is in lendisk.db, for status and the
+	// alert, also after a restart.
+	if u, err := h.db.UnmatchableRows(ctx); err != nil || u["files"].Objects != 1 || u["files"].Key != "big" {
+		t.Fatalf("unmatchable rows %+v %v", u, err)
+	}
 	// Retried every round, but reported once per row while the daemon runs.
 	d.ResolveStranded(ctx)
 	d.ResolveStranded(ctx)
@@ -219,6 +224,9 @@ func TestUnreadableUploadIDLeavesTheRowPendingAndReported(t *testing.T) {
 	}
 	d.ResolveStranded(ctx)
 	assertOneDoneRow(t, h, store, "big", body)
+	if u, err := h.db.UnmatchableRows(ctx); err != nil || len(u) != 0 {
+		t.Fatalf("unmatchable rows after settling %+v %v", u, err)
+	}
 }
 
 // EP-3 (#62): a decorator given no store to read upload IDs from

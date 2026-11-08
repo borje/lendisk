@@ -2215,11 +2215,25 @@ upstream bucket is Q-V.
   will be cancelled, not sent. One replaced only by a write after `m`
   still holds `m`, which was written while the put was the key's bytes.
   A data put before `m` whose queue row is still `pending` holds it too
-  (#20 review): a completed multipart upload is answered before its row
-  is hashed, done and placed (§3.3, #49), so the tool may write the
-  index naming it first; a row stranded pending holds the bucket's
-  metadata until `ResolveStranded` or the next start settles it
-  (`TestAPendingDataUploadHoldsTheMetadataBarrier`).
+  (#20 review), whatever wrote it: a pending row has no placement yet,
+  and one kind is answered before it is done (a completed multipart
+  upload, hashed after its answer, §3.3, #49), so the tool may write the
+  index naming it first. A row stranded pending holds the bucket's
+  metadata until `ResolveStranded` (each minute) or the next start
+  settles it (`TestAPendingDataUploadHoldsTheMetadataBarrier`). One may
+  never settle: a completion whose object's upload ID cannot be read
+  (`errUploadUnreadable`, its xattrs lost when the store was copied
+  without them, #62). It still holds the metadata, which keeps the
+  index consistent, and since a held metadata row heads its place's
+  FIFO, replication of every bucket to every friend waits behind it. So
+  the decorator marks it in `lendisk.db` (`queue.unmatchable`, schema 22,
+  `state.DB.MarkUnmatchable`, read only while the row is pending): `status`
+  counts it as stuck ("cannot be matched to the store: restore the
+  store's xattrs or rewrite the key"), `status --wait` exits 4, and the
+  `upload_unmatchable` alert names it (§3.8;
+  `TestAnUnmatchablePendingUploadIsStuckNotBeingWritten`,
+  `TestUnreadableUploadIDLeavesTheRowPendingAndReported`,
+  `TestStatusWaitStopsOnAnUnmatchableUpload`).
   Because the place's FIFO
   waits behind a held metadata row, a lagging data copy holds back
   every place's metadata, so data rows are re-routed early: a `queued`
@@ -2760,13 +2774,15 @@ upstream bucket is Q-V.
     `TestStatusWaitStopsWhenAFriendRefusesEverything`). A copy still
     `queued` at an unreachable friend is waiting, not stuck: `Reroute`
     may move it.
-  - *a pending put* (#20 review): a completed multipart upload is
-    answered before its queue row is hashed and done (§3.3, #49), so
-    restic may write the index and snapshot naming the pack while the
-    pack has no placement at all. No `w` at or above a pending put is
-    valid; it counts as waiting (`pending`, bytes not yet known), never
-    stuck, and holds the metadata barrier too (above). A row stranded
-    pending holds the watermark until it is settled
+  - *a pending put* (#20 review), any data or metadata put whose queue
+    row is not done yet, has no placement at all; a completed multipart
+    upload is even answered before its row is hashed and done (§3.3,
+    #49), so the tool may write the index and snapshot naming the pack
+    first. No `w` at or above a pending put is valid; it counts as
+    waiting (`pending`, bytes not yet known) and holds the metadata
+    barrier too (above). It is stuck only when marked unmatchable
+    (above, reason `unmatchable`). A row stranded pending holds the
+    watermark until it is settled
     (`TestAPendingUploadBelowTheSnapshotHoldsTheWatermark`,
     `TestStatusWaitWaitsForAMultipartPack`).
   - *only the pool holds copies* (#20 review). An acknowledgement
@@ -2810,7 +2826,10 @@ upstream bucket is Q-V.
   Capture times are whole seconds and sequences follow them, so a time
   claim is strictly before a second (#20 review): the second of the
   first write that is not offsite may hold offsite writes too, and the
-  second of an offsite index may hold another index that is not:
+  second of an offsite index may hold another index that is not. Both
+  claims assume sequence order follows `created_at`: a clock stepped
+  back (no NTP, a manual set) can capture a later write with an earlier
+  second, and the claim then overclaims for it:
   - *restic:* the latest snapshot key still live, `snapshots/<id>`, by
     restic's short ID (its first 8 characters, as `restic snapshots`
     prints): "snapshot 1a2b3c4d is offsite at 2 copies"; while the next
@@ -3561,7 +3580,12 @@ capture decorator, so nothing stands between that and posix (#62).
     re-placed (#26). It raises at once: the worker calls `Alerted` when
     it drops one. A deficit from placement (the pool had no room for
     `copies` when the object was captured) shows in `status` as bytes
-    below `copies` but raises no alert until #26's threshold alert.
+    below `copies` but raises no alert until #26's threshold alert;
+  - `upload_unmatchable`, subject the bucket: completed uploads whose
+    pending rows cannot be matched to the store (`queue.unmatchable`,
+    §3.4 REPL-1, #20), each holding the bucket's metadata and so every
+    friend's queue; raised once, cleared when the rows settle
+    (`TestAnUnmatchableUploadIsAlertedUntilItSettles`).
   Later tickets add a kind to `alert.kinds` and its condition to the
   evaluator. Each raise is delivered at least once to each configured
   channel: success is recorded in `hook_at` or `webhook_at` against

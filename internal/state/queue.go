@@ -1,6 +1,7 @@
 package state
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -151,6 +152,48 @@ func (db *DB) FinishDelete(ctx context.Context, seqs ...int64) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// MarkUnmatchable records on pending row seq why it cannot be matched
+// to the object in the store (#62): it may never settle, and it holds
+// its bucket's metadata (Held), so status counts it as stuck and an
+// alert names it (#20). The mark counts only while the row is pending.
+func (db *DB) MarkUnmatchable(ctx context.Context, seq int64, detail string) error {
+	_, err := db.ExecContext(ctx, `UPDATE queue SET unmatchable = ? WHERE seq = ? AND state = 'pending'`,
+		cmp.Or(detail, "unmatchable"), seq)
+	return err
+}
+
+// Unmatchable counts a bucket's pending rows marked unmatchable, with
+// the first one's key and reason.
+type Unmatchable struct {
+	Objects     int64
+	Key, Detail string
+}
+
+// UnmatchableRows returns, per bucket, the pending rows marked
+// unmatchable; buckets with none are absent.
+func (db *DB) UnmatchableRows(ctx context.Context) (map[string]Unmatchable, error) {
+	rows, err := db.QueryContext(ctx, `SELECT bucket, key, unmatchable FROM queue
+		WHERE state = 'pending' AND unmatchable IS NOT NULL ORDER BY seq`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]Unmatchable{}
+	for rows.Next() {
+		var b, k, d string
+		if err := rows.Scan(&b, &k, &d); err != nil {
+			return nil, err
+		}
+		u := out[b]
+		if u.Objects == 0 {
+			u.Key, u.Detail = k, d
+		}
+		u.Objects++
+		out[b] = u
+	}
+	return out, rows.Err()
 }
 
 // DropCaptures removes pending rows whose backend call failed or never

@@ -53,6 +53,44 @@ func TestAPendingUploadBelowTheSnapshotHoldsTheWatermark(t *testing.T) {
 	}
 }
 
+// REPL-11 (#20 second review): a pending upload that cannot be matched
+// to the object in the store (its xattrs lost) may never settle. The
+// barrier still holds the metadata after it, which is safe for the
+// index, but the row is marked: Offsite counts it as stuck with its own
+// reason, not as still being written, and UnmatchableRows names its
+// bucket for the alert. Settling the row clears the mark.
+func TestAnUnmatchablePendingUploadIsStuckNotBeingWritten(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.bucket("laptop", 2)
+	p.friend("B", 100)
+	p.friend("C", 100)
+	big := p.pending("laptop", "data/big", "data")
+	idx := p.put("laptop", "index/1", "metadata", 0.01)
+	if err := p.db.MarkUnmatchable(ctx, big, "no upload ID"); err != nil {
+		t.Fatal(err)
+	}
+	o := p.offsite("laptop", idx)
+	if o.Stuck.Objects != 1 || o.Stuck.Unmatchable != 1 || o.Waiting.Pending != 0 || o.Waiting.Objects != 2 { // it and the index
+		t.Fatalf("an unmatchable upload: %+v", o)
+	}
+	if !p.held(idx) {
+		t.Fatal("metadata after an unmatchable upload is not held")
+	}
+	if n, err := p.db.UnmatchableRows(ctx); err != nil || n["laptop"].Objects != 1 || n["laptop"].Key != "data/big" || len(n) != 1 {
+		t.Fatalf("unmatchable rows %v %v", n, err)
+	}
+	if _, err := p.db.FinishPut(ctx, big, unit, "h-big"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := p.db.UnmatchableRows(ctx); err != nil || len(n) != 0 {
+		t.Fatalf("unmatchable rows after settling %v %v", n, err)
+	}
+	if o := p.offsite("laptop", idx); o.Stuck.Objects != 0 {
+		t.Fatalf("settled: %+v", o)
+	}
+}
+
 // REPL-1 (#20 review): the metadata barrier holds metadata behind a
 // data upload still pending before it, which has no placement row yet;
 // a pending upload after it, or metadata's own, does not.
