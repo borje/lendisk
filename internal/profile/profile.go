@@ -64,6 +64,21 @@ type Profile struct {
 	// rewrite, which each lender stores, keeping the version it
 	// replaces as a tombstone (LEND-4, RET-1).
 	RewritableKeys []string `toml:"rewritable"`
+	// NamesSnapshots: the last path segment of a snapshot key is the
+	// snapshot's ID as the tool shows it (restic: snapshots/<id>), so
+	// status names the snapshot that is offsite (REPL-11, #20). Without
+	// it status names the snapshot key's capture time: Kopia's snapshot
+	// keys are index blobs, which name no snapshot.
+	NamesSnapshots bool `toml:"names_snapshots"`
+}
+
+// SnapshotID returns the snapshot ID a snapshot key names; ok is false
+// when the profile's snapshot keys name none.
+func (p *Profile) SnapshotID(key string) (id string, ok bool) {
+	if !p.NamesSnapshots {
+		return "", false
+	}
+	return NameHash(key), true
 }
 
 // Rewritable reports whether the tool rewrites key in place in normal
@@ -172,7 +187,7 @@ func (s Set) add(file string, b []byte) error {
 		return fmt.Errorf("%s: %w", file, err)
 	}
 	if un := md.Undecoded(); len(un) > 0 {
-		return fmt.Errorf("%s: unknown key %q (expected encrypted, local_only, snapshot, metadata, data, hash_named, rewritable)", file, un[0].String())
+		return fmt.Errorf("%s: unknown key %q (expected encrypted, local_only, snapshot, metadata, data, hash_named, rewritable, names_snapshots)", file, un[0].String())
 	}
 	for _, l := range [][]string{p.LocalOnly, p.Snapshot, p.Metadata, p.Data, p.HashNamedKeys, p.RewritableKeys} {
 		for _, pat := range l {

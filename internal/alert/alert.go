@@ -74,11 +74,16 @@ const (
 	// than copies until written again or re-placed (#26). The subject is
 	// the bucket.
 	KindCopiesDropped = "copies_dropped"
+	// KindUploadUnmatchable: completed uploads of a bucket whose rows
+	// cannot be matched to the object in the store (#62); each holds the
+	// bucket's metadata, and so every friend's queue, until it settles
+	// (#20). Subject: the bucket.
+	KindUploadUnmatchable = "upload_unmatchable"
 )
 
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
-	KindPoolTooSmall, KindCopiesDropped}
+	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -319,6 +324,16 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 	dropped, err := s.DB.DroppedBelowCopies(ctx)
 	if err != nil {
 		return nil, err
+	}
+	unmatched, err := s.DB.UnmatchableRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range slices.Sorted(maps.Keys(unmatched)) {
+		u := unmatched[b]
+		msg := fmt.Sprintf("bucket %s: %s completed by the backup tool cannot be matched to the store (%s: %s), so nothing after it replicates to any friend; restore the store's xattrs or rewrite the key",
+			b, countObjects(u.Objects), u.Key, u.Detail)
+		out = append(out, alertOf(KindUploadUnmatchable, b, msg))
 	}
 	for _, b := range slices.Sorted(maps.Keys(dropped)) {
 		d := dropped[b]

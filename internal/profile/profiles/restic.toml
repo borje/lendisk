@@ -14,6 +14,11 @@ local_only = ["locks/*"]
 # A snapshot's arrival means a backup is complete; status names it.
 snapshot = ["snapshots/*"]
 
+# A snapshot key's file name is the snapshot's ID, as `restic snapshots`
+# shows it (its first 8 characters), so status says which snapshot is
+# offsite (REPL-11).
+names_snapshots = true
+
 # Placed at every friend (REPL-12, D6).
 metadata = ["config", "keys/*", "index/*", "snapshots/*"]
 

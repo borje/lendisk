@@ -51,6 +51,8 @@ type node struct {
 	tuneBridge func(*bridge.Bridge)
 	// tuneAlerts, when set, is given to serveLogged's daemon.
 	tuneAlerts func(*alert.Service)
+	// sleep, when set, is every command's pause between polls.
+	sleep func(context.Context, time.Duration) error
 }
 
 func newNode(t *testing.T) *node {
@@ -73,7 +75,7 @@ func (n *node) run(stdin string, phrase string, args ...string) (int, string, st
 		regions:   n.regions,
 		clock:     n.clock, dialTimeout: n.dialTimeout,
 		redeemTransport: n.redeemTransport, beforeFriendship: n.beforeFriendship,
-		afterFetch: n.afterFetch, listBudget: n.listBudget,
+		afterFetch: n.afterFetch, listBudget: n.listBudget, sleep: n.sleep,
 	}
 	args = append(args, "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0")
 	code := a.run(args)

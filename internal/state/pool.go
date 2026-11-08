@@ -408,7 +408,10 @@ func column(ctx context.Context, tx querier, q string, args ...any) ([]string, e
 // which status shows. A queued put that a done write of the key before
 // the metadata replaced will be cancelled, not sent, so it does not hold
 // it either; one replaced only after the metadata still does, as the
-// metadata was written while it was the key's bytes.
+// metadata was written while it was the key's bytes. A data put before
+// it still pending holds it too (#20 review): a completed multipart
+// upload is answered before its row is done and placed (#49), so the
+// tool may write the index naming it first.
 //
 // The mirror holds a data delete (#21 review): it is sent to any place
 // only when no metadata or snapshot row of its bucket before it, put
@@ -442,6 +445,8 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND p.op = 'put' AND d.class = 'data'
 			AND NOT EXISTS (SELECT 1 FROM queue l
 				WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.seq < q.seq AND l.state = 'done'))
+			OR EXISTS (SELECT 1 FROM queue u WHERE u.state = 'pending' AND u.bucket = q.bucket AND u.seq < q.seq
+				AND u.op = 'put' AND u.class = 'data')
 		WHEN q.op = 'delete' THEN EXISTS (
 			SELECT 1 FROM placement p JOIN queue m ON m.seq = p.seq
 			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND m.class IN ('metadata', 'snapshot')

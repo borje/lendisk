@@ -101,7 +101,8 @@ func (d *Decorator) strand(seqs ...int64) {
 // unmatchable reports a completion's row that cannot be matched to the
 // object in the store (errUploadUnreadable), once per row while the
 // daemon runs: it is retried every round and may never settle (#62).
-// Status counts it among the bucket's pending writes.
+// It is marked in lendisk.db (MarkUnmatchable), so status counts it as
+// stuck and an alert names it until it settles (#20).
 func (d *Decorator) unmatchable(e state.Entry, err error) {
 	d.mu.Lock()
 	seen := d.unmatched[e.Seq]
@@ -112,6 +113,11 @@ func (d *Decorator) unmatchable(e state.Entry, err error) {
 	d.mu.Unlock()
 	if seen {
 		return
+	}
+	// In lendisk.db too, for status and the upload_unmatchable alert: the
+	// row holds its bucket's metadata until it settles (#20).
+	if merr := d.DB.MarkUnmatchable(context.Background(), e.Seq, err.Error()); merr != nil {
+		d.Log.Error("capture: recording an unmatchable row failed", "seq", e.Seq, "err", merr)
 	}
 	d.Log.Warn("capture: a completed upload's row cannot be matched to the object in the store; leaving it pending and retrying while serving, reported once",
 		"seq", e.Seq, "bucket", e.Bucket, "key", e.Key, "upload", e.Upload, "err", err)

@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -306,6 +307,10 @@ type StatusBucket struct {
 	// (the generic profile): friends hold its objects in the clear, so
 	// it is outside lendisk's trust guarantee (EP-8, P-3).
 	OutsideTrust bool `json:"outside_trust"`
+	// Offsite is how much of the bucket is offsite at Copies places:
+	// the watermark, the latest snapshot and whether it is offsite
+	// (REPL-4, REPL-11, #20).
+	Offsite StatusOffsite `json:"offsite"`
 }
 
 // StatusPool is the pool of friends that hold copies (D6).
@@ -365,11 +370,28 @@ const StatusSchema = 1
 
 func (a *app) statusCmd() *cobra.Command {
 	var asJSON, quiet bool
+	var wait string
+	var timeout time.Duration
 	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show this node's state",
-		Args:  cobra.NoArgs,
+		Long: `Show this node's state.
+
+With --wait <bucket>, wait instead until the bucket's latest snapshot
+captured before the wait began (for a bucket with no snapshot keys, its
+latest write) is offsite at the bucket's copies, so a backup script can
+block on replication. Exit codes: 0 offsite; 1 an error, or the daemon
+is not running; 2 a usage error; 3 timed out; 4 it cannot be offsite as
+things stand (objects refused by a friend, dropped at a full or gone
+friend, or with no room in the pool), which status shows.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if wait != "" && asJSON {
+				return usageError{errors.New("--wait prints one line; leave out --json")}
+			}
+			if timeout < 0 {
+				return usageError{fmt.Errorf("--timeout %v is negative; 0 waits without a limit", timeout)}
+			}
 			cfg, log, err := a.load(a.errOut)
 			if err != nil {
 				return err
@@ -377,6 +399,15 @@ func (a *app) statusCmd() *cobra.Command {
 			id, err := identity.Load(cfg.ConfigDir())
 			if err != nil {
 				return err
+			}
+			if wait != "" {
+				db, err := state.Open(cmd.Context(), cfg.DataDir, log)
+				if err != nil {
+					return err
+				}
+				defer db.Close()
+				db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
+				return a.waitOffsite(cmd.Context(), cfg, db, wait, timeout, quiet)
 			}
 			if quiet {
 				return nil
@@ -400,6 +431,8 @@ func (a *app) statusCmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
+			// As the daemon judges reachability: which friends are gone (D6).
+			db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
 			bs, err := db.Buckets(cmd.Context())
 			if err != nil {
 				return err
@@ -422,12 +455,15 @@ func (a *app) statusCmd() *cobra.Command {
 			}
 			for _, b := range bs {
 				q, bc := queues[b.Name], below[b.Name]
+				off, err := offsiteStatus(cmd.Context(), db, b, profiles.Get(b.Profile))
+				if err != nil {
+					return err
+				}
 				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
 					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1,
-					OutsideTrust: !profiles.Get(b.Profile).Encrypted})
+					OutsideTrust: !profiles.Get(b.Profile).Encrypted, Offsite: off})
 			}
-			db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
 			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
 				return err
 			}
@@ -521,6 +557,9 @@ func (a *app) statusCmd() *cobra.Command {
 				if b.SingleCopy {
 					fmt.Fprintf(a.out, "    %s\n", singleCopyLine)
 				}
+				for _, l := range offsiteLines(b) {
+					fmt.Fprintf(a.out, "    %s\n", l)
+				}
 			}
 			if st.Pool.SingleFriend {
 				fmt.Fprintln(a.out, singleFriendLine)
@@ -603,5 +642,7 @@ func (a *app) statusCmd() *cobra.Command {
 	}
 	cmd.Flags().BoolVar(&asJSON, "json", false, "print status as JSON")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "print nothing; exit 0 if the node is set up (for health checks)")
+	cmd.Flags().StringVar(&wait, "wait", "", "wait until `bucket`'s latest snapshot is offsite at its copies (exit 3 on timeout, 4 if it cannot be)")
+	cmd.Flags().DurationVar(&timeout, "timeout", 24*time.Hour, "with --wait, how long to wait; 0 waits without a limit")
 	return cmd
 }

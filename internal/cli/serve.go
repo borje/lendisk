@@ -103,7 +103,7 @@ func (a *app) serveCmd() *cobra.Command {
 				a.tuneFetch(fetch)
 			}
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
-				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
+				Profiles: profiles, AfterStore: a.afterStore, BeforeHash: a.beforeHash, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
 				Fetch: fetch}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
@@ -167,7 +167,7 @@ func (a *app) serveCmd() *cobra.Command {
 				// Replication to friends (#18) never blocks the endpoint
 				// (REPL-9): it reads the store and lendisk.db only.
 				w := &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
-					Alerted: alerts.Check}
+					Alerted: alerts.Check, Now: a.clock}
 				if a.tuneReplication != nil {
 					a.tuneReplication(w)
 				}

@@ -15,3 +15,7 @@ const (
 	settleKeys = 20_000
 	settleWait = 10 * time.Second
 )
+
+// offsiteObjects sizes the large-bucket watermark test: a fifth of the
+// objects, as the race detector makes its query about forty times slower.
+const offsiteObjects = 4_000
