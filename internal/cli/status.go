@@ -51,6 +51,9 @@ type Status struct {
 	// FormerFriends are friendships that ended and whose replicas are
 	// kept until the retention window ends (PEER-5, #25).
 	FormerFriends []StatusFormer `json:"former_friends"`
+	// Lending is the effective cap on the sum of the node's numbers
+	// (LEND-1, #24); absent when it cannot be read.
+	Lending *StatusLending `json:"lending,omitempty"`
 }
 
 // StatusFormer is one ended friendship in its retention window.
@@ -560,6 +563,11 @@ friend, or with no room in the pool), which status shows.`,
 				return err
 			}
 			st.Pool.SingleFriend = st.Pool.Friends == 1
+			if l, err := a.lendingStatus(cmd.Context(), cfg, db); err == nil {
+				st.Lending = &l
+			} else {
+				log.Warn("cannot read the lending cap", "err", err)
+			}
 			if st.Places, err = places(cmd.Context(), db, a.now()); err != nil {
 				return err
 			}
@@ -673,6 +681,10 @@ friend, or with no room in the pool), which status shows.`,
 			}
 			if st.Pool.SingleFriend {
 				fmt.Fprintln(a.out, singleFriendLine)
+			}
+			if st.Lending != nil {
+				fmt.Fprintf(a.out, "Lending: at most %s (%s); numbers and open invites take %s\n",
+					humanSize(st.Lending.MaxTotal), st.Lending.From, humanSize(st.Lending.Numbers))
 			}
 			if len(st.Places) > 0 {
 				fmt.Fprintf(a.out, "Places:  %d\n", len(st.Places))

@@ -62,7 +62,7 @@ type Config struct {
 
 // Lending is the [lending] section (LEND-1, LEND-8).
 type Lending struct {
-	MaxTotal string `toml:"max_total" help:"the most this node lends all friends together: the sum of its numbers for its friendships, and of its open invites, may not exceed it (LEND-1, LEND-8), such as 240G; empty for no cap but the store's free-space floor"`
+	MaxTotal string `toml:"max_total" help:"the most this node lends all friends together: the sum of its numbers for its friendships, and of its open invites, may not exceed it (LEND-1, LEND-8), such as 240G; empty means what the store's filesystem can hold, its size less store.free_space_floor"`
 }
 
 // Store is the [store] section: one store for the node's own buckets and
@@ -202,7 +202,8 @@ func (c *Config) ReplaceAfter() time.Duration {
 }
 
 // MaxTotal is lending.max_total in bytes, which Validate checked; ok is
-// false when it is unset (no cap).
+// false when it is unset: the cap is then what the store's filesystem
+// can hold, which the caller reads.
 func (c *Config) MaxTotal() (n int64, ok bool) {
 	if strings.TrimSpace(c.Lending.MaxTotal) == "" {
 		return 0, false

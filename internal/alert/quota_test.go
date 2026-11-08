@@ -26,7 +26,7 @@ func TestQuotaUseRaisesAlerts(t *testing.T) {
 			t.Fatal(err)
 		}
 		// The friend's answer sets this node's count of its use there.
-		if _, err := db.QuotaAnswered(ctx, peer, own, state.QuotaAnswer{Number: 1 << 40, Lent: use}, now); err != nil {
+		if _, err := db.QuotaAnswered(ctx, peer, own, now, state.QuotaAnswer{Number: 1 << 40, Lent: use}, now); err != nil {
 			t.Fatal(err)
 		}
 	}

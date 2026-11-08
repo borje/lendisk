@@ -94,7 +94,8 @@ func (a *app) runInvite(ctx context.Context, quota, retention, expires string) e
 	if _, err := db.PurgeInvites(ctx, now); err != nil {
 		return err
 	}
-	if err := checkMaxTotal(ctx, cfg, db, now, number); err != nil {
+	max, from, err := a.maxTotal(cfg)
+	if err != nil {
 		return err
 	}
 	inv, err := invite.New(a.rng(), addr, number, ret)
@@ -106,8 +107,9 @@ func (a *app) runInvite(ctx context.Context, quota, retention, expires string) e
 		return err
 	}
 	until := now.Add(exp)
-	if err := db.AddInvite(ctx, state.Invite{Key: key.NodeID().String(), Number: number, Retention: inv.Retention, ExpiresAt: until}); err != nil {
-		return err
+	if err := db.AddInviteWithin(ctx, state.Invite{Key: key.NodeID().String(), Number: number, Retention: inv.Retention, ExpiresAt: until},
+		max, now); err != nil {
+		return overMaxTotal(err, max, from)
 	}
 	fmt.Fprintln(a.out, inv.String())
 	fmt.Fprintf(a.errOut, "Single-use invite, valid until %s. Your friend runs `lendisk peer add <invite>`\n"+
@@ -278,15 +280,16 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 				return usageError{err}
 			}
 		}
-		if err := checkMaxTotal(ctx, cfg, db, a.now(), number); err != nil {
+		max, from, err := a.maxTotal(cfg)
+		if err != nil {
 			return err
 		}
-		err = db.StartRedeem(ctx, state.PendingRedeem{InviteKey: ikID, Peer: them.String(),
-			Number: number, Retention: ret, StartedAt: a.now()})
+		err = db.StartRedeemWithin(ctx, state.PendingRedeem{InviteKey: ikID, Peer: them.String(),
+			Number: number, Retention: ret, StartedAt: a.now()}, max, a.now())
 		if errors.Is(err, state.ErrExists) {
 			return errors.New(redeemInProgress)
 		} else if err != nil {
-			return err
+			return overMaxTotal(err, max, from)
 		}
 	default:
 		return err
@@ -421,7 +424,7 @@ type PeerJSON struct {
 }
 
 func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
-	_, db, err := a.openState(ctx)
+	cfg, db, err := a.openState(ctx)
 	if err != nil {
 		return err
 	}
@@ -464,6 +467,12 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 	if len(fs) == 0 {
 		fmt.Fprintln(a.out, "No friends yet; `lendisk invite --quota 100G` makes an invite.")
 		return nil
+	}
+	if l, err := a.lendingStatus(ctx, cfg, db); err == nil {
+		fmt.Fprintf(a.out, "This node lends at most %s (%s); its numbers and open invites take %s.\n",
+			humanSize(l.MaxTotal), l.From, humanSize(l.Numbers))
+	} else {
+		fmt.Fprintf(a.out, "This node's lending cap is unknown: %v\n", err)
 	}
 	tw := tabwriter.NewWriter(a.out, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "FRIEND\tQUOTA\tNUMBERS\tYOU USE THERE\tTHEY USE HERE\tREMAINING\tREACH\tLAST SEEN\tVERIFIED\tPROTOCOL\tTHEIR REPO\tYOU KEEP\tTHEY KEEP\tSINCE")

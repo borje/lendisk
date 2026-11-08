@@ -165,9 +165,10 @@ type querier interface {
 
 func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT f.peer_key,
-		min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)), coalesce(u.bytes, 0),
+		min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)), coalesce(u.bytes, 0) + coalesce(fr.bytes, 0),
 		coalesce(c.condition, ''), coalesce(c.since, 0), c.last_ok
 		FROM friendship f LEFT JOIN place_use u ON u.place = f.peer_key LEFT JOIN place c ON c.place = f.peer_key
+		LEFT JOIN place_freed fr ON fr.place = f.peer_key
 		WHERE coalesce(f.address, '') != '' ORDER BY f.peer_key`)
 	if err != nil {
 		return nil, err
@@ -766,9 +767,11 @@ func (db *DB) DroppedBelowCopies(ctx context.Context) (map[string]BelowStat, err
 
 // PlaceUse returns the borrower's count of what each place holds or
 // will hold: its queued and acked rows, objects at their size plus
-// ObjectOverhead, less what deletes free.
+// ObjectOverhead, less what deletes free; since its first quota answer,
+// deletes free nothing until the next answer (place_freed, #68).
 func (db *DB) PlaceUse(ctx context.Context) (map[string]int64, error) {
-	rows, err := db.QueryContext(ctx, `SELECT place, bytes FROM place_use`)
+	rows, err := db.QueryContext(ctx, `SELECT u.place, u.bytes + coalesce(fr.bytes, 0)
+		FROM place_use u LEFT JOIN place_freed fr ON fr.place = u.place`)
 	if err != nil {
 		return nil, err
 	}

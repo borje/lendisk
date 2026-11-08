@@ -5,13 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/borje/lendisk/internal/config"
+	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/store"
 )
 
 // Each side's number for a friendship (LEND-8, PEER-6, #24): `peer
@@ -52,17 +53,16 @@ func (a *app) runPeerQuota(ctx context.Context, s, size string) error {
 	}
 	defer db.Close()
 	db.Clock = a.clock
-	maxTotal, _ := cfg.MaxTotal()
+	maxTotal, from, err := a.maxTotal(cfg)
+	if err != nil {
+		return err
+	}
 	before, after, err := db.SetOwnNumber(ctx, peer.String(), n, maxTotal)
-	var over *state.MaxTotalError
 	switch {
 	case errors.Is(err, state.ErrNotFound):
 		return fmt.Errorf("%s is not a friend of this node; `lendisk peer list` shows your friends", peer)
-	case errors.As(err, &over):
-		return fmt.Errorf("refused: lending.max_total is %s and your other numbers and open invites take %s, so this friendship can have at most %s; "+
-			"lower another number or raise lending.max_total", formatSize(over.Max), formatSize(over.Others), formatSize(max(over.Max-over.Others, 0)))
 	case err != nil:
-		return err
+		return overMaxTotal(err, maxTotal, from)
 	}
 	fmt.Fprintf(a.out, "Your number for %s is now %s (was %s); theirs is %s.\n", peer, formatSize(n),
 		formatSize(before.OwnNumber), formatSize(after.PeerNumber))
@@ -95,21 +95,70 @@ func (a *app) runPeerQuota(ctx context.Context, s, size string) error {
 	return nil
 }
 
-// checkMaxTotal refuses adding a number n at now past lending.max_total
-// (LEND-1): an invite's or a redeem's.
-func checkMaxTotal(ctx context.Context, cfg *config.Loaded, db *state.DB, now time.Time, n int64) error {
-	max, ok := cfg.MaxTotal()
-	if !ok {
-		return nil
+// Where the effective cap comes from.
+const (
+	capSet  = "lending.max_total"
+	capDisk = "the store's filesystem less its free-space floor"
+)
+
+// maxTotal is the effective cap on the sum of the node's numbers
+// (LEND-1) and where it comes from: lending.max_total if set, else what
+// the store's filesystem can hold, its size less the free-space floor
+// (LEND-2), read with Statfs (#24 review).
+func (a *app) maxTotal(cfg *config.Loaded) (int64, string, error) {
+	if n, ok := cfg.MaxTotal(); ok {
+		return n, capSet, nil
 	}
-	err := db.CheckMaxTotal(ctx, now, n, max)
+	statfs := a.lendStatfs
+	if statfs == nil {
+		statfs = a.checker().Statfs
+	}
+	sp, err := statfs(cfg.StorePath())
+	if err != nil {
+		return 0, "", fmt.Errorf("cannot read the store's size, which caps what this node lends unless lending.max_total is set: %w; set lending.max_total, or check %s", err, cfg.StorePath())
+	}
+	floor, _ := config.ParseFloor(cfg.Store.FreeSpaceFloor)
+	f := store.FloorBytes(floor, sp.Total)
+	if sp.Total <= f {
+		return 1, capDisk, nil // nothing to lend; 0 would mean no cap
+	}
+	return int64(min(sp.Total-f, uint64(control.MaxNumber))), capDisk, nil
+}
+
+// StatusLending is the effective cap on what the node lends (LEND-1) in
+// `status --json`: the cap, where it comes from (lending.max_total, or
+// the store's filesystem less its free-space floor) and what the node's
+// numbers and open invites take of it.
+type StatusLending struct {
+	MaxTotal int64  `json:"max_total"`
+	From     string `json:"from"`
+	Numbers  int64  `json:"numbers"`
+}
+
+// lendingStatus reads the effective cap and what it holds.
+func (a *app) lendingStatus(ctx context.Context, cfg *config.Loaded, db *state.DB) (StatusLending, error) {
+	max, from, err := a.maxTotal(cfg)
+	if err != nil {
+		return StatusLending{}, err
+	}
+	n, err := db.LentNumbers(ctx, a.now(), "")
+	return StatusLending{MaxTotal: max, From: from, Numbers: n}, err
+}
+
+// overMaxTotal words a refusal past the cap max, which comes from from;
+// any other error is returned as it is.
+func overMaxTotal(err error, max int64, from string) error {
 	var over *state.MaxTotalError
-	if errors.As(err, &over) {
-		return fmt.Errorf("refused: lending.max_total is %s and your numbers and open invites take %s, so you can lend at most %s more; "+
-			"lower a number (`lendisk peer quota`) or raise lending.max_total", formatSize(over.Max), formatSize(over.Others),
-			formatSize(max-min(over.Others, max)))
+	if !errors.As(err, &over) {
+		return err
 	}
-	return err
+	how := "raise lending.max_total"
+	if from == capDisk {
+		how = "set lending.max_total, if the store's filesystem is shared or will grow"
+	}
+	return fmt.Errorf("refused: this node lends at most %s (%s) and its numbers and open invites take %s, so at most %s more; "+
+		"lower a number (`lendisk peer quota`) or %s", formatSize(max), from, formatSize(over.Others),
+		formatSize(max-min(over.Others, max)), how)
 }
 
 // humanSize writes bytes for a person: B, KiB, MiB, GiB or TiB with one

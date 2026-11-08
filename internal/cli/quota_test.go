@@ -66,7 +66,7 @@ func TestPeerQuotaSetsYourNumberWithinTheMaxTotal(t *testing.T) {
 	cap := []string{"--lending-max-total", "100G"}
 
 	code, out, e := n.run("", "", append([]string{"peer", "quota", b, "60G"}, cap...)...)
-	if code != 1 || !strings.Contains(e, "lending.max_total is 100G") || !strings.Contains(e, "at most 50G") {
+	if code != 1 || !strings.Contains(e, "at most 100G (lending.max_total)") || !strings.Contains(e, "at most 50G more") {
 		t.Fatalf("a number past the max total: %d %s%s", code, out, e)
 	}
 	if p := n.peerOf(b); p.OwnNumber != 50<<30 {

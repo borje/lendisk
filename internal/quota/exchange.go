@@ -233,6 +233,7 @@ func (x *Exchanger) Pass(ctx context.Context) {
 // exchange makes one call to f and records its outcome.
 func (x *Exchanger) exchange(ctx context.Context, f state.Friendship, req control.QuotaRequest) {
 	defer x.wg.Done()
+	sentAt := x.now()
 	cctx, cancel := context.WithTimeout(ctx, or(x.Timeout, defaultTimeout))
 	resp, err := x.call(cctx, f, req)
 	cancel()
@@ -265,7 +266,7 @@ func (x *Exchanger) exchange(ctx context.Context, f state.Friendship, req contro
 	if x.Path != nil {
 		path = x.Path(ctx, f.Peer)
 	}
-	_, err = x.DB.QuotaAnswered(ctx, f.Peer, req.Number, state.QuotaAnswer{Number: resp.Number, Use: resp.Use, Lent: resp.Lent,
+	_, err = x.DB.QuotaAnswered(ctx, f.Peer, req.Number, sentAt, state.QuotaAnswer{Number: resp.Number, Use: resp.Use, Lent: resp.Lent,
 		RepositorySize: resp.RepositorySize, Protocol: resp.Protocol, Path: path}, now)
 	x.mu.Lock()
 	delete(x.inflight, f.Peer)

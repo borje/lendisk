@@ -236,6 +236,7 @@ func TestTheFriendsNumberReachesChanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.b.number = 80 << 30
+	s.c.add(time.Second) // the call goes out after the friend's report
 	s.pass() // tells 80G; the answer raises the friend's number to 80G
 	s.pass() // sees the raised quota
 	want := []change{{"B", -1, 50 << 30}, {"B", 50 << 30, 20 << 30}, {"B", 20 << 30, 80 << 30}}

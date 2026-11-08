@@ -1432,11 +1432,21 @@ upstream bucket is Q-V.
   every friendship's own number, every unused, unexpired invite's
   number and every redeem in progress (`state.DB.LentNumbers`), since
   each becomes a friendship's number; `invite --quota` and `peer add`'s
-  number are checked the same way (`checkMaxTotal`). Unset,
-  `lending.max_total` is no cap (*decision, #24*: a default would be
-  arbitrary before `init` asks for the repository size, LEND-7, whose
-  suggestion is the place to set it; the free-space floor still
-  bounds every write). `peer quota` prints the new quota each way, says
+  number are checked the same way, in the transaction that stores the
+  invite or the redeem record (`state.DB.AddInviteWithin`,
+  `StartRedeemWithin`; write transactions are `IMMEDIATE`, so two
+  commands cannot both pass the check), a redeem leaving out other
+  redeems with the same inviter, which it settles; the comparison is
+  `n > max − others`, which cannot overflow. *Decision (#24 review):*
+  unset, `lending.max_total` is what the store's filesystem can hold:
+  its size, read with the store checker's `Statfs`, less the LEND-2
+  free-space floor (`app.maxTotal`). LEND-1 requires a cap, and the
+  disk is the one a node has before `init` asks for the repository
+  size (LEND-7, whose suggestion is the value to set); a set value
+  overrides it, for a filesystem that is shared or will grow. `peer
+  list` and `status` (`lending` in `status --json`: `max_total`,
+  `from`, `numbers`) show the effective cap and what the numbers and
+  open invites take of it. `peer quota` prints the new quota each way, says
   when it stays until the friend raises theirs, and, when the quota is
   now below what either side stores, that new objects stop and nothing
   is deleted. Migration 25 adds to the friendship row what the quota
@@ -1470,7 +1480,12 @@ upstream bucket is Q-V.
   space, its lender's count of what the caller stores there
   (`lent_usage`, §3.5) and its repository size; the caller applies the
   answer (`state.DB.QuotaAnswered`), which marks the number it sent
-  told only if it is still the own number. Each pass compares every
+  told only if it is still the own number. An answer does not
+  overwrite the friend's number when the friend's own call applied one
+  at or after this call was sent (`friendship.reported_at`, migration
+  26, in nanoseconds): that number is newer, and an hourly call's
+  answer could otherwise restore the old one for an hour
+  (`TestAnAnswerOlderThanTheFriendsReportKeepsItsNumber`). Each pass compares every
   friendship's quota with the last it saw and hands a change to
   `Exchanger.Changed`, also when it first sees a friendship (before
   −1, since a friendship made and lowered within one poll must still
@@ -2265,8 +2280,14 @@ upstream bucket is Q-V.
   (`lent`, its `lent_usage`), plus the bytes of the place's `queued`
   rows that are puts (`state.DB.QuotaAnswered`, one transaction); the
   triggers move it from there. An orphan copy the borrower does not
-  know of is so counted, not deleted; a delete stays counted until the
-  lender purges the tomb; a send in flight across the answer may be
+  know of is so counted, not deleted. A delete stays counted until an
+  answer stops counting it (the lender purged the tomb): what a
+  delete's negative size takes off `place_use` after the place's last
+  answer is added up in `place_freed` (migration 26, triggers on
+  `placement` for rows of negative size) and counted back wherever the
+  use is read (`PlaceUse`, D6's pool), until the next answer sets it to
+  0. A place gets its `place_freed` row from its first answer; before
+  that its deletes free at once, as they did. A send in flight across the answer may be
   counted twice (less room) or, if acknowledged between the lender's
   count and the transaction, missed until the next answer
   (`TestQuotaAnswerReconcilesThePlacesUse`). Left to #68: retrying a
@@ -3275,7 +3296,8 @@ the handler's own reads and is never cancelled; nothing below
   store; an upload begun long ago that still gets parts keeps it.
   `lending.max_total` bounds the sum of the node's own numbers;
   `peer quota`, `invite` and `peer add` refuse a value that would
-  exceed it (LEND-8, §3.2). The
+  exceed it (LEND-8, §3.2); unset, it is the store's filesystem size less
+  the free-space floor (*decision, #24 review*, §3.2). The
   borrower side keeps its own count of what it has stored at each
   place, for D6's free fraction (`place_use`, §3.4), and corrects it
   from the lender's answers: a `507`, which makes the place full until

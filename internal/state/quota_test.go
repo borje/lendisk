@@ -91,10 +91,10 @@ func TestQuotaReportsApplyTheOthersNumber(t *testing.T) {
 	}
 	a := QuotaAnswer{Number: 60 * unit, Use: 9, Lent: 2 * unit, RepositorySize: 4 << 30, Protocol: "0.1", Path: "direct"}
 	// An answer to a number that is no longer this node's tells nothing.
-	if f, _ = p.db.QuotaAnswered(ctx, "B", 45*unit, a, p.now); f.ToldNumber != 0 {
+	if f, _ = p.db.QuotaAnswered(ctx, "B", 45*unit, p.now, a, p.now); f.ToldNumber != 0 {
 		t.Fatalf("an answer to another number told it: %+v", f)
 	}
-	f, err = p.db.QuotaAnswered(ctx, "B", 50*unit, a, p.now)
+	f, err = p.db.QuotaAnswered(ctx, "B", 50*unit, p.now, a, p.now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestQuotaReportsApplyTheOthersNumber(t *testing.T) {
 	if _, _, err := p.db.SetOwnNumber(ctx, "B", 40*unit, 0); err != nil {
 		t.Fatal(err)
 	}
-	if f, _ = p.db.QuotaAnswered(ctx, "B", 50*unit, a, p.now); f.ToldNumber != 50*unit || f.OwnNumber != 40*unit {
+	if f, _ = p.db.QuotaAnswered(ctx, "B", 50*unit, p.now, a, p.now); f.ToldNumber != 50*unit || f.OwnNumber != 40*unit {
 		t.Fatalf("an answer to an older number: %+v", f)
 	}
 }
@@ -139,7 +139,7 @@ func TestQuotaAnswerReconcilesThePlacesUse(t *testing.T) {
 	}
 	// B, as lender, holds 2 units of ours plus an orphan of 5 units the
 	// count never knew of, and keeps them: 7 units.
-	if _, err := p.db.QuotaAnswered(ctx, "B", 10*unit, QuotaAnswer{Number: 10 * unit, Lent: 7 * unit}, p.now); err != nil {
+	if _, err := p.db.QuotaAnswered(ctx, "B", 10*unit, p.now, QuotaAnswer{Number: 10 * unit, Lent: 7 * unit}, p.now); err != nil {
 		t.Fatal(err)
 	}
 	if use("B") != 7*unit {
@@ -148,7 +148,7 @@ func TestQuotaAnswerReconcilesThePlacesUse(t *testing.T) {
 	// Queued, unsent rows count on top of the lender's word.
 	d3 := p.put("laptop", "data/3", "data", 1) // C: 3/10 used, B: 7/10, so C
 	p.wantPlaces("data/3", d3, "C")
-	if _, err := p.db.QuotaAnswered(ctx, "C", 10*unit, QuotaAnswer{Number: 10 * unit, Lent: 0}, p.now); err != nil {
+	if _, err := p.db.QuotaAnswered(ctx, "C", 10*unit, p.now, QuotaAnswer{Number: 10 * unit, Lent: 0}, p.now); err != nil {
 		t.Fatal(err)
 	}
 	if use("C") != 4*unit {
@@ -158,15 +158,87 @@ func TestQuotaAnswerReconcilesThePlacesUse(t *testing.T) {
 	// for C (6 left of 10) although B's own count said 8 left.
 	d4 := p.put("laptop", "data/4", "data", 1)
 	p.wantPlaces("data/4", d4, "C")
-	// A delete placed at B frees nothing until the next answer: the
-	// lender keeps the tomb counted for its window.
+	// A delete placed at B frees nothing, queued or acknowledged, until
+	// the lender's answer stops counting it: the lender keeps the tomb
+	// counted for its window (#68). Placement sees the same count.
 	del := p.del("laptop", "data/1", "data")
 	p.wantPlaces("the delete", del, "B")
-	if _, err := p.db.QuotaAnswered(ctx, "B", 10*unit, QuotaAnswer{Number: 10 * unit, Lent: 7 * unit}, p.now); err != nil {
+	if use("B") != 7*unit {
+		t.Fatalf("B's count with a delete queued %d, want the lender's 7 units still", use("B"))
+	}
+	p.ack("B", del)
+	if use("B") != 7*unit {
+		t.Fatalf("B's count with the delete acknowledged %d, want 7 units still", use("B"))
+	}
+	d5 := p.put("laptop", "data/5", "data", 1) // B: 7/10 used, C: 5/10, so C
+	p.wantPlaces("data/5", d5, "C")
+	// The lender purged the tomb: its answer frees it.
+	if _, err := p.db.QuotaAnswered(ctx, "B", 10*unit, p.now, QuotaAnswer{Number: 10 * unit, Lent: 5 * unit}, p.now); err != nil {
 		t.Fatal(err)
 	}
-	if use("B") != 7*unit {
-		t.Fatalf("B's count with a delete queued %d, want the lender's 7 units", use("B"))
+	if use("B") != 5*unit {
+		t.Fatalf("B's count after the purge %d, want the lender's 5 units", use("B"))
+	}
+}
+
+// #24 review: an answer to a call sent before the friend's own call set
+// its number carries the friend's older number and does not overwrite
+// the newer one.
+func TestAnAnswerOlderThanTheFriendsReportKeepsItsNumber(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 50)
+	sent := p.now
+	p.now = p.now.Add(time.Second)
+	if _, err := p.db.QuotaReported(ctx, "B", QuotaReport{Number: 20 * unit}, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.now = p.now.Add(time.Second)
+	f, err := p.db.QuotaAnswered(ctx, "B", 50*unit, sent, QuotaAnswer{Number: 40 * unit, Lent: unit}, p.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.PeerNumber != 20*unit || f.ToldNumber != 50*unit || f.LentThere != unit {
+		t.Fatalf("after a stale answer: %+v", f)
+	}
+	// An answer to a call sent after the report applies.
+	if f, _ = p.db.QuotaAnswered(ctx, "B", 50*unit, p.now, QuotaAnswer{Number: 30 * unit}, p.now); f.PeerNumber != 30*unit {
+		t.Fatalf("after a fresh answer: %+v", f)
+	}
+}
+
+// LEND-1 (#24 review): an invite and a redeem in progress are checked
+// against lending.max_total in the transaction that stores them; a
+// redeem settles any other redeem with the same inviter, so that one is
+// not counted twice; and the check does not overflow.
+func TestInvitesAndRedeemsCheckedAgainstTheMaxTotal(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 50)
+	inv := Invite{Key: "ik", Number: 30 * unit, Retention: time.Hour, ExpiresAt: p.now.Add(time.Hour)}
+	if err := p.db.AddInviteWithin(ctx, inv, 79*unit, p.now); !errors.Is(err, ErrOverMaxTotal) {
+		t.Fatalf("an invite past the max total: %v", err)
+	}
+	if err := p.db.AddInviteWithin(ctx, inv, 80*unit, p.now); err != nil {
+		t.Fatal(err)
+	}
+	r := PendingRedeem{InviteKey: "ik2", Peer: "D", Number: 10 * unit, StartedAt: p.now}
+	if err := p.db.StartRedeemWithin(ctx, r, 89*unit, p.now); !errors.Is(err, ErrOverMaxTotal) {
+		t.Fatalf("a redeem past the max total: %v", err)
+	}
+	if err := p.db.StartRedeemWithin(ctx, r, 90*unit, p.now); err != nil {
+		t.Fatal(err)
+	}
+	// Another redeem with D settles the first: 50 + 30 + 15 fits 95.
+	r2 := PendingRedeem{InviteKey: "ik3", Peer: "D", Number: 15 * unit, StartedAt: p.now}
+	if err := p.db.StartRedeemWithin(ctx, r2, 95*unit, p.now); err != nil {
+		t.Fatalf("a second redeem with the same inviter: %v", err)
+	}
+	if _, _, err := p.db.SetOwnNumber(ctx, "B", 1<<62, 1<<62); !errors.Is(err, ErrOverMaxTotal) {
+		t.Fatalf("a number that overflows the sum: %v", err)
+	}
+	if err := p.db.AddInviteWithin(ctx, Invite{Key: "big", Number: 1 << 62, ExpiresAt: p.now.Add(time.Hour)}, 1<<62, p.now); !errors.Is(err, ErrOverMaxTotal) {
+		t.Fatalf("an invite that overflows the sum: %v", err)
 	}
 }
 

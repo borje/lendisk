@@ -103,6 +103,9 @@ type app struct {
 	// tuneQuota, if set, adjusts the daemon's quota exchanger (#24)
 	// before it starts; tests only.
 	tuneQuota func(*quota.Exchanger)
+	// lendStatfs reads the store's size for the default lending cap
+	// (maxTotal); nil means the store checker's Statfs. Tests set it.
+	lendStatfs func(dir string) (store.Space, error)
 }
 
 func (a *app) checker() store.Checker {
