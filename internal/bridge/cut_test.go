@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -406,5 +407,46 @@ func TestCutClosesOnlyOnceTheClientHasTheRemovedAnswer(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Cut did not return once the client closed the connection")
+	}
+}
+
+// deadlineConn records the last read deadline set; setting readEnded
+// signals entering and then waits a moment, widening the window between
+// a cut's check and its deadline.
+type deadlineConn struct {
+	net.Conn
+	mu      sync.Mutex
+	last    time.Time
+	cutting chan struct{}
+}
+
+func (d *deadlineConn) SetReadDeadline(t time.Time) error {
+	if t.Equal(readEnded) {
+		close(d.cutting)
+		time.Sleep(50 * time.Millisecond)
+	}
+	d.mu.Lock()
+	d.last = t
+	d.mu.Unlock()
+	return nil
+}
+
+// #84 review: a cut that checked the connection was not hijacked must
+// not then overwrite the deadline its handler set once it hijacked it,
+// which would end the wait for the client and drop the answer again.
+func TestCutDoesNotOverwriteAHijackersDeadline(t *testing.T) {
+	dc := &deadlineConn{cutting: make(chan struct{})}
+	pc := &peerConn{Conn: dc}
+	done := make(chan struct{})
+	go func() { pc.cutNow(); close(done) }()
+	<-dc.cutting
+	pc.hijack()
+	want := time.Now().Add(5 * time.Second)
+	pc.SetReadDeadline(want)
+	<-done
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+	if !dc.last.Equal(want) {
+		t.Fatalf("the read deadline after the hijacker set it: %v, want %v", dc.last, want)
 	}
 }

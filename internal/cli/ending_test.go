@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -256,15 +257,18 @@ func TestFarewellRevokesInOrderTellsAndPurges(t *testing.T) {
 	}
 }
 
-// PEER-5 (#84): a friend that got the remove call ends the friendship
-// and from then refuses this node's key at connect, which looks like
-// being unreachable (control.ErrNotConnected). So after a try whose
-// request was sent whole and got no answer (control.ErrNoAnswer),
-// tellRefusals tries in a row that never connect count as told. Without
-// such a try, failing to connect never counts: the friend may just be
-// offline. Any answer in between starts the count over, and an answer
-// that it holds no friendship (403) counts as told at once.
-func TestAFriendThatRefusesAfterTheRemoveCallCountsAsTold(t *testing.T) {
+// PEER-5 (#84 review): a friend that got the remove call ends the
+// friendship and from then refuses this node's key at connect, which
+// looks like being unreachable (control.ErrNotConnected). But a request
+// written whole (control.ErrNoAnswer) may only have reached the local
+// end of the tunnel, and a friend that fell asleep just then looks the
+// same. So after such a try and tellRefusals tries in a row that never
+// connect, the friend is shown as probably told (the farewell's
+// notify_error says so) and is still asked, every tellProbablyEvery
+// with jitter, until it answers: 200 or 403 is told at once. Without a
+// try sent whole, failing to connect never makes it probable; an answer
+// in between starts over.
+func TestAFriendThatRefusesAfterTheRemoveCallIsAskedUntilItAnswers(t *testing.T) {
 	parallel(t, 0)
 	ctx := t.Context()
 	db, err := state.Open(ctx, t.TempDir(), slog.New(slog.DiscardHandler))
@@ -272,9 +276,9 @@ func TestAFriendThatRefusesAfterTheRemoveCallCountsAsTold(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
-	b, c, d := newID(t).NodeID(), newID(t).NodeID(), newID(t).NodeID()
+	b, c, d, e := newID(t).NodeID(), newID(t).NodeID(), newID(t).NodeID(), newID(t).NodeID()
 	now := time.Unix(1_800_000_000, 0)
-	for _, p := range []identity.NodeID{b, c, d} {
+	for _, p := range []identity.NodeID{b, c, d, e} {
 		if err := db.AddFriendship(ctx, state.Friendship{Peer: p.String(), Address: "tc" + p.String(), CreatedAt: now}); err != nil {
 			t.Fatal(err)
 		}
@@ -285,17 +289,18 @@ func TestAFriendThatRefusesAfterTheRemoveCallCountsAsTold(t *testing.T) {
 	var mu sync.Mutex
 	answers := map[identity.NodeID][]error{}
 	tries := map[identity.NodeID]int{}
-	set := func(p identity.NodeID, errs ...error) { mu.Lock(); answers[p] = errs; mu.Unlock() }
 	wrap := func(stage error) error { return fmt.Errorf("%w: %w", stage, context.DeadlineExceeded) }
 	noAnswer, notConnected := wrap(control.ErrNoAnswer), wrap(control.ErrNotConnected)
-	refused := &control.CallError{Status: http.StatusInternalServerError, Message: "try again"}
-	// B got the call and lost the answer, then refuses at connect. C is
-	// offline throughout. D lost the answer, then answered 500 (it failed
-	// to end it), so the count starts over at its next lost answer.
-	set(b, noAnswer, notConnected, notConnected, notConnected)
-	set(c, notConnected, notConnected, notConnected, notConnected, notConnected, notConnected)
-	set(d, noAnswer, notConnected, refused, noAnswer, notConnected, notConnected, notConnected)
+	failed := &control.CallError{Status: http.StatusInternalServerError, Message: "try again"}
+	// B got the call (or only its local tunnel did) and then slept
+	// through three tries; it answers when it wakes. C is offline
+	// throughout. D answered 500 (it failed to end it) between refusals,
+	// so it never becomes probable. E answers 403.
+	answers[b] = []error{noAnswer, notConnected, notConnected, notConnected, notConnected, nil}
+	answers[d] = []error{noAnswer, notConnected, failed, notConnected, notConnected, notConnected}
+	answers[e] = []error{&control.CallError{Status: http.StatusForbidden, Message: state.NoRelationship}}
 	fw := &farewell{DB: db, Log: slog.New(slog.DiscardHandler), Now: func() time.Time { return now },
+		Rand:  func() float64 { return 0.5 }, // no jitter: exactly tellProbablyEvery
 		Clear: func() {}, Cut: func(...identity.NodeID) int { return 0 }, Disconnect: func(identity.NodeID) bool { return false },
 		Tell: func(_ context.Context, f state.FormerFriend) error {
 			p, _ := identity.ParseNodeID(f.Peer)
@@ -310,53 +315,77 @@ func TestAFriendThatRefusesAfterTheRemoveCallCountsAsTold(t *testing.T) {
 		},
 		Purge: func(context.Context, string) error { return nil },
 	}
-	told := func(p identity.NodeID) bool {
+	former := func(p identity.NodeID) state.FormerFriend {
 		fs, err := db.FormerFriends(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		for _, f := range fs {
 			if f.Peer == p.String() {
-				return !f.NotifiedAt.IsZero()
+				return f
 			}
 		}
 		t.Fatalf("%s is no former friend", p)
-		return false
+		return state.FormerFriend{}
 	}
-	// Each pass is past every backoff.
-	for i := range 7 {
+	triesOf := func(p identity.NodeID) int { mu.Lock(); defer mu.Unlock(); return tries[p] }
+	probable := func(p identity.NodeID) bool { return strings.Contains(former(p).NotifyError, "probably") }
+	pass := func(advance time.Duration) {
 		fw.pass(ctx)
 		fw.wait()
-		now = now.Add(2 * tellMaxBackoff)
-		mu.Lock()
-		tb, tc, td := tries[b], tries[c], tries[d]
-		mu.Unlock()
-		if want := min(i+1, 4); tb != want {
-			t.Fatalf("pass %d: B tried %d times, want %d", i, tb, want)
-		}
-		if got := told(b); got != (i >= 3) {
-			t.Fatalf("pass %d: B told %v", i, got)
-		}
-		if tc != i+1 || told(c) {
-			t.Fatalf("pass %d: C, never reached, tried %d times, told %v", i, tc, told(c))
-		}
-		if got := told(d); got != (i >= 6) || td != i+1 {
-			t.Fatalf("pass %d: D tried %d times, told %v", i, td, got)
-		}
+		now = now.Add(advance)
 	}
-
-	// A 403 (no relationship) counts at once.
-	e := newID(t).NodeID()
-	if err := db.AddFriendship(ctx, state.Friendship{Peer: e.String(), Address: "tcE", CreatedAt: now}); err != nil {
-		t.Fatal(err)
+	// Four passes, each past every backoff: B's lost answer and three
+	// refusals.
+	for range 4 {
+		pass(2 * tellMaxBackoff)
 	}
-	if _, err := db.RemoveFriendship(ctx, e.String(), false, now); err != nil {
-		t.Fatal(err)
+	if n := triesOf(b); n != 4 {
+		t.Fatalf("B tried %d times, want 4", n)
 	}
-	set(e, &control.CallError{Status: http.StatusForbidden, Message: state.NoRelationship})
-	fw.pass(ctx)
-	fw.wait()
-	if !told(e) {
+	if f := former(b); !f.NotifiedAt.IsZero() || !probable(b) {
+		t.Fatalf("B after three refusals: told at %v, %q; want not told, probably", f.NotifiedAt, f.NotifyError)
+	}
+	if f := former(e); f.NotifiedAt.IsZero() {
 		t.Fatal("E answered 403 and is not told")
+	}
+	for _, p := range []identity.NodeID{c, d} {
+		if f := former(p); !f.NotifiedAt.IsZero() || probable(p) || triesOf(p) != 4 {
+			t.Fatalf("%s: tried %d times, told at %v, %q", map[identity.NodeID]string{c: "C", d: "D"}[p], triesOf(p),
+				f.NotifiedAt, f.NotifyError)
+		}
+	}
+	// B's last try was 2 h ago; it is asked again 6 h after it, not on
+	// the backoff.
+	pass(3 * time.Hour)    // at 2 h
+	pass(50 * time.Minute) // at 5 h
+	pass(10 * time.Minute) // at 5h50m
+	if n := triesOf(b); n != 4 {
+		t.Fatalf("B was asked again %d times before tellProbablyEvery", n-4)
+	}
+	pass(tellProbablyEvery) // at 6 h: asked, still asleep
+	if n := triesOf(b); n != 5 || !probable(b) || !former(b).NotifiedAt.IsZero() {
+		t.Fatalf("B at 6 h: %d tries, %+v", n, former(b))
+	}
+	pass(tellProbablyEvery) // it woke: told
+	if n := triesOf(b); n != 6 || former(b).NotifiedAt.IsZero() {
+		t.Fatalf("B after it woke: %d tries, %+v", n, former(b))
+	}
+	pass(tellProbablyEvery)
+	if n := triesOf(b); n != 6 {
+		t.Fatalf("B told, yet asked again (%d tries)", n)
+	}
+}
+
+// The jitter of the slow retry stays within a tenth of
+// tellProbablyEvery either way.
+func TestProbablyToldRetryJitter(t *testing.T) {
+	parallel(t, 0)
+	for _, r := range []float64{0, 0.5, 0.999} {
+		fw := &farewell{Rand: func() float64 { return r }}
+		d := fw.probablyEvery()
+		if d < tellProbablyEvery*9/10 || d > tellProbablyEvery*11/10 {
+			t.Fatalf("r=%v: %v", r, d)
+		}
 	}
 }

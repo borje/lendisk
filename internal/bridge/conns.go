@@ -28,8 +28,11 @@ var ErrCut = errors.New("the relationship with this key ended")
 const DefaultGrace = 2 * time.Second
 
 // DefaultLinger bounds how long a connection whose last answer is
-// written waits for the client to close it (Conns.Linger).
-const DefaultLinger = 5 * time.Second
+// written waits for the client to close it (Conns.Linger). It is the
+// remove call's control.DefaultAnswerWait: the two bound the same wait,
+// the handler's from its side and Cut's from its own, and Cut must not
+// close the remove call's connection while its handler still waits.
+const DefaultLinger = control.DefaultAnswerWait
 
 // Conns tracks the tunnel's open connections by the key each
 // authenticated with (SEC-15, #25), so that ending a friendship can cut
@@ -213,14 +216,19 @@ func (c *peerConn) hijackedAt() (time.Time, bool) {
 // body being proxied, and the drain net/http does after a handler)
 // unless a handler hijacked it, and cancels its requests in flight; it
 // reports whether one was being served.
+//
+// The deadline is set under mu, as SetReadDeadline and hijack take it,
+// so a hijack comes wholly before the cut (which then leaves the
+// connection's reads alone) or after it (and the handler's own deadline
+// is the last one set, #84 review).
 func (c *peerConn) cutNow() bool {
 	c.mu.Lock()
 	c.cut = true
-	cancel, hijacked := c.cancel, !c.hijacked.IsZero()
-	c.mu.Unlock()
-	if !hijacked {
+	cancel := c.cancel
+	if c.hijacked.IsZero() {
 		c.Conn.SetReadDeadline(readEnded)
 	}
+	c.mu.Unlock()
 	if cancel != nil {
 		cancel(ErrCut)
 	}
@@ -235,10 +243,10 @@ var readEnded = time.Unix(1, 0)
 // that hijacked the connection sets its own.
 func (c *peerConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.cut && c.hijacked.IsZero() {
 		t = readEnded
 	}
-	c.mu.Unlock()
 	return c.Conn.SetReadDeadline(t)
 }
 

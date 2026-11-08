@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"sync"
 	"text/tabwriter"
@@ -29,9 +30,11 @@ import (
 //     a connection closed after the disconnect never tells the client;
 //   - tells a friend that this node ended it (Tell, the remove call),
 //     retried with a backoff from a minute to an hour until it answers;
-//     an answer that it holds no friendship (403) counts as told, and
-//     so do tellRefusals tries in a row that never connect after a try
-//     whose request was sent whole and got no answer (#84);
+//     an answer that it holds no friendship (403) counts as told. After
+//     a try whose request was sent whole and got no answer, and
+//     tellRefusals tries in a row that never connect, the friend has
+//     probably ended it too (its notify_error says so), and is asked
+//     every tellProbablyEvery until it answers (#84);
 //   - at the end of the retention window purges the friend's replica
 //     here (Purge: its lent buckets and its manifest) and forgets it, on
 //     a goroutine of its own, one friend at a time, so a slow purge
@@ -55,6 +58,9 @@ type farewell struct {
 	Purge func(ctx context.Context, peer string) error
 	// Alerted asks the alert service to look again; nil means nothing.
 	Alerted func()
+	// Rand returns a number in [0, 1) for the jitter of the slow retry
+	// of a friend probably told; nil means math/rand/v2.
+	Rand func() float64
 
 	once    sync.Once
 	wake    chan struct{}
@@ -76,15 +82,32 @@ const (
 	tellMaxBackoff = time.Hour
 	tellTimeout    = 30 * time.Second
 	// tellRefusals is how many tries in a row that never connect, after
-	// a remove call sent whole and unanswered, count as told (#84). A
-	// friend that got the call ends the friendship and refuses this
-	// node's key at connect, which tailcat shows as no connection, the
-	// same as an offline friend; a friend still holding the friendship
-	// admits the key. Three tries span the backoff's first seven minutes:
-	// a friend that went offline just as it got the call, without
-	// ending it, would have to stay offline that long.
+	// a remove call sent whole and unanswered, make the friend probably
+	// told (#84). A friend that got the call ends the friendship and
+	// refuses this node's key at connect, which tailcat shows as no
+	// connection, the same as an offline friend; a friend still holding
+	// the friendship admits the key. But "sent whole" means only that
+	// the local end of the tunnel took it, so a friend that fell asleep
+	// just then looks the same: it is still asked, every
+	// tellProbablyEvery, until it answers (#84 review).
 	tellRefusals = 3
+	// tellProbablyEvery is the time between tries, with a tenth's jitter
+	// either way, to a friend probably told (#84 review).
+	tellProbablyEvery = 6 * time.Hour
 )
+
+// probablyTold is the farewell's notify_error for a friend probably told.
+const probablyTold = "it got the remove call and has refused this node's key since, so it has probably " +
+	"ended the friendship too; asking again every 6 hours until it answers"
+
+// probablyEvery is tellProbablyEvery with its jitter.
+func (f *farewell) probablyEvery() time.Duration {
+	r := rand.Float64
+	if f.Rand != nil {
+		r = f.Rand
+	}
+	return time.Duration(float64(tellProbablyEvery) * (0.9 + 0.2*r()))
+}
 
 func (f *farewell) init() {
 	f.once.Do(func() { f.wake = make(chan struct{}, 1) })
@@ -280,23 +303,32 @@ func (f *farewell) tell(ctx context.Context, ff state.FormerFriend, now time.Tim
 		var ce *control.CallError
 		f.mu.Lock()
 		delete(f.telling, ff.Peer)
-		refusing := false
+		became := false
 		switch {
 		case err == nil:
 		case errors.As(err, &ce) && ce.Status == http.StatusForbidden:
 			err = nil // it holds no friendship with this node either
 		case errors.Is(err, control.ErrNoAnswer):
-			f.sent[ff.Peer], f.refusals[ff.Peer] = true, 0
+			if !f.sent[ff.Peer] {
+				f.sent[ff.Peer], f.refusals[ff.Peer] = true, 0
+			}
 		case errors.Is(err, control.ErrNotConnected) && f.sent[ff.Peer]:
 			f.refusals[ff.Peer]++
-			if f.refusals[ff.Peer] >= tellRefusals {
-				refusing, err = true, nil
+			if f.refusals[ff.Peer] == tellRefusals {
+				became = true
 			}
 		default: // it answered, or the try failed some other way
 			delete(f.sent, ff.Peer)
 			delete(f.refusals, ff.Peer)
 		}
-		if err != nil {
+		probably := err != nil && f.refusals[ff.Peer] >= tellRefusals
+		switch {
+		case probably:
+			// Asked again, slowly, until it answers or the purge (#84
+			// review): the call may only have reached the local end of
+			// the tunnel of a friend that then fell asleep.
+			f.next[ff.Peer] = f.now().Add(f.probablyEvery())
+		case err != nil:
 			b := f.backoff[ff.Peer]
 			if b == 0 {
 				b = tellMinBackoff
@@ -309,13 +341,21 @@ func (f *farewell) tell(ctx context.Context, ff state.FormerFriend, now time.Tim
 			return
 		}
 		msg := ""
-		if err != nil {
+		switch {
+		case probably:
+			msg = probablyTold
+			if became {
+				f.Log.Info("ending friendships: the former friend got the remove call and refuses this node's key since; "+
+					"it probably ended the friendship too, and is asked again every few hours until it answers",
+					"peer", ff.Peer, "tries", tellRefusals)
+			} else {
+				f.Log.Debug("ending friendships: the former friend, probably told, did not answer; asking again later",
+					"peer", ff.Peer, "err", err)
+			}
+		case err != nil:
 			msg = err.Error()
 			f.Log.Warn("ending friendships: telling the former friend failed; trying again later", "peer", ff.Peer, "err", err)
-		} else if refusing {
-			f.Log.Info("ending friendships: the former friend got the remove call and refuses this node's key since; counted as told",
-				"peer", ff.Peer, "tries", tellRefusals)
-		} else {
+		default:
 			f.Log.Info("ending friendships: the former friend was told", "peer", ff.Peer)
 		}
 		if err := f.DB.NoteFarewell(ctx, ff.Peer, msg, f.now()); err != nil && ctx.Err() == nil {

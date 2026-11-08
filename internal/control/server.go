@@ -325,7 +325,8 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, c Caller) {
 	writeJSON(w, http.StatusOK, page)
 }
 
-// DefaultAnswerWait is Server.AnswerWait when it is zero.
+// DefaultAnswerWait is Server.AnswerWait when it is zero. The bridge's
+// Conns.Linger defaults to it too: one wait, bounded from both sides.
 const DefaultAnswerWait = 5 * time.Second
 
 // remove is the remove call (PEER-5, #25): the caller ended the
