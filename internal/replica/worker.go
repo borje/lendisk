@@ -25,8 +25,10 @@ import (
 // order, one object at a time, the places in parallel. A metadata row
 // at the head of a FIFO waits until every earlier data object of its
 // bucket is acknowledged wherever it is placed (the barrier,
-// state.DB.Held), and unsent data at a friend that stopped answering is
-// re-routed (state.DB.Reroute). An object is read
+// state.DB.Held), unsent data at a friend that stopped answering is
+// re-routed (state.DB.Reroute), and copies are re-placed when the pool
+// changes (state.DB.Replace, REPL-13): a copy re-placement deletes is a
+// delete in its place's FIFO. An object is read
 // from the store as it is sent, once per place, with its capture hash
 // (REPL-10); the place's acknowledgement records the hash. The queue is
 // lendisk.db, so a restart continues at the first unacknowledged row.
@@ -51,6 +53,10 @@ type Worker struct {
 	// RerouteEvery is how often unsent data at friends that stopped
 	// answering is re-routed (state.DB.Reroute, §3.4; default 1 minute).
 	RerouteEvery time.Duration
+	// ReplaceEvery is how often re-placement runs when the pool has not
+	// changed (state.DB.Replace, REPL-13; default an hour). A change to
+	// the pool (state.DB.PoolFingerprint) runs it within five polls.
+	ReplaceEvery time.Duration
 	// RewriteRetry is how long a rewrite the place refuses without a
 	// version to name instead is retried before it is refused for good
 	// (default DefaultRewriteRetry, #74).
@@ -69,6 +75,12 @@ type Worker struct {
 	// service reads it at once (alert.Service.Check, #13). It must not
 	// block.
 	Alerted func()
+	// Fill, if set, puts an own bucket's object the store lacks into it
+	// from a friend that holds it, verified (the gateway's read-through,
+	// EP-10): filled is false when no friend is recorded holding it, an
+	// error means it may pass. A recovered node's store starts empty, and
+	// its copies must still be re-placed (REPL-13, #26 review).
+	Fill func(ctx context.Context, bucket, key string) (filled bool, err error)
 	// Full, if set, is called after a place answered 507 (LEND-2), so
 	// the daemon asks it for its own count of this node's use (the quota
 	// call, #68). It must not block.
@@ -200,6 +212,10 @@ var errLocal = errors.New("the store cannot supply the captured object")
 // re-queues (state.RequeueOversize).
 var errOversize = fmt.Errorf("%w: larger than one PUT carries", errLocal)
 
+// errGone: the store holds no file for the object. A local error, unless
+// Worker.Fill can put it there from a friend (after recover, #26 review).
+var errGone = fmt.Errorf("%w: it is gone", errLocal)
+
 // errStore: the store cannot be read now: the bucket's directory is
 // missing (a disk not mounted), or opening, stating or reading the
 // object failed in a way that may pass (EMFILE, EACCES, EIO…). Nothing
@@ -225,11 +241,27 @@ func (w *Worker) Run(ctx context.Context) {
 	if friendships == nil {
 		friendships = w.DB.Friendships
 	}
-	var rerouted time.Time
+	var rerouted, replaced time.Time
+	var pool string // the pool's fingerprint at the last re-placement pass
+	again := false  // the last pass left a row in flight: look again
 	for {
-		if now := w.now(); now.Sub(rerouted) >= orDefault(w.RerouteEvery, time.Minute) {
+		now := w.now()
+		if now.Sub(rerouted) >= orDefault(w.RerouteEvery, time.Minute) {
 			rerouted = now
 			w.reroute(ctx)
+			if again {
+				replaced = time.Time{}
+			}
+		}
+		// Re-placement (REPL-13, #26): after every change to the pool,
+		// and hourly.
+		if fp, err := w.DB.PoolFingerprint(ctx); err != nil {
+			if ctx.Err() == nil {
+				w.Log.Error("replication: reading the pool failed", "err", err)
+			}
+		} else if fp != pool || now.Sub(replaced) >= orDefault(w.ReplaceEvery, time.Hour) {
+			pool, replaced = fp, now
+			again = w.replace(ctx)
 		}
 		fs, err := friendships(ctx)
 		if err != nil {
@@ -300,6 +332,32 @@ func (w *Worker) reroute(ctx context.Context) {
 		w.Log.Info("replication: re-routed unsent data from friends that stopped answering or are full",
 			"moved", moved, "dropped_below_copies", dropped)
 	}
+}
+
+// replace runs a re-placement pass (REPL-13, state.DB.Replace): copies
+// of a pool that changed are placed elsewhere, surplus copies removed.
+// It reports whether the pass left a copy alone because it was being
+// sent, or failed, so the next re-routing tick looks again.
+func (w *Worker) replace(ctx context.Context) bool {
+	// Called with w.flight held, as Replace applies its batches.
+	sending := func(place string, seq int64) bool {
+		s, ok := w.sending[place]
+		return ok && s == seq
+	}
+	st, err := w.DB.Replace(ctx, sending, &w.flight)
+	if st.Below > 0 || st.Placed > 0 || st.Dropping > 0 || st.Cancelled > 0 {
+		w.alerted() // alert.KindBelowCopies reads what the pass recorded
+	}
+	switch {
+	case err != nil:
+		if ctx.Err() == nil {
+			w.Log.Error("replication: re-placing copies failed", "err", err)
+		}
+	case st.Placed > 0 || st.Dropping > 0 || st.Cancelled > 0:
+		w.Log.Info("replication: re-placed copies after the pool changed",
+			"placed", st.Placed, "deleting", st.Dropping, "cancelled", st.Cancelled, "below_copies", st.Below)
+	}
+	return st.Skipped > 0 || err != nil // a failed batch is tried again at the next tick
 }
 
 func (w *Worker) connect(f state.Friendship) (Replica, error) {
@@ -731,7 +789,7 @@ func heldDesc(held string, ok bool) string {
 // put sends the row's object from the store, marked as a rewrite of the
 // version with hash replaces if that is set.
 func (w *Worker) put(ctx context.Context, place string, r Replica, p state.Placement, replaces string) error {
-	body, done, err := w.openCaptured(ctx, p)
+	body, done, err := w.openFilled(ctx, p)
 	if err != nil {
 		return err
 	}
@@ -763,6 +821,28 @@ func (w *Worker) put(ctx context.Context, place string, r Replica, p state.Place
 		return fmt.Errorf("%w (the store's copy matches its capture hash)", err)
 	}
 	return err
+}
+
+// openFilled is openCaptured, but an object the store holds no file for
+// is first put there by Fill, when set, from a friend that holds it:
+// after `recover` the store is empty, and re-placement must still send
+// copies (REPL-13, ID-5, #26 review). A fetch that fails may pass, so
+// the row waits as for an unreadable store; with no friend holding it,
+// its absence is the store's local error.
+func (w *Worker) openFilled(ctx context.Context, p state.Placement) (io.Reader, func(), error) {
+	body, done, err := w.openCaptured(ctx, p)
+	if !errors.Is(err, errGone) || w.Fill == nil {
+		return body, done, err
+	}
+	filled, ferr := w.Fill(ctx, p.Bucket, p.Key)
+	switch {
+	case ferr != nil:
+		return nil, nil, fmt.Errorf("%w: %s/%s is not in this node's store, and fetching it from a friend that holds it failed: %w",
+			errStore, p.Bucket, p.Key, ferr)
+	case !filled:
+		return nil, nil, err
+	}
+	return w.openCaptured(ctx, p)
 }
 
 // openCaptured opens the row's object in the store, checked against
@@ -817,7 +897,10 @@ func (w *Worker) openCaptured(ctx context.Context, p state.Placement) (io.Reader
 	case err != nil && o.doing == "":
 		return nil, nil, fmt.Errorf("%w: %w", errStore, err) // it stalled
 	case o.doing == "opening" && (errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)):
-		return nil, nil, local("it is gone")
+		if err := w.storeReadable(ctx, p.Bucket); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, errGone
 	case err != nil:
 		return nil, nil, w.unreadable(ctx, p, o.doing, err)
 	}
@@ -845,7 +928,7 @@ func (w *Worker) openCaptured(ctx context.Context, p state.Placement) (io.Reader
 // write outside lendisk changed it: VER-5), errStore when it cannot be
 // read now.
 func (w *Worker) verify(ctx context.Context, p state.Placement) error {
-	body, done, err := w.openCaptured(ctx, p)
+	body, done, err := w.openFilled(ctx, p)
 	if err != nil {
 		return err
 	}

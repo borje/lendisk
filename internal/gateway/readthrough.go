@@ -102,6 +102,38 @@ func (d *Decorator) HeadObject(ctx context.Context, in *s3.HeadObjectInput) (*s3
 	return d.Backend.HeadObject(ctx, in)
 }
 
+// Fill puts the version that counts of an own bucket's key into the
+// store through the read-through, for replication of an object the store
+// lacks (after `recover`, ID-5): a copy re-placement places at a new
+// friend is read from a friend that holds it, verified against the
+// recorded hash, never sent unverified (REPL-13, #26 review). filled is
+// true when the store holds it now; false with no error when no friend
+// is recorded holding that version, so its absence is the store's.
+// Another error may pass: no friend holding it answered.
+func (g *Gateway) Fill(ctx context.Context, bucket, key string) (filled bool, err error) {
+	l := g.running.Load()
+	if l == nil {
+		return false, errNotServing
+	}
+	d, ok := l.Next.(*Decorator)
+	if !ok {
+		return false, errNotServing
+	}
+	if src, ok, err := d.DB.Source(ctx, bucket, key); err != nil {
+		return false, err
+	} else if !ok || len(src.Places) == 0 {
+		return false, nil // no friend holds it: the store's loss stands
+	}
+	switch err := d.readThrough(ctx, &bucket, &key); {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, errUnknown):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // readThrough puts the version that counts of an own bucket's key into
 // the store, or says why not: errUnknown when the index knows none (the
 // caller's not-found stands), or an s3err.APIError for the client. It

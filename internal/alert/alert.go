@@ -6,8 +6,9 @@
 // the store could not supply (VER-5), objects a place refused (LEND-4),
 // keys changed after a friend acknowledged them (EP-11), a friendship
 // the friend ended and the purge of an ended one (PEER-5), and a
-// friendship's quota nearly or wholly used either way (PEER-6, #24), and
-// a bucket holding a Kopia format-1 repository (COMPAT-1, #79).
+// friendship's quota nearly or wholly used either way (PEER-6, #24),
+// a bucket holding a Kopia format-1 repository (COMPAT-1, #79), and
+// objects below copies past replication.replace_after (REPL-13, #26).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -120,6 +121,13 @@ const (
 	// Subject: the bucket. It clears when the bucket captures the blob
 	// `kopia repository set-parameters --upgrade` writes, or is deleted.
 	KindKopiaFormat1 = "kopia_format1"
+	// KindBelowCopies: live data objects of a bucket have been below its
+	// copies for longer than BelowAfter (replication.replace_after,
+	// REPL-13's threshold), as the re-placement pass found them (OPS-2,
+	// #26): re-placement had nowhere to put the missing copies, so the
+	// pool needs a friend, more quota or overflow. Subject: the bucket.
+	// It clears at the first pass that finds none below.
+	KindBelowCopies = "below_copies"
 )
 
 // KopiaUpgrade is the command that upgrades a Kopia format-1 repository
@@ -157,7 +165,7 @@ const PurgeWarning = 7 * 24 * time.Hour
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindPurgeSoon,
-	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1}
+	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -197,6 +205,10 @@ type Service struct {
 	// one-minute blip 24h after the last answer would alert at once.
 	// The reachability probe (#65) may let this be revisited.
 	MinRetrying time.Duration
+	// BelowAfter is how long a bucket's objects may stay below its
+	// copies before KindBelowCopies is raised (default 7 days, REPL-13's
+	// replication.replace_after).
+	BelowAfter time.Duration
 
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
@@ -486,6 +498,24 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		msg := fmt.Sprintf("bucket %s: %s completed by the backup tool cannot be matched to the store (%s: %s), so nothing after it replicates to any friend; restore the store's xattrs or rewrite the key",
 			b, countObjects(u.Objects), u.Key, u.Detail)
 		out = append(out, alertOf(KindUploadUnmatchable, b, msg))
+	}
+	belowSince, err := s.DB.BelowCopiesSince(ctx)
+	if err != nil {
+		return nil, err
+	}
+	belowAfter := orDefault(s.BelowAfter, 7*24*time.Hour)
+	copiesOf := map[string]int{}
+	for _, b := range bs {
+		copiesOf[b.Name] = b.Copies
+	}
+	for _, b := range slices.Sorted(maps.Keys(belowSince)) {
+		bc := belowSince[b]
+		if now.Sub(bc.Since) < belowAfter {
+			continue
+		}
+		msg := fmt.Sprintf("bucket %s has had objects at fewer than its %d copies since %s (longer than %v); now %s (%s): re-placement has nowhere to put the missing copies. Add a friend (lendisk invite), agree a higher quota (lendisk peer quota), or lower copies (lendisk bucket set %s --copies N)",
+			b, copiesOf[b], bc.Since.UTC().Format(time.RFC3339), belowAfter, countObjects(bc.Objects), gb(bc.Bytes), b)
+		out = append(out, alertOf(KindBelowCopies, b, msg))
 	}
 	for _, b := range slices.Sorted(maps.Keys(dropped)) {
 		d := dropped[b]

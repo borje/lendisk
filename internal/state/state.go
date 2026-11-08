@@ -21,6 +21,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -54,6 +55,10 @@ type DB struct {
 	// goroutine: it must not block. The daemon logs it and asks the
 	// alert service to look.
 	KeyChanged func(ChangedKey)
+
+	// bucketLocks holds a *sync.Mutex per bucket, shared by the placer
+	// and re-placement (lockBucket, #26).
+	bucketLocks sync.Map
 }
 
 func (db *DB) now() time.Time {

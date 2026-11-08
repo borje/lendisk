@@ -133,7 +133,7 @@ func (a *app) serveCmd() *cobra.Command {
 			// of their own: nothing else waits for them. Made before the
 			// gateway, whose captures may hold back a changed key (EP-11).
 			alerts := &alert.Service{DB: db, Log: log, Node: nodeID, Command: cfg.Alerts.Command, Webhook: cfg.Alerts.Webhook,
-				UnreachableAfter: cfg.UnreachableAfter(), Now: a.clock}
+				UnreachableAfter: cfg.UnreachableAfter(), BelowAfter: cfg.ReplaceAfter(), Now: a.clock}
 			if a.tuneAlerts != nil {
 				a.tuneAlerts(alerts)
 			}
@@ -202,7 +202,7 @@ func (a *app) serveCmd() *cobra.Command {
 				// Replication to friends (#18) never blocks the endpoint
 				// (REPL-9): it reads the store and lendisk.db only.
 				w = &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
-					Alerted: alerts.Check, Now: a.clock, Full: xch.Due}
+					Alerted: alerts.Check, Now: a.clock, Full: xch.Due, Fill: gw.Fill}
 				if a.tuneReplication != nil {
 					a.tuneReplication(w)
 				}

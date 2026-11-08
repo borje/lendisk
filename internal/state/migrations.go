@@ -535,4 +535,40 @@ var migrations = []Migration{
 		ALTER TABLE buckets ADD COLUMN format1_key TEXT;
 		ALTER TABLE buckets ADD COLUMN upgraded_at INTEGER;`,
 	},
+	{
+		Version: 28, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Re-placement (REPL-13, #26). placement.state gains 'dropping': a
+		-- copy the place holds (it was acked) that re-placement deletes
+		-- there, in the place's FIFO as a delete of the key at the row's
+		-- sequence; and 'drained': that delete acknowledged, the place
+		-- keeping the bytes as a tombstone for the window (RET-1).
+		-- replaces is, on a copy re-placement placed, the place whose
+		-- copy it replaces: that copy is marked dropping when this one is
+		-- acknowledged. replaced_at is when re-placement placed or
+		-- queued the row again (unix seconds; NULL for a row placed at
+		-- capture), so status tells re-placement from the backlog.
+		ALTER TABLE placement ADD COLUMN replaces TEXT;
+		ALTER TABLE placement ADD COLUMN replaced_at INTEGER;
+		CREATE INDEX placement_dropping ON placement (place, seq) WHERE state = 'dropping';
+		-- A copy marked dropping leaves place_use (it is no longer acked)
+		-- but the lender counts it until it purges the tomb: like a
+		-- delete's freed bytes, it is counted back in place_freed until the
+		-- place's next quota answer (#24, #68).
+		CREATE TRIGGER place_freed_dropping AFTER UPDATE OF state ON placement
+		WHEN OLD.state = 'acked' AND NEW.state = 'dropping' AND coalesce(OLD.size, 0) > 0 BEGIN
+			UPDATE place_freed SET bytes = bytes + OLD.size WHERE place = OLD.place;
+		END;
+		-- Per bucket, since when the re-placement pass has found live
+		-- objects below copies with nowhere to put the missing copies
+		-- (OPS-2's below-copies alert), and how many at its last pass. No
+		-- row while none are.
+		CREATE TABLE below_copies (
+			bucket     TEXT PRIMARY KEY,
+			since      INTEGER NOT NULL, -- unix seconds
+			objects    INTEGER NOT NULL,
+			bytes      INTEGER NOT NULL,
+			checked_at INTEGER NOT NULL  -- unix seconds: the last pass
+		);`,
+	},
 }

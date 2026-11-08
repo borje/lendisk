@@ -26,7 +26,8 @@ import (
 // and was never acknowledged: cancelled as superseded, or re-routed
 // elsewhere. Its send may have landed, so it stays the place's row of
 // the key and a later delete follows it (REPL-2, #21); out of the FIFO
-// and not counted in the place's use.
+// and not counted in the place's use. Re-placement's dropping and
+// drained (#26) are in replace.go.
 const (
 	PlacementQueued    = "queued"
 	PlacementAcked     = "acked"
@@ -86,37 +87,84 @@ type Placement struct {
 	CreatedAt  time.Time // when the write was captured
 }
 
-// NextPlacement returns the head of place's FIFO: its queued row with
-// the lowest sequence. ok is false when the FIFO is empty.
+// NextPlacement returns the head of place's FIFO: its queued or
+// dropping row with the lowest sequence. A dropping row (re-placement,
+// #26) is returned as a delete of its key. ok is false when the FIFO is
+// empty.
 func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok bool, err error) {
-	var created int64
-	err = db.QueryRowContext(ctx, `SELECT p.seq, p.place, p.bucket, p.key, p.op, q.class, coalesce(q.size, 0),
-		coalesce(q.sha256, ''), p.state, q.created_at, coalesce(q.rewritable, 0)
-		FROM placement p JOIN queue q ON q.seq = p.seq
-		WHERE p.place = ? AND p.state = 'queued' ORDER BY p.seq LIMIT 1`, place).
-		Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Class, &p.Size, &p.SHA256, &p.State, &created, &p.Rewritable)
-	if errors.Is(err, sql.ErrNoRows) {
-		return p, false, nil
+	head := func(state string) (Placement, bool, error) {
+		var p Placement
+		var created int64
+		err := db.QueryRowContext(ctx, `SELECT p.seq, p.place, p.bucket, p.key, p.op, q.class, coalesce(q.size, 0),
+			coalesce(q.sha256, ''), p.state, q.created_at, coalesce(q.rewritable, 0)
+			FROM placement p JOIN queue q ON q.seq = p.seq
+			WHERE p.place = ? AND p.state = ? ORDER BY p.seq LIMIT 1`, place, state).
+			Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Class, &p.Size, &p.SHA256, &p.State, &created, &p.Rewritable)
+		if errors.Is(err, sql.ErrNoRows) {
+			return p, false, nil
+		}
+		p.CreatedAt = time.Unix(created, 0)
+		return p, err == nil, err
 	}
+	p, ok, err = head(PlacementQueued)
 	if err != nil {
 		return p, false, err
 	}
-	p.CreatedAt = time.Unix(created, 0)
-	return p, true, nil
+	d, dok, err := head(PlacementDropping)
+	if err != nil {
+		return p, false, err
+	}
+	if dok && (!ok || d.Seq < p.Seq) {
+		d.Op, d.Size = OpDelete, 0
+		return d, true, nil
+	}
+	return p, ok, nil
 }
 
 // AckPlacement records that place acknowledged the row, with the hash it
-// verified (empty for a delete). Acknowledging again is harmless.
+// verified (empty for a delete). Acknowledging again is harmless. A
+// dropping row's delete acknowledged leaves it drained (#26). A copy
+// re-placement placed in place of another (placement.replaces) makes
+// that other copy dropping once acknowledged, in the same transaction:
+// the object keeps the copies it had, and the drained place no longer
+// counts as holding it (REPL-13, REPL-11).
 func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 string, now time.Time) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	r, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementDrained+`', acked_at = ?
+		WHERE place = ? AND seq = ? AND state = '`+PlacementDropping+`'`, now.Unix(), place, seq)
+	if err != nil {
+		return err
+	}
+	if n, err := r.RowsAffected(); err != nil {
+		return err
+	} else if n > 0 {
+		return tx.Commit()
+	}
 	// A put acknowledged after a delete of its key was placed there (it
 	// was in flight) no longer counts: that delete removes it, and its
 	// own count did not include it (#21).
-	_, err := db.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?1, acked_at = ?2,
+	if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?1, acked_at = ?2,
 		size = CASE WHEN op = 'put' AND state != 'acked' AND EXISTS (SELECT 1 FROM placement d
 			WHERE d.place = placement.place AND d.bucket = placement.bucket AND d.key = placement.key
 			AND d.op = 'delete' AND d.seq > placement.seq) THEN 0 ELSE size END
-		WHERE place = ?3 AND seq = ?4`, nullStr(sha256), now.Unix(), place, seq)
-	return err
+		WHERE place = ?3 AND seq = ?4 AND state != '`+PlacementDrained+`'`, nullStr(sha256), now.Unix(), place, seq); err != nil {
+		return err
+	}
+	var replaces sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT replaces FROM placement WHERE place = ? AND seq = ? AND state = 'acked' AND op = 'put'`,
+		place, seq).Scan(&replaces); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if replaces.Valid && replaces.String != place {
+		if _, err := tx.ExecContext(ctx, markDropping, replaces.String, seq); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // StartPlacement records that place's sender took row seq to send it,
@@ -127,7 +175,7 @@ func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 
 // (REPL-2, #21).
 func (db *DB) StartPlacement(ctx context.Context, place string, seq int64, now time.Time) (ok bool, err error) {
 	r, err := db.ExecContext(ctx, `UPDATE placement SET started_at = coalesce(started_at, ?)
-		WHERE place = ? AND seq = ? AND state = 'queued'`, now.Unix(), place, seq)
+		WHERE place = ? AND seq = ? AND state IN ('queued', 'dropping')`, now.Unix(), place, seq)
 	if err != nil {
 		return false, err
 	}
@@ -248,12 +296,13 @@ func (db *DB) LaterCapture(ctx context.Context, seq int64) (bool, error) {
 }
 
 // AckedHash returns the hash place last acknowledged for a key; ok is
-// false when it holds none (never acknowledged, or deleted since).
+// false when it holds none (never acknowledged, or deleted since, by a
+// delete or by re-placement's, #26).
 func (db *DB) AckedHash(ctx context.Context, place, bucket, key string) (string, bool, error) {
 	var op string
 	var h sql.NullString
-	err := db.QueryRowContext(ctx, `SELECT op, sha256 FROM placement
-		WHERE place = ? AND bucket = ? AND key = ? AND state = 'acked' ORDER BY seq DESC LIMIT 1`,
+	err := db.QueryRowContext(ctx, `SELECT CASE WHEN state = 'acked' THEN op ELSE 'delete' END, sha256 FROM placement
+		WHERE place = ? AND bucket = ? AND key = ? AND state IN ('acked', 'drained') ORDER BY seq DESC LIMIT 1`,
 		place, bucket, key).Scan(&op, &h)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && op != OpPut) {
 		return "", false, nil
@@ -269,7 +318,8 @@ func (db *DB) AckedHash(ctx context.Context, place, bucket, key string) (string,
 func (db *DB) AckedPutHash(ctx context.Context, place, bucket, key string) (string, bool, error) {
 	var h sql.NullString
 	err := db.QueryRowContext(ctx, `SELECT sha256 FROM placement
-		WHERE place = ? AND bucket = ? AND key = ? AND state = 'acked' AND op = 'put' ORDER BY seq DESC LIMIT 1`,
+		WHERE place = ? AND bucket = ? AND key = ? AND state IN ('acked', 'dropping', 'drained') AND op = 'put'
+		ORDER BY seq DESC LIMIT 1`,
 		place, bucket, key).Scan(&h)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
@@ -287,8 +337,23 @@ func (db *DB) AckedPutHash(ctx context.Context, place, bucket, key string) (stri
 // and written again is a new object to the borrower; the lender, which
 // still holds the old version in its tomb, takes it only so marked.
 func (db *DB) ReplacedHash(ctx context.Context, place, bucket, key string, seq int64) (string, bool, error) {
+	// A copy re-placement deleted there (drained, #26) is in the lender's
+	// tomb as it was acknowledged.
+	var state string
+	var drained sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT state, sha256 FROM placement
+		WHERE place = ? AND bucket = ? AND key = ? AND seq < ? AND state IN ('acked', 'drained')
+		ORDER BY seq DESC LIMIT 1`, place, bucket, key, seq).Scan(&state, &drained)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", false, nil
+	case err != nil:
+		return "", false, err
+	case state == PlacementDrained:
+		return drained.String, drained.String != "", nil
+	}
 	var h string
-	err := db.QueryRowContext(ctx, `WITH d AS (SELECT max(seq) AS seq FROM placement
+	err = db.QueryRowContext(ctx, `WITH d AS (SELECT max(seq) AS seq FROM placement
 			WHERE place = ?1 AND bucket = ?2 AND key = ?3 AND seq < ?4 AND state = 'acked' AND op = 'delete'
 			AND seq = (SELECT max(x.seq) FROM placement x WHERE x.place = ?1 AND x.bucket = ?2 AND x.key = ?3
 				AND x.seq < ?4 AND x.state = 'acked'))
@@ -309,16 +374,19 @@ type PlaceStat struct {
 	Lag         time.Duration // age of the oldest queued row; zero when none
 	Oldest      time.Time     // capture time of the oldest queued row
 	Refused     int64         // rows the place itself refused for good (not RefuseObject's), not written again since
+	Dropping    int64         // copies re-placement is deleting there (#26), also in its FIFO
 }
 
 // PlaceStats returns each place's FIFO size and lag at now; places with
-// no placement rows are absent.
+// no placement rows are absent. A row re-placement queued counts its
+// lag from then (replaced_at), not from its capture (#26).
 func (db *DB) PlaceStats(ctx context.Context, now time.Time) (map[string]PlaceStat, error) {
 	rows, err := db.QueryContext(ctx, `SELECT p.place,
 		count(*) FILTER (WHERE p.state = 'queued'),
 		coalesce(sum(q.size) FILTER (WHERE p.state = 'queued' AND p.op = 'put'), 0),
-		min(q.created_at) FILTER (WHERE p.state = 'queued'),
-		count(*) FILTER (WHERE p.state = 'refused' AND (p.cause IS NULL OR p.cause = 'immutable') AND `+current+`)
+		min(coalesce(p.replaced_at, q.created_at)) FILTER (WHERE p.state = 'queued'),
+		count(*) FILTER (WHERE p.state = 'refused' AND (p.cause IS NULL OR p.cause = 'immutable') AND `+current+`),
+		count(*) FILTER (WHERE p.state = 'dropping')
 		FROM placement p JOIN queue q ON q.seq = p.seq GROUP BY p.place`)
 	if err != nil {
 		return nil, err
@@ -329,7 +397,7 @@ func (db *DB) PlaceStats(ctx context.Context, now time.Time) (map[string]PlaceSt
 		var place string
 		var s PlaceStat
 		var oldest sql.NullInt64
-		if err := rows.Scan(&place, &s.Queued, &s.QueuedBytes, &oldest, &s.Refused); err != nil {
+		if err := rows.Scan(&place, &s.Queued, &s.QueuedBytes, &oldest, &s.Refused, &s.Dropping); err != nil {
 			return nil, err
 		}
 		if oldest.Valid {

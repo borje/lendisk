@@ -9,6 +9,7 @@ import (
 	"maps"
 	"path/filepath"
 	"slices"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -211,8 +212,46 @@ type StatusPlace struct {
 	// and not written again since (#57); objects the store could not
 	// supply count against their bucket.
 	Refused int64 `json:"refused"`
+	// Dropping counts copies re-placement is deleting there (REPL-13,
+	// #26): moved to other places, or surplus after copies was lowered.
+	// They wait in its FIFO as deletes, not in Queue.
+	Dropping int64 `json:"dropping"`
 	// LastOK is when the place last acknowledged anything (RFC 3339).
 	LastOK string `json:"last_ok,omitempty"`
+}
+
+// replacingLine says what re-placement is doing for bucket b, or "".
+func replacingLine(b StatusBucket) string {
+	r := b.Replacing
+	var parts []string
+	if r.Queued > 0 {
+		parts = append(parts, fmt.Sprintf("%s (%d bytes) placed after the pool changed %s to be sent",
+			countCopies(r.Queued), r.QueuedBytes, waits(r.Queued)))
+	}
+	if r.Dropping > 0 {
+		parts = append(parts, fmt.Sprintf("%s moved away %s to be deleted", countCopies(r.Dropping), waits(r.Dropping)))
+	}
+	if r.BelowSince != "" {
+		parts = append(parts, fmt.Sprintf("objects below %d copies with nowhere to place them since %s", b.Copies, r.BelowSince))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "re-placement: " + strings.Join(parts, "; ")
+}
+
+func countCopies(n int64) string {
+	if n == 1 {
+		return "1 copy"
+	}
+	return fmt.Sprintf("%d copies", n)
+}
+
+func waits(n int64) string {
+	if n == 1 {
+		return "waits"
+	}
+	return "wait"
 }
 
 // placeStates are StatusPlace.State in words.
@@ -258,7 +297,7 @@ func places(ctx context.Context, db *state.DB, now time.Time) ([]StatusPlace, er
 		st, c := stats[p], conds[p]
 		sp := StatusPlace{Place: p, Kind: "friend", Removed: !seen[p], State: c.Condition, Detail: c.Detail,
 			Queue:      StatusQueue{Objects: st.Queued, Bytes: st.QueuedBytes},
-			LagSeconds: int64(st.Lag / time.Second), Refused: st.Refused}
+			LagSeconds: int64(st.Lag / time.Second), Refused: st.Refused, Dropping: st.Dropping}
 		if !c.LastOK.IsZero() {
 			sp.LastOK = c.LastOK.UTC().Format(time.RFC3339)
 		}
@@ -327,6 +366,8 @@ type StatusBucket struct {
 	// a place refused them, or a friend gone past replace_after or
 	// removed (PEER-5) held them, until re-placement (#26).
 	BelowCopies StatusBelow `json:"below_copies"`
+	// Replacing is re-placement in progress (REPL-13, OPS-1, #26).
+	Replacing StatusReplacing `json:"replacing"`
 	// SingleCopy is true when copies is 1: each object is held by one
 	// friend, so losing that friend's disk loses the offsite copy (EP-6).
 	SingleCopy bool `json:"single_copy"`
@@ -386,6 +427,19 @@ type StatusPool struct {
 	// SingleFriend is true with exactly one: one lost disk loses every
 	// offsite copy (EP-6).
 	SingleFriend bool `json:"single_friend"`
+}
+
+// StatusReplacing is a bucket's re-placement in progress (REPL-13, #26):
+// copies it placed after the pool changed that still wait to be sent,
+// copies it is deleting at places that no longer hold them, and, while
+// objects stay below copies with nowhere to put the missing copies,
+// since when (OPS-2's below_copies alert fires once that is longer than
+// replication.replace_after).
+type StatusReplacing struct {
+	Queued      int64  `json:"queued"`
+	QueuedBytes int64  `json:"queued_bytes"`
+	Dropping    int64  `json:"dropping"`
+	BelowSince  string `json:"below_since,omitempty"` // RFC 3339, UTC
 }
 
 // StatusBelow counts objects and bytes below a bucket's copies.
@@ -551,6 +605,14 @@ friend, or with no room in the pool), which status shows.`,
 			if err != nil {
 				return err
 			}
+			replacing, err := db.Replacing(cmd.Context())
+			if err != nil {
+				return err
+			}
+			belowSince, err := db.BelowCopiesSince(cmd.Context())
+			if err != nil {
+				return err
+			}
 			profiles, err := profile.Load(filepath.Join(cfg.ConfigDir(), "profiles"))
 			if err != nil {
 				return err
@@ -574,7 +636,12 @@ friend, or with no room in the pool), which status shows.`,
 				if changed[b.Name] == nil {
 					changed[b.Name] = []StatusChanged{}
 				}
-				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies,
+				r := replacing[b.Name]
+				rs := StatusReplacing{Queued: r.Queued, QueuedBytes: r.QueuedBytes, Dropping: r.Dropping}
+				if bs, ok := belowSince[b.Name]; ok {
+					rs.BelowSince = bs.Since.UTC().Format(time.RFC3339)
+				}
+				st.Buckets = append(st.Buckets, StatusBucket{Name: b.Name, Profile: b.Profile, Copies: b.Copies, Replacing: rs,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
 					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1,
 					OutsideTrust: !profiles.Get(b.Profile).Encrypted, Offsite: off,
@@ -683,7 +750,7 @@ friend, or with no room in the pool), which status shows.`,
 					fmt.Fprintf(a.out, ", %d objects, %d bytes at fewer than %d places", b.BelowCopies.Objects,
 						b.BelowCopies.Bytes, b.Copies)
 					if len(st.FormerFriends) > 0 {
-						fmt.Fprint(a.out, " (copies at an ended friendship no longer count; re-placement is not built yet, #26)")
+						fmt.Fprint(a.out, " (copies at an ended friendship no longer count)")
 					}
 				}
 				fmt.Fprintln(a.out)
@@ -702,6 +769,9 @@ friend, or with no room in the pool), which status shows.`,
 				if f := b.KopiaFormat1; f != nil {
 					fmt.Fprintf(a.out, "    ! Kopia repository in format version 1, which lendisk does not support (blob %s, %s);\n", f.Key, f.Since)
 					fmt.Fprintf(a.out, "      writes are accepted and replicated as before; run `%s` (Kopia 0.9 or later)\n", f.Fix)
+				}
+				if l := replacingLine(b); l != "" {
+					fmt.Fprintf(a.out, "    %s\n", l)
 				}
 			}
 			if st.Pool.SingleFriend {
@@ -723,6 +793,9 @@ friend, or with no room in the pool), which status shows.`,
 					p.Queue.Objects, p.Queue.Bytes, time.Duration(p.LagSeconds)*time.Second)
 				if p.Refused > 0 {
 					fmt.Fprintf(a.out, ", %d refused", p.Refused)
+				}
+				if p.Dropping > 0 {
+					fmt.Fprintf(a.out, ", %s moved away to delete", countCopies(p.Dropping))
 				}
 				if p.Detail != "" {
 					fmt.Fprintf(a.out, " (%s)", p.Detail)

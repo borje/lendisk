@@ -191,26 +191,36 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 	return out, rows.Err()
 }
 
-// unsentMetadata is the bytes of bucket's live metadata not placed at
-// place: a friend added later receives them (REPL-13, #26), so they are
-// not room for data (D6 step 1).
+// unsentMetadata is the bytes of bucket's live metadata with no row at
+// place that holds, refuses or deletes it: a friend added later receives
+// them from re-placement (REPL-13, #26), and until then gets no data
+// (choose, Reroute), so that its FIFO sends the bucket's metadata ahead
+// of newer data (REPL-1). A change EP-11 held back is placed nowhere and
+// does not count, nor does metadata the store could not supply
+// (RefuseObject), which no friend is sent (#26 review).
 func unsentMetadata(ctx context.Context, tx querier, bucket, place string) (int64, error) {
 	var n int64
 	err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(q.size + ?3), 0) FROM queue q
 		WHERE q.bucket = ?1 AND q.class IN ('metadata', 'snapshot') AND q.op = 'put' AND q.state = 'done'
 		AND NOT EXISTS (SELECT 1 FROM queue l
 			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
-		AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.place = ?2 AND p.bucket = q.bucket AND p.key = q.key)`,
+		AND q.immutable IS NULL
+		AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.place = ?2 AND p.seq = q.seq
+			AND p.state IN ('queued', 'acked', 'refused', 'dropping'))
+		AND NOT EXISTS (SELECT 1 FROM placement r WHERE r.seq = q.seq AND r.state = 'refused'
+			AND r.cause IN ('store', 'oversize'))`,
 		bucket, place, ObjectOverhead).Scan(&n)
 	return n, err
 }
 
 // choose is D6's choice of up to n places for an object of bucket that
 // counts need bytes at a place, never one in exclude: friends with free
-// capacity for it (quota less use, the bucket's unsent metadata and the
-// metadata reserve), reachable ones first, each by largest free fraction
+// capacity for it (quota less use and the metadata reserve), reachable
+// ones first, each by largest free fraction
 // (free ÷ quota), ties by node ID. A friend gone past replace_after,
-// removed, or full by its last answer is not room; with reachableOnly,
+// removed, or full by its last answer is not room, nor is one lacking
+// some of the bucket's live metadata (unsentMetadata: re-placement sends
+// it first, #26); with reachableOnly,
 // neither is an unreachable one (re-routing, so rows do not move between
 // friends that both stopped answering). Fewer than n means the pool
 // lacks room: what fits is placed, and the deficit shows as bytes below
@@ -243,7 +253,10 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 		if err != nil {
 			return nil, err
 		}
-		free := freeRoom(p.quota, p.use, meta, live)
+		if meta > 0 {
+			continue // its metadata first (REPL-13, #26)
+		}
+		free := freeRoom(p.quota, p.use, 0, live)
 		if !fits(free, need) {
 			continue
 		}
@@ -360,7 +373,13 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 // the place holds what it heals (placeTx), with the bytes it adds to the
 // place's use.
 func (db *DB) insertPlacement(ctx context.Context, tx *sql.Tx, seq int64, place string, heal bool) error {
-	_, err := tx.ExecContext(ctx, `WITH c AS (
+	return insertPlacement(ctx, tx, seq, place, heal, db.now().Unix())
+}
+
+// insertPlacement is DB.insertPlacement in x, acknowledged at now (unix
+// seconds) when held.
+func insertPlacement(ctx context.Context, x execer, seq int64, place string, heal bool, now int64) error {
+	_, err := x.ExecContext(ctx, `WITH c AS (
 		SELECT q.seq, q.bucket, q.key, q.op, q.sha256,
 			?3 AND q.op = 'put'
 			AND EXISTS (SELECT 1 FROM placement a
@@ -395,7 +414,7 @@ func (db *DB) insertPlacement(ctx context.Context, tx *sql.Tx, seq int64, place 
 			CASE WHEN held THEN sha256 END,
 			CASE WHEN held THEN ?5 END,
 			size
-		FROM c`, seq, place, heal, ObjectOverhead, db.now().Unix())
+		FROM c`, seq, place, heal, ObjectOverhead, now)
 	return err
 }
 
@@ -539,7 +558,10 @@ func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64)
 			}
 			unsent[k] = meta
 		}
-		return freeRoom(t.quota, t.use, capped(meta)+capped(t.taken), live), nil
+		if meta > 0 {
+			return -1, nil // its metadata first (REPL-13, #26): no room for data
+		}
+		return freeRoom(t.quota, t.use, capped(t.taken), live), nil
 	}
 	sentTo := map[int64][]string{} // seq -> friends this pass moved a copy of it to
 	var ops []rerouteOp
@@ -691,6 +713,13 @@ func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(st
 			drops[op.from] = append(drops[op.from], op.seq)
 			continue
 		}
+		// A copy re-placement placed keeps what it replaces (#26).
+		var replaces sql.NullString
+		var replacedAt sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT replaces, replaced_at FROM placement WHERE place = ? AND seq = ?`,
+			op.from, op.seq).Scan(&replaces, &replacedAt); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return 0, 0, err
+		}
 		// A row a sender took may have landed: it stays, abandoned, so
 		// a later delete still reaches the friend (#21 review).
 		r, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementAbandoned+`'
@@ -716,6 +745,12 @@ func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(st
 		}
 		if err := db.insertPlacement(ctx, tx, op.seq, op.to, false); err != nil {
 			return 0, 0, err
+		}
+		if replacedAt.Valid {
+			if _, err := tx.ExecContext(ctx, `UPDATE placement SET replaces = ?, replaced_at = ? WHERE place = ? AND seq = ?`,
+				replaces, replacedAt, op.to, op.seq); err != nil {
+				return 0, 0, err
+			}
 		}
 		moved++
 	}

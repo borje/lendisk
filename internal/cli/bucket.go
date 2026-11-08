@@ -130,8 +130,56 @@ holds, and counts every friend holding that version as holding it.`,
 			return nil
 		},
 	}
-	cmd.AddCommand(add, list, show, resolve)
+	var setCopies int
+	set := &cobra.Command{
+		Use:   "set <name> --copies N",
+		Short: "Change a bucket's copies; the daemon adds or removes copies to match",
+		Long: `set changes how many friends hold each object of the bucket (EP-6).
+The running daemon then places the missing copies, read from this node's
+store, or deletes the surplus ones, never leaving an object at fewer
+places than it has (REPL-13); ` + "`lendisk status`" + ` shows the re-placement.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !cmd.Flags().Changed("copies") {
+				return usageError{errors.New("--copies is required")}
+			}
+			return a.runBucketSet(cmd.Context(), args[0], setCopies)
+		},
+	}
+	set.Flags().IntVar(&setCopies, "copies", 0, "how many friends hold each object (required)")
+	cmd.AddCommand(add, list, show, resolve, set)
 	return cmd
+}
+
+// runBucketSet changes bucket name's copies (EP-6, REPL-13, #26). The
+// daemon notices the change and re-places; nothing here needs it.
+func (a *app) runBucketSet(ctx context.Context, name string, copies int) error {
+	if copies < 1 {
+		return usageError{errors.New("--copies must be at least 1")}
+	}
+	cfg, db, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.SetCopies(ctx, name, copies); errors.Is(err, state.ErrNotFound) {
+		return fmt.Errorf("no bucket %q; `lendisk bucket list` shows them", name)
+	} else if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.out, "Bucket %s now keeps %d copies of each object; the daemon adds or removes copies to match (`lendisk status` shows it).\n",
+		name, copies)
+	if copies == 1 {
+		fmt.Fprintln(a.out, singleCopyWarning)
+	}
+	db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
+	if places, err := db.PoolSize(ctx); err != nil {
+		return err
+	} else if places < copies {
+		fmt.Fprintf(a.out, "Your pool has %d places, fewer than copies %d: objects are held at fewer places until more friends join (`lendisk invite --quota <size>`).\n",
+			places, copies)
+	}
+	return nil
 }
 
 // openState loads the config, checks the node is initialised and opens
@@ -224,7 +272,7 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 // copies was set, and status of a pool of one friend (EP-6). Neither is
 // an alert.
 const (
-	singleCopyWarning = "Warning: copies = 1. Each object is held by one friend only, so if that friend's disk is lost, this bucket has no offsite copy left. Add a second friend, or recreate the bucket with --copies 2."
+	singleCopyWarning = "Warning: copies = 1. Each object is held by one friend only, so if that friend's disk is lost, this bucket has no offsite copy left. Add a second friend, or run `lendisk bucket set <name> --copies 2`."
 	singleCopyLine    = "! one copy: losing that friend's disk loses the offsite copy; 2 is recommended"
 	singleFriendLine  = "Friends (1: one lost disk loses every offsite copy)"
 )
