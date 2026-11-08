@@ -1,6 +1,6 @@
 # lendisk — requirements
 
-Status: draft v0.11.3, 2026-11-08. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.11.4, 2026-11-08. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
@@ -21,7 +21,8 @@ alert (EP-6); v0.11.2 gives a node a dial key per friend, derived
 from the same phrase, to connect to its friends with (ID-1, SEC-10,
 SEC-12, SEC-14); v0.11.3 lets a profile name the few keys its tool
 rewrites in place, which replicate as rewrites while lenders keep the
-replaced version (EP-7, EP-11, LEND-4, RET-1). The design
+replaced version (EP-7, EP-11, LEND-4, RET-1); v0.11.4 supports Kopia repositories
+in format version 2 or later only (COMPAT-1). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -1007,7 +1008,10 @@ waits for a reconnect would each turn a component choice into a hole.
 
 - **COMPAT-1** Supported backup tools in v1: restic and Kopia, each at
   the latest release and the two before it, tested in CI through the S3
-  endpoint. Duplicacy and rclone should work via `generic` and are
+  endpoint. Kopia repositories must be in format version 2 or later
+  (Kopia 0.9, 2021, and since 0.11 the default); a `kopia` bucket that
+  receives format-1 blobs is not refused, but `status` says so and an
+  alert names `kopia repository set-parameters --upgrade`. Duplicacy and rclone should work via `generic` and are
   smoke-tested.
 - **COMPAT-2** Supported platforms for v1: Linux amd64 and arm64, as
   static binaries in one package with one systemd unit, and as a
@@ -1256,6 +1260,13 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.11.4 (2026-11-08)** Kopia format version 1 (repositories made by
+  Kopia 0.8 or earlier and never upgraded) is not supported (#79). Its
+  compaction and cleanup blobs `m*` and `l*` are not listed in EP-7, so
+  they would be held as data at `copies` friends only. COMPAT-1 now names format 2
+  or later, and a bucket that receives format-1 blobs is shown and
+  alerted with the upgrade command rather than refused, so a running
+  backup is not broken. Decided by the user.
 - **v0.11.3 (2026-11-08)** Kopia rewrites `kopia.maintenance` after
   every maintenance run, and `kopia.repository` and `kopia.blobcfg` on
   a password change or `set-parameters`; restic rewrites `config` in
