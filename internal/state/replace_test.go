@@ -33,6 +33,27 @@ func TestReplacementWaitsForRecoveryLists(t *testing.T) {
 	p.wantPlaces("data/1", d1, "B", "C")
 }
 
+// REPL-13 (#26 review): metadata the store could not supply is sent
+// nowhere, so a friend added later does not wait for it: it gets data
+// once the rest of the bucket's metadata is queued there.
+func TestStoreRefusedMetadataDoesNotKeepANewFriendFromData(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 2)
+	m1 := p.put("laptop", "index/1", "metadata", 0.1)
+	if _, err := p.db.RefuseObject(ctx, m1, CauseStore, "gone"); err != nil {
+		t.Fatal(err)
+	}
+	p.friend("D", 100)
+	p.replace()
+	d1 := p.put("laptop", "data/1", "data", 1)
+	if got := p.places(d1); !slices.Contains(got, "D") {
+		t.Fatalf("data/1 placed at %v: D lacks only metadata no friend gets", got)
+	}
+}
+
 // replace runs one re-placement pass and fails the test on an error.
 func (p *pool) replace() ReplaceStats {
 	p.t.Helper()

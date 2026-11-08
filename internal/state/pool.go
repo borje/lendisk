@@ -196,7 +196,8 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 // them from re-placement (REPL-13, #26), and until then gets no data
 // (choose, Reroute), so that its FIFO sends the bucket's metadata ahead
 // of newer data (REPL-1). A change EP-11 held back is placed nowhere and
-// does not count.
+// does not count, nor does metadata the store could not supply
+// (RefuseObject), which no friend is sent (#26 review).
 func unsentMetadata(ctx context.Context, tx querier, bucket, place string) (int64, error) {
 	var n int64
 	err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(q.size + ?3), 0) FROM queue q
@@ -205,7 +206,9 @@ func unsentMetadata(ctx context.Context, tx querier, bucket, place string) (int6
 			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
 		AND q.immutable IS NULL
 		AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.place = ?2 AND p.seq = q.seq
-			AND p.state IN ('queued', 'acked', 'refused', 'dropping'))`,
+			AND p.state IN ('queued', 'acked', 'refused', 'dropping'))
+		AND NOT EXISTS (SELECT 1 FROM placement r WHERE r.seq = q.seq AND r.state = 'refused'
+			AND r.cause IN ('store', 'oversize'))`,
 		bucket, place, ObjectOverhead).Scan(&n)
 	return n, err
 }
