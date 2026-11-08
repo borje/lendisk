@@ -2788,7 +2788,11 @@ capture decorator, so nothing stands between that and posix (#62).
   `replaced`: the hashes of the versions its rewrites replaced whose
   tombs are kept, newest first, at most 1,000
   (`gateway.MaxReplaced`, `state.ReplacedVersions`), which recovery
-  reads (§3.1 ID-5). A delete's tomb is never listed as replaced.
+  reads (§3.1 ID-5). A delete's tomb is never listed as replaced. In
+  the moment between a rewrite's move and its publication, the key is
+  listed as the version it replaces, live, from the pending rewrite
+  row, so a recovery list read then does not record it as deleted
+  (`TestKeyInARewritesGapListsAsItsOldVersion`).
   *Window (#17):* the purge time is fixed at the delete: deleted at
   plus `gateway.Retention`, the longer of the friendship's two
   retention offers exchanged at redeem (`own_retention`, this node's

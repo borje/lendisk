@@ -67,7 +67,9 @@ type LentIndex struct {
 // List returns up to limit keys of borrower's bucket sealed after the
 // key after, in key order, and the key the next page starts after: ""
 // when none follows. A tombstoned key is listed with its newest
-// tombstone, unless it is live again. Keys of lendisk's own and the
+// tombstone, unless it is live again; a key whose newest tombstone is a
+// rewrite still in progress (pending) is listed live, as the version it
+// still holds. Keys of lendisk's own and the
 // store's housekeeping (SEC-5's reserved prefixes) are not listed.
 func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, after string, limit int) ([]LentObject, string, error) {
 	if limit < 1 || limit > MaxListPage {
@@ -150,6 +152,14 @@ func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, 
 	for _, t := range tombs {
 		if bounded && t.Key > bound || live[t.Key] {
 			continue // a key live again is listed live
+		}
+		if t.Pending && t.Rewrite {
+			// A rewrite between moving the version it replaces into its
+			// tomb and publishing the new one (#74): the key still holds
+			// that version, and is listed so, not as deleted.
+			live[t.Key] = true
+			out = append(out, LentObject{Key: t.Key, Size: t.Size, SHA256: t.SHA256})
+			continue
 		}
 		out = append(out, LentObject{Key: t.Key, Size: t.Size, SHA256: t.SHA256, TombstonedAt: t.DeletedAt})
 	}
