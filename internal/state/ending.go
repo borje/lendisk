@@ -98,6 +98,11 @@ func (db *DB) RemoveFriendship(ctx context.Context, peer string, byPeer bool, no
 	if err := forgetManifestPush(ctx, tx, peer); err != nil {
 		return FormerFriend{}, err
 	}
+	// Its replicas' verification ends with it (#27 review): befriended
+	// again, it starts unchecked, not unverified.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM replica_check WHERE place = ?`, peer); err != nil {
+		return FormerFriend{}, err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementAbandoned+`'
 		WHERE place = ? AND state = 'queued' AND op = 'put' AND started_at IS NOT NULL`, peer); err != nil {
 		return FormerFriend{}, err

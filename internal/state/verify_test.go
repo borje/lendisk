@@ -301,6 +301,33 @@ func TestVerifyRequestsRoundTrip(t *testing.T) {
 	}
 }
 
+// VER-1 (#27 review): a replica's verification record ends with the
+// friendship or the bucket, so a friend befriended again, or a bucket
+// added again by the same name, starts with no unverified mark.
+func TestReplicaRecordsEndWithTheFriendshipAndTheBucket(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 1)
+	for _, f := range []string{"B", "C"} {
+		if err := p.db.RecordUnverified(ctx, f, "laptop", "lost", p.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := p.db.RemoveFriendship(ctx, "B", false, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.friend("B", 10)
+	if err := p.db.DeleteBucket(ctx, "laptop"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := p.db.QueryRow(`SELECT count(*) FROM replica_check`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("%d records left (%v)", n, err)
+	}
+}
+
 // VER-1, SEC-7 (#27 review): a replica whose FIFO never empties (a
 // friend at quota, a slow uplink) is challenged anyway once it is more
 // than a day overdue, so it is not starved for good: a day after its

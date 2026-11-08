@@ -4002,7 +4002,10 @@ the handler's own reads and is never cancelled; nothing below
     review: a full check runs for hours beside backups). An unverified
     replica is not challenged daily any more; `lendisk verify --full`
     passing clears the mark (`RecordVerified` with full), a ranged pass
-    does not.
+    does not. A replica's record ends with the friendship
+    (`RemoveFriendship`) and with the bucket (`DeleteBucket`), so a
+    friend befriended again starts unchecked, not unverified
+    (`TestReplicaRecordsEndWithTheFriendshipAndTheBucket`).
   - *Decision: one failed proof drains the replica (#27).* Precedent:
     Tahoe-LAFS's verifier (`tahoe check --verify`) downloads and checks
     every share, and its repairer regenerates only the shares found
