@@ -231,6 +231,42 @@ func TestEndingAFriendshipTellsTheFriendAndLeavesTheOthers(t *testing.T) {
 	}
 }
 
+// PEER-5, SEC-10 (CI on cc6a3c1): A's daemon calls B the moment A has
+// stored the friendship, before B's `peer add`, a one-shot command, has
+// stored its side, so B's daemon refuses A's dial key and remembers the
+// refusal (transport.DeniedFor), with no Clear from the other process.
+// A then removes B. Its remove call is admitted once that refusal
+// expires, within the call's first try: B ends the friendship on its
+// side as if it had been friends for long.
+func TestAFriendRemovedJustAfterBefriendingIsTold(t *testing.T) {
+	parallel(t, 2)
+	a, b := friendNode(t), friendNode(t)
+	pa := newProcNode(t, a, envFarewellInterval+"=200ms")
+	pa.start()
+	pb := newProcNode(t, b, "LENDISK_LOG_LEVEL=debug")
+	pb.start()
+	aID := a.identity()
+	b.beforeFriendship = func() error {
+		// A has stored the friendship and calls B; B has not.
+		within(t, 30*time.Second, "B refusing A's first call", func() bool {
+			log, _ := os.ReadFile(pb.logf)
+			return strings.Contains(string(log), `msg="tunnel refused unknown key"`)
+		})
+		return nil
+	}
+	befriend(t, a, b)
+	bID := b.identity().NodeID().String()
+	if code, out, e := a.run("", "", "peer", "remove", bID); code != 0 {
+		t.Fatalf("peer remove: %d %s%s", code, out, e)
+	}
+	removed := time.Now()
+	within(t, 60*time.Second, "B ending the friendship on its side", func() bool {
+		fs := b.status().FormerFriends
+		return len(b.peers()) == 0 && len(fs) == 1 && fs[0].Peer == aID.NodeID().String() && fs[0].ByPeer
+	})
+	t.Logf("B ended it on its side %v after A's `peer remove`", time.Since(removed).Round(time.Millisecond))
+}
+
 // PEER-5 (#25, #28): each side holds the other's replica for the
 // retention window and then purges it. A removes B, which stored
 // objects, a tomb and its manifest at A, and which A had placed an
