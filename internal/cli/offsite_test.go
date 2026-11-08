@@ -177,36 +177,79 @@ func TestStatusSaysWhichResticSnapshotIsOffsite(t *testing.T) {
 }
 
 // REPL-11 (#20): Kopia's snapshot keys are index blobs, which name no
-// snapshot, so status names the time: every snapshot Kopia finished by
-// the time the offsite index was written is offsite. A generic bucket
-// has no snapshot keys: status names its last fully placed write.
+// snapshot, so status names the time: every snapshot Kopia finished
+// before the second the offsite index was written in is offsite. A
+// generic bucket has no snapshot keys: status names the time before
+// which every write is offsite. Capture times are whole seconds, so both
+// claims are strictly before a second that may also hold a write that
+// is not offsite (#20 review).
 func TestStatusNamesATimeForKopiaAndGenericBuckets(t *testing.T) {
 	o := newOffsiteNode(t, "kopia", "kopia")
 	o.addBucket(t, "files", "generic")
 	idx := "xn0_044bfd62a9837c42e60a1084b0fc2482-sa69963c6d5b144b1146-c1"
+	idx2 := "xn0_8c87047a9eb0795baa9b460fb8844608-s6331a632e5515605146-c1"
 	for _, s := range []int64{o.put("kopia", "kopia.repository", "metadata", 100), o.put("kopia", "p186cf", "data", 1000),
 		o.put("kopia", "qe46e1", "data", 100), o.put("kopia", idx, "snapshot", 100),
 		o.put("files", "a.txt", "data", 10)} {
 		o.ack(s)
 	}
-	o.now = o.now.Add(time.Hour)
+	// In the same second: another session's pack and index, and another
+	// generic write, none of them offsite yet.
+	o.put("kopia", "p681b4", "data", 1000)
+	o.put("kopia", idx2, "snapshot", 100)
 	o.put("files", "b.txt", "data", 20)
 	st := o.status()
-	if k := bucketOf(t, st, "kopia").Offsite; k.Snapshot == nil || k.Snapshot.Key != idx || k.Snapshot.ID != "" || !k.Complete {
+	if k := bucketOf(t, st, "kopia").Offsite; k.Snapshot == nil || k.Snapshot.Key != idx || k.Snapshot.ID != "" ||
+		k.LatestSnapshot.Key != idx2 || k.Complete || k.Before != "2026-11-08T10:00:00Z" {
 		t.Fatalf("kopia offsite %+v", k)
 	}
 	if g := bucketOf(t, st, "files").Offsite; g.Snapshot != nil || g.Through != "2026-11-08T10:00:00Z" || g.Complete ||
-		g.Waiting.Objects != 1 {
+		g.Waiting.Objects != 1 || g.Before != "2026-11-08T10:00:00Z" {
 		t.Fatalf("generic offsite %+v", g)
 	}
 	_, text, _ := o.run("", "", "status")
 	for _, want := range []string{
-		"    every snapshot finished by 2026-11-08 10:00:00 UTC is offsite at 2 copies (through " + idx + ")\n",
-		"    every write up to 2026-11-08 10:00:00 UTC is offsite at 2 copies; later ones are not yet: 1 objects, 20 bytes still to reach 2 places\n",
+		"    the snapshot key " + idx2 + " of 2026-11-08 10:00:00 UTC is not offsite at 2 copies yet: 2 objects, 1100 bytes still to reach 2 places\n",
+		"    every snapshot finished before 2026-11-08 10:00:00 UTC is offsite at 2 copies (through " + idx + ")\n",
+		"    every write captured before 2026-11-08 10:00:00 UTC is offsite at 2 copies; later ones are not yet: 1 objects, 20 bytes still to reach 2 places\n",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("status lacks %q:\n%s", want, text)
 		}
+	}
+}
+
+// REPL-5 (#20 review): status --wait waits at least ten times as long
+// as its last read of the watermark took, and never less than 2 s, so a
+// large bucket does not keep a small machine busy.
+func TestStatusWaitBacksOffOnASlowRead(t *testing.T) {
+	o := newOffsiteNode(t, "laptop", "restic")
+	o.daemonUp()
+	s1 := o.put("laptop", snapA, "snapshot", 100)
+	now := o.now
+	o.node.clock = func() time.Time { now = now.Add(700 * time.Millisecond); return now } // every read is slow
+	var pauses []time.Duration
+	o.node.sleep = func(_ context.Context, d time.Duration) error {
+		pauses = append(pauses, d)
+		if len(pauses) == 2 {
+			o.ack(s1)
+		}
+		return nil
+	}
+	if code, _, errOut := o.run("", "", "status", "--wait", "laptop", "--timeout", "1h"); code != 0 {
+		t.Fatalf("status --wait: exit %d %s", code, errOut)
+	}
+	// The clock moves 0.7 s per reading, and the read itself reads it too
+	// (lendisk.db judges which friends are gone by it): at least 0.7 s.
+	if len(pauses) != 2 || pauses[0] < 7*time.Second || pauses[0]%(7*time.Second) != 0 {
+		t.Fatalf("pauses %v, want ten times a read of n × 0.7 s", pauses)
+	}
+	o.node.clock = func() time.Time { return now }
+	s2 := o.put("laptop", snapB, "snapshot", 100)
+	pauses = nil
+	o.node.sleep = func(_ context.Context, d time.Duration) error { pauses = append(pauses, d); o.ack(s2); return nil }
+	if code, _, errOut := o.run("", "", "status", "--wait", "laptop"); code != 0 || len(pauses) != 1 || pauses[0] != 2*time.Second {
+		t.Fatalf("a fast read: exit %d, pauses %v %s", code, pauses, errOut)
 	}
 }
 

@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"bytes"
 	"cmp"
+	"crypto/rand"
+	"encoding/hex"
 	"maps"
 	"os"
 	"os/exec"
@@ -11,6 +14,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/identity"
@@ -27,6 +34,7 @@ type fourFriends struct {
 	friends map[string]*procNode // B, C and D by node ID
 	aID     *identity.Identity
 	env     []string // restic's environment
+	creds   creds    // the bucket's credential
 	src     string
 }
 
@@ -65,6 +73,7 @@ func newFourFriends(t *testing.T, aEnv ...string) *fourFriends {
 			}
 		}
 	}
+	f.creds = c
 	f.env = append(os.Environ(), "AWS_ACCESS_KEY_ID="+c.access, "AWS_SECRET_ACCESS_KEY="+c.secret,
 		"RESTIC_REPOSITORY=s3:http://"+f.a.addr+"/laptop", "RESTIC_PASSWORD=test-password",
 		"RESTIC_CACHE_DIR="+t.TempDir())
@@ -87,10 +96,13 @@ var reSaved = regexp.MustCompile(`snapshot ([0-9a-f]{8}) saved`)
 
 // backup writes count new files of 1 MiB and backs them up; it returns
 // restic's short snapshot ID.
-func (f *fourFriends) backup(prefix string, count int) string {
+func (f *fourFriends) backup(prefix string, count int, flags ...string) string {
 	f.t.Helper()
 	randomFiles(f.t, f.src, prefix, count, 1<<20)
-	m := reSaved.FindStringSubmatch(f.restic("backup", "--pack-size", "4", "--no-scan", f.src))
+	if flags == nil {
+		flags = []string{"--pack-size", "4"}
+	}
+	m := reSaved.FindStringSubmatch(f.restic(append(append([]string{"backup"}, flags...), "--no-scan", f.src)...))
 	if m == nil {
 		f.t.Fatal("restic printed no snapshot ID")
 	}
@@ -297,5 +309,70 @@ func TestScenarioFriendOfflineForThreeDays(t *testing.T) {
 	f.placedAsSpecified()
 	if b := bucketOf(t, f.an.status(), "laptop"); !b.Offsite.Complete {
 		t.Fatalf("offsite after B drained: %+v", b.Offsite)
+	}
+}
+
+// REPL-1, REPL-5, REPL-11 (#20 review): a pack uploaded as a multipart
+// upload is answered before lendisk has hashed it and completed its
+// queue row (#49); here each such hash is held back four seconds, and
+// the tool writes the index and snapshot meanwhile. status --wait still
+// returns only once the pack is at two friends: a pending pack holds
+// the watermark and the metadata barrier. restic 0.19.1 sends no
+// multipart upload (§3.3), so a stock S3 client writes the backup in
+// restic's layout to the restic bucket, between real daemons.
+func TestStatusWaitWaitsForAMultipartPack(t *testing.T) {
+	f := newFourFriends(t, envHashDelay+"=4s")
+	ctx := t.Context()
+	cl := s3client(f.a.addr, f.creds)
+	bucket := aws.String("laptop")
+	hexKey := func(prefix string) string {
+		b := make([]byte, 32)
+		rand.Read(b)
+		return prefix + hex.EncodeToString(b)
+	}
+	pack := hexKey("data/7f/")
+	up, err := cl.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: bucket, Key: aws.String(pack)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parts []types.CompletedPart
+	for n, size := range []int{5 << 20, 1 << 20} {
+		body := make([]byte, size)
+		rand.Read(body)
+		r, err := cl.UploadPart(ctx, &s3.UploadPartInput{Bucket: bucket, Key: aws.String(pack), UploadId: up.UploadId,
+			PartNumber: aws.Int32(int32(n + 1)), Body: bytes.NewReader(body)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parts = append(parts, types.CompletedPart{ETag: r.ETag, PartNumber: aws.Int32(int32(n + 1))})
+	}
+	if _, err := cl.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: bucket, Key: aws.String(pack),
+		UploadId: up.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: parts}}); err != nil {
+		t.Fatal(err)
+	}
+	snap := hexKey("snapshots/")
+	for _, k := range []string{hexKey("index/"), snap} {
+		if _, err := cl.PutObject(ctx, &s3.PutObjectInput{Bucket: bucket, Key: aws.String(k),
+			Body: strings.NewReader("encrypted " + k)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var pending int
+	if err := openDB(t, f.an).QueryRow(`SELECT count(*) FROM queue WHERE key = ? AND state = 'pending'`, pack).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if pending != 1 {
+		t.Fatal("the pack's row is not pending while the snapshot is written: the test shows nothing")
+	}
+	f.waitOffsite(strings.TrimPrefix(snap, "snapshots/")[:8])
+	n := 0
+	h := replicable(t, f.an, "laptop")[pack]
+	for _, pn := range f.friends {
+		if lentObjects(t, pn.node, f.aID, "laptop")[pack] == h {
+			n++
+		}
+	}
+	if n < 2 {
+		t.Fatalf("status --wait returned with the multipart pack at %d friends", n)
 	}
 }

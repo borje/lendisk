@@ -57,6 +57,10 @@ const (
 	// envRerouteEvery is the replication worker's time between re-routing
 	// passes, on its clock (a Go duration).
 	envRerouteEvery = "LENDISK_TEST_REROUTE_EVERY"
+	// envHashDelay is a pause before a completed multipart upload, which
+	// the client has been answered for, is hashed (a Go duration): its
+	// queue row stays pending meanwhile.
+	envHashDelay = "LENDISK_TEST_HASH_DELAY"
 )
 
 // offsetClock is real time plus the duration in the file at path, read
@@ -97,6 +101,9 @@ func TestMain(m *testing.M) {
 			}
 		}
 		a.tuneReplication = tuneFromEnv
+		if d, err := time.ParseDuration(os.Getenv(envHashDelay)); err == nil {
+			a.beforeHash = func() { time.Sleep(d) }
+		}
 		if f := os.Getenv(envClock); f != "" {
 			a.clock = offsetClock(f)
 		}

@@ -19,7 +19,7 @@ snapshot = ["n*", "xn*"]
 # Their names say nothing of which snapshot (Kopia writes one xn blob
 # per session, snapshot or maintenance, named by a hash and the session
 # ID), so names_snapshots stays off: status says every snapshot Kopia
-# finished by the time the offsite index was written is offsite.
+# finished before the second the offsite index was written in is offsite.
 
 # Placed at every friend (REPL-12, D6): the format, blob-storage and
 # maintenance-schedule blobs, the index and epoch blobs (xn uncompacted,

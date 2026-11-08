@@ -33,8 +33,13 @@ type StatusOffsite struct {
 	Snapshot       *StatusSnapshot `json:"snapshot,omitempty"`
 	LatestSnapshot *StatusSnapshot `json:"latest_snapshot,omitempty"`
 	// Through is the capture time of the last fully placed write (RFC
-	// 3339, UTC): every write up to it is offsite. Empty when none is.
+	// 3339, UTC). Empty when none is.
 	Through string `json:"through,omitempty"`
+	// Before is the capture time of the first write not offsite (RFC
+	// 3339, UTC): every write captured in an earlier second is offsite.
+	// Capture times are whole seconds, so that write's second may hold
+	// offsite writes too. Empty when everything is offsite.
+	Before string `json:"before,omitempty"`
 	// Waiting is what keeps the latest snapshot (the latest write, with
 	// none) from being offsite: objects short of copies places. Stuck is those with no copy on its way to
 	// make up copies, by reason; waiting alone does not bring them.
@@ -55,19 +60,24 @@ type StatusSnapshot struct {
 	Offsite    bool   `json:"offsite"`
 }
 
-// StatusShortfall counts objects short of copies, and why for stuck
-// ones: refused by a friend (or unreadable in the store), dropped at a
-// full or gone friend, or no room in the pool.
+// StatusShortfall counts objects short of copies, how many are still
+// being written to the store (Pending, whose bytes are not counted yet),
+// and why for stuck ones: refused by a friend (or unreadable in the
+// store), dropped at a full or gone friend, held only by a friend
+// removed or gone past replace_after, or no room in the pool.
 type StatusShortfall struct {
 	Objects  int64 `json:"objects"`
 	Bytes    int64 `json:"bytes"`
+	Pending  int64 `json:"pending"`
 	Refused  int64 `json:"refused"`
 	Dropped  int64 `json:"dropped"`
+	Gone     int64 `json:"gone"`
 	Unplaced int64 `json:"unplaced"`
 }
 
 func shortfall(s state.Shortfall) StatusShortfall {
-	return StatusShortfall{Objects: s.Objects, Bytes: s.Bytes, Refused: s.Refused, Dropped: s.Dropped, Unplaced: s.Unplaced}
+	return StatusShortfall{Objects: s.Objects, Bytes: s.Bytes, Pending: s.Pending, Refused: s.Refused,
+		Dropped: s.Dropped, Gone: s.Gone, Unplaced: s.Unplaced}
 }
 
 // offsiteStatus reads bucket b's offsite state.
@@ -94,11 +104,13 @@ func offsiteStatus(ctx context.Context, db *state.DB, b state.Bucket, p *profile
 	out.Snapshot = snapshotOf(snap, p, o.Watermark)
 	out.LatestSnapshot = snapshotOf(latest, p, o.Watermark)
 	// What waits is counted for the latest snapshot, when there is one:
-	// the writes of a backup still running after it are not its.
-	if latest.Seq > 0 && latest.Seq < o.Latest && latest.Seq > o.Watermark {
-		if o, err = db.Offsite(ctx, b.Name, latest.Seq); err != nil {
-			return out, err
-		}
+	// the writes of a backup still running after it are not its. For
+	// recounts without reading the database again.
+	if latest.Seq > 0 {
+		o = o.For(latest.Seq)
+	}
+	if o.Next.Seq > 0 {
+		out.Before = utc(o.Next.CapturedAt)
 	}
 	out.Waiting, out.Stuck = shortfall(o.Waiting), shortfall(o.Stuck)
 	return out, nil
@@ -144,7 +156,9 @@ func offsitePhrase(s *StatusSnapshot, copies int) string {
 	if s.ID != "" {
 		return fmt.Sprintf("snapshot %s is offsite at %s", snapshotName(s), at)
 	}
-	return fmt.Sprintf("every snapshot finished by %s is offsite at %s (through %s)", textTime(s.CapturedAt), at, s.Key)
+	// Strictly before the index blob's capture second: another index
+	// captured in that second may be above the watermark.
+	return fmt.Sprintf("every snapshot finished before %s is offsite at %s (through %s)", textTime(s.CapturedAt), at, s.Key)
 }
 
 // notYetPhrase says that s is not offsite at copies yet.
@@ -160,6 +174,9 @@ func notYetPhrase(s *StatusSnapshot, copies int) string {
 func shortPhrase(waiting, stuck StatusShortfall, copies int) string {
 	places := plural(int64(copies), "place", "places")
 	s := fmt.Sprintf("%d objects, %d bytes still to reach %s", waiting.Objects, waiting.Bytes, places)
+	if waiting.Pending > 0 {
+		s += fmt.Sprintf(" (%d still being written to the store)", waiting.Pending)
+	}
 	if stuck.Objects == 0 {
 		return s
 	}
@@ -168,6 +185,7 @@ func shortPhrase(waiting, stuck StatusShortfall, copies int) string {
 		n    int64
 		what string
 	}{{stuck.Refused, "refused by a friend"}, {stuck.Dropped, "dropped at a full or gone friend"},
+		{stuck.Gone, "held by a friend removed or gone past replace_after"},
 		{stuck.Unplaced, "with no room for them in the pool"}} {
 		if r.n > 0 {
 			why = append(why, fmt.Sprintf("%d %s", r.n, r.what))
@@ -191,8 +209,10 @@ func offsiteLines(b StatusBucket) []string {
 		if o.Through == "" {
 			return []string{fmt.Sprintf("no write is offsite at %s yet: %s", at, short)}
 		}
-		return []string{fmt.Sprintf("every write up to %s is offsite at %s; later ones are not yet: %s",
-			textTime(o.Through), at, short)}
+		// Strictly before the first write that is not: capture times
+		// are whole seconds.
+		return []string{fmt.Sprintf("every write captured before %s is offsite at %s; later ones are not yet: %s",
+			textTime(o.Before), at, short)}
 	case o.LatestSnapshot.Offsite:
 		return []string{offsitePhrase(o.LatestSnapshot, b.Copies)}
 	}
@@ -208,8 +228,13 @@ func offsiteLines(b StatusBucket) []string {
 	return lines
 }
 
-// waitPoll is how often `status --wait` reads lendisk.db.
+// waitPoll is how often `status --wait` reads lendisk.db at most; it
+// waits at least ten times as long as the last read took, so a large
+// bucket does not keep a small machine busy (#20 review).
 const waitPoll = 2 * time.Second
+
+// waitInterval is the pause after a read of the watermark that took took.
+func waitInterval(took time.Duration) time.Duration { return max(waitPoll, 10*took) }
 
 // waitOffsite is `status --wait bucket` (REPL-5): it polls lendisk.db,
 // which the daemon writes as acknowledgements arrive (WAL, so reading
@@ -261,10 +286,12 @@ func (a *app) waitOffsite(ctx context.Context, cfg *config.Loaded, db *state.DB,
 	}
 	first, reported := true, false
 	for ; ; first = false {
+		began := a.now()
 		o, err := db.Offsite(ctx, bucket, target.Seq)
 		if err != nil {
 			return err
 		}
+		took := a.now().Sub(began)
 		s, at := name(o)
 		copies := plural(int64(o.Copies), "copy", "copies")
 		if o.Reached() {
@@ -275,12 +302,12 @@ func (a *app) waitOffsite(ctx context.Context, cfg *config.Loaded, db *state.DB,
 				case s != nil:
 					fmt.Fprintln(a.out, offsitePhrase(s, o.Copies))
 				default:
-					fmt.Fprintf(a.out, "every write up to %s is offsite at %s\n", at, copies)
+					fmt.Fprintf(a.out, "every write before the wait is offsite at %s (the last captured at %s)\n", copies, at)
 				}
 			}
 			return nil
 		}
-		what := fmt.Sprintf("the writes up to %s are not offsite at %s yet", at, copies)
+		what := fmt.Sprintf("the writes before the wait (the last captured at %s) are not offsite at %s yet", at, copies)
 		if s != nil {
 			what = notYetPhrase(s, o.Copies)
 		}
@@ -300,7 +327,7 @@ func (a *app) waitOffsite(ctx context.Context, cfg *config.Loaded, db *state.DB,
 		if timeout > 0 && a.now().Sub(start) >= timeout {
 			return codeError{fmt.Errorf("timed out after %v: %s", timeout, what), 3}
 		}
-		if err := a.pause(ctx, waitPoll); err != nil {
+		if err := a.pause(ctx, waitInterval(took)); err != nil {
 			return err
 		}
 	}

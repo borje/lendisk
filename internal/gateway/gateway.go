@@ -84,6 +84,9 @@ type Gateway struct {
 
 	// AfterStore is the decorator's crash-window hook. Tests only.
 	AfterStore func()
+	// BeforeHash, if set, runs before a completed multipart upload,
+	// already answered, is hashed: a slow hash. Tests only.
+	BeforeHash func()
 	// ResolveEvery is how often rows a failed request left pending are
 	// settled while serving (default a minute).
 	ResolveEvery time.Duration
@@ -232,7 +235,7 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 // anything is served (EP-3).
 func (g *Gateway) decorator(ctx context.Context, be *Store) (*Decorator, error) {
 	d := &Decorator{Backend: be, Uploads: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore,
-		Fetch: g.Fetch, ctx: ctx}
+		Fetch: g.Fetch, ctx: ctx, beforeHash: g.BeforeHash}
 	if d.Profiles == nil {
 		set, err := profile.Load("")
 		if err != nil {

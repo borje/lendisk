@@ -53,6 +53,9 @@ type app struct {
 	// afterStore is the capture crash-window hook (gateway.AfterStore);
 	// tests only.
 	afterStore func()
+	// beforeHash is the gateway's hook before a completed upload is
+	// hashed (gateway.BeforeHash); tests only.
+	beforeHash func()
 	// tuneBridge, if set, adjusts the bridge before it serves. Tests only.
 	tuneBridge func(*bridge.Bridge)
 	// tuneReplication, if set, adjusts the replication worker before it

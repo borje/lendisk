@@ -406,6 +406,7 @@ friend, or with no room in the pool), which status shows.`,
 					return err
 				}
 				defer db.Close()
+				db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
 				return a.waitOffsite(cmd.Context(), cfg, db, wait, timeout, quiet)
 			}
 			if quiet {
@@ -430,6 +431,8 @@ friend, or with no room in the pool), which status shows.`,
 				return err
 			}
 			defer db.Close()
+			// As the daemon judges reachability: which friends are gone (D6).
+			db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
 			bs, err := db.Buckets(cmd.Context())
 			if err != nil {
 				return err
@@ -461,7 +464,6 @@ friend, or with no room in the pool), which status shows.`,
 					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1,
 					OutsideTrust: !profiles.Get(b.Profile).Encrypted, Offsite: off})
 			}
-			db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
 			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
 				return err
 			}

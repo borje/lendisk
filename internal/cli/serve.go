@@ -103,7 +103,7 @@ func (a *app) serveCmd() *cobra.Command {
 				a.tuneFetch(fetch)
 			}
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
-				Profiles: profiles, AfterStore: a.afterStore, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
+				Profiles: profiles, AfterStore: a.afterStore, BeforeHash: a.beforeHash, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
 				Fetch: fetch}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
