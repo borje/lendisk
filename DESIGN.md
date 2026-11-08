@@ -2814,8 +2814,10 @@ upstream bucket is Q-V.
   - *Surplus.* With more good copies than `copies` (lowered, EP-6; or a
     gone friend back while its replacement waits), unsent ones no
     sender holds are cancelled first, then acknowledged ones are marked
-    `dropping` while more than `copies` stay acknowledged, the fullest
-    place (smallest free fraction) first. A row a sender holds is left
+    `dropping` while more than `copies` stay acknowledged: at an
+    unreachable friend first, as the others answer, then the fullest
+    place (smallest free fraction)
+    (`TestASurplusCopyAtAnUnreachableFriendGoesFirst`). A row a sender holds is left
     alone and the worker looks again at its next re-routing tick
     (`TestASurplusCopyBeingSentIsNotCancelled`).
   - *Removed friends (#25 review).* A friend removed has no friendship

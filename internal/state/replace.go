@@ -560,6 +560,12 @@ func (m *replacer) page(ctx context.Context, bucket string, after int64) ([]robj
 	return out, rows.Err()
 }
 
+// reachable reports whether place is a friend that is not unreachable.
+func (m *replacer) reachable(place string) bool {
+	f := m.friends[place]
+	return f != nil && f.reachable
+}
+
 // fullness orders places for a surplus copy to go: the smallest free
 // fraction first (the fullest), ties by node ID.
 func (m *replacer) fullness(a, b string) int {
@@ -637,7 +643,18 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 				queued = append(queued, r)
 			}
 		}
-		byFull := func(a, b prow) int { return m.fullness(a.place, b.place) }
+		// Unreachable friends first (the others answer, #26 review),
+		// then the fullest.
+		byFull := func(a, b prow) int {
+			ra, rb := m.reachable(a.place), m.reachable(b.place)
+			if ra != rb {
+				if rb {
+					return -1
+				}
+				return 1
+			}
+			return m.fullness(a.place, b.place)
+		}
 		slices.SortFunc(queued, byFull)
 		slices.SortFunc(ackedRows, byFull)
 		for _, r := range queued {

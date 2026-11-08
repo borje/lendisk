@@ -54,6 +54,25 @@ func TestStoreRefusedMetadataDoesNotKeepANewFriendFromData(t *testing.T) {
 	}
 }
 
+// EP-6, REPL-13 (#26 review): a surplus copy at an unreachable friend
+// goes first, however much room it has: the others answer.
+func TestASurplusCopyAtAnUnreachableFriendGoesFirst(t *testing.T) {
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 100) // the least full
+	p.friend("D", 10)
+	p.bucket("laptop", 3)
+	d1 := p.put("laptop", "data/1", "data", 1)
+	p.ackAll(d1)
+	p.condition("C", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-2*time.Hour))
+	if err := p.db.SetCopies(context.Background(), "laptop", 2); err != nil {
+		t.Fatal(err)
+	}
+	p.replace()
+	p.wantState("C", d1, PlacementDropping)
+	p.wantPlaces("data/1", d1, "B", "D")
+}
+
 // replace runs one re-placement pass and fails the test on an error.
 func (p *pool) replace() ReplaceStats {
 	p.t.Helper()
