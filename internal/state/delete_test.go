@@ -325,3 +325,26 @@ func TestDataDeleteWaitsForEarlierMetadataAtFriendsThatAnswer(t *testing.T) {
 		t.Fatal("a delete held by metadata written after it")
 	}
 }
+
+// REPL-12 (#21): a put acknowledged after its delete was placed (it was
+// in flight) is freed by that delete like one acknowledged before it.
+func TestAPutAcknowledgedAfterItsDeleteIsFreed(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.bucket("laptop", 1)
+	d := p.put("laptop", "data/1", "data", 2)
+	p.start("B", d)
+	del := p.del("laptop", "data/1", "data")
+	p.ack("B", d)
+	p.ack("B", del)
+	if use, err := p.db.PlaceUse(ctx); err != nil || use["B"] != 0 {
+		t.Fatalf("use %v %v after the put and its delete", use, err)
+	}
+	// A put written again after the delete still counts.
+	d2 := p.put("laptop", "data/1", "data", 1)
+	p.ack("B", d2)
+	if use, _ := p.db.PlaceUse(ctx); use["B"] != unit {
+		t.Fatalf("use %v after a write after the delete", use)
+	}
+}

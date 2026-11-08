@@ -2079,9 +2079,11 @@ upstream bucket is Q-V.
   delete there (a put a delete cancels leaves the count with its row).
   SQLite triggers on `placement` keep it as rows are
   inserted, acknowledged, refused, re-queued, cancelled and moved, so
-  placing an object reads one row per friend. A row acknowledged after
-  its delete was placed (a send in flight) stays counted: the count
-  errs towards less room. A lender keeps a deleted object counted
+  placing an object reads one row per friend. A put acknowledged after
+  a delete of its key was placed at the place (a send in flight) is
+  acknowledged with size 0 (`AckPlacement`, #21): that delete removes
+  it, and the delete's own size did not include it
+  (`TestAPutAcknowledgedAfterItsDeleteIsFreed`). A lender keeps a deleted object counted
   until its purge (§3.6), so this count frees it a retention window
   early, erring towards more room until the `507` below or the `quota`
   answer corrects it. *Correction from the lender's answers:* the lender's only
@@ -2095,8 +2097,9 @@ upstream bucket is Q-V.
   corrects `place_use` but the rows, so it drifts from what the lender
   holds. Known sources: a send that landed but whose answer was lost
   (a network error), whose row is then re-routed, cancelled as
-  superseded or dropped, leaves bytes the count does not hold; a row
-  acknowledged after its delete was placed stays counted; a lender's
+  superseded or dropped, leaves bytes the count does not hold (an
+  `abandoned` row, #21, is not counted either, though a delete still
+  follows it); a lender's
   real per-object overhead and its retention of deleted objects (RET-1)
   differ from the fixed 4 KiB and the immediate free; a refused row's
   place may still hold older bytes of the key; and partial multipart

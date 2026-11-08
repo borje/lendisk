@@ -100,8 +100,14 @@ func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok 
 // AckPlacement records that place acknowledged the row, with the hash it
 // verified (empty for a delete). Acknowledging again is harmless.
 func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?, acked_at = ?
-		WHERE place = ? AND seq = ?`, nullStr(sha256), now.Unix(), place, seq)
+	// A put acknowledged after a delete of its key was placed there (it
+	// was in flight) no longer counts: that delete removes it, and its
+	// own count did not include it (#21).
+	_, err := db.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?1, acked_at = ?2,
+		size = CASE WHEN op = 'put' AND state != 'acked' AND EXISTS (SELECT 1 FROM placement d
+			WHERE d.place = placement.place AND d.bucket = placement.bucket AND d.key = placement.key
+			AND d.op = 'delete' AND d.seq > placement.seq) THEN 0 ELSE size END
+		WHERE place = ?3 AND seq = ?4`, nullStr(sha256), now.Unix(), place, seq)
 	return err
 }
 
