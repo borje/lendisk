@@ -1,6 +1,7 @@
 package bridge
 
 import (
+	"io"
 	"net/http"
 	"sync/atomic"
 
@@ -68,10 +69,24 @@ func (b *Bridge) TunnelS3Handler() http.Handler {
 				Description: "lendisk: the access key must be the node ID this connection authenticated as"})
 			return
 		}
-		defer b.bound(w, r)()
+		defer b.bound(w, r, caller.Peer.String())()
+		if b.Pace != nil {
+			// LEND-5: the answer to this borrower at its own rate.
+			w = &pacedAnswer{ResponseWriter: w, w: b.Pace.LendOut(r.Context(), caller.Peer.String(), w)}
+		}
 		b.proxy.ServeHTTP(w, r)
 	})
 }
+
+// pacedAnswer is a response writer whose body is paced (LEND-5). Unwrap
+// lets the proxy flush and set deadlines on the connection's writer.
+type pacedAnswer struct {
+	http.ResponseWriter
+	w io.Writer
+}
+
+func (p *pacedAnswer) Write(b []byte) (int, error) { return p.w.Write(b) }
+func (p *pacedAnswer) Unwrap() http.ResponseWriter { return p.ResponseWriter }
 
 // Late is a handler set once its target exists: the tunnel serves before
 // the gateway is ready, and answers S3 with 503 until then.

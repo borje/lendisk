@@ -7,6 +7,7 @@ import (
 	"errors"
 	"hash"
 	"io"
+	"io/fs"
 	"log/slog"
 	"maps"
 	"strconv"
@@ -752,9 +753,9 @@ func (l *Lending) createUploadLent(ctx context.Context, peer, sealed string, in 
 	if err := checkKey(key); err != nil {
 		return none, err
 	}
-	// A rewrite is a single put (#74): a multipart create's mark is
-	// dropped, and a key holding other bytes refuses it as ever.
-	want, _, meta, err := declared(in.Metadata)
+	// A rewrite in parts (#74, #23): the mark is checked here and again
+	// at completion, and kept with the upload, not with the object.
+	want, mark, meta, err := declared(in.Metadata)
 	if err != nil {
 		return none, err
 	}
@@ -768,7 +769,10 @@ func (l *Lending) createUploadLent(ctx context.Context, peer, sealed string, in 
 	if err != nil {
 		return none, errInternal
 	}
-	if has && old.sha256 != want {
+	if mark == want {
+		mark = ""
+	}
+	if has && old.sha256 != want && old.sha256 != mark {
 		return none, errKeyChanged
 	}
 	if !has {
@@ -776,7 +780,9 @@ func (l *Lending) createUploadLent(ctx context.Context, peer, sealed string, in 
 		if err != nil {
 			return none, err
 		}
-		if _, same := sameHash(ts, want); len(ts) > 0 && !same {
+		_, same := sameHash(ts, want)
+		newer := mark != "" && len(ts) > 0 && ts[len(ts)-1].SHA256 == mark
+		if len(ts) > 0 && !same && !newer {
 			return none, errKeyChanged
 		}
 	}
@@ -793,7 +799,7 @@ func (l *Lending) createUploadLent(ctx context.Context, peer, sealed string, in 
 		return res, err
 	}
 	if err := l.DB.AddLentUpload(context.Background(), state.LentUpload{UploadID: res.UploadId, Peer: peer, Sealed: sealed,
-		Key: key, SHA256: want, CreatedAt: l.now()}); err != nil {
+		Key: key, SHA256: want, CreatedAt: l.now(), Replaces: mark}); err != nil {
 		l.log().Error("lending: recording a borrower's upload failed; refusing it", "bucket", *in.Bucket, "key", key, "err", err)
 		id := res.UploadId
 		l.Next.AbortMultipartUpload(context.Background(), &s3.AbortMultipartUploadInput{Bucket: in.Bucket, Key: in.Key, UploadId: &id})
@@ -972,7 +978,10 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 	if uerr != nil {
 		return none, "", uerr
 	}
-	if has && old.sha256 != u.SHA256 {
+	// A rewrite in parts (#74, #23): the key must still hold the
+	// version the upload was marked as replacing.
+	rewrite := has && old.sha256 != u.SHA256 && u.Replaces != "" && old.sha256 == u.Replaces
+	if has && old.sha256 != u.SHA256 && !rewrite {
 		return none, "", errKeyChanged
 	}
 	var tomb *state.Tombstone
@@ -982,7 +991,8 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 			return none, "", err
 		}
 		t, same := sameHash(ts, u.SHA256)
-		if len(ts) > 0 && !same {
+		newer := u.Replaces != "" && len(ts) > 0 && ts[len(ts)-1].SHA256 == u.Replaces
+		if len(ts) > 0 && !same && !newer {
 			return none, "", errKeyChanged
 		}
 		if same {
@@ -1012,7 +1022,7 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		}
 		return s3response.CompleteMultipartUploadResult{Bucket: in.Bucket, Key: in.Key, ETag: &etag}, "", nil
 	}
-	if has {
+	if has && !rewrite {
 		// The same object again: keep the stored one.
 		if err := l.Next.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: in.Bucket, Key: in.Key, UploadId: in.UploadId}); err != nil {
 			return none, "", err
@@ -1032,19 +1042,40 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 	}
 	// A borrower's put of the key waits for the key's lock this
 	// completion holds; an object published by other means since the
-	// check above refuses this one.
+	// check above refuses this one. A rewrite first moves the version it
+	// replaces into its tomb, as a marked PUT does (rewrite.go), and
+	// publishes unconditionally: nothing else publishes at the key while
+	// this completion holds its lock.
 	c := *in
 	c.IfNoneMatch = &anyETag
+	var replaced state.Tombstone
+	if rewrite {
+		if replaced, err = l.tombForRewrite(ctx, peer, sealed, bucket, key, old); err != nil {
+			return none, "", err
+		}
+		c.IfNoneMatch = nil
+	}
+	undo := func() {
+		if replaced.ID == 0 {
+			return
+		}
+		if _, rerr := l.revive(ctx, bucket, replaced); rerr != nil && !isCode(rerr, "PreconditionFailed") {
+			l.log().Error("lending: moving a rewrite's replaced version back failed; it stays in its tomb", "bucket", bucket, "key", key, "err", rerr)
+		}
+	}
 	res, ver, err := l.Next.CompleteMultipartUpload(ctx, &c)
 	if preconditionFailed(err) {
+		undo()
 		return res, ver, errKeyChanged
 	}
 	if err != nil {
+		undo()
 		return res, ver, err
 	}
 	n, got, err := l.hashStored(ctx, bucket, key)
 	if err != nil || got != u.SHA256 {
 		l.remove(bucket, key)
+		undo()
 		l.count(peer, -(parts + itemOverhead))
 		l.dropUpload(uploadID)
 		if err != nil {
@@ -1053,9 +1084,50 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		}
 		return none, "", errBadDigest
 	}
+	if replaced.ID != 0 {
+		if err := l.DB.KeepTombstone(context.Background(), replaced.ID); err != nil {
+			l.log().Warn("lending: marking a rewrite's tombstone kept failed; the next start settles it", "bucket", bucket, "key", key, "err", err)
+		}
+	}
 	l.count(peer, n-parts)
 	l.dropUpload(uploadID)
 	return res, ver, nil
+}
+
+// tombForRewrite moves old, the version a rewrite in parts replaces,
+// into a tomb, its row written pending first (as replace does for a
+// marked PUT). The caller holds the key's lock and the borrower's pub
+// lock, and moves it back (revive) if the new version is not published.
+func (l *Lending) tombForRewrite(ctx context.Context, peer, sealed, bucket, key string, old storedObject) (state.Tombstone, error) {
+	f, err := l.DB.GetFriendship(ctx, peer)
+	if errors.Is(err, state.ErrNotFound) {
+		return state.Tombstone{}, errNotFriend
+	}
+	if err != nil {
+		return state.Tombstone{}, errInternal
+	}
+	now := l.now()
+	tomb, err := l.tombName(bucket, key, now)
+	if err != nil {
+		return state.Tombstone{}, errInternal
+	}
+	row := state.Tombstone{Peer: peer, Sealed: sealed, Key: key, Tomb: tomb, SHA256: old.sha256, ETag: old.etag,
+		Size: old.size, DeletedAt: now, PurgeAfter: now.Add(Retention(f)), Rewrite: true, Pending: true}
+	id, err := l.DB.AddTombstone(context.Background(), row)
+	if err != nil {
+		l.log().Error("lending: recording a rewrite's tombstone failed; refusing the rewrite", "bucket", bucket, "key", key, "err", err)
+		return state.Tombstone{}, errInternal
+	}
+	if err := l.moveIntoTomb(bucket, key, tomb); err != nil {
+		l.dropTomb(id)
+		if errors.Is(err, fs.ErrNotExist) {
+			return state.Tombstone{}, errKeyChanged
+		}
+		l.log().Error("lending: moving a rewrite's replaced version into its tomb failed; refusing the rewrite", "bucket", bucket, "key", key, "err", err)
+		return state.Tombstone{}, errInternal
+	}
+	row.ID = id
+	return row, nil
 }
 
 // verifyLanded hashes an object that upload u completed before a crash;

@@ -135,7 +135,7 @@ func TestUnmarkedOrStaleRewriteRefused(t *testing.T) {
 		"unmarked":           func() error { return l.put("config", v3, hashMeta(v3)) },
 		"stale mark":         func() error { return l.put("config", v3, rewriteMeta(v3, sum(v1))) },
 		"mark of the bytes":  func() error { return l.put("config", v3, rewriteMeta(v3, sum(v3))) },
-		"multipart, marked":  func() error { _, err := l.create("config", rewriteMeta(v3, sum(v2))); return err },
+		"multipart, stale":   func() error { _, err := l.create("config", rewriteMeta(v3, sum(v1))); return err },
 		"multipart unmarked": func() error { return l.mpu("config", sum(v3), v3) },
 	} {
 		if err := try(); code(err) != "PreconditionFailed" || status(err) != 412 {

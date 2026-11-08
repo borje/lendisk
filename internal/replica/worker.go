@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/pace"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -31,7 +32,11 @@ import (
 // delete in its place's FIFO. An object is read
 // from the store as it is sent, once per place, with its capture hash
 // (REPL-10); the place's acknowledgement records the hash. The queue is
-// lendisk.db, so a restart continues at the first unacknowledged row.
+// lendisk.db, so a restart continues at the first unacknowledged row;
+// an object larger than the part size goes in parts, recorded there as
+// they complete, so a restart continues at the next part (REPL-6). Every
+// body sent is paced by Pace (REPL-7), and nothing is sent outside its
+// schedule.
 type Worker struct {
 	DB       *state.DB
 	StoreDir string // the posix store: an object is <StoreDir>/<bucket>/<key>
@@ -86,8 +91,12 @@ type Worker struct {
 	// call, #68). It must not block.
 	Full func(place string)
 	// OnRead, if set, is called after each read of a body sent to a
-	// place, with the bytes read so far. Tests only.
+	// place, with the bytes of the object read so far. Tests only.
 	OnRead func(place string, seq, read int64)
+	// Pace paces every body sent and holds the schedule and the part
+	// size (REPL-6, REPL-7); nil sends unpaced, at any time, in parts of
+	// pace.DefaultPartSize.
+	Pace *pace.Pacer
 
 	// friendships reads the friendships; nil means DB.Friendships. Tests
 	// set it to fail.
@@ -207,10 +216,15 @@ var errSuperseded = errors.New("superseded by a later write of the key")
 // against its bucket (#50, #57).
 var errLocal = errors.New("the store cannot supply the captured object")
 
-// errOversize: the object is larger than one PUT carries. A local error
-// refused with cause oversize, which multipart replication (#23)
-// re-queues (state.RequeueOversize).
-var errOversize = fmt.Errorf("%w: larger than one PUT carries", errLocal)
+// errOversize: the object is larger than the place can be sent (one
+// PUT, or MaxObjectSize in parts). A local error refused with cause
+// oversize, which the worker re-queues at start when it can send it
+// (state.RequeueOversize, #61, #23).
+var errOversize = fmt.Errorf("%w: larger than an object can be sent", errLocal)
+
+// errWindowClosed: the schedule closed (REPL-7). The row stays queued
+// and its parts recorded; it continues once the schedule opens.
+var errWindowClosed = errors.New("outside the replication schedule")
 
 // errGone: the store holds no file for the object. A local error, unless
 // Worker.Fill can put it there from a friend (after recover, #26 review).
@@ -241,6 +255,7 @@ func (w *Worker) Run(ctx context.Context) {
 	if friendships == nil {
 		friendships = w.DB.Friendships
 	}
+	w.start(ctx)
 	var rerouted, replaced time.Time
 	var pool string // the pool's fingerprint at the last re-placement pass
 	again := false  // the last pass left a row in flight: look again
@@ -249,6 +264,7 @@ func (w *Worker) Run(ctx context.Context) {
 		if now.Sub(rerouted) >= orDefault(w.RerouteEvery, time.Minute) {
 			rerouted = now
 			w.reroute(ctx)
+			w.dropStale(ctx)
 			if again {
 				replaced = time.Time{}
 			}
@@ -306,6 +322,39 @@ func (w *Worker) Run(ctx context.Context) {
 		}
 		if !sleep(ctx, 5*poll) {
 			return
+		}
+	}
+}
+
+// start runs once when the worker starts: rows refused only as too
+// large for one PUT are put back in their FIFOs, as they now go in parts
+// (state.RequeueOversize, #61, #23), and the multipart uploads of rows
+// that left their FIFO while the daemon was down are forgotten.
+func (w *Worker) start(ctx context.Context) {
+	if n, err := w.DB.RequeueOversize(ctx, MaxObjectSize); err != nil {
+		if ctx.Err() == nil {
+			w.Log.Error("replication: re-queueing objects too large for one PUT failed", "err", err)
+		}
+	} else if n > 0 {
+		w.Log.Info("replication: objects refused as too large for one PUT are queued again, to be sent in parts", "rows", n)
+	}
+	w.dropStale(ctx)
+}
+
+// dropStale forgets the uploads of rows no longer queued at their place
+// (acknowledged, refused, re-routed). The place's own upload is left to
+// it: a lender aborts an upload with no part for a week (§3.5 LEND-1).
+func (w *Worker) dropStale(ctx context.Context) {
+	stale, err := w.DB.StaleTransfers(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			w.Log.Error("replication: reading unfinished uploads failed", "err", err)
+		}
+		return
+	}
+	for _, t := range stale {
+		if err := w.DB.DropTransfer(ctx, t.Place, t.Seq); err != nil && ctx.Err() == nil {
+			w.Log.Error("replication: forgetting an unfinished upload failed", "place", t.Place, "seq", t.Seq, "err", err)
 		}
 	}
 }
@@ -404,6 +453,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	// kind after anything else is alerted and backs off from minB, so a
 	// store failure is alerted whatever the network did before (#61).
 	failing := ""
+	closed := false // the schedule was closed at the last look
 	log := w.Log.With("place", place)
 	// stale: the place may be recorded as waiting on the store, so an
 	// empty FIFO resets it (#57). True at start for a condition left by
@@ -471,6 +521,16 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				continue
 			}
 		}
+		// The schedule (REPL-7): nothing is taken while it is closed.
+		if !w.Pace.Open() {
+			if !closed {
+				log.Info("replication: outside the schedule; waiting for it to open", "schedule", w.Pace.Settings().Schedule.String())
+				closed = true
+			}
+			sleep(ctx, poll)
+			continue
+		}
+		closed = false
 		// Taken: from here the send may land, so a delete of the key
 		// follows the row instead of cancelling it. A row a delete has
 		// cancelled meanwhile is not sent (REPL-2, #21).
@@ -509,11 +569,18 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			condition(state.ConditionOK, "")
 			log.Debug("replicated", row...)
 		case errors.Is(err, errSuperseded):
+			w.forget(place, r, p)
 			if err := w.DB.CancelPlacement(bg, place, p.Seq); err != nil {
 				log.Error("replication: cancelling a superseded row failed", append(row, "err", err)...)
 				sleep(ctx, poll)
 			}
+		case errors.Is(err, errWindowClosed):
+			// Stopped at the end of a part; the rest goes once the schedule
+			// opens again (REPL-7).
+			log.Info("replication: the schedule closed; the object continues at its next part when it opens", row...)
+			sleep(ctx, poll)
 		case errors.Is(err, ErrImmutable) && p.Rewritable:
+			w.forget(place, r, p)
 			w.refuse(log, place, p, row, err, "replication alert: the friend keeps refusing a rewrite of this rewritable key; not replicated there")
 			condition(state.ConditionOK, "")
 		case errors.Is(err, ErrImmutable):
@@ -524,6 +591,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			if errors.As(err, &ce) {
 				held = ce.held
 			}
+			w.forget(place, r, p)
 			log.Error("immutability alert: the friend holds this key with another hash; not replicated there",
 				append(row, "sha256", p.SHA256, "held", held, "alert", true, "err", err)...)
 			if err := w.DB.RefuseChanged(bg, place, p.Seq, held, err.Error()); err != nil {
@@ -542,10 +610,12 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			}
 			// Nothing will make the store supply the captured bytes, so
 			// waiting would stall every place's FIFO for good (#48, #50).
+			w.forget(place, r, p)
 			w.refuseObject(log, p, row, err)
 		case errors.Is(err, ErrRejected):
 			// send re-hashed the store's copy and it matches the capture:
 			// the place is at fault, and only its copy is refused (#57).
+			w.forget(place, r, p)
 			w.refuse(log, place, p, row, err, "replication alert: the place rejects bytes that match their capture hash; not replicated there")
 			condition(state.ConditionOK, "") // the place answered
 		case errors.Is(err, errStore):
@@ -786,29 +856,35 @@ func heldDesc(held string, ok bool) string {
 }
 
 // put sends the row's object from the store, marked as a rewrite of the
-// version with hash replaces if that is set.
+// version with hash replaces if that is set: in one PUT, or in parts
+// when it is larger than the part size or one PUT, or when an upload of
+// it is already under way (REPL-6). Each body is paced and holds an
+// upload slot while it is sent (REPL-7).
 func (w *Worker) put(ctx context.Context, place string, r Replica, p state.Placement, replaces string) error {
-	body, done, err := w.openFilled(ctx, p)
-	if err != nil {
-		return err
+	mp, multi := r.(Multipart)
+	limit := int64(MaxPutSize)
+	if multi {
+		limit = MaxObjectSize
 	}
-	defer done()
-	// A store read that does not return ends the body with an error, so
-	// the put fails as the store's failure before the client's stall
-	// timeout blames the place (#61).
-	sr := w.storeReader(body, p.Size)
-	defer sr.Close()
-	body = sr
-	if w.OnRead != nil {
-		body = &observed{r: body, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
+	if p.Size > limit {
+		return fmt.Errorf("%w: %d bytes is more than %d", errOversize, p.Size, limit)
 	}
-	err = r.Put(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Replaces: replaces, Body: body})
+	var err error
+	if multi {
+		tr, has, terr := w.DB.Transfer(ctx, place, p.Seq)
+		if terr != nil {
+			return terr
+		}
+		if p.Size > w.Pace.PartSize() || p.Size > MaxPutSize || has {
+			err = w.putParts(ctx, place, mp, p, replaces, tr, has)
+		} else {
+			err = w.putOnce(ctx, place, r, p, replaces)
+		}
+	} else {
+		err = w.putOnce(ctx, place, r, p, replaces)
+	}
 	if ctx.Err() != nil || err == nil {
 		return err
-	}
-	if rerr := sr.failed(); rerr != nil {
-		// The place did not fail: reading the store did.
-		return w.unreadable(ctx, p, "reading", rerr)
 	}
 	if errors.Is(err, ErrRejected) {
 		// The place says the bytes do not match the hash. Only the
@@ -821,6 +897,217 @@ func (w *Worker) put(ctx context.Context, place string, r Replica, p state.Place
 	}
 	return err
 }
+
+// putOnce sends the object in one PUT; an interrupted one is sent again
+// whole.
+func (w *Worker) putOnce(ctx context.Context, place string, r Replica, p state.Placement, replaces string) error {
+	body, done, err := w.openFilled(ctx, p)
+	if err != nil {
+		return err
+	}
+	defer done()
+	release, err := w.Pace.Slot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// A store read that does not return ends the body with an error, so
+	// the put fails as the store's failure before the client's stall
+	// timeout blames the place (#61).
+	sr := w.storeReader(body, p.Size)
+	defer sr.Close()
+	body = w.Pace.Send(ctx, place, sr)
+	if w.OnRead != nil {
+		body = &observed{r: body, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
+	}
+	err = r.Put(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Replaces: replaces, Body: body})
+	if ctx.Err() != nil || err == nil {
+		return err
+	}
+	if rerr := sr.failed(); rerr != nil {
+		// The place did not fail: reading the store did.
+		return w.unreadable(ctx, p, "reading", rerr)
+	}
+	return err
+}
+
+// partSizeFor is the part size for an object of size bytes: the
+// configured one, larger (in whole MiB) when the object would need more
+// than MaxParts.
+func partSizeFor(size, configured int64) int64 {
+	if need := (size + MaxParts - 1) / MaxParts; need > configured {
+		const mib = 1 << 20
+		return (need + mib - 1) / mib * mib
+	}
+	return configured
+}
+
+// putParts sends the object in parts (REPL-6, Q-Y.1). The upload ID and
+// each part the place acknowledges are recorded as they complete
+// (state.Transfer); an upload recorded before is checked against the
+// place's listing, the parts it holds with the recorded ETag are kept,
+// and the rest are sent, each read from its offset in the store. An
+// upload the place no longer has starts the object over, as does one
+// begun with another mark than the row now needs. The schedule is
+// checked before each part, so a closing window stops the object at the
+// end of the part in flight (REPL-7).
+func (w *Worker) putParts(ctx context.Context, place string, mp Multipart, p state.Placement, replaces string, tr state.Transfer, has bool) error {
+	body, done, err := w.openFilled(ctx, p)
+	if err != nil {
+		return err
+	}
+	defer done()
+	ra, ok := body.(io.ReaderAt)
+	if !ok {
+		return fmt.Errorf("%w: %s/%s cannot be read from an offset", errStore, p.Bucket, p.Key)
+	}
+	if has && tr.Replaces != replaces {
+		// Begun as a rewrite of another version, or of none: the place
+		// would store it so, so it starts over (#74).
+		w.abort(mp, p, tr)
+		has = false
+	}
+	kept := map[int]state.TransferPart{}
+	if has {
+		listed, err := mp.Parts(ctx, p.Bucket, p.Key, tr.UploadID)
+		switch {
+		case errors.Is(err, ErrNoSuchUpload):
+			w.dropTransfer(place, p.Seq)
+			has = false
+		case err != nil:
+			return err
+		}
+		for _, part := range tr.Parts {
+			if e, ok := listed[part.Number]; ok && trimETag(e) == trimETag(part.ETag) {
+				kept[part.Number] = part
+			}
+		}
+	}
+	if !has {
+		if !w.Pace.Open() {
+			return errWindowClosed
+		}
+		size := partSizeFor(p.Size, w.Pace.PartSize())
+		id, err := mp.Create(ctx, Object{Bucket: p.Bucket, Key: p.Key, Size: p.Size, SHA256: p.SHA256, Replaces: replaces})
+		if err != nil {
+			return err
+		}
+		tr = state.Transfer{Place: place, Seq: p.Seq, UploadID: id, PartSize: size, Replaces: replaces}
+		if err := w.DB.BeginTransfer(context.Background(), tr); err != nil {
+			w.abort(mp, p, tr)
+			return err
+		}
+	}
+	n := int((p.Size + tr.PartSize - 1) / tr.PartSize)
+	if len(kept) > 0 {
+		w.Log.Info("replication: resuming an upload at its next part", "place", place, "bucket", p.Bucket, "key", p.Key,
+			"seq", p.Seq, "parts_kept", len(kept), "parts", n)
+	}
+	for i := 1; i <= n; i++ {
+		if _, ok := kept[i]; ok {
+			continue
+		}
+		if !w.Pace.Open() {
+			return errWindowClosed
+		}
+		if sup, err := w.DB.Superseded(ctx, p.Seq); err != nil {
+			return err
+		} else if sup {
+			return errSuperseded
+		}
+		off := int64(i-1) * tr.PartSize
+		part, err := w.putPart(ctx, place, mp, p, tr.UploadID, i, io.NewSectionReader(ra, off, min(tr.PartSize, p.Size-off)), off)
+		if errors.Is(err, ErrNoSuchUpload) {
+			w.dropTransfer(place, p.Seq)
+			return fmt.Errorf("the place no longer has the upload of %s; starting the object over: %w", p.Key, err)
+		}
+		if err != nil {
+			return err
+		}
+		kept[i] = part
+		if err := w.DB.AddTransferPart(context.Background(), place, p.Seq, part); err != nil {
+			return err
+		}
+	}
+	parts := make([]Part, 0, n)
+	for i := 1; i <= n; i++ {
+		k := kept[i]
+		parts = append(parts, Part{Number: k.Number, ETag: k.ETag, SHA256: k.SHA256, Size: k.Size})
+	}
+	err = mp.Complete(ctx, p.Bucket, p.Key, tr.UploadID, parts)
+	switch {
+	case err == nil, errors.Is(err, ErrRejected):
+		// Stored, or refused and removed by the place with the upload.
+		w.dropTransfer(place, p.Seq)
+	case errors.Is(err, ErrNoSuchUpload):
+		w.dropTransfer(place, p.Seq)
+		return fmt.Errorf("the place no longer has the upload of %s; starting the object over: %w", p.Key, err)
+	}
+	return err
+}
+
+// putPart sends part n, read from the store through section; off is
+// its offset in the object.
+func (w *Worker) putPart(ctx context.Context, place string, mp Multipart, p state.Placement, id string, n int, section *io.SectionReader, off int64) (state.TransferPart, error) {
+	release, err := w.Pace.Slot(ctx)
+	if err != nil {
+		return state.TransferPart{}, err
+	}
+	defer release()
+	size := section.Size()
+	sr := w.storeReader(section, size)
+	defer sr.Close()
+	body := w.Pace.Send(ctx, place, sr)
+	if w.OnRead != nil {
+		body = &observed{r: body, n: off, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
+	}
+	part, err := mp.PutPart(ctx, p.Bucket, p.Key, id, n, body, size)
+	if ctx.Err() != nil {
+		return state.TransferPart{}, ctx.Err()
+	}
+	if err != nil {
+		if rerr := sr.failed(); rerr != nil {
+			return state.TransferPart{}, w.unreadable(ctx, p, "reading", rerr)
+		}
+		return state.TransferPart{}, err
+	}
+	return state.TransferPart{Number: n, ETag: part.ETag, SHA256: part.SHA256, Size: size}, nil
+}
+
+// forget drops the row's upload at place, if one is under way: the row
+// left the FIFO for another reason than its acknowledgement.
+func (w *Worker) forget(place string, r Replica, p state.Placement) {
+	tr, has, err := w.DB.Transfer(context.Background(), place, p.Seq)
+	if err != nil || !has {
+		return
+	}
+	if mp, ok := r.(Multipart); ok {
+		w.abort(mp, p, tr)
+		return
+	}
+	w.dropTransfer(place, p.Seq)
+}
+
+// abort drops the upload at its place, as far as the place answers, and
+// forgets it here. A place that does not answer aborts it itself once
+// it has had no part for a week (§3.5 LEND-1).
+func (w *Worker) abort(mp Multipart, p state.Placement, tr state.Transfer) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := mp.Abort(ctx, p.Bucket, p.Key, tr.UploadID); err != nil && !errors.Is(err, ErrNoSuchUpload) {
+		w.Log.Debug("replication: aborting an unfinished upload at the place failed; it lapses there", "place", tr.Place,
+			"seq", tr.Seq, "err", err)
+	}
+	w.dropTransfer(tr.Place, tr.Seq)
+}
+
+func (w *Worker) dropTransfer(place string, seq int64) {
+	if err := w.DB.DropTransfer(context.Background(), place, seq); err != nil {
+		w.Log.Error("replication: forgetting an upload failed", "place", place, "seq", seq, "err", err)
+	}
+}
+
+func trimETag(e string) string { return strings.Trim(e, `"`) }
 
 // openFilled is openCaptured, but an object the store holds no file for
 // is first put there by Fill, when set, from a friend that holds it:
@@ -845,19 +1132,15 @@ func (w *Worker) openFilled(ctx context.Context, p state.Placement) (io.Reader, 
 }
 
 // openCaptured opens the row's object in the store, checked against
-// the capture: a body of p.Size bytes and the function that closes it.
+// the capture: a body of p.Size bytes (an *os.File, readable from an
+// offset, but for a directory marker) and the function that closes it.
 // The error is errLocal only for what is definitely permanent (gone, a
-// directory or special file, another size, an escaping key, too large to
-// send), errStore for anything that may pass (#57), including an open or
+// directory or special file, another size, an escaping key), errStore for anything that may pass (#57), including an open or
 // stat that does not return within Worker.StoreStall (#63).
 func (w *Worker) openCaptured(ctx context.Context, p state.Placement) (io.Reader, func(), error) {
 	name := filepath.FromSlash(p.Key)
 	if !filepath.IsLocal(name) {
 		return nil, nil, fmt.Errorf("%w: key %q does not name a file in the store", errLocal, p.Key)
-	}
-	if p.Size > MaxPutSize {
-		return nil, nil, fmt.Errorf("%w: %d bytes is more than %d and multipart replication is not built yet (#23)",
-			errOversize, p.Size, int64(MaxPutSize))
 	}
 	// local blames the object, unless the bucket's directory is
 	// unreadable too, which is the store's fault, not the object's.

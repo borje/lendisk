@@ -33,9 +33,17 @@ const MetaSHA256 = "lendisk-sha256"
 // it keeps as a tombstone for the retention window (RET-1).
 const MetaReplaces = "lendisk-replaces"
 
-// MaxPutSize is the largest object one S3 PUT carries (5 GiB). The
-// worker refuses a larger one until multipart replication (#23).
+// MaxPutSize is the largest object one S3 PUT carries (5 GiB). A larger
+// one is sent in parts (REPL-6, #23).
 const MaxPutSize = 5 << 30
+
+// MaxObjectSize is the largest object S3 stores (5 TiB), and so the
+// largest the worker sends; a larger one is refused as oversize.
+const MaxObjectSize = 5 << 40
+
+// MaxParts is the most parts S3 takes for one object; the part size
+// grows for an object that would need more (REPL-6).
+const MaxParts = 10000
 
 // Object is one object to send: the queue row's facts and the store's
 // bytes, read once as they are sent.
@@ -62,6 +70,37 @@ type Replica interface {
 	// refused (#74), and acts on the answer only by marking a rewrite.
 	Head(ctx context.Context, bucket, key string) (sha256 string, ok bool, err error)
 }
+
+// Multipart is a place that takes an object in parts (REPL-6, #23):
+// minio-go's low-level multipart calls (Q-Y.1). Friend is one. Each
+// part carries its own SHA-256; the place verifies the whole object
+// against Object.SHA256 at Complete (LEND-4).
+type Multipart interface {
+	// Create begins an upload of o (its Body unused), marked as a
+	// rewrite of o.Replaces when that is set (#74).
+	Create(ctx context.Context, o Object) (uploadID string, err error)
+	// Parts lists the parts the place holds for the upload: number to
+	// ETag. ErrNoSuchUpload when the place no longer has the upload.
+	Parts(ctx context.Context, bucket, key, uploadID string) (map[int]string, error)
+	// PutPart sends part n, size bytes read once from body.
+	PutPart(ctx context.Context, bucket, key, uploadID string, n int, body io.Reader, size int64) (Part, error)
+	// Complete assembles the parts, in number order.
+	Complete(ctx context.Context, bucket, key, uploadID string, parts []Part) error
+	// Abort drops the upload and its parts at the place.
+	Abort(ctx context.Context, bucket, key, uploadID string) error
+}
+
+// Part is a part the place acknowledged.
+type Part struct {
+	Number int
+	ETag   string
+	SHA256 string // hex
+	Size   int64
+}
+
+// ErrNoSuchUpload: the place no longer has the upload (aborted, or
+// abandoned there); the object starts over (REPL-6).
+var ErrNoSuchUpload = errors.New("the upload is gone at the place")
 
 // A place's refusals, as the worker acts on them (§3.4 Errors). Any
 // other error is retried with backoff.

@@ -615,8 +615,9 @@ Why an in-process client, and why minio-go:
 
 What lendisk writes because the client does not: the resume loop,
 which keeps the multipart upload ID and the ETag of each completed part
-on the queue row so a restart continues at the next part (REPL-6); a
-token-bucket limiter (`golang.org/x/time/rate`) around each part and a
+with the queue row's placement at that place (table `transfer`, #23) so
+a restart continues at the next part (REPL-6); a token-bucket limiter
+(`golang.org/x/time/rate`, `internal/pace`) around each body and a
 time-of-day timetable checked before each part (REPL-7); and the FIFO
 queue, which was lendisk's in every version.
 
@@ -2581,13 +2582,21 @@ upstream bucket is Q-V.
   write: once a later write or delete of the key is done, it no longer
   does. A client's ordinary retry, of an object queued or acknowledged
   everywhere, is still dropped, so exactly-once capture (#6) holds. Rows
-  refused only as too large for one PUT (cause `oversize`) are put back
-  in their places' FIFOs by `state.RequeueOversize` when multipart
-  replication lands: #23 calls it once, at the start of a worker that
-  can send them, with `replica.MaxPutSize`; it also re-queues rows
-  refused before #61 told the causes apart (cause `store`, size above
-  that limit). A row a later write of the key replaced stays as it
-  is. A re-upload also heals them.
+  refused only as too large to send (cause `oversize`) are put back
+  in their places' FIFOs by `state.RequeueOversize`, which the worker
+  calls once at start (`Worker.start`, #23) with the largest object it
+  sends (`replica.MaxObjectSize`, 5 TiB): since #23 an object above one
+  PUT goes in parts, so every row refused for its size before is
+  re-queued once, and only one above 5 TiB stays refused. Rows refused
+  before #61 told the causes apart (cause `store`, every object above
+  5 GiB, refused for its size before its file was looked at) were given
+  cause `oversize` by migration 31, an append-only data migration, so
+  `RequeueOversize` matches the cause alone and never re-queues, and
+  re-alerts at each start, a genuine store refusal of a large object
+  (`TestOldStoreRefusalsAboveOnePutBecomeOversize`,
+  `TestOversizeRefusalsCanBeRequeued`, `TestOversizeRowsAreRequeuedAtStart`).
+  A row a later write of the key replaced stays as it is. A re-upload
+  also heals them.
   Table `place` keeps each place's last answer:
   `condition` (`ok`, `retrying`, `quota`, `removed`, and `store` while
   it waits because this node's store cannot be read), `detail`, `since`
@@ -3037,13 +3046,15 @@ upstream bucket is Q-V.
   The dial is bounded by 30 s, the wait for a response's headers by
   2 minutes, and a body the transport takes no bytes from for 2 minutes
   cancels the request (a friend switched off mid-transfer).
-- **Operations.** `Put` streams the object from the store through the
-  decorator into `PutObject`, or for objects above the part size into
-  the low-level multipart calls (`NewMultipartUpload`, `PutObjectPart`,
-  `CompleteMultipartUpload`), with `x-amz-meta-lendisk-sha256` from the
-  queue row. Until #23 every object is one `PutObject` (up to 5 GiB)
-  and an interrupted one is sent again whole; the multipart path and its
-  resume come with #23. The request checksum is SHA-256 (S3-3, Q-Y.2): a single
+- **Operations.** `Put` streams the object from the store into
+  `PutObject`; an object larger than the part size (or than one PUT,
+  5 GiB) goes into the low-level multipart calls (`replica.Multipart`:
+  `NewMultipartUpload`, `PutObjectPart`, `ListObjectParts`,
+  `CompleteMultipartUpload`, `AbortMultipartUpload`;
+  `internal/replica/multipart.go`), with `x-amz-meta-lendisk-sha256`
+  from the queue row, and resumes at the next part (REPL-6, below). An
+  object no larger than the part size is one `PutObject`, sent again
+  whole when interrupted. The request checksum is SHA-256 (S3-3, Q-Y.2): a single
   PUT carries the queue row's hash as `x-amz-checksum-sha256`, at no
   extra read; a multipart upload is created with
   `x-amz-checksum-algorithm: SHA256` and each part carries its own
@@ -3144,9 +3155,20 @@ upstream bucket is Q-V.
   (`TestRewriteRefusedPastTheRetryWindowIsRefused`); a later write of
   the key heals it as any refusal is healed. A rewrite
   refused again after the retry with the place's hash is a refusal like
-  any other `412` (`place_refused`). Rewrites are single PUTs: rewritable keys are a
-  few KiB, and multipart replication (#23) would need the mark at
-  `CreateMultipartUpload`.
+  any other `412` (`place_refused`). *Decision (#23): a rewrite goes in
+  parts like any put.* Rewritable keys are a few KiB, but a put marked
+  after a delete (*EP-11*, below) may be any key of any size, so a
+  marked object above the part size is a multipart upload carrying the
+  mark at `CreateMultipartUpload`; the lender checks it there and again
+  at completion (§3.5 LEND-4). The mark an upload was begun with is
+  kept with it (`transfer.replaces`); a resumed upload whose row now
+  needs another mark is aborted and begun again. Keeping rewrites to
+  one PUT would have refused a deleted-and-rewritten object above 5 GiB
+  for good, with no cause `RequeueOversize` could tell apart. Precedent:
+  S3's conditional writes apply `If-Match` and `If-None-Match` to
+  `CompleteMultipartUpload` as to `PutObject` (2024), checked when the
+  object is published, not when the upload begins
+  (`TestALargeRewriteIsMarkedAtItsCreate`).
   *Choice of mark (#74).* S3's conditional writes put `If-Match` with
   the current version's ETag on a `PutObject` to replace only that
   version; S3 Object Lock with versioning keeps the replaced version
@@ -3313,9 +3335,10 @@ upstream bucket is Q-V.
   definitely cannot supply as captured is a *local error*: the file is
   gone (`ENOENT`, or `ENOTDIR` for a path through a file), its size
   differs from the capture, it is a directory or special file, its key
-  names no file under the bucket, it is larger than one PUT carries
-  (5 GiB, `replica.MaxPutSize`, until multipart replication, #23;
-  refused with cause `oversize`, *Healing* above), or
+  names no file under the bucket, it is larger than the worker sends
+  (5 TiB, `replica.MaxObjectSize`, in parts since #23; 5 GiB,
+  `replica.MaxPutSize`, to a place that takes no parts; refused with
+  cause `oversize`, *Healing* above), or
   its bytes no longer match the capture hash after a place answered
   `BadDigest` (above). Every other failure to open, stat or read the
   object (`EMFILE` under load, `EACCES` until a restore's ownership is
@@ -3397,34 +3420,103 @@ upstream bucket is Q-V.
   it cannot read as captured is a local error, above (#48, #50). On
   acknowledgement the row becomes `acked` with its hash and the place
   `ok`. Nothing is acknowledged before the place answers, so a restart
-  of either side sends the head row again whole; the friend stores the
-  same bytes under the same key, and nothing is sent twice that was
-  acknowledged. `status` (and `places` in `status --json`) shows per
+  of either side sends the head row again: whole for an object up to
+  the part size, from its next part above it (REPL-6); the friend
+  stores the same bytes under the same key, and nothing is sent twice
+  that was acknowledged. `status` (and `places` in `status --json`) shows per
   place its condition, queued objects and bytes, lag (age of the oldest
   queued row) and the rows it refused; per bucket (`buckets[].refused`)
   the objects refused for a local error; refusals a later write healed
   are not counted (*Healing*, above).
-- **REPL-6** The upload ID and the number, ETag and checksum of each
-  completed part are written to the queue row as parts complete. After
-  a restart or an interruption the worker lists the parts of the open
-  upload (`ListObjectParts`), keeps the stored parts whose ETag
-  matches, and continues at the next part, reading the store from that
-  part's offset. A part the target acknowledged but the row missed is
-  sent again; a `NoSuchUpload` (aborted or expired at the target)
-  starts the object over. Shown with `SIGKILL` mid-part against
-  versitygw and Garage (Q-Y.1). Objects below
-  the part size (16 MiB, configurable) restart whole. The same for
-  friends and overflow targets.
-- **REPL-7** Per-peer and global limits are token buckets
-  (`golang.org/x/time/rate`) wrapped around the reader of each uploaded
-  part and of every download (read-through, VER-2 samples, `verify
-  --full`);
-  the time-of-day schedule is checked before each part, so a closing
-  window stops a transfer within one part, which is part size over rate
-  in time (16 s for 16 MiB at 1 MiB/s). Each read is cut to the
-  smallest bucket's burst (64 KiB) before `WaitN`. Both change at
-  runtime from the configuration: `SetLimit` applies from the next
-  read (Q-Y.4).
+- **REPL-6 (#23)** An object larger than `replication.part_size` (16
+  MiB; 5 MiB to 5 GiB) goes in parts (`Worker.putParts`). Each upload
+  belongs to a placement row, since every place has its own: table
+  `transfer` (migration 31) keeps, per place and queue row, the upload
+  ID, the part size it was begun with and the mark it carries (#74),
+  and `transfer_part` the number, ETag, SHA-256 and size of each part
+  the place acknowledged, written as each part completes
+  (`state.DB.BeginTransfer`, `AddTransferPart`). After a restart or an
+  interruption the worker lists the upload's parts at the place
+  (`ListObjectParts`), keeps the recorded parts it lists with the same
+  ETag, and sends the rest, each read from its offset in the store (an
+  `io.SectionReader` over the store's file, through the same stall
+  guard as a whole object); it logs "resuming an upload at its next
+  part" with `parts_kept`. A part the place holds but the row missed
+  (killed between the answer and the write) is sent again; a
+  `NoSuchUpload` (aborted, or abandoned by the lender after a week,
+  §3.5) starts the object over, as does a row that now needs another
+  mark. A part size giving more than 10000 parts (`replica.MaxParts`)
+  grows to the next whole MiB that fits; the largest object sent is 5
+  TiB. Before each part the worker checks that a later write has not
+  superseded the row. Completion is answered by the place's whole-object
+  check (LEND-4); a refusal there, a superseded row and any other
+  outcome that takes the row out of the FIFO abort the upload at the
+  place (best effort) and drop its record (`Worker.forget`); records
+  of rows that left their FIFO otherwise (re-routed, refused by another
+  sender) are dropped at start and on each re-routing tick
+  (`state.DB.StaleTransfers`), their uploads left for the lender to
+  abandon. Objects up to the part size are one PUT and restart whole.
+  *Decision:* the record is per placement row, not on the queue row
+  the requirement's wording suggests, because each place's upload has
+  its own ID and parts. Against a real lender with `SIGKILL` inside part
+  4 of 6 (`TestALargeObjectResumesAtTheNextPartAfterSIGKILL`); in
+  the worker, `TestALargeObjectIsSentInPartsAndRetriedFromTheFailedPart`,
+  `TestARestartContinuesAtTheNextPart`,
+  `TestAnUploadGoneAtThePlaceStartsOver`, `TestASmallObjectRestartsWhole`,
+  `TestAnObjectAboveOnePutGoesInParts`.
+- **REPL-7 (#23)** `internal/pace` owns pacing: one `pace.Pacer` per
+  daemon, shared by the worker, the read-through's fetcher and the
+  tunnel bridge. Limits are token buckets (`golang.org/x/time/rate`,
+  64 KiB burst, each read cut to it, reserved at the pacer's clock and
+  slept by its injected sleep): `replication.upload_limit` and
+  `download_limit` for all friends together, and per friend
+  `[[replication.peer_limit]]` (`peer` by node ID, `upload`,
+  `download`), in bytes a second. Uploads wrap every body the worker
+  sends (single PUTs and each part, `Pacer.Send`); downloads wrap every
+  read-through fetch (`Fetcher.Pace`, `Pacer.Fetch`;
+  `TestFetchesArePacedByTheDownloadLimits`).
+  *Decision: challenges are not downloads.* A daily or full
+  verification (VER-1, §3.6) moves 32 bytes per object over the
+  tunnel; the reads happen at the lender, which paces them per friend
+  already (§3.7 *Pacing*). Counting them would slow nothing on the link.
+  *Pace by concurrency (#76):* a lender ends a request body that
+  arrives below its floor rate (8 KiB/s over 10 minutes, §3.5 LEND-2).
+  So no limit may be below `pace.MinRate`, 16 KiB/s, twice the floor
+  (config refuses it, `TestRatesBelowTheFloorAreRefused`), and a
+  global upload limit admits only as many bodies at once as it keeps
+  at `MinRate` each (`Pacer.Slot`, at least one; each body takes a slot
+  for its length), so a body is never trickled below the floor; a
+  per-friend limit applies to one body at a time, as each place sends
+  one object at a time (`TestUploadSlotsKeepEveryBodyAboveTheFloor`,
+  `TestAGlobalLimitPacesByConcurrency`).
+  The schedule (`replication.schedule`, local-time windows such as
+  "01:00-07:00", comma-separated, one ending before it starts running
+  past midnight; empty is always) is checked before a row is taken and
+  before each part, so a closing window stops a transfer at the end of
+  the part in flight, which is part size over rate in time (16 s for 16
+  MiB at 1 MiB/s); the row stays taken with its parts recorded and
+  continues at its next part when a window opens
+  (`TestAClosingWindowStopsAtTheEndOfThePart`). Deletes wait with the
+  puts; re-placement's moves are FIFO rows and so obey both (REPL-13).
+  The read-through ignores the schedule: a restore waits for no window.
+  *Decision: changes apply without a restart, from the file.* The
+  daemon never writes its config (OPS-6), so it re-reads it: it looks
+  at the file's modification time, size and inode every 10 s and
+  reloads on a change, and reloads at once on SIGHUP (the systemd
+  example's `ExecReload`); the flags and environment it started with
+  still apply on top (`cli.reloader`). The pacing settings
+  (`part_size`, `schedule`, the limits, LEND-5's) apply from each
+  transfer's next read (`Pacer.Set`, `SetLimitAt`, Q-Y.4); a file that
+  no longer loads keeps the settings in force, with an error logged;
+  a change to any other setting is logged as waiting for the next
+  start (`TestPacingChangesApplyWithoutARestart`). Precedent: rclone
+  changes `--bwlimit` at run time through its rc API
+  (`core/bwlimit`) and a timetable, restic's `--limit-upload` is fixed
+  for the run, Syncthing applies most settings from its config live and
+  marks the rest "requires restart", and nginx, sshd and Prometheus
+  reload on SIGHUP. lendisk has no settings API (the CLI talks to the
+  daemon through `lendisk.db`), so the file, watched and on SIGHUP,
+  serves both the editor in a container and `systemctl reload`.
 - **REPL-8** `export --for <peer>` pages through the bucket through the
   decorator and writes one file per key at its key path (or Kopia's
   sharded layout), for each key with a `placement` row at that peer;
@@ -3782,6 +3874,17 @@ the handler's own reads and is never cancelled; nothing below
   the store. A body longer
   than its `Content-Length` ends the write in `Lending` with
   `InvalidRequest`.
+  *LEND-5 (#23):* `[[lending.borrower_limit]]` (`peer` by node ID,
+  `receive`, `send`, bytes a second, at least `pace.MinRate`) limits
+  what one borrower sends this node (its puts and parts) and what this
+  node answers it, on the tunnel only (`Bridge.Pace`: `Pacer.LendIn`
+  around the bounded body, `Pacer.LendOut` around the answer). The
+  node's own replication limits do not apply to lending. The time the
+  lender's own limit holds a body back moves its floor window and its
+  stall deadline on (`boundedBody.excuse`), so a lender's pacing never
+  ends a borrower's body as slow, however many of its bodies share the
+  limit (`TestALenderLimitsOneBorrowerWithoutEndingItsBodies`). It
+  changes without a restart, like REPL-7's.
 - **LEND-4** `Lending` hashes a borrower's body as it streams it to the
   backend (SHA-256) and compares with `x-amz-meta-lendisk-sha256` at
   the end of the stream: a mismatch fails that last read, so posix
@@ -3796,7 +3899,7 @@ the handler's own reads and is never cancelled; nothing below
   carries its own `lendisk-sha256` (COMPAT-4), read with a `HEAD`;
   another hash is refused with `PreconditionFailed` (412), at
   `PutObject`, `CreateMultipartUpload` and again at completion, unless
-  the `PutObject` is a rewrite marked with the stored hash (*Rewrites*,
+  the put or the upload is a rewrite marked with the stored hash (*Rewrites*,
   below). With
   the same hash the put is accepted without storing anything: its body
   is hashed and discarded, so a body that only claims the hash gets
@@ -3828,8 +3931,21 @@ the handler's own reads and is never cancelled; nothing below
   64 hex digits, else `InvalidRequest`), to a key whose stored object
   has exactly that hash and another than the put's, is a rewrite. The
   mark is taken out of the metadata whatever happens, so it is never
-  stored; on `CreateMultipartUpload` it is dropped and the key refuses
-  other bytes as ever. A rewrite is admitted against quota like a new
+  stored. *In parts (#23):* a `CreateMultipartUpload` carrying the mark
+  is admitted to a key holding exactly that version, or holding nothing
+  but tombs the newest of which has it, and the mark is kept with the
+  upload (`lent_upload.replaces`, migration 31); at completion, under
+  the key's lock, a key that still holds the marked version has it
+  moved into a tomb (`Lending.tombForRewrite`, the row pending and
+  marked `rewrite`, as for a PUT) and the upload is completed without
+  condition and verified whole; a mismatch or a failed completion
+  moves the version back (`revive`). A key that changed meanwhile is
+  `412`; a key with only tombs, the newest the marked one, takes the
+  object beside them (`TestMarkedMultipartRewriteKeepsTheReplacedVersionAsATomb`,
+  `TestMarkedMultipartRewriteRefusedWhenStaleOrWrong`,
+  `TestMarkedMultipartOfADeletedKeyKeepsItsTomb`). A lender older than
+  #23 drops the mark at the create and refuses the upload `412`, which
+  the borrower handles as any refused rewrite. A rewrite is admitted against quota like a new
   object (its size plus the overhead), since both versions count until
   the old one is purged (LEND-1). Its body streams to the store as any
   put's; once it has read its declared length (or ended) and matched
@@ -4813,7 +4929,8 @@ the handler's own reads and is never cancelled; nothing below
   control path), which S3 clients and the replica worker retry. The
   borrower's replica client moves one object per bucket at a time over
   a couple of connections (§3.4), well inside both. Loopback and LAN
-  listeners are not counted. The caps are constants, not settings.
+  listeners are not counted. The caps are constants, not settings;
+  rate limits per borrower are settings (LEND-5, §3.5).
   A request holds its slot until its answer is written, so neither
   direction may hang on the friend (#76): a request body is bounded by
   the stall bound and the floor rate (§3.5 LEND-2), and each write to

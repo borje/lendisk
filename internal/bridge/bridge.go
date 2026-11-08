@@ -25,6 +25,7 @@ import (
 	"github.com/versity/versitygw/s3err"
 
 	"github.com/borje/lendisk/internal/gateway"
+	"github.com/borje/lendisk/internal/pace"
 )
 
 // Bridge proxies HTTP requests to the gateway socket.
@@ -41,7 +42,11 @@ type Bridge struct {
 	// (defaults DefaultFloorRate, DefaultFloorWindow).
 	FloorRate   int64
 	FloorWindow time.Duration
-	proxy       *httputil.ReverseProxy
+	// Pace limits, per borrower, what it sends this node and what this
+	// node answers it on the tunnel (LEND-5); nil limits nothing. Its
+	// waits are not counted against the borrower's floor rate.
+	Pace  *pace.Pacer
+	proxy *httputil.ReverseProxy
 }
 
 // New returns a bridge to the gateway on socket.

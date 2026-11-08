@@ -415,40 +415,42 @@ func TestHealingDoesNotTrustAnOlderAcknowledgement(t *testing.T) {
 	}
 }
 
-// REPL-1 (#61): a row refused only for being larger than one PUT
+// REPL-1 (#61, #23): a row refused only for being larger than one PUT
 // carries keeps that cause and counts against its bucket until
-// multipart replication (#23) re-queues it; so is one refused before
-// the cause was told apart (cause store, but larger than one PUT). One a
-// later write replaced is not re-queued, nor is one refused for another
-// store cause.
+// multipart replication (#23) re-queues it, if it is no larger than
+// what the worker can now send. One a later write replaced is not
+// re-queued, nor is one refused for another store cause, whatever its
+// size: migration 31 gave the pre-#61 ones their cause, so the cause
+// alone decides (TestOldStoreRefusalsAboveOnePutBecomeOversize).
 func TestOversizeRefusalsCanBeRequeued(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t)
 	friend(t, db, "B")
 	friend(t, db, "C")
-	const putLimit = 10 // capture's sizes are the key's length
+	const sendLimit = 10 // capture's sizes are the key's length
 	big := capture(t, db, "laptop", "data/big", OpPut)
-	oldBig := capture(t, db, "laptop", "data/old-big", OpPut)
+	tooBig := capture(t, db, "laptop", "data/too-big", OpPut)
+	storeBig := capture(t, db, "laptop", "data/old-big", OpPut)
 	gone := capture(t, db, "laptop", "data/gone", OpPut)
 	replaced := capture(t, db, "laptop", "data/replaced", OpPut)
 	for _, r := range []struct {
 		seq   int64
 		cause string
-	}{{big, CauseOversize}, {oldBig, CauseStore}, {gone, CauseStore}, {replaced, CauseOversize}} {
+	}{{big, CauseOversize}, {tooBig, CauseOversize}, {storeBig, CauseStore}, {gone, CauseStore}, {replaced, CauseOversize}} {
 		if ok, err := db.RefuseObject(ctx, r.seq, r.cause, "refused"); err != nil || !ok {
 			t.Fatal(ok, err)
 		}
 	}
-	if r := mustRefused(t, db); r["laptop"] != 4 {
+	if r := mustRefused(t, db); r["laptop"] != 5 {
 		t.Fatalf("refused %v", r)
 	}
 	later := capture(t, db, "laptop", "data/replaced", OpPut)
-	n, err := db.RequeueOversize(ctx, putLimit)
-	if err != nil || n != 4 {
-		t.Fatalf("requeued %d %v, want big and old-big at B and C", n, err)
+	n, err := db.RequeueOversize(ctx, sendLimit)
+	if err != nil || n != 2 {
+		t.Fatalf("requeued %d %v, want big at B and C", n, err)
 	}
 	for _, place := range []string{"B", "C"} {
-		for _, want := range []int64{big, oldBig, later} {
+		for _, want := range []int64{big, later} {
 			p, ok, _ := db.NextPlacement(ctx, place)
 			if !ok || p.Seq != want {
 				t.Fatalf("%s head %+v %v, want %d", place, p, ok, want)
@@ -458,8 +460,8 @@ func TestOversizeRefusalsCanBeRequeued(t *testing.T) {
 			}
 		}
 	}
-	if r := mustRefused(t, db); r["laptop"] != 1 {
-		t.Fatalf("refused %v, want only data/gone", r)
+	if r := mustRefused(t, db); r["laptop"] != 3 {
+		t.Fatalf("refused %v, want data/too-big, data/old-big and data/gone", r)
 	}
 }
 

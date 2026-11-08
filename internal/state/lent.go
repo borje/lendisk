@@ -43,12 +43,15 @@ type LentUpload struct {
 	SHA256                      string // hex
 	CreatedAt                   time.Time
 	Counted                     int64 // part bytes counted in lent_usage
+	// Replaces is the version the upload was marked, at its create, as
+	// replacing (a rewrite, #74, #23); "" for a new object.
+	Replaces string
 }
 
 // AddLentUpload records an upload a borrower began.
 func (db *DB) AddLentUpload(ctx context.Context, u LentUpload) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO lent_upload (upload_id, peer_key, sealed, key, sha256, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`, u.UploadID, u.Peer, u.Sealed, u.Key, u.SHA256, u.CreatedAt.Unix())
+	_, err := db.ExecContext(ctx, `INSERT INTO lent_upload (upload_id, peer_key, sealed, key, sha256, created_at, replaces)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, u.UploadID, u.Peer, u.Sealed, u.Key, u.SHA256, u.CreatedAt.Unix(), nullStr(u.Replaces))
 	return err
 }
 
@@ -57,8 +60,10 @@ func (db *DB) AddLentUpload(ctx context.Context, u LentUpload) error {
 func (db *DB) GetLentUpload(ctx context.Context, uploadID string) (LentUpload, error) {
 	u := LentUpload{UploadID: uploadID}
 	var created int64
-	err := db.QueryRowContext(ctx, `SELECT peer_key, sealed, key, sha256, created_at, counted FROM lent_upload WHERE upload_id = ?`,
-		uploadID).Scan(&u.Peer, &u.Sealed, &u.Key, &u.SHA256, &created, &u.Counted)
+	var replaces sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT peer_key, sealed, key, sha256, created_at, counted, replaces FROM lent_upload WHERE upload_id = ?`,
+		uploadID).Scan(&u.Peer, &u.Sealed, &u.Key, &u.SHA256, &created, &u.Counted, &replaces)
+	u.Replaces = replaces.String
 	if errors.Is(err, sql.ErrNoRows) {
 		return LentUpload{}, ErrNotFound
 	}

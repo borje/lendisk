@@ -503,11 +503,47 @@ func rewriteAttacks(t *testing.T, a *node, c *s3.Client, bID *identity.Identity,
 		}
 		check(name)
 	}
-	if _, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(sealed), Key: aws.String(key),
-		Metadata: rewriteMeta(other, v[3])}); err == nil {
-		t.Error("B's marked multipart rewrite was begun")
+	// #23: in parts the same holds. A stale or false mark is refused at
+	// the create; a rightly marked upload, completed, stores its bytes and
+	// the version it replaced is a tomb like the others.
+	for name, meta := range map[string]map[string]string{
+		"unmarked":   hashMeta(other),
+		"stale mark": rewriteMeta(other, v[1]),
+	} {
+		if _, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(sealed), Key: aws.String(key),
+			Metadata: meta}); err == nil {
+			t.Errorf("B's %s multipart rewrite was begun", name)
+		}
+		check(name + " in parts")
 	}
-	check("a marked multipart rewrite")
+	up, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(sealed), Key: aws.String(key),
+		Metadata: rewriteMeta(other, v[3])})
+	if err != nil {
+		t.Fatalf("B's marked multipart rewrite: %v", err)
+	}
+	n := int32(1)
+	part, err := c.UploadPart(ctx, &s3.UploadPartInput{Bucket: aws.String(sealed), Key: aws.String(key), UploadId: up.UploadId,
+		PartNumber: &n, Body: bytes.NewReader(other)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{Bucket: aws.String(sealed), Key: aws.String(key),
+		UploadId: up.UploadId, MultipartUpload: &types.CompletedMultipartUpload{Parts: []types.CompletedPart{{PartNumber: &n, ETag: part.ETag}}}}); err != nil {
+		t.Fatalf("completing B's marked multipart rewrite: %v", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, key)); err != nil || !bytes.Equal(got, other) {
+		t.Fatalf("after the multipart rewrite the key holds %q (%v)", got, err)
+	}
+	ts, err := db.TombstonesOf(ctx, bID.NodeID().String(), sealed, key)
+	if err != nil || len(ts) != 4 {
+		t.Fatalf("after the multipart rewrite the tombstones are %+v (%v)", ts, err)
+	}
+	for i, tb := range ts {
+		got, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(tb.Tomb)))
+		if err != nil || !bytes.Equal(got, v[i]) || !tb.Rewrite {
+			t.Fatalf("after the multipart rewrite tomb %d holds %q (%v): %+v", i, got, err, tb)
+		}
+	}
 }
 
 // redeemAbuses runs #69's redeem abuses at a, which must be serving: a

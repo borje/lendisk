@@ -33,6 +33,9 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/pflag"
+
+	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/pace"
 )
 
 const (
@@ -63,6 +66,15 @@ type Config struct {
 // Lending is the [lending] section (LEND-1, LEND-8).
 type Lending struct {
 	MaxTotal string `toml:"max_total" help:"the most this node lends all friends together: the sum of its numbers for its friendships, and of its open invites, may not exceed it (LEND-1, LEND-8), such as 240G; empty means what the store's filesystem can hold, its size less store.free_space_floor"`
+	// BorrowerLimit is [[lending.borrower_limit]] (LEND-5).
+	BorrowerLimit []BorrowerLimit `toml:"borrower_limit" help:"rate limits on one friend as a borrower (LEND-5), repeatable: what this node receives from it (its uploads) and sends it (answers to its reads), in bytes a second, at least 16K each or empty for none; changes apply without a restart; e.g. 'peer=<node id>,receive=2M,send=4M'"`
+}
+
+// BorrowerLimit is one [[lending.borrower_limit]] entry (LEND-5).
+type BorrowerLimit struct {
+	Peer    string `toml:"peer"`
+	Receive string `toml:"receive"`
+	Send    string `toml:"send"`
 }
 
 // Store is the [store] section: one store for the node's own buckets and
@@ -177,6 +189,128 @@ type Replication struct {
 	Copies       Number `toml:"copies" default:"2" help:"how many friends hold each object of a bucket created without --copies (EP-6); 1 means one lost friend loses data, and bucket add and status say so"`
 	RerouteAfter string `toml:"reroute_after" default:"1h" help:"move the unsent copies at a friend that has failed this long to another friend with room (D6, REPL-1), such as 1h or 90m"`
 	ReplaceAfter string `toml:"replace_after" default:"168h" help:"a friend failing this long since its last answer is no longer room for copies (REPL-12, REPL-13), such as 168h"`
+	// The rest is pacing (REPL-6, REPL-7); it applies without a restart
+	// (the daemon re-reads the file, §3.4 REPL-7).
+	PartSize      string      `toml:"part_size" default:"16M" help:"objects larger than this are sent in parts of this size and resume at the next part after an interruption (REPL-6); 5M to 5G"`
+	Schedule      string      `toml:"schedule" help:"when replication sends, in local time: windows such as '01:00-07:00', comma-separated; one ending before it starts runs past midnight; empty means at any time (REPL-7). A closing window stops a transfer at the end of its part"`
+	UploadLimit   string      `toml:"upload_limit" help:"most bytes a second replication sends, all friends together (REPL-7), such as 2M; at least 16K, empty for no limit"`
+	DownloadLimit string      `toml:"download_limit" help:"most bytes a second this node fetches from friends (the read-through), all friends together (REPL-7); at least 16K, empty for no limit"`
+	PeerLimit     []PeerLimit `toml:"peer_limit" help:"per-friend limits on what replication sends to it and fetches from it (REPL-7), repeatable, bytes a second, at least 16K each or empty for none; e.g. 'peer=<node id>,upload=1M,download=4M'"`
+}
+
+// PeerLimit is one [[replication.peer_limit]] entry (REPL-7).
+type PeerLimit struct {
+	Peer     string `toml:"peer"`
+	Upload   string `toml:"upload"`
+	Download string `toml:"download"`
+}
+
+// rate reads a limit in bytes a second; empty is none (0).
+func rate(s string) (int64, error) {
+	if strings.TrimSpace(s) == "" {
+		return 0, nil
+	}
+	v, err := ParseSize(s)
+	if err != nil {
+		return 0, fmt.Errorf("%w (bytes a second)", err)
+	}
+	if v > 1<<50 {
+		return 0, fmt.Errorf("%q: too large", s)
+	}
+	if err := pace.CheckRate(int64(v)); err != nil || v == 0 {
+		if v == 0 {
+			return 0, fmt.Errorf("%q: give at least 16K, or leave it empty for no limit", s)
+		}
+		return 0, err
+	}
+	return int64(v), nil
+}
+
+// PartSize is replication.part_size in bytes, which Validate checked.
+func (c *Config) PartSize() int64 {
+	v, _ := ParseSize(c.Replication.PartSize)
+	return int64(v)
+}
+
+// Pace is the pacing settings (REPL-7, LEND-5), which Validate checked.
+func (c *Config) Pace() pace.Settings {
+	var s pace.Settings
+	s.Up, _ = rate(c.Replication.UploadLimit)
+	s.Down, _ = rate(c.Replication.DownloadLimit)
+	s.Schedule, _ = pace.ParseSchedule(c.Replication.Schedule)
+	for _, p := range c.Replication.PeerLimit {
+		if s.Peers == nil {
+			s.Peers = map[string]pace.Rates{}
+		}
+		id, _ := identity.ParseNodeID(p.Peer)
+		var r pace.Rates
+		r.Up, _ = rate(p.Upload)
+		r.Down, _ = rate(p.Download)
+		s.Peers[id.String()] = r
+	}
+	for _, p := range c.Lending.BorrowerLimit {
+		if s.Lend == nil {
+			s.Lend = map[string]pace.Rates{}
+		}
+		id, _ := identity.ParseNodeID(p.Peer)
+		var r pace.Rates
+		r.Down, _ = rate(p.Receive)
+		r.Up, _ = rate(p.Send)
+		s.Lend[id.String()] = r
+	}
+	return s
+}
+
+// checkPacing validates the pacing settings.
+func (c *Config) checkPacing() []error {
+	var errs []error
+	if v, err := ParseSize(c.Replication.PartSize); err != nil || v < 5<<20 || v > 5<<30 {
+		errs = append(errs, fmt.Errorf("replication.part_size = %q: want a size from 5M to 5G, such as 16M", c.Replication.PartSize))
+	}
+	if _, err := pace.ParseSchedule(c.Replication.Schedule); err != nil {
+		errs = append(errs, fmt.Errorf("replication.schedule: %w", err))
+	}
+	for _, r := range []struct{ key, v string }{
+		{"replication.upload_limit", c.Replication.UploadLimit},
+		{"replication.download_limit", c.Replication.DownloadLimit},
+	} {
+		if _, err := rate(r.v); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", r.key, err))
+		}
+	}
+	type entry struct {
+		peer   string
+		limits [][2]string
+	}
+	check := func(key string, es []entry) {
+		seen := map[string]bool{}
+		for i, e := range es {
+			id, err := identity.ParseNodeID(e.peer)
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s entry %d: peer = %q: want the friend's node ID, as `lendisk peer list` shows it", key, i+1, e.peer))
+				continue
+			}
+			if seen[id.String()] {
+				errs = append(errs, fmt.Errorf("%s entry %d: a second entry for %s; give each friend one", key, i+1, e.peer))
+			}
+			seen[id.String()] = true
+			for _, l := range e.limits {
+				if _, err := rate(l[1]); err != nil {
+					errs = append(errs, fmt.Errorf("%s entry %d: %s: %w", key, i+1, l[0], err))
+				}
+			}
+		}
+	}
+	var peers, lend []entry
+	for _, p := range c.Replication.PeerLimit {
+		peers = append(peers, entry{p.Peer, [][2]string{{"upload", p.Upload}, {"download", p.Download}}})
+	}
+	for _, p := range c.Lending.BorrowerLimit {
+		lend = append(lend, entry{p.Peer, [][2]string{{"receive", p.Receive}, {"send", p.Send}}})
+	}
+	check("replication.peer_limit", peers)
+	check("lending.borrower_limit", lend)
+	return errs
 }
 
 // Number is an integer setting kept as text, so the flag and variable
@@ -271,6 +405,7 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("%s = %q: want a positive duration such as 1h or 168h", d.key, d.v))
 		}
 	}
+	errs = append(errs, c.checkPacing()...)
 	if m := strings.TrimSpace(c.Lending.MaxTotal); m != "" {
 		if v, err := ParseSize(m); err != nil || v == 0 || v > 1<<62 {
 			errs = append(errs, fmt.Errorf("lending.max_total = %q: want a size above zero such as 240G, or empty for no cap", c.Lending.MaxTotal))

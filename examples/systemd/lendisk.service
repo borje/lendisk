@@ -17,6 +17,9 @@ Type=simple
 User=lendisk
 Group=lendisk
 ExecStart=/usr/local/bin/lendisk serve --config /etc/lendisk/lendisk.toml
+# Pacing settings (schedule, limits, part size) apply on reload, and
+# within 10 s of the file changing anyway (REPL-7).
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
