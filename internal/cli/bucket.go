@@ -286,7 +286,7 @@ func toolLines(w io.Writer, b state.Bucket, where, url, cacert string) {
 				tlsFlag = " --root-ca-pem-path=" + cacert
 			}
 		}
-		fmt.Fprintf(w, "For Kopia %s:\n\n", where)
+		fmt.Fprintf(w, "For Kopia 0.9 or later (repository format 2 or later) %s:\n\n", where)
 		fmt.Fprintf(w, "  kopia repository create s3 --endpoint=%s%s --bucket=%s \\\n", hostPort, tlsFlag, b.Name)
 		fmt.Fprintf(w, "    --access-key=%s --secret-access-key=%s\n", b.AccessKey, b.SecretKey)
 	default:

@@ -40,3 +40,18 @@ hash_named = []
 # change or `kopia repository set-parameters`. Each lender keeps the
 # version a rewrite replaces as a tombstone for the retention window.
 rewritable = ["kopia.repository", "kopia.blobcfg", "kopia.maintenance"]
+
+# Kopia repository format version 1 (Kopia 0.8 and earlier, never
+# upgraded) is not supported (COMPAT-1, #79): only its legacy index
+# manager writes the index blobs n*, the compaction log m* and the cleanup
+# blobs l* (Kopia 0.23.1 repo/content/indexblob/index_blob_manager_v0.go:23-29);
+# formats 2 and 3 index through the epoch manager (x*). Such a bucket is
+# shown and alerted, never refused. `kopia repository set-parameters
+# --upgrade` writes one n* blob of its own, the legacy-index poison blob
+# (repo/format/upgrade_lock.go:19), which ends the warning.
+format1_keys = ["n*", "m*", "l*"]
+# The epoch manager's blobs (x*) are never written in format 1, so any of
+# them means format 2 or later: a repository upgraded by Kopia 0.9-0.11,
+# which wrote no poison blob, or one whose poison write failed (#79
+# review).
+upgraded_keys = ["n00000000000000000000000000000000-repository_unreadable_by_this_kopia_version_upgrade_required", "x*"]

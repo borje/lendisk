@@ -81,9 +81,10 @@ Profiles: `restic`, `kopia` and `generic` (any S3 tool, such as rclone or
 Duplicacy). A generic bucket is not encrypted, so friends can read it;
 `bucket add` wants `--i-understand-no-encryption` for one. With rclone, pass
 `--disable Copy,Move --no-update-modtime`; `--backup-dir` and `--suffix` do
-not work against lendisk. Kopia rewrites `kopia.maintenance` on every
-maintenance run, which friends refuse, so a kopia bucket shows one refused
-object and a `place_refused` alert until #74 is settled.
+not work against lendisk. Kopia must be 0.9 or later, with the repository
+in format 2 or later (the default since Kopia 0.9). A repository still in
+format 1 (made by Kopia 0.8 or earlier) is accepted, but `status` and a
+`kopia_format1` alert say to run `kopia repository set-parameters --upgrade`.
 
 ## Restoring
 

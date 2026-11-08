@@ -55,6 +55,8 @@ type harness struct {
 	// fetch is the gateway's read-through fetcher; log, if set, its log.
 	fetch Fetcher
 	log   *slog.Logger
+	// clock is the gateway's Clock; nil is time.Now.
+	clock func() time.Time
 }
 
 func newHarness(t *testing.T, buckets map[string]string) *harness {
@@ -99,7 +101,7 @@ func (h *harness) serve(noCapture bool) (stop func()) {
 	}
 	g := &Gateway{StoreDir: h.store, Socket: filepath.Join(h.t.TempDir(), "gw.sock"), DB: h.db, Self: h.self, Log: log,
 		ResolveEvery: 20 * time.Millisecond, noCapture: noCapture, Statfs: h.statfs, Floor: h.floor,
-		ReconcileEvery: h.reconcileEvery, Fetch: h.fetch}
+		ReconcileEvery: h.reconcileEvery, Fetch: h.fetch, Clock: h.clock}
 	h.gw = g
 	g.lendingHook = h.lending
 	ctx, cancel := context.WithCancel(context.Background())
