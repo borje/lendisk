@@ -523,8 +523,9 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 // applied only if it is still queued there and sending(place, seq) is
 // false under the lock: its send may land, and the place's row must be
 // there to record it, or no delete would reach the copy. A batch that
-// fails is rolled back and the pass goes on with the next: the errors
-// are returned together with what the other batches did.
+// fails is rolled back and retried one row at a time, so a bad row
+// holds only itself (#68); the pass goes on and returns the rows'
+// errors together with what the others did.
 func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64) bool, lock sync.Locker) (moved, dropped int64, err error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
@@ -628,10 +629,21 @@ func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64)
 	var errs []error
 	for len(ops) > 0 && ctx.Err() == nil {
 		n := min(len(ops), 64)
-		if m, d, err := db.applyReroute(ctx, ops[:n], sending, lock); err != nil {
-			errs = append(errs, fmt.Errorf("re-routing rows %d to %d: %w", ops[0].seq, ops[n-1].seq, err))
-		} else {
+		if m, d, err := db.applyReroute(ctx, ops[:n], sending, lock); err == nil {
 			moved, dropped = moved+m, dropped+d
+		} else {
+			// One row at a time, so a bad row holds only itself (#68).
+			for _, op := range ops[:n] {
+				if ctx.Err() != nil {
+					break
+				}
+				m, d, err := db.applyReroute(ctx, []rerouteOp{op}, sending, lock)
+				if err != nil {
+					errs = append(errs, fmt.Errorf("re-routing row %d from %s: %w", op.seq, op.from, err))
+					continue
+				}
+				moved, dropped = moved+m, dropped+d
+			}
 		}
 		ops = ops[n:]
 	}

@@ -2440,8 +2440,7 @@ upstream bucket is Q-V.
   once the sends stop (#85,
   `TestAnAnswerThatCrossedASendIsSettledOnceThePlaceIsIdle`). A place
   whose FIFO never empties (a friend at quota) waits for the hourly
-  call. Left to #68: retrying a
-  failed re-routing batch row by row.
+  call. A failed re-routing batch is retried row by row (#68, below).
   *What each side counts (#85).* Between answers the borrower's count
   of a place (`PlaceUse`: `place_use` plus `place_freed`) follows the
   lender's rule (§3.5 LEND-1: an object's bytes plus 4 KiB until its
@@ -2644,9 +2643,11 @@ upstream bucket is Q-V.
   each under the worker's lock, re-checking that each row is still
   queued and not being sent, so captures never wait behind a long pass
   (3000 waiting rows in a bucket of 1200 metadata objects take tens of
-  milliseconds). A batch that fails is rolled back and the pass goes on
-  with the next, returning the errors with what the others did, so one
-  bad row cannot stop re-routing for the node. With no reachable friend with room the row waits at
+  milliseconds). A batch that fails is rolled back and retried one row
+  at a time, and the pass goes on, returning the failed rows' errors
+  with what the others did, so one bad row holds only itself, never
+  the other 63 of its batch (#68,
+  `TestOneBadRowDoesNotHoldItsReroutingBatch`). With no reachable friend with room the row waits at
   its friend, and the lag shows in `status`. *Decision (#19,
   review):* the row is dropped instead of waiting (state `dropped`:
   out of the FIFO, not counted in `place_use`) when its friend is gone

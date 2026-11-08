@@ -1014,3 +1014,35 @@ func TestAHugeQuotaDoesNotOverflow(t *testing.T) {
 	}
 	p.wantPlaces("data/1", s, "H")
 }
+
+// §3.4 (#68, review of #19): a re-routing batch that fails is retried
+// one row at a time, so one bad row does not keep the rest of its batch
+// from moving every pass.
+func TestOneBadRowDoesNotHoldItsReroutingBatch(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 2)
+	var seqs []int64
+	for i := range 3 {
+		seqs = append(seqs, p.put("laptop", fmt.Sprintf("data/%d", i), "data", 0.1))
+	}
+	p.friend("D", 10) // joins after: where C's rows go
+	p.condition("C", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	bad := seqs[1]
+	if _, err := p.db.Exec(fmt.Sprintf(`CREATE TRIGGER fail BEFORE INSERT ON placement WHEN NEW.place = 'D' AND NEW.seq = %d
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`, bad)); err != nil {
+		t.Fatal(err)
+	}
+	moved, dropped, err := p.db.Reroute(ctx, nil, nil)
+	if err == nil {
+		t.Fatal("no error from the bad row")
+	}
+	if moved != 2 || dropped != 0 {
+		t.Fatalf("moved %d dropped %d, want the two good rows moved", moved, dropped)
+	}
+	p.wantPlaces("data/0", seqs[0], "B", "D")
+	p.wantPlaces("data/1", bad, "B", "C")
+	p.wantPlaces("data/2", seqs[2], "B", "D")
+}
