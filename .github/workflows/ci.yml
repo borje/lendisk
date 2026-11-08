@@ -19,6 +19,11 @@ jobs:
         run: |
           out=$(gofmt -l cmd internal)
           if [ -n "$out" ]; then echo "not gofmt'ed:"; echo "$out"; exit 1; fi
+      - name: cached tool downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/tools-cache
+          key: tools-kopia-0.23.1-duplicacy-3.3.0
       - name: backup tools for the end-to-end tests (EP-1, COMPAT-1)
         env:
           # Pinned releases, checked against the SHA-256 each project
@@ -31,12 +36,14 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq restic rclone
-          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-x64.tar.gz"
+          # Downloads are cached, so a GitHub release outage only matters
+          # when the pinned versions change.
+          mkdir -p ~/tools-cache && cd ~/tools-cache
+          [ -f kopia.tar.gz ] || curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-x64.tar.gz"
           echo "${KOPIA_SHA256}  kopia.tar.gz" | sha256sum -c -
-          tar xzf kopia.tar.gz
-          sudo install -m 0755 "kopia-${KOPIA_VERSION}-linux-x64/kopia" /usr/local/bin/kopia
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o duplicacy "https://github.com/gilbertchen/duplicacy/releases/download/v${DUPLICACY_VERSION}/duplicacy_linux_x64_${DUPLICACY_VERSION}"
+          tar xzf kopia.tar.gz -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/kopia-${KOPIA_VERSION}-linux-x64/kopia" /usr/local/bin/kopia
+          [ -f duplicacy ] || curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o duplicacy "https://github.com/gilbertchen/duplicacy/releases/download/v${DUPLICACY_VERSION}/duplicacy_linux_x64_${DUPLICACY_VERSION}"
           echo "${DUPLICACY_SHA256}  duplicacy" | sha256sum -c -
           sudo install -m 0755 duplicacy /usr/local/bin/duplicacy
           restic version; rclone version | head -1; aws --version; kopia --version; duplicacy 2>&1 | grep -A1 VERSION
