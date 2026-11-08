@@ -2131,13 +2131,15 @@ upstream bucket is Q-V.
   place the row they complete in the same transaction (above). Table
   `placement`: `seq` (the queue row), `place` (the
   friend's node ID), `bucket`, `key` and `op` copied from the queue row
-  so the index outlives it, `state` (`queued`, `acked`, `refused`, and
-  from #19 `dropped`),
+  so the index outlives it, `state` (`queued`, `acked`, `refused`,
+  from #19 `dropped`, and from #21 `abandoned`),
   and on acknowledgement `sha256` and `acked_at`: acked put rows are
   the index of acknowledged hashes (REPL-10, `state.AckedHash`).
   `started_at` (schema 21) is set when the place's sender takes the row
-  to send it (`state.DB.StartPlacement`) and never cleared (*Deletes*,
-  below).
+  to send it (`state.DB.StartPlacement`) and never cleared; migration
+  21 sets it to 0 on every row queued when it runs, as an older lendisk
+  may have sent them. `abandoned` is a taken put that will not be sent
+  again and was never acknowledged (*Deletes*, below).
   `refused` (with `detail`) is a refusal that would repeat; the row
   leaves the FIFO. Its `cause` (schema 9) is NULL when the place
   refused (a `412`), `store` when the node's own store could not
@@ -2217,7 +2219,10 @@ upstream bucket is Q-V.
   target while the unreachable friend still has room (REPL-12).
   The moved row keeps its sequence, so it takes its turn in the new
   place's FIFO ahead of later rows. Re-routing an unsent row moves no
-  bytes. A row its sender has taken and not yet recorded an outcome for
+  bytes. A row a sender took before (a failed send that may have
+  landed) leaves its friend an `abandoned` row, so a later delete of
+  the key still goes there (*Deletes*, below;
+  `TestRerouteKeepsATakenRowsPlaceForItsDelete`). A row its sender has taken and not yet recorded an outcome for
   is not moved: should the send land, the place's row must be there to
   record it, or no later delete would reach the copy. The worker keeps
   that set (`Worker.sending`) under a lock that the sender takes its row
@@ -2279,6 +2284,17 @@ upstream bucket is Q-V.
     never both. A taken row stays taken, through a failed send, a
     retry and a restart: a send whose answer was lost may have landed,
     so the delete must follow it (`TestDeleteFollowsAPutInFlightAndPrecedesARewrite`).
+    The claim also outlives the row's leaving the FIFO unacknowledged:
+    a taken row cancelled as superseded (`CancelPlacement`) or
+    re-routed elsewhere (`Reroute`) becomes `abandoned`, not deleted,
+    and stays the place's row of the key, so a later delete still goes
+    there even when the write that superseded it went to another place
+    or was itself cancelled untaken
+    (`TestDeleteReachesAPlaceWhoseTakenPutWasSuperseded`,
+    `TestALostAnswerStillGetsItsDelete`). The sender checks
+    `Superseded` before it takes a row, so a row never sent is removed,
+    not abandoned. An `abandoned` row is out of the FIFO and out of the
+    count, and is never acknowledged.
   - *Even what metadata waits for.* The cancel applies when metadata of
     the bucket was captured between the put and the delete too: the
     store no longer holds the put's bytes, so it could never be sent
@@ -2292,10 +2308,10 @@ upstream bucket is Q-V.
     until every place has them is a follow-up the coordinator files.
   - *Then follow what remains.* The delete is queued at each friend
     whose latest remaining row of the key is a put (taken, acked,
-    refused or dropped), at its sequence, so it is behind every
+    refused, dropped or abandoned), at its sequence, so it is behind every
     earlier write of the key there and ahead of every later one; a
     place whose latest row is a delete already gets no second one. A
-    put taken but superseded by the delete is cancelled at its next
+    put taken but superseded by the delete is abandoned at its next
     try (`Superseded`), and the delete is sent after it; a key the
     friend lacks counts as deleted.
   - *Ordering across places* needs nothing more: a data delete is not

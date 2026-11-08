@@ -410,8 +410,12 @@ var migrations = []Migration{
 		SQL: `
 		-- Deletes (REPL-2, #21): when the place's sender took the row to
 		-- send it. A delete cancels a queued put no sender has taken,
-		-- and follows one that was taken, which may have landed.
+		-- and follows one that was taken, which may have landed. A row
+		-- queued now may have been sent by an older lendisk: taken, at
+		-- an unknown time (0). placement.state gains 'abandoned': a
+		-- taken row cancelled or re-routed unacknowledged.
 		ALTER TABLE placement ADD COLUMN started_at INTEGER; -- unix seconds; NULL until taken
+		UPDATE placement SET started_at = 0 WHERE state = 'queued';
 		CREATE INDEX placement_queued_key ON placement (bucket, key) WHERE state = 'queued';`,
 	},
 }

@@ -314,6 +314,50 @@ func TestOverwrittenOrDeletedPutIsNotSent(t *testing.T) {
 	}
 }
 
+// REPL-2 (#21 review): B stores data/1 but its answer is lost, and its
+// retries keep failing; the key is written again (the new bytes go to
+// C) and then deleted. The retry finds the row superseded, but the
+// place may hold it, so the delete still goes to B and B ends up
+// without a live data/1.
+func TestALostAnswerStillGetsItsDelete(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	fx.bucket("laptop", 1)
+	b := fx.places["B"]
+	var mu sync.Mutex
+	failing, tries := true, 0
+	b.fail = func(op, key string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if op != "put" || key != "data/1" || !failing {
+			return nil
+		}
+		tries++
+		if tries == 1 { // landed; the answer is lost
+			b.objs["laptop/data/1"] = []byte("first")
+		}
+		return errors.New("connection reset")
+	}
+	p1 := fx.write("laptop", "data/1", "first")
+	fx.run()
+	waitFor(t, "B to store data/1 and lose the answer", func() bool { mu.Lock(); defer mu.Unlock(); return tries > 0 })
+	fx.write("laptop", "data/1", "second!")
+	waitFor(t, "B's sender to cancel the superseded row", func() bool {
+		var n int
+		fx.db.QueryRow(`SELECT count(*) FROM placement WHERE place = 'B' AND seq = ? AND state = 'queued'`, p1).Scan(&n)
+		return n == 0
+	})
+	fx.remove("laptop", "data/1")
+	mu.Lock()
+	failing = false
+	mu.Unlock()
+	fx.drained("B")
+	fx.drained("C")
+	if fx.holds("B", "laptop", "data/1") {
+		log, _, _, _ := b.snapshot()
+		t.Fatalf("B keeps the deleted data/1 live; it was sent %v", log)
+	}
+}
+
 // REPL-2 (#21): a delete never overtakes a write of the key before it,
 // nor does a write after it overtake the delete. At B the put is in
 // flight when the key is deleted and written again: B gets the put, the

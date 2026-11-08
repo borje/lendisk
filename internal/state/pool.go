@@ -638,13 +638,27 @@ func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(st
 			drops[op.from] = append(drops[op.from], op.seq)
 			continue
 		}
-		r, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, op.from, op.seq)
+		// A row a sender took may have landed: it stays, abandoned, so
+		// a later delete still reaches the friend (#21 review).
+		r, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementAbandoned+`'
+			WHERE place = ? AND seq = ? AND state = 'queued' AND started_at IS NOT NULL`, op.from, op.seq)
 		if err != nil {
 			return 0, 0, err
 		}
-		if n, err := r.RowsAffected(); err != nil {
+		n, err := r.RowsAffected()
+		if err != nil {
 			return 0, 0, err
-		} else if n == 0 {
+		}
+		if n == 0 {
+			r, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, op.from, op.seq)
+			if err != nil {
+				return 0, 0, err
+			}
+			if n, err = r.RowsAffected(); err != nil {
+				return 0, 0, err
+			}
+		}
+		if n == 0 {
 			continue // sent, refused or cancelled since the scan
 		}
 		if err := db.insertPlacement(ctx, tx, op.seq, op.to, false); err != nil {

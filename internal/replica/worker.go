@@ -354,6 +354,21 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				continue
 			}
 		}
+		// A put a later write or delete replaced is cancelled before it
+		// is taken, so only a row once sent stays the place's row of the
+		// key for a later delete (#21).
+		if p.Op == state.OpPut {
+			if sup, err := w.DB.Superseded(ctx, p.Seq); err != nil || sup {
+				if err == nil {
+					err = w.DB.CancelPlacement(context.Background(), place, p.Seq)
+				}
+				if err != nil && ctx.Err() == nil {
+					log.Error("replication: cancelling a superseded row failed", "seq", p.Seq, "err", err)
+					sleep(ctx, poll)
+				}
+				continue
+			}
+		}
 		// Taken: from here the send may land, so a delete of the key
 		// follows the row instead of cancelling it. A row a delete has
 		// cancelled meanwhile is not sent (REPL-2, #21).

@@ -202,7 +202,7 @@ func TestWorkerReroutesFromAnUnreachableFriend(t *testing.T) {
 		return fx.holds("D", "repo", "data/1") && fx.holds("B", "repo", "index/1") && fx.holds("D", "repo", "index/1")
 	})
 	var places []string
-	rows, err := fx.db.Query(`SELECT place FROM placement WHERE seq = ? ORDER BY place`, d)
+	rows, err := fx.db.Query(`SELECT place || ' ' || state FROM placement WHERE seq = ? ORDER BY place`, d)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,9 @@ func TestWorkerReroutesFromAnUnreachableFriend(t *testing.T) {
 		places = append(places, p)
 	}
 	rows.Close()
-	if !slices.Equal(places, []string{"B", "D"}) {
+	// C was sent data/1 and failed: the send may have landed, so C keeps
+	// its row, abandoned, for a later delete (#21 review).
+	if !slices.Equal(places, []string{"B acked", "C abandoned", "D acked"}) {
 		t.Fatalf("data/1 placed at %v", places)
 	}
 }

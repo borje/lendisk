@@ -2,7 +2,9 @@ package state
 
 import (
 	"context"
+	"log/slog"
 	"testing"
+	"time"
 )
 
 // start marks place's row seq as taken by its sender, as the worker does
@@ -150,5 +152,121 @@ func TestDeleteKeepsItsPlaceInEachFIFO(t *testing.T) {
 	}
 	if len(got) != 3 || got[0] != d1 || got[1] != del || got[2] != d2 {
 		t.Fatalf("B's FIFO %v, want %d %d %d", got, d1, del, d2)
+	}
+}
+
+// rowState is place's row seq's state, or "" if it has none.
+func (p *pool) rowState(place string, seq int64) string {
+	p.t.Helper()
+	var st string
+	p.db.QueryRow(`SELECT state FROM placement WHERE place = ? AND seq = ?`, place, seq).Scan(&st)
+	return st
+}
+
+// REPL-2 (#21 review): a put taken at a place may have landed there
+// even when its row is later cancelled as superseded (its answer lost,
+// then a new write of the key captured): a later delete still reaches
+// that place, whether the new write went elsewhere or waits, untaken,
+// at the same place.
+func TestDeleteReachesAPlaceWhoseTakenPutWasSuperseded(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 1)
+	p1 := p.put("laptop", "data/1", "data", 1)
+	p.wantPlaces("data/1", p1, "B")
+	p.start("B", p1) // sent; the answer was lost
+	p2 := p.rewrite("laptop", "data/1", "data", 1)
+	p.wantPlaces("data/1 written again", p2, "C")
+	if err := p.db.CancelPlacement(ctx, "B", p1); err != nil { // its sender finds it superseded
+		t.Fatal(err)
+	}
+	del := p.del("laptop", "data/1", "data")
+	p.wantPlaces("delete of data/1", del, "B")
+
+	use, err := p.db.PlaceUse(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if use["B"] != 0 || use["C"] != 0 {
+		t.Fatalf("use %v after every write was deleted", use)
+	}
+
+	// The new write waits at the same place, not taken.
+	p = newPool(t)
+	p.friend("B", 10)
+	p.bucket("laptop", 1)
+	q1 := p.put("laptop", "data/2", "data", 1)
+	p.start("B", q1)
+	q2 := p.rewrite("laptop", "data/2", "data", 1)
+	p.wantPlaces("data/2 written again", q2, "B")
+	if err := p.db.CancelPlacement(ctx, "B", q1); err != nil {
+		t.Fatal(err)
+	}
+	del = p.del("laptop", "data/2", "data")
+	p.wantPlaces("delete of data/2", del, "B")
+	if st := p.rowState("B", q2); st != "" {
+		t.Fatalf("the untaken new write is %q, want cancelled", st)
+	}
+	if st := p.rowState("B", q1); st != PlacementAbandoned {
+		t.Fatalf("the taken superseded write is %q", st)
+	}
+	if use, _ := p.db.PlaceUse(ctx); use["B"] != 0 {
+		t.Fatalf("use %v after every write was deleted", use)
+	}
+}
+
+// REPL-2, §3.4 (#21 review): re-routing a taken row away from a friend
+// that stopped answering leaves that friend a row a later delete still
+// follows: the send may have landed there.
+func TestRerouteKeepsATakenRowsPlaceForItsDelete(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 1)
+	d := p.put("laptop", "data/1", "data", 1)
+	p.wantPlaces("data/1", d, "B")
+	p.start("B", d)
+	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	moved, _, err := p.db.Reroute(ctx, nil, nil)
+	if err != nil || moved != 1 {
+		t.Fatalf("moved %d %v", moved, err)
+	}
+	p.wantPlaces("data/1 re-routed", d, "C")
+	del := p.del("laptop", "data/1", "data")
+	p.wantPlaces("delete of data/1", del, "B")
+}
+
+// #21 review: rows queued when migration 21 runs may have been sent by
+// an older lendisk, so they count as taken: a delete follows them.
+func TestRowsQueuedBeforeTheUpgradeCountAsTaken(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	quiet := slog.New(slog.DiscardHandler)
+	old, err := open(ctx, dir, migrations[:20], quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	friend(t, old, "B")
+	seqs, err := old.BeginCaptures(ctx, []Capture{{Bucket: "laptop", Key: "data/1", Op: OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.FinishPut(ctx, seqs[0], 5, "h"); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+	db, err := Open(ctx, dir, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	del := capture(t, db, "laptop", "data/1", OpDelete)
+	var n int
+	db.QueryRow(`SELECT count(*) FROM placement WHERE place = 'B' AND seq IN (?, ?) AND state = 'queued'`, seqs[0], del).Scan(&n)
+	if n != 2 {
+		t.Fatalf("%d of the put and its delete queued at B, want both", n)
 	}
 }

@@ -20,11 +20,17 @@ import (
 // reroute_after while it held a metadata barrier, with no other friend
 // with room (Reroute, #19); out of the FIFO, not counted in the place's
 // use, and the object is below copies until re-placement (#26).
+// abandoned is a taken put (StartPlacement) that will not be sent again
+// and was never acknowledged: cancelled as superseded, or re-routed
+// elsewhere. Its send may have landed, so it stays the place's row of
+// the key and a later delete follows it (REPL-2, #21); out of the FIFO
+// and not counted in the place's use.
 const (
-	PlacementQueued  = "queued"
-	PlacementAcked   = "acked"
-	PlacementRefused = "refused"
-	PlacementDropped = "dropped"
+	PlacementQueued    = "queued"
+	PlacementAcked     = "acked"
+	PlacementRefused   = "refused"
+	PlacementDropped   = "dropped"
+	PlacementAbandoned = "abandoned"
 )
 
 // Place conditions: how a place answered last (#18).
@@ -115,9 +121,17 @@ func (db *DB) StartPlacement(ctx context.Context, place string, seq int64, now t
 	return n == 1, err
 }
 
-// CancelPlacement removes a queued row that will not be sent.
+// CancelPlacement takes a queued row that will not be sent out of the
+// FIFO: removed if no sender ever took it, else abandoned, as a send of
+// it may have landed and a later delete must still reach the place
+// (#21 review).
 func (db *DB) CancelPlacement(ctx context.Context, place string, seq int64) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, place, seq)
+	_, err := db.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementAbandoned+`'
+		WHERE place = ? AND seq = ? AND state = 'queued' AND started_at IS NOT NULL`, place, seq)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, place, seq)
 	return err
 }
 
