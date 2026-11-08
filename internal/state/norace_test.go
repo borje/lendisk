@@ -14,5 +14,10 @@ const (
 	settleWait = time.Second
 )
 
-// offsiteObjects sizes the large-bucket watermark test.
-const offsiteObjects = 20_000
+// offsiteObjects, offsiteLimit and offsiteFactor size and bound the
+// large-bucket watermark test.
+const (
+	offsiteObjects = 20_000
+	offsiteLimit   = 2 * time.Second
+	offsiteFactor  = 8 // it measures under 3 with or without -race
+)

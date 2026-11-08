@@ -236,9 +236,14 @@ func TestDroppedAndUnplacedCopiesAreStuckQueuedOnesWait(t *testing.T) {
 }
 
 // §3.4 REPL-11 (#20): the watermark of a large bucket, offsiteObjects data
-// objects (20000, fewer under -race) at two of three friends, a tenth deleted, and 1200 metadata
-// objects everywhere, takes well under passLimit, as status --wait reads
-// it every 2 s; one object still queued holds it.
+// objects (20000, fewer under -race) at two of three friends, a tenth
+// deleted, and 1200 metadata objects everywhere, takes well under
+// offsiteLimit (2 s, as status --wait reads it every 2 s; none under
+// -race, whose speed depends on the runner's load), and at most
+// offsiteFactor times a yardstick read on the same machine just before:
+// one indexed look-up per put and place, the cost §3.4 promises. A
+// query that grows worse than linear in the bucket fails the yardstick
+// anywhere. One object still queued holds the watermark.
 func TestOffsiteOfALargeBucketIsFast(t *testing.T) {
 	p := newPool(t)
 	ctx := context.Background()
@@ -275,12 +280,34 @@ func TestOffsiteOfALargeBucketIsFast(t *testing.T) {
 		t.Fatal(err)
 	}
 	last := p.put("laptop", "data/last", "data", 1)
-	start := time.Now()
-	o := p.offsite("laptop", 0)
-	took := time.Since(start)
-	t.Logf("Offsite over %d rows took %v", o.Latest, took)
-	if took > passLimit {
-		t.Fatalf("Offsite took %v, over %v", took, passLimit)
+	holders, err := p.db.holders(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The best of two runs of each, interleaved, so a burst of load on a
+	// shared runner slows both or neither.
+	var o Offsite
+	took, yard := time.Duration(1<<62), time.Duration(1<<62)
+	for range 2 {
+		start := time.Now()
+		var n int
+		if err := p.db.QueryRowContext(ctx, `SELECT count(*) FROM queue q, json_each(?2) pl
+			WHERE q.bucket = ?1 AND q.state = 'done' AND q.op = 'put' AND EXISTS (SELECT 1 FROM placement a
+				WHERE a.place = pl.value AND a.bucket = q.bucket AND a.key = q.key)`, "laptop", holders).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		yard = min(yard, time.Since(start))
+		start = time.Now()
+		o = p.offsite("laptop", 0)
+		took = min(took, time.Since(start))
+	}
+	ratio := float64(took) / float64(yard)
+	t.Logf("Offsite over %d rows took %v, %.1f times the yardstick's %v", o.Latest, took, ratio, yard)
+	if offsiteLimit > 0 && took > offsiteLimit {
+		t.Fatalf("Offsite took %v, over %v", took, offsiteLimit)
+	}
+	if ratio > offsiteFactor {
+		t.Fatalf("Offsite took %v, %.1f times the yardstick's %v, over %d", took, ratio, yard, offsiteFactor)
 	}
 	if o.Watermark != last-1 || o.Waiting.Objects != 1 {
 		t.Fatalf("offsite %+v, want the watermark just before %d", o, last)
