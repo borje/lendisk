@@ -9,7 +9,8 @@
 // friendship's quota nearly or wholly used either way (PEER-6, #24),
 // a bucket holding a Kopia format-1 repository (COMPAT-1, #79),
 // objects below copies past replication.replace_after (REPL-13, #26),
-// and a friend's replica that failed verification (VER-1, #27).
+// and a friend's replica that failed verification or has not passed it
+// for days (VER-1, SEC-7, #27).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -136,7 +137,17 @@ const (
 	// ID and the bucket, as <peer>/<bucket>. It clears when `lendisk
 	// verify <bucket> --peer <id> --full` passes, or the friendship ends.
 	KindReplicaUnverified = "replica_unverified"
+	// KindReplicaUnchecked: a friend's replica of a bucket that holds
+	// acknowledged objects has not passed a challenge for UncheckedAfter
+	// (3 days): the friend answers every challenge with an error, or its
+	// FIFO never empties (SEC-7, VER-1, #27 review). Nothing is drained;
+	// it says the replica's state is unknown. Subject: <peer>/<bucket>.
+	// It clears at the next pass.
+	KindReplicaUnchecked = "replica_unchecked"
 )
+
+// DefaultUncheckedAfter is Service.UncheckedAfter when zero.
+const DefaultUncheckedAfter = 3 * 24 * time.Hour
 
 // KopiaUpgrade is the command that upgrades a Kopia format-1 repository
 // (COMPAT-1).
@@ -173,7 +184,8 @@ const PurgeWarning = 7 * 24 * time.Hour
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindPurgeSoon,
-	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified}
+	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
+	KindReplicaUnchecked}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -217,6 +229,10 @@ type Service struct {
 	// copies before KindBelowCopies is raised (default 7 days, REPL-13's
 	// replication.replace_after).
 	BelowAfter time.Duration
+	// UncheckedAfter is how long a replica holding acknowledged objects
+	// may go without passing a challenge before KindReplicaUnchecked
+	// (default DefaultUncheckedAfter).
+	UncheckedAfter time.Duration
 
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
@@ -535,7 +551,17 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 	if err != nil {
 		return nil, err
 	}
+	unchecked := orDefault(s.UncheckedAfter, DefaultUncheckedAfter)
 	for _, c := range checks {
+		if from := c.LastPassOrHeld(); !c.Unverified() && !c.HeldSince.IsZero() && now.Sub(from) >= unchecked {
+			why := "it has not been challenged since (its copies kept being sent, or it was unreachable)"
+			if c.Error != "" {
+				why = "the last challenge got no answer: " + c.Error
+			}
+			msg := fmt.Sprintf("friend %s's replica of bucket %s has not passed a challenge since %s (longer than %v): %s. Nothing is moved; whether it still holds the data is unknown. `lendisk verify %s --peer %s` checks it now",
+				c.Place, c.Bucket, from.UTC().Format(time.RFC3339), unchecked, why, c.Bucket, c.Place)
+			out = append(out, alertOf(KindReplicaUnchecked, c.Place+"/"+c.Bucket, msg))
+		}
 		if !c.Unverified() {
 			continue
 		}

@@ -3957,7 +3957,12 @@ the handler's own reads and is never cancelled; nothing below
     (`replica_check.checked_at`, schema 29; `state.DB.DueReplicas`,
     looked at every 5 s; a replica with rows of the bucket `queued` or
     `dropping` there waits until its FIFO is empty, so a backup in
-    progress is not slowed by its challenge), up to
+    progress is not slowed by its challenge, but only until it is more
+    than a day (`state.Overdue`) past due, counted from its last answer
+    or, never answered, from its first acknowledgement: then it is
+    challenged anyway, so a FIFO that never empties, at a friend at
+    quota or behind a slow uplink, does not starve it,
+    `TestAStarvedReplicaIsChallengedOnceOverdue`), up to
     `verify.DefaultSamples` (8) distinct
     objects at random, each with a random range of at most
     `verify.DefaultRange` (64 KiB) and its own nonce. Randomness
@@ -4052,10 +4057,19 @@ the handler's own reads and is never cancelled; nothing below
   deletes half the packs it holds of A's in its store; with A's clock
   a day on, A raises `replica_unverified` for B's replica and every
   data object ends at both C and D, the snapshot offsite at two copies.
-- *Accepted (#27):* a lender that answers every challenge with an
-  error, never a definite one, is never failed; `status` shows its
-  replica not verified since its last pass. REPL-13's unreachable
-  threshold does not cover it, since it answers.
+- *Withheld proofs (SEC-7, #27 review).* SEC-7 has VER-1 detect a
+  friend that loses *or withholds* a replica. One that answers every
+  challenge with an error, never a definite one, is never failed, and a
+  replica whose challenge never runs proves nothing either. So a
+  replica holding acknowledged objects that has not passed a challenge
+  for `alert.DefaultUncheckedAfter` (3 days), counted from its last
+  pass or, never passed, from its first acknowledgement still held
+  (`ReplicaCheck.LastPassOrHeld`), raises `replica_unchecked` (§3.8).
+  It drains nothing: the friend may be right and the network wrong, and
+  REPL-13's unreachable threshold covers a friend that does not answer
+  at all. It says the replica's state is unknown, and what the last
+  challenge got (`TestAReplicaNeverVerifiedIsAlerted`: a friend
+  answering `500`, and one never challenged since its last pass).
 - **VER-2** Samples are whole-object `GetObject` calls by the replica
   client, hashed by lendisk and compared with the index; the method
   for overflow targets (S3-6), and for the evicted part of a bucket if
@@ -4462,6 +4476,11 @@ the handler's own reads and is never cancelled; nothing below
     is set; not raised for a former friend
     (`TestAFailedVerificationIsAlerted`). A challenge that got no answer
     raises nothing;
+  - `replica_unchecked`, subject `<friend>/<bucket>`: the replica holds
+    acknowledged objects and has not passed a challenge for 3 days
+    (`alert.Service.UncheckedAfter`; §3.6 *Withheld proofs*), with the
+    last challenge's error if it got none; drains nothing, cleared by
+    the next pass;
   - `friend_removed`, subject the former friend: it ended the
     friendship (its remove call, §3.2 PEER-5, #25); raised at once,
     cleared at the purge or when the two are friends again. This

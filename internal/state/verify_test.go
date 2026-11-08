@@ -301,6 +301,47 @@ func TestVerifyRequestsRoundTrip(t *testing.T) {
 	}
 }
 
+// VER-1, SEC-7 (#27 review): a replica whose FIFO never empties (a
+// friend at quota, a slow uplink) is challenged anyway once it is more
+// than a day overdue, so it is not starved for good: a day after its
+// last answer it waits for quiet, two days after it no longer does. One
+// never answered is overdue a day after its first acknowledgement.
+func TestAStarvedReplicaIsChallengedOnceOverdue(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.bucket("laptop", 1)
+	due := func() bool {
+		t.Helper()
+		ks, err := p.db.DueReplicas(ctx, p.now, 24*time.Hour, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(ks) == 1
+	}
+	a := p.put("laptop", "data/a", "data", 0.1)
+	p.ackAll(a)
+	p.put("laptop", "data/b", "data", 0.1) // stays queued
+	if due() {
+		t.Fatal("due while replicating, just acknowledged")
+	}
+	p.now = p.now.Add(24*time.Hour + time.Minute)
+	if !due() {
+		t.Fatal("never answered, a day after the first acknowledgement: not due")
+	}
+	if err := p.db.RecordVerified(ctx, "B", "laptop", false, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.now = p.now.Add(36 * time.Hour)
+	if due() {
+		t.Fatal("due half a day overdue while replicating")
+	}
+	p.now = p.now.Add(12*time.Hour + time.Minute)
+	if !due() {
+		t.Fatal("not due more than a day overdue")
+	}
+}
+
 // VER-1 (#27 review): an object is still challengeable at a place while
 // the place's row of it is acked and it is its key's latest done write;
 // not once deleted, written again, or dropped there.

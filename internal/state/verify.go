@@ -30,6 +30,20 @@ type ReplicaCheck struct {
 	Detail       string    // what failed
 	Error        string    // the last check that got no answer
 	ErrorAt      time.Time
+	// HeldSince is the first acknowledgement the friend still holds of
+	// the bucket; zero when it holds none.
+	HeldSince time.Time
+}
+
+// LastPassOrHeld is when the replica last passed a challenge, or, if
+// never, since when it has held acknowledged objects: what
+// replica_unchecked counts from. Zero when it holds nothing and never
+// passed.
+func (c ReplicaCheck) LastPassOrHeld() time.Time {
+	if !c.VerifiedAt.IsZero() {
+		return c.VerifiedAt
+	}
+	return c.HeldSince
 }
 
 // Unverified reports whether the replica is marked unverified.
@@ -79,12 +93,21 @@ func (db *DB) RecordCheckError(ctx context.Context, place, bucket, msg string, n
 	return err
 }
 
+// Overdue is how long past its daily challenge a replica waits for its
+// FIFO to empty before it is challenged anyway.
+const Overdue = 24 * time.Hour
+
+// heldSince is the first acknowledgement still held at f.peer_key of
+// bucket b.name (unix seconds), NULL when it holds none.
+const heldSince = `(SELECT min(h.acked_at) FROM placement h
+	WHERE h.place = f.peer_key AND h.bucket = b.name AND h.state = 'acked' AND h.op = 'put')`
+
 // ReplicaChecks returns every replica that a friend with an address
 // holds acknowledged objects of, or that has a record, by bucket and
 // then friend; a replica never checked has zero times.
 func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name, c.checked_at, c.verified_at, c.full_at,
-		c.unverified_at, coalesce(c.detail, ''), coalesce(c.error, ''), c.error_at
+		c.unverified_at, coalesce(c.detail, ''), coalesce(c.error, ''), c.error_at, `+heldSince+`
 		FROM friendship f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
 		WHERE c.place IS NOT NULL OR coalesce(f.address, '') != '' AND EXISTS (SELECT 1 FROM placement p
@@ -97,12 +120,13 @@ func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 	var out []ReplicaCheck
 	for rows.Next() {
 		var c ReplicaCheck
-		var checked, verified, full, unverified, errAt sql.NullInt64
-		if err := rows.Scan(&c.Place, &c.Bucket, &checked, &verified, &full, &unverified, &c.Detail, &c.Error, &errAt); err != nil {
+		var checked, verified, full, unverified, errAt, held sql.NullInt64
+		if err := rows.Scan(&c.Place, &c.Bucket, &checked, &verified, &full, &unverified, &c.Detail, &c.Error, &errAt,
+			&held); err != nil {
 			return nil, err
 		}
 		c.CheckedAt, c.VerifiedAt, c.FullAt = timeOf(checked), timeOf(verified), timeOf(full)
-		c.UnverifiedAt, c.ErrorAt = timeOf(unverified), timeOf(errAt)
+		c.UnverifiedAt, c.ErrorAt, c.HeldSince = timeOf(unverified), timeOf(errAt), timeOf(held)
 		out = append(out, c)
 	}
 	return out, rows.Err()
@@ -113,7 +137,11 @@ func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 // the bucket, not marked unverified, last answered every or more ago
 // (or never), and with no error within retry. A replica with copies of
 // the bucket still to send or delete there waits until its FIFO is
-// empty: a backup in progress is not slowed by its challenge.
+// empty: a backup in progress is not slowed by its challenge, until it
+// is more than Overdue past due (from its last answer, or, never
+// answered, from its first acknowledgement), when it is challenged
+// anyway, so a FIFO that never empties (a friend at quota, a slow
+// uplink) does not starve it (#27 review).
 func (db *DB) DueReplicas(ctx context.Context, now time.Time, every, retry time.Duration) ([]ReplicaKey, error) {
 	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name FROM friendship f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
@@ -121,9 +149,12 @@ func (db *DB) DueReplicas(ctx context.Context, now time.Time, every, retry time.
 		AND (c.checked_at IS NULL OR c.checked_at <= ?1) AND (c.error_at IS NULL OR c.error_at <= ?2)
 		AND EXISTS (SELECT 1 FROM placement p
 			WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state = 'acked' AND p.op = 'put')
-		AND NOT EXISTS (SELECT 1 FROM placement p
-			WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state IN ('queued', 'dropping'))
-		ORDER BY b.name, f.peer_key`, now.Add(-every).Unix(), now.Add(-retry).Unix())
+		AND (NOT EXISTS (SELECT 1 FROM placement p
+				WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state IN ('queued', 'dropping'))
+			OR c.checked_at <= ?3
+			OR c.checked_at IS NULL AND `+heldSince+` <= ?4)
+		ORDER BY b.name, f.peer_key`, now.Add(-every).Unix(), now.Add(-retry).Unix(),
+		now.Add(-every-Overdue).Unix(), now.Add(-Overdue).Unix())
 	if err != nil {
 		return nil, err
 	}
