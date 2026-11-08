@@ -323,14 +323,13 @@ func (w *Worker) reroute(ctx context.Context) {
 	if dropped > 0 {
 		w.alerted() // alert.KindCopiesDropped
 	}
-	switch {
-	case err != nil:
-		if ctx.Err() == nil {
-			w.Log.Error("replication: re-routing unsent data failed", "err", err)
-		}
-	case moved > 0 || dropped > 0:
+	// A pass can both move rows and fail on others: say both.
+	if moved > 0 || dropped > 0 {
 		w.Log.Info("replication: re-routed unsent data from friends that stopped answering or are full",
 			"moved", moved, "dropped_below_copies", dropped)
+	}
+	if err != nil && ctx.Err() == nil {
+		w.Log.Error("replication: re-routing unsent data failed", "err", err)
 	}
 }
 

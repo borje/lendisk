@@ -2,8 +2,10 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -1045,4 +1047,52 @@ func TestOneBadRowDoesNotHoldItsReroutingBatch(t *testing.T) {
 	p.wantPlaces("data/0", seqs[0], "B", "D")
 	p.wantPlaces("data/1", bad, "B", "C")
 	p.wantPlaces("data/2", seqs[2], "B", "D")
+}
+
+// §3.4 (#68 review): a batch that fails because the database is busy
+// is not retried row by row: every row would wait out busy_timeout in
+// turn while the worker holds its lock. The pass stops at the first
+// busy error and the rows wait for the next pass.
+func TestABusyDatabaseStopsTheReroutingPass(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 2)
+	var seqs []int64
+	for i := range 3 {
+		seqs = append(seqs, p.put("laptop", fmt.Sprintf("data/%d", i), "data", 0.1))
+	}
+	p.friend("D", 10)
+	p.condition("C", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+	// One pooled connection that gives up on a lock at once, and
+	// another handle holding the write lock.
+	p.db.SetMaxOpenConns(1)
+	if _, err := p.db.Exec(`PRAGMA busy_timeout = 0`); err != nil {
+		t.Fatal(err)
+	}
+	other, err := sql.Open("sqlite", "file:"+p.db.Path+"?_txlock=immediate")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	tx, err := other.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	moved, _, err := p.db.Reroute(ctx, nil, nil)
+	if err == nil || moved != 0 {
+		t.Fatalf("moved %d, %v; want nothing moved and the busy error", moved, err)
+	}
+	if n := strings.Count(err.Error(), "re-routing"); n != 1 {
+		t.Fatalf("%d errors, want the pass stopped at the first busy one:\n%v", n, err)
+	}
+	tx.Rollback()
+	if moved, _, err := p.db.Reroute(ctx, nil, nil); err != nil || moved != 3 {
+		t.Fatalf("the next pass: moved %d, %v", moved, err)
+	}
+	for i, s := range seqs {
+		p.wantPlaces(fmt.Sprintf("data/%d", i), s, "B", "D")
+	}
 }

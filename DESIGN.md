@@ -2684,7 +2684,13 @@ upstream bucket is Q-V.
   at a time, and the pass goes on, returning the failed rows' errors
   with what the others did, so one bad row holds only itself, never
   the other 63 of its batch (#68,
-  `TestOneBadRowDoesNotHoldItsReroutingBatch`). With no reachable friend with room the row waits at
+  `TestOneBadRowDoesNotHoldItsReroutingBatch`). A busy or locked
+  database (`SQLITE_BUSY`, `SQLITE_LOCKED`) is not a bad row: the pass
+  stops at the first such error, since each row would wait out
+  `busy_timeout` (30 s) in turn under the worker's lock, and the rest
+  wait for the next pass (`TestABusyDatabaseStopsTheReroutingPass`).
+  The worker logs what a pass moved even when it also failed.
+  With no reachable friend with room the row waits at
   its friend, and the lag shows in `status`. *Decision (#19,
   review):* the row is dropped instead of waiting (state `dropped`:
   out of the FIFO, not counted in `place_use`) when its friend is gone
