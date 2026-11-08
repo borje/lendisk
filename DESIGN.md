@@ -3124,6 +3124,18 @@ The lender's policy on a borrower's requests lives in the decorator's
 outer layer, `gateway.Lending` (`internal/gateway/quota.go`), which
 knows the borrower from the request's account; it sits above the
 capture decorator, so nothing stands between that and posix (#62).
+Every `Lending` method versitygw calls first detaches the request's
+context (`detach`, `context.WithoutCancel`). versitygw passes the
+`*fasthttp.RequestCtx`, whose `Done` is the server's shutdown channel
+and whose values fasthttp recycles when the handler returns; each
+`context.WithCancel` below it (every `database/sql` query makes one)
+starts a goroutine that reads those values at shutdown, after the
+handler may have returned, which the race detector caught in CI. The
+detached context keeps the values (the account, `bucket-owner`) for
+the handler's own reads and is never cancelled; nothing below
+`Lending` sees the fasthttp context
+(`TestARequestsContextIsNotWatchedPastItsHandler`,
+`TestEveryLendingMethodDetachesTheRequestContext`).
 
 - **LEND-1** `Lending` keeps a per-friend counter and enforces the
   friendship's quota (`Friendship.Quota`, the smaller number) on it.

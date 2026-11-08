@@ -25,6 +25,10 @@
 //     before anything is served, and rows a failed request left pending
 //     while serving every ResolveEvery (Decorator.ResolveStranded); Run
 //     does both.
+//   - Every Lending method versitygw calls starts with ctx = detach(ctx):
+//     the request's fasthttp context must not reach the database or the
+//     store, whose cancellable children would read it after fasthttp
+//     recycled it.
 package gateway
 
 import (
