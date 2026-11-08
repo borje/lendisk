@@ -676,9 +676,9 @@ func TestRerouteMovesOnlyToAReachableFriend(t *testing.T) {
 
 // manyWaiting fills p with friends B, C and D (room for about 20 more
 // objects), a bucket of 1200 metadata objects acknowledged everywhere,
-// and 3000 data rows acknowledged at C and queued at B, the friend to
+// and rows data rows acknowledged at C and queued at B, the friend to
 // re-route from; with barrier, a metadata row queued at C after them.
-func manyWaiting(t *testing.T, p *pool, barrier bool) {
+func manyWaiting(t *testing.T, p *pool, rows int, barrier bool) {
 	t.Helper()
 	ctx := context.Background()
 	p.friend("B", 1<<20)
@@ -696,7 +696,7 @@ func manyWaiting(t *testing.T, p *pool, barrier bool) {
 		`INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
 			SELECT q.seq, f.peer_key, q.bucket, q.key, 'put', 'acked', 'h', ?1, 100 + 4096
 			FROM queue q, friendship f WHERE q.class = 'metadata'`,
-		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3000)
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
 		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
 			SELECT 'laptop', 'data/' || i, 'put', 'data', 'done', 1048576 - 4096, 'h', ?1 FROM n`,
 		`INSERT INTO placement (seq, place, bucket, key, op, state, size)
@@ -711,7 +711,7 @@ func manyWaiting(t *testing.T, p *pool, barrier bool) {
 			SELECT seq, 'C', bucket, key, 'put', 'queued', 4196 FROM queue WHERE key = 'index/new'`)
 	}
 	for _, q := range qs {
-		if _, err := tx.ExecContext(ctx, q, p.now.Unix()); err != nil {
+		if _, err := tx.ExecContext(ctx, q, p.now.Unix(), rows); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -720,41 +720,77 @@ func manyWaiting(t *testing.T, p *pool, barrier bool) {
 	}
 }
 
-// reroutePass runs one pass and checks it took under passLimit (more
-// under the race detector) and filled D no further than its quota.
-func reroutePass(t *testing.T, p *pool) (moved, dropped int64) {
+// manyRows is how many rows wait at B in the re-routing pass tests.
+const manyRows = 3000
+
+// fastReroute fills a pool with manyRows waiting rows (manyWaiting,
+// with barrier), puts B in condition for two hours, runs one re-routing
+// pass, checks it filled D no further than its quota and was fast, and
+// returns what it did.
+//
+// Without the race detector the pass takes under passLimit. Under it,
+// whose speed depends on the runner's load (5.5 s for 3000 rows on a
+// loaded CI runner), it takes at most passGrowth times a pass over a
+// quarter of the rows: linear work grows four times, work per row that
+// grows with the rows sixteen. Each size is timed twice, interleaved,
+// and the best kept, so a burst of load slows both or neither.
+func fastReroute(t *testing.T, barrier bool, condition string) (moved, dropped int64) {
 	t.Helper()
-	ctx := context.Background()
-	start := time.Now()
-	moved, dropped, err := p.db.Reroute(ctx, nil, nil)
-	took := time.Since(start)
-	if err != nil {
-		t.Fatal(err)
+	pass := func(rows int) (moved, dropped int64, took time.Duration) {
+		t.Helper()
+		ctx := context.Background()
+		p := newPool(t)
+		manyWaiting(t, p, rows, barrier)
+		p.condition("B", condition, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
+		start := time.Now()
+		moved, dropped, err := p.db.Reroute(ctx, nil, nil)
+		took = time.Since(start)
+		if err != nil {
+			t.Fatal(err)
+		}
+		use, err := p.db.PlaceUse(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if use["D"] > 40*unit {
+			t.Fatalf("D counts %d bytes, more than its quota", use["D"])
+		}
+		return moved, dropped, took
 	}
-	t.Logf("a pass over 3000 rows took %v, moved %d, dropped %d", took, moved, dropped)
-	if took > passLimit {
-		t.Fatalf("a pass took %v, over %v", took, passLimit)
+	moved, dropped, took := pass(manyRows)
+	t.Logf("a pass over %d rows took %v, moved %d, dropped %d", manyRows, took, moved, dropped)
+	if passGrowth == 0 {
+		if took > passLimit {
+			t.Fatalf("a pass over %d rows took %v, over %v", manyRows, took, passLimit)
+		}
+		return moved, dropped
 	}
-	use, err := p.db.PlaceUse(ctx)
-	if err != nil {
-		t.Fatal(err)
+	quarter := time.Duration(1 << 62)
+	for i := range 2 {
+		_, _, q := pass(manyRows / 4)
+		quarter = min(quarter, q)
+		if i == 0 {
+			_, _, again := pass(manyRows)
+			took = min(took, again)
+		}
 	}
-	if use["D"] > 40*unit {
-		t.Fatalf("D counts %d bytes, more than its quota", use["D"])
+	ratio := float64(took) / float64(quarter)
+	t.Logf("best of two: %v over %d rows, %.1f times %v over %d", took, manyRows, ratio, quarter, manyRows/4)
+	if ratio > passGrowth {
+		t.Fatalf("a pass over %d rows took %v, %.1f times the %v over %d, over %d",
+			manyRows, took, ratio, quarter, manyRows/4, passGrowth)
 	}
 	return moved, dropped
 }
 
 // §3.4 (#19 final review): a re-routing pass over 3000 waiting rows in
 // a bucket of 1200 metadata objects is fast (tens of milliseconds;
-// passLimit, 2 s or 5 s under the race detector, keeps CI stable), so
-// it never keeps captures waiting on the write lock past busy_timeout.
-// Only a few rows find room; the rest wait at the unreachable friend.
+// passLimit, 2 s, keeps CI stable; under the race detector it must grow
+// no worse than linearly), so it never keeps captures waiting on the
+// write lock past busy_timeout. Only a few rows find room; the rest
+// wait at the unreachable friend.
 func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
-	p := newPool(t)
-	manyWaiting(t, p, false)
-	p.condition("B", ConditionRetrying, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
-	if moved, dropped := reroutePass(t, p); moved == 0 || moved > 40 || dropped != 0 {
+	if moved, dropped := fastReroute(t, false, ConditionRetrying); moved == 0 || moved > 40 || dropped != 0 {
 		t.Fatalf("moved %d dropped %d: D has room for a few", moved, dropped)
 	}
 }
@@ -763,12 +799,9 @@ func TestRerouteOfManyWaitingRowsIsFast(t *testing.T) {
 // 507 for reroute_after, where every row holds a metadata barrier: the
 // few that fit move, the rest are dropped, in one fast pass.
 func TestRerouteOfManyRowsAtAFullFriendIsFast(t *testing.T) {
-	p := newPool(t)
-	manyWaiting(t, p, true)
-	p.condition("B", ConditionQuota, p.now.Add(-2*time.Hour), p.now.Add(-3*time.Hour))
-	moved, dropped := reroutePass(t, p)
-	if moved == 0 || moved > 40 || moved+dropped != 3000 {
-		t.Fatalf("moved %d dropped %d of 3000", moved, dropped)
+	moved, dropped := fastReroute(t, true, ConditionQuota)
+	if moved == 0 || moved > 40 || moved+dropped != manyRows {
+		t.Fatalf("moved %d dropped %d of %d", moved, dropped, manyRows)
 	}
 }
 

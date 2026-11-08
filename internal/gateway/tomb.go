@@ -211,6 +211,15 @@ func sameHash(ts []state.Tombstone, want string) (state.Tombstone, bool) {
 	return state.Tombstone{}, false
 }
 
+// newestTomb returns the ID of the newest of ts (tombsOf's order), or 0
+// for none.
+func newestTomb(ts []state.Tombstone) int64 {
+	if len(ts) == 0 {
+		return 0
+	}
+	return ts[len(ts)-1].ID
+}
+
 // tombsOf returns a key's tombstones; a failure to read them refuses the
 // write that asked.
 func (l *Lending) tombsOf(ctx context.Context, peer, sealed, key string) ([]state.Tombstone, error) {

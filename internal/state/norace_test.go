@@ -4,8 +4,12 @@ package state
 
 import "time"
 
-// passLimit bounds one re-routing pass in tests.
-const passLimit = 2 * time.Second
+// passLimit bounds one re-routing pass in tests; passGrowth, its
+// growth with the rows, is checked only under the race detector.
+const (
+	passLimit  = 2 * time.Second
+	passGrowth = 0
+)
 
 // settleKeys and settleWait size the large-bucket settling test: a
 // 2,000-key batch takes about 0.06 s.
