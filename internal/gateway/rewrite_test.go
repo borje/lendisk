@@ -152,12 +152,13 @@ func TestUnmarkedOrStaleRewriteRefused(t *testing.T) {
 	}
 	unchanged("a malformed mark")
 
-	// A deleted key: a rewrite never replaces a tomb; same bytes revive.
+	// A deleted key: a rewrite must name the deleted version, the newest
+	// tomb (TestRewriteOfADeletedKeyKeepsItsTomb); an older one is stale.
 	if err := l.del("config"); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.put("config", v3, rewriteMeta(v3, sum(v2))); code(err) != "PreconditionFailed" {
-		t.Fatalf("rewrite of a deleted key: %v", err)
+	if err := l.put("config", v3, rewriteMeta(v3, sum(v1))); code(err) != "PreconditionFailed" {
+		t.Fatalf("rewrite of a deleted key naming an older tomb: %v", err)
 	}
 	if ts := l.tombs("config"); len(ts) != 2 {
 		t.Fatalf("tombstones %+v", ts)

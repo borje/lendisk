@@ -534,7 +534,13 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 	if err != nil {
 		return none, err
 	}
-	if len(ts) > 0 {
+	// A rewrite marked with the newest tomb's hash: the borrower replaces
+	// the version it deleted (a rewritable key written anew, #74). The
+	// tombs stay, so nothing is lost within the window; it is published
+	// as a new object. Any other write of a tombstoned key takes the
+	// tomb path: the same bytes revive, others are refused.
+	newer := mark != "" && want != mark && len(ts) > 0 && ts[len(ts)-1].SHA256 == mark
+	if len(ts) > 0 && !newer {
 		return l.putOverTomb(ctx, peer, *in.Bucket, b, want, ts)
 	}
 	release, err := l.reserve(ctx, peer, size+itemOverhead)
@@ -576,6 +582,7 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 		}
 		return lockKey()
 	}
+	b.onFull = b.onEOF // the declared length is read: lock now, even if the store reads no further
 	if size == 0 {
 		// The store may publish without reading.
 		if err := lockKey(); err != nil {
@@ -953,8 +960,9 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 	if l.beforeComplete != nil {
 		l.beforeComplete()
 	}
-	// A put of the key (which takes no key lock) may have been published
-	// since the check above: then this one is refused.
+	// A borrower's put of the key waits for the key's lock this
+	// completion holds; an object published by other means since the
+	// check above refuses this one.
 	c := *in
 	c.IfNoneMatch = &anyETag
 	res, ver, err := l.Next.CompleteMultipartUpload(ctx, &c)

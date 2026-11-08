@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -406,7 +407,10 @@ func TestBorrowerCannotPurgeEarly(t *testing.T) {
 		if got, err := l.tombBytes(tomb); err != nil || !bytes.Equal(got, body) {
 			t.Fatalf("after %q the tomb holds %q (%v)", n, got, err)
 		}
-		if ts := l.tombs("data/ef/pack"); len(ts) != 1 || ts[0].ID != tomb.ID {
+		// The tomb is kept. A rewrite marked with its hash stores other
+		// bytes at the key beside it (#74), which a later delete tombs
+		// too: more tombs, never fewer.
+		if ts := l.tombs("data/ef/pack"); !slices.ContainsFunc(ts, func(x state.Tombstone) bool { return x.ID == tomb.ID }) {
 			t.Fatalf("after %q the tombstones are %+v", n, ts)
 		}
 	}

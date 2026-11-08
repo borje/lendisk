@@ -40,8 +40,9 @@ import (
 //     depth (OpenBackend), so no S3 call reads, writes, lists or deletes
 //     there, and checkKey refuses the name besides.
 //   - A put of the same hash to a tombstoned key revives the object; a
-//     put or multipart upload of another hash is refused (LEND-4), a
-//     rewrite's included: a rewrite replaces only a live version.
+//     put or multipart upload of another hash is refused (LEND-4),
+//     except a rewrite marked with the newest tomb's hash, which is
+//     stored beside the tombs (a rewritable key written anew, #74).
 //   - A rewrite's replaced version is tombstoned the same way
 //     (rewrite.go, #74), its row marked Rewrite; settleTombs moves a
 //     pending one back if the key holds nothing.

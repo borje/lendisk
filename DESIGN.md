@@ -2371,8 +2371,10 @@ upstream bucket is Q-V.
 - **Rewrites (#74, EP-7, LEND-4).** A put whose queue row says the key
   is rewritable (`queue.rewritable`, set at capture from the bucket's
   profile, §3.3 EP-7; `state.Placement.Rewritable`) is sent to a place
-  that acknowledged another version of the key (`state.AckedHash`) as a
-  rewrite of that version: `Object.Replaces`, which `Friend.Put` sends
+  that acknowledged another version of the key as a rewrite of that
+  version (`state.AckedPutHash`: the last put the place acknowledged,
+  deleted since or not, since a deleted version is in the lender's tomb
+  and a rewrite naming it is stored beside it, §3.5): `Object.Replaces`, which `Friend.Put` sends
   as the user metadata `x-amz-meta-lendisk-replaces` with the
   replaced version's SHA-256 (`replica.MetaReplaces`), signed like
   every header. A first put, a put to a place that acknowledged the
@@ -2395,7 +2397,17 @@ upstream bucket is Q-V.
   it), or holds exactly the version the refused rewrite named, that may
   pass: the row waits with the network backoff, the place shows
   `retrying`, and nothing is refused or alerted
-  (`TestRefusedRewriteWithNoNewsFromTheHeadIsRetried`). A rewrite
+  (`TestRefusedRewriteWithNoNewsFromTheHeadIsRetried`), but only for
+  an hour (`Worker.RewriteRetry`, `replica.DefaultRewriteRetry`; kept
+  in memory, so a restart starts the hour again). It need not pass: a
+  tomb of a version other than the one named stands until its purge,
+  and a lender too old to read the mark refuses every rewrite. Past the
+  hour the row is refused for good at that place, `place_refused`, its
+  log line and alert saying the friend keeps refusing a rewrite of a
+  rewritable key, so the place's strict FIFO moves on instead of
+  stalling for the whole window
+  (`TestRewriteRefusedPastTheRetryWindowIsRefused`); a later write of
+  the key heals it as any refusal is healed. A rewrite
   refused again after the retry with the place's hash is a refusal like
   any other `412` (`place_refused`). Rewrites are single PUTs: rewritable keys are a
   few KiB, and multipart replication (#23) would need the mark at
@@ -2738,6 +2750,21 @@ capture decorator, so nothing stands between that and posix (#62).
   published, the row is kept and the new bytes are counted. If the
   store does not publish (its checksum check, a full disk), the
   replaced version is moved back (`revive`), and the borrower retries.
+  *A deleted key written anew (#74, second review).* A `PutObject` to a
+  key that holds no object, marked with the hash of its newest tomb
+  (the version the borrower deleted), is stored as a new object beside
+  the tombs, which stay for their windows: this is a rewritable key
+  the tool deleted and wrote again with other bytes (a Kopia repository
+  made anew), and without it the lender would refuse every version
+  until the purge. A mark naming an older tomb is stale and refused,
+  as is any unmarked write of other bytes
+  (`TestRewriteOfADeletedKeyKeepsItsTomb`). A borrower's put of a key
+  whose multipart upload is completing waits for the completion's lock
+  and is then refused, or answered with the stored ETag for the same
+  bytes (`TestPutRacingACompletionWaitsForIt`); a put takes the key's
+  lock as soon as it has read its declared length, even from a store
+  that never reads the end of the body
+  (`TestPutTakesTheKeyLockWhenTheStoreStopsAtTheLength`).
   The lender does not know the borrower's profile and needs not: a
   borrower may mark any key, and whatever it marks, each replaced
   version is kept for the window (RET-2,
@@ -2808,7 +2835,14 @@ capture decorator, so nothing stands between that and posix (#62).
   the moment between a rewrite's move and its publication, the key is
   listed as the version it replaces, live, from the pending rewrite
   row, so a recovery list read then does not record it as deleted
-  (`TestKeyInARewritesGapListsAsItsOldVersion`).
+  (`TestKeyInARewritesGapListsAsItsOldVersion`). The list reads the
+  store before the tombstones, so for any key whose newest tombstone is
+  a rewrite's and which the store's listing lacked, it heads the store
+  again: a rewrite that published in between is listed live with its
+  new version; one still pending as the version it replaces; only a
+  key the store still lacks after a kept rewrite row is listed
+  tombstoned. A key listed from a rewrite row carries its replaced
+  versions too (`TestListSeesARewriteFinishedBetweenItsReads`).
   *Window (#17):* the purge time is fixed at the delete: deleted at
   plus `gateway.Retention`, the longer of the friendship's two
   retention offers exchanged at redeem (`own_retention`, this node's
@@ -2835,7 +2869,9 @@ capture decorator, so nothing stands between that and posix (#62).
   revives the same way. Another hash is `PreconditionFailed` (412,
   LEND-4) before any byte is read, at `PutObject`,
   `CreateMultipartUpload` and completion, so a tombstoned key takes
-  only its own bytes back until it is purged.
+  only its own bytes back until it is purged, except a rewrite marked
+  with the newest tomb's hash, stored beside the tombs (§3.5
+  *Rewrites*, #74).
   *Crash safety:* the row is written, pending, before the rename and
   marked kept after it; a revival marks it pending before the link.
   At every start, before anything is served and before the reconcile,
@@ -2883,8 +2919,10 @@ capture decorator, so nothing stands between that and posix (#62).
   ends. `TestHostilePeer` (§3.9 SEC-7) runs the same list, in the same
   order, over the tunnel from both of the borrower's keys
   (`purgeAttacks`). Since #74 the list includes a rewrite marked with
-  the tomb's hash, of the key and of the tomb's own path (refused: a
-  rewrite replaces only a live version), and `TestHostilePeer` also
+  the tomb's hash, of the key (stored beside the tomb, which is kept:
+  §3.5 *Rewrites*) and of the tomb's own path (refused); the check after
+  each attack is that the tomb is kept with its bytes, since a rewrite
+  and a later delete may add tombs beside it. `TestHostilePeer` also
   has the borrower rewrite a live key three times and then try stale,
   false, malformed and absent marks and a marked multipart upload
   (`rewriteAttacks`): every replaced version is a tomb holding its

@@ -94,7 +94,7 @@ type Lending struct {
 
 	tombDirs sync.Mutex // creating and removing directories for tombs and revivals
 
-	keys     keyLocks // one multipart create, completion or delete per borrower's key at a time
+	keys     keyLocks // per borrower's key: deletes, multipart creates and completions, puts (from a verified body until the store answers), rewrites, revivals and purges
 	uploads  keyLocks // one accounting step per borrower's upload at a time
 	mu       sync.Mutex
 	peers    map[string]*borrowerUse

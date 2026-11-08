@@ -22,6 +22,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/invite"
 	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 )
 
@@ -128,7 +129,10 @@ func TestHostilePeer(t *testing.T) {
 		if got, err := os.ReadFile(filepath.Join(bDir, filepath.FromSlash(tomb.Tomb))); err != nil || !bytes.Equal(got, body) {
 			t.Fatalf("after %s the tomb holds %q (%v)", when, got, err)
 		}
-		if ts, err := aDB.TombstonesOf(ctx, bID.NodeID().String(), bSealed, "data/ef/pack"); err != nil || len(ts) != 1 || ts[0].ID != tomb.ID {
+		// Kept: a rewrite marked with its hash stores other bytes beside it
+		// (#74), which a later delete tombs too; more tombs, never fewer.
+		if ts, err := aDB.TombstonesOf(ctx, bID.NodeID().String(), bSealed, "data/ef/pack"); err != nil ||
+			!slices.ContainsFunc(ts, func(x state.Tombstone) bool { return x.ID == tomb.ID }) {
 			t.Fatalf("after %s the tombstones are %+v (%v)", when, ts, err)
 		}
 	}
