@@ -6,7 +6,8 @@
 // the store could not supply (VER-5), objects a place refused (LEND-4),
 // keys changed after a friend acknowledged them (EP-11), a friendship
 // the friend ended and the purge of an ended one (PEER-5), and a
-// friendship's quota nearly or wholly used either way (PEER-6, #24).
+// friendship's quota nearly or wholly used either way (PEER-6, #24), and
+// a bucket holding a Kopia format-1 repository (COMPAT-1, #79).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -113,7 +114,24 @@ const (
 	// from it and nothing is deleted. The friend gets quota_exhausted.
 	// Subject: the friend.
 	KindLentOverQuota = "lent_over_quota"
+	// KindKopiaFormat1: a kopia bucket captured a blob only Kopia's
+	// repository format version 1 writes (COMPAT-1, #79), which lendisk
+	// does not support; writes are accepted and replicated as before.
+	// Subject: the bucket. It clears when the bucket captures the blob
+	// `kopia repository set-parameters --upgrade` writes, or is deleted.
+	KindKopiaFormat1 = "kopia_format1"
 )
+
+// KopiaUpgrade is the command that upgrades a Kopia format-1 repository
+// (COMPAT-1).
+const KopiaUpgrade = "kopia repository set-parameters --upgrade"
+
+// KopiaFormat1Message says what a bucket holding a Kopia format-1
+// repository means, for the alert and status alike.
+func KopiaFormat1Message(b state.Bucket) string {
+	return fmt.Sprintf("bucket %s holds a Kopia repository in format version 1 (Kopia 0.8 or earlier; it wrote %s at %s), which lendisk does not support: its compaction and cleanup blobs reach only `copies` friends, not every friend. Writes are accepted and replicated as before. Run `%s` with Kopia 0.9 or later (every client of the repository must then be 0.9 or later)",
+		b.Name, b.Format1Key, b.Format1At.UTC().Format(time.RFC3339), KopiaUpgrade)
+}
 
 // QuotaHighPercent is the use of a quota above which KindQuotaHigh is
 // raised (OPS-2).
@@ -139,7 +157,7 @@ const PurgeWarning = 7 * 24 * time.Hour
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindPurgeSoon,
-	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota}
+	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -445,6 +463,9 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		return nil, err
 	}
 	for _, b := range bs {
+		if b.Format1() {
+			out = append(out, alertOf(KindKopiaFormat1, b.Name, KopiaFormat1Message(b)))
+		}
 		if b.Copies <= pool {
 			continue
 		}

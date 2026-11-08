@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/gateway"
@@ -341,6 +342,17 @@ type StatusBucket struct {
 	// acknowledged, which the bucket's profile does not name rewritable:
 	// the local write stands, but is not replicated (EP-11, #22).
 	Changed []StatusChanged `json:"changed"`
+	// KopiaFormat1 is set while the bucket holds a Kopia repository in
+	// format version 1, which lendisk does not support (COMPAT-1, #79):
+	// writes are accepted and replicated as before. Absent otherwise.
+	KopiaFormat1 *StatusKopiaFormat1 `json:"kopia_format1,omitempty"`
+}
+
+// StatusKopiaFormat1 says a bucket holds a Kopia format-1 repository.
+type StatusKopiaFormat1 struct {
+	Since string `json:"since"` // RFC 3339, UTC: when Key was captured
+	Key   string `json:"key"`   // the first format-1 blob captured
+	Fix   string `json:"fix"`   // the command that upgrades it
 }
 
 // StatusChanged is one changed key (EP-11).
@@ -442,6 +454,15 @@ func changedLines(b StatusBucket) []string {
 	}
 	return append(out, "  write the acknowledged bytes back, or, to keep the new ones, delete the key and write it again;",
 		"  a friend that reports other bytes for every key is at fault (see its refusals under Places)")
+}
+
+// kopiaFormat1 is what status says of a bucket holding a Kopia
+// format-1 repository (COMPAT-1), nil for any other.
+func kopiaFormat1(b state.Bucket) *StatusKopiaFormat1 {
+	if !b.Format1() {
+		return nil
+	}
+	return &StatusKopiaFormat1{Since: b.Format1At.UTC().Format(time.RFC3339), Key: b.Format1Key, Fix: alert.KopiaUpgrade}
 }
 
 // StatusSchema is the current `status --json` schema number.
@@ -557,7 +578,7 @@ friend, or with no room in the pool), which status shows.`,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
 					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1,
 					OutsideTrust: !profiles.Get(b.Profile).Encrypted, Offsite: off,
-					Changed: changed[b.Name]})
+					Changed: changed[b.Name], KopiaFormat1: kopiaFormat1(b)})
 			}
 			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
 				return err
@@ -677,6 +698,10 @@ friend, or with no room in the pool), which status shows.`,
 				}
 				for _, l := range changedLines(b) {
 					fmt.Fprintf(a.out, "    %s\n", l)
+				}
+				if f := b.KopiaFormat1; f != nil {
+					fmt.Fprintf(a.out, "    ! Kopia repository in format version 1, which lendisk does not support (blob %s, %s);\n", f.Key, f.Since)
+					fmt.Fprintf(a.out, "      writes are accepted and replicated as before; run `%s` (Kopia 0.9 or later)\n", f.Fix)
 				}
 			}
 			if st.Pool.SingleFriend {

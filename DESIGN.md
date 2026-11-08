@@ -1,6 +1,6 @@
 # lendisk — design
 
-Status: draft v0.17, 2026-11-08. Companion to REQUIREMENTS.md v0.11.3.
+Status: draft v0.18, 2026-11-08. Companion to REQUIREMENTS.md v0.11.4.
 REQUIREMENTS.md v0.9 made the two requirement changes this design
 needed (Q-T, resolved); its later versions moved third-party
 credentials to the environment,
@@ -98,7 +98,10 @@ rewrite marked with the hash of the version it replaces
 replaced version as a tombstone for the retention window; and
 recovery reads those tombstones to tell the newest version where
 friends disagree (§3.3 EP-7, §3.4, §3.5 LEND-4, §3.6 RET-1, §3.1
-ID-5). The trust model is unchanged throughout.
+ID-5). v0.18 follows REQUIREMENTS v0.11.4 (#79): a Kopia format-1
+repository, told by the blobs only that format writes, is shown in
+`status` and alerted until Kopia's upgrade, never refused (§3.3 EP-7,
+§3.8, §3.10 COMPAT-1). The trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -2075,6 +2078,62 @@ upstream bucket is Q-V.
   a tomb. A changed key that is not rewritable is not replicated
   (EP-11, #22): held back at capture with the `key_changed` alert
   (§3.4).
+  *Kopia format 1 (COMPAT-1, #79).* Kopia 0.23.1 still creates format
+  1 (`kopia repository create … --format-version=1`; versions in
+  `repo/format/format_provider.go:42-44`). What only format 1 writes,
+  read from its source: `repo/format/content_format.go:29-39` gives
+  formats 2 and 3 the epoch manager and format 1 none, and
+  `repo/content/committed_read_manager.go:295-298` picks the legacy
+  `indexblob.ManagerV0` exactly when the epoch manager is off. Only
+  ManagerV0 writes the prefixes of
+  `repo/content/indexblob/index_blob_manager_v0.go:23-29`: plain index
+  blobs `n*` (`WriteIndexBlobs`, :216), the compaction log `m*`
+  (`registerCompaction`, :192) and the cleanup blobs `l*`
+  (`delayCleanupBlobs`, :401). Formats 2 and 3 index through
+  `internal/epoch/epoch_manager.go:206-212` (`xn`, `xs`, `xr`, `xe`,
+  `xw`), so a plain `n*` is format 1's too, with one exception: the
+  upgrade (`set-parameters --upgrade`,
+  `cli/command_repository_set_parameters.go:134-138`, or `repository
+  upgrade`'s commit, `repo/format/upgrade_lock.go:111`) writes the
+  legacy-index poison blob
+  `n00000000000000000000000000000000-repository_unreadable_by_this_kopia_version_upgrade_required`
+  (`upgrade_lock.go:19`) beside its rewrite of `kopia.repository`, so that a
+  format-1 client can no longer open the repository. The upgrade
+  converts the active `n*` indexes into the first epoch (`xn0_*`,
+  `index_blob_manager_v1.go:165`) and deletes no `n*`, `m*` or `l*`
+  blob; nothing in later maintenance does either, so they stay in the
+  bucket (and at friends) after an upgrade, unread. A format-1
+  repository writes `n*` blobs at `create` and with every snapshot,
+  `m*` and `l*` only when maintenance compacts indexes.
+  Two profile lists say this as data: `format1_keys = ["n*", "m*",
+  "l*"]` and `upgraded_keys` = the poison blob's name, checked first
+  (`profile.Profile.Format`); only `kopia` has them. They change no
+  class (`n*` stays a snapshot key, `m*` and `l*` data, so these reach
+  `copies` friends only: why format 1 is unsupported), and no write is
+  refused for them. After the store accepts a captured put or completed
+  upload, the decorator (`noteFormat`) marks the bucket on a
+  `format1_keys` key, once (`buckets.format1_at`, `format1_key`,
+  migration 27; `state.DB.MarkFormat1`, on the gateway's clock), and
+  records the upgrade on an `upgraded_keys` key (`buckets.upgraded_at`,
+  `MarkUpgraded`). The bucket holds a format-1 repository while
+  `format1_at` is set and `upgraded_at` is not (`state.Bucket.Format1`);
+  a format-1 key captured after the upgrade marks nothing, which keeps
+  an import of an upgraded repository, walking its leftover `n*`
+  blobs, from marking it. So the warning ends at the upgrade itself,
+  not after a quiet period or on a `kopia.repository` rewrite (which a
+  format-1 `set-parameters` also does, and whose format version is
+  encrypted), and when the bucket is deleted with its row. `status`
+  prints "! Kopia repository in format version 1, which lendisk does
+  not support" under the bucket with the first such blob, its time and
+  `kopia repository set-parameters --upgrade` (Kopia 0.9 or later);
+  `status --json` adds `buckets[].kopia_format1` (`since`, `key`,
+  `fix`), absent otherwise; the `kopia_format1` alert (§3.8) says the
+  same. `bucket add`'s Kopia lines say Kopia 0.9 or later (repository
+  format 2 or later). `TestKopiaFormat1RepositoryIsWarnedUntilUpgraded`
+  creates a format-1 repository with real Kopia 0.23.1 through
+  lendisk, takes two snapshots (every key captured in its class), finds
+  the status lines and the alert, upgrades, snapshots and verifies, and
+  finds both gone.
 - **EP-10** The read-through (`gateway/readthrough.go`, #30). The
   decorator's `GetObject` and `HeadObject` turn the store's not-found
   for an own bucket's key (not a local-only one; `lent-*` buckets pass
@@ -4024,7 +4083,14 @@ the handler's own reads and is never cancelled; nothing below
     (`lent_usage`) than the quota, after a lowering: no new objects
     are accepted from it and nothing is deleted. With the friend's
     `quota_exhausted` this is PEER-6's "notifies both", as is `peer
-    quota`'s own output (`TestQuotaUseRaisesAlerts`).
+    quota`'s own output (`TestQuotaUseRaisesAlerts`);
+  - `kopia_format1`, subject the bucket: it holds a Kopia repository in
+    format version 1 (`state.Bucket.Format1`, §3.3 EP-7, COMPAT-1,
+    #79), which lendisk does not support; the message names the first
+    format-1 blob, says writes are accepted and replicated as before,
+    and gives `kopia repository set-parameters --upgrade`. Raised once
+    per bucket, cleared when the bucket captures the upgrade's poison
+    blob or is deleted (`TestKopiaFormat1BucketIsAlertedUntilUpgraded`).
   The three quota alerts have hysteresis (#24 review): one stays raised
   until its condition has been false for `alert.Service.QuotaHold`
   (`DefaultQuotaHold`, 10 minutes), so a friend flipping it with every
@@ -4430,6 +4496,10 @@ the handler's own reads and is never cancelled; nothing below
 
 ### 3.10 Compatibility
 
+- **COMPAT-1** Kopia repositories in format version 2 or later: a
+  `kopia` bucket that captures a blob only format 1 writes is marked,
+  shown in `status` and alerted (`kopia_format1`), never refused
+  (§3.3 EP-7, *Kopia format 1*).
 - **COMPAT-2** lendisk is one static Go binary for amd64, arm64 and
   32-bit ARM, so the package exists for every v1 platform.
   The container image recommends `network_mode: host` (D2). versitygw

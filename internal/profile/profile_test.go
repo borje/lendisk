@@ -279,3 +279,64 @@ func TestSnapshotIDsFromSnapshotKeys(t *testing.T) {
 		t.Errorf("mytool: SnapshotID = %q %v", id, ok)
 	}
 }
+
+// COMPAT-1, EP-7 (#79): the kopia profile tells a format-1 repository's
+// blobs (legacy index n*, compaction log m*, cleanup l*) from the
+// blob the format upgrade writes (Kopia's legacy-index poison blob, an
+// n* name of its own), and both from what formats 2 and 3 write. The
+// classes are unchanged: n* is still a snapshot key, m* and l* data.
+func TestKopiaProfileSpotsFormat1Blobs(t *testing.T) {
+	set, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := set.Get("kopia")
+	cases := map[string]Format{
+		"n0123456789abcdef0123456789abcdef-s0123456789abcdef-c1":                                         Format1,
+		"n0123456789abcdef0123456789abcdef":                                                              Format1,
+		"m0123456789abcdef0123456789abcdef":                                                              Format1,
+		"l0123456789abcdef0123456789abcdef":                                                              Format1,
+		"n00000000000000000000000000000000-repository_unreadable_by_this_kopia_version_upgrade_required": Upgraded,
+		"xn0_0123456789abcdef0123456789abcdef-s01-c1":                                                    FormatOK,
+		"xs0_0123456789abcdef0123456789abcdef":                                                           FormatOK,
+		"p0123456789abcdef0123456789abcdef-s0123":                                                        FormatOK,
+		"q0123456789abcdef0123456789abcdef-s0123":                                                        FormatOK,
+		"s0123456789abcdef-c1":                                                                           FormatOK,
+		"kopia.repository":                                                                               FormatOK,
+		"kopia.maintenance":                                                                              FormatOK,
+		"kopia.repository.backup.20261108":                                                               FormatOK,
+		"_log_20261108000000_0123":                                                                       FormatOK,
+	}
+	for key, want := range cases {
+		if got := p.Format(key); got != want {
+			t.Errorf("Format(%q) = %v, want %v", key, got, want)
+		}
+	}
+	if c := p.Classify("m0123"); c != Data {
+		t.Errorf("m* is %s, want data (EP-7 does not list it)", c)
+	}
+	for _, name := range []string{"restic", "generic"} {
+		if f := set.Get(name).Format("n0123"); f != FormatOK {
+			t.Errorf("%s: Format = %v; only kopia names format-1 keys", name, f)
+		}
+	}
+}
+
+// EP-7 (#79): format1_keys and upgraded_keys are read from a profile
+// file, and an empty pattern in them is refused.
+func TestFormatKeysReadFromProfileFile(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "old.toml"), []byte("format1_keys = [\"v1/*\"]\nupgraded_keys = [\"v1/upgraded\"]\n"), 0o600)
+	set, err := Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := set.Get("old")
+	if p.Format("v1/x") != Format1 || p.Format("v1/upgraded") != Upgraded || p.Format("v2/x") != FormatOK {
+		t.Fatalf("old: %+v", p)
+	}
+	os.WriteFile(filepath.Join(dir, "old.toml"), []byte(`upgraded_keys = [""]`), 0o600)
+	if _, err := Load(dir); err == nil || !strings.Contains(err.Error(), "old.toml") {
+		t.Fatalf("empty pattern: %v", err)
+	}
+}

@@ -427,3 +427,107 @@ func TestReplicateKopiaToFriend(t *testing.T) {
 		t.Fatalf("B's live kopia.maintenance after the purge: %q, want %q", got, again)
 	}
 }
+
+// kopiaFormat1Alert returns n's kopia_format1 alert for bucket, if raised.
+func kopiaFormat1Alert(n *node, bucket string) (StatusAlert, bool) {
+	for _, a := range n.status().Alerts {
+		if a.Kind == alert.KindKopiaFormat1 && a.Subject == bucket {
+			return a, true
+		}
+	}
+	return StatusAlert{}, false
+}
+
+// COMPAT-1 (#79), with real Kopia: `bucket add` asks for Kopia 0.9 or
+// later. A repository created with --format-version=1 is accepted and
+// captured as any other (writes are never refused), but status, text
+// and --json, says the bucket holds a format-1 repository, which
+// lendisk does not support, and to run `kopia repository set-parameters
+// --upgrade`; an alert of kind kopia_format1 says the same, raised once.
+// After that upgrade (Kopia writes its legacy-index poison blob) and a
+// snapshot in the new format, the warning and the alert clear.
+func TestKopiaFormat1RepositoryIsWarnedUntilUpgraded(t *testing.T) {
+	serving(t, 0)
+	k := newKopia(t)
+	n := newNode(t)
+	n.mustInit(t)
+	code, out, errOut := n.run("", "", "bucket", "add", "vault", "--profile", "kopia")
+	if code != 0 {
+		t.Fatalf("bucket add: %s", errOut)
+	}
+	if !strings.Contains(out, "Kopia 0.9 or later (repository format 2 or later)") {
+		t.Fatalf("bucket add does not ask for Kopia 0.9:\n%s", out)
+	}
+	n.tuneAlerts = func(s *alert.Service) { s.Interval = 50 * time.Millisecond }
+	d := n.serve(t)
+
+	k.run(append(kopiaLines(t, out, d.addr), "--format-version=1")...)
+	src := t.TempDir()
+	randomFiles(t, src, "f", 4, 64<<10)
+	k.run("snapshot", "create", src)
+	k.run("snapshot", "create", src)
+
+	var raised StatusAlert
+	deadline := time.Now().Add(20 * time.Second)
+	for ok := false; !ok; raised, ok = kopiaFormat1Alert(n, "vault") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no kopia_format1 alert: %+v", n.status().Alerts)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, want := range []string{"vault", "format version 1", "not support", "kopia repository set-parameters --upgrade"} {
+		if !strings.Contains(raised.Message, want) {
+			t.Errorf("alert lacks %q: %s", want, raised.Message)
+		}
+	}
+	st := n.status()
+	f := st.Buckets[0].KopiaFormat1
+	if f == nil || f.Since == "" || f.Key == "" || f.Key[0] != 'n' || f.Fix != "kopia repository set-parameters --upgrade" {
+		t.Fatalf("status --json bucket: %+v", st.Buckets[0])
+	}
+	_, text, _ := n.run("", "", "status")
+	if !strings.Contains(text, "Kopia repository in format version 1, which lendisk does not support") ||
+		!strings.Contains(text, "kopia repository set-parameters --upgrade") {
+		t.Fatalf("status text:\n%s", text)
+	}
+
+	// Nothing was refused: every key in the store but the logs is
+	// captured, in the class the profile gives it.
+	set, err := profile.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps := latestCaptures(t, n, "vault")
+	format1 := 0
+	for key := range kopiaReplicable(t, n, "vault") {
+		e, ok := caps[key]
+		if !ok || e.Class != string(set.Get("kopia").Classify(key)) {
+			t.Errorf("%s: captured %v as %+v", key, ok, e)
+		}
+		if set.Get("kopia").Format(key) == profile.Format1 {
+			format1++
+		}
+	}
+	if format1 == 0 {
+		t.Fatal("Kopia --format-version=1 wrote no format-1 blob")
+	}
+
+	k.run("repository", "set-parameters", "--upgrade")
+	randomFiles(t, src, "g", 2, 64<<10)
+	k.run("snapshot", "create", src)
+	k.run("snapshot", "verify", "--verify-files-percent=100")
+	deadline = time.Now().Add(20 * time.Second)
+	for _, ok := kopiaFormat1Alert(n, "vault"); ok; _, ok = kopiaFormat1Alert(n, "vault") {
+		if time.Now().After(deadline) {
+			t.Fatal("kopia_format1 not cleared after the upgrade")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if b := n.status().Buckets[0]; b.KopiaFormat1 != nil {
+		t.Fatalf("status after the upgrade: %+v", b)
+	}
+	if _, text, _ := n.run("", "", "status"); strings.Contains(text, "format version 1") {
+		t.Fatalf("status text after the upgrade:\n%s", text)
+	}
+	d.stop()
+}

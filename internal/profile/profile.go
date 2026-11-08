@@ -15,6 +15,9 @@
 //   - A rewritable key keeps its class: Rewritable only says the tool
 //     rewrites it in place in normal use, so a changed version is sent
 //     to each place as a rewrite rather than refused (EP-7, EP-11).
+//   - Format only reports what a key says of the repository's format
+//     (COMPAT-1, #79); it never changes a key's class, and a write is
+//     never refused for it.
 package profile
 
 import (
@@ -70,6 +73,51 @@ type Profile struct {
 	// it status names the snapshot key's capture time: Kopia's snapshot
 	// keys are index blobs, which name no snapshot.
 	NamesSnapshots bool `toml:"names_snapshots"`
+	// Format1Keys are keys only an unsupported old repository format
+	// writes (COMPAT-1, #79: Kopia format 1's legacy index, compaction
+	// log and cleanup blobs). UpgradedKeys are keys the tool writes when
+	// it upgrades such a repository, checked first.
+	Format1Keys  []string `toml:"format1_keys"`
+	UpgradedKeys []string `toml:"upgraded_keys"`
+}
+
+// Format is what a key says of its repository's format (COMPAT-1).
+type Format int
+
+const (
+	// FormatOK: the key says nothing of an unsupported format.
+	FormatOK Format = iota
+	// Format1: only the unsupported old format writes the key.
+	Format1
+	// Upgraded: the tool writes the key when it upgrades a repository
+	// out of the old format.
+	Upgraded
+)
+
+func (f Format) String() string {
+	return [...]string{"ok", "format1", "upgraded"}[f]
+}
+
+// Format reports what key says of its repository's format: written by
+// the upgrade out of the old format, else only by the old format, else
+// nothing (COMPAT-1, #79).
+func (p *Profile) Format(key string) Format {
+	switch {
+	case matchAny(p.UpgradedKeys, key):
+		return Upgraded
+	case matchAny(p.Format1Keys, key):
+		return Format1
+	}
+	return FormatOK
+}
+
+func matchAny(patterns []string, key string) bool {
+	for _, pat := range patterns {
+		if glob(pat, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // SnapshotID returns the snapshot ID a snapshot key names; ok is false
@@ -83,25 +131,11 @@ func (p *Profile) SnapshotID(key string) (id string, ok bool) {
 
 // Rewritable reports whether the tool rewrites key in place in normal
 // use (EP-7).
-func (p *Profile) Rewritable(key string) bool {
-	for _, pat := range p.RewritableKeys {
-		if glob(pat, key) {
-			return true
-		}
-	}
-	return false
-}
+func (p *Profile) Rewritable(key string) bool { return matchAny(p.RewritableKeys, key) }
 
 // HashNamed reports whether the tool names key by the SHA-256 of its
 // content (NameHash).
-func (p *Profile) HashNamed(key string) bool {
-	for _, pat := range p.HashNamedKeys {
-		if glob(pat, key) {
-			return true
-		}
-	}
-	return false
-}
+func (p *Profile) HashNamed(key string) bool { return matchAny(p.HashNamedKeys, key) }
 
 // NameHash is the hash a hash-named key's name carries: its last path
 // segment.
@@ -187,9 +221,9 @@ func (s Set) add(file string, b []byte) error {
 		return fmt.Errorf("%s: %w", file, err)
 	}
 	if un := md.Undecoded(); len(un) > 0 {
-		return fmt.Errorf("%s: unknown key %q (expected encrypted, local_only, snapshot, metadata, data, hash_named, rewritable, names_snapshots)", file, un[0].String())
+		return fmt.Errorf("%s: unknown key %q (expected encrypted, local_only, snapshot, metadata, data, hash_named, rewritable, names_snapshots, format1_keys, upgraded_keys)", file, un[0].String())
 	}
-	for _, l := range [][]string{p.LocalOnly, p.Snapshot, p.Metadata, p.Data, p.HashNamedKeys, p.RewritableKeys} {
+	for _, l := range [][]string{p.LocalOnly, p.Snapshot, p.Metadata, p.Data, p.HashNamedKeys, p.RewritableKeys, p.Format1Keys, p.UpgradedKeys} {
 		for _, pat := range l {
 			if pat == "" {
 				return fmt.Errorf("%s: empty pattern", file)

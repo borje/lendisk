@@ -520,4 +520,19 @@ var migrations = []Migration{
 			UPDATE place_freed SET bytes = max(bytes + OLD.size, 0) WHERE place = OLD.place;
 		END;`,
 	},
+	{
+		Version: 27, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Kopia format version 1 (COMPAT-1, #79). format1_at is when the
+		-- bucket first captured a key only an unsupported old repository
+		-- format writes (profile format1_keys), format1_key that key;
+		-- upgraded_at when it captured the key the tool's upgrade out of
+		-- that format writes (upgraded_keys). The bucket holds a format-1
+		-- repository while format1_at is set and upgraded_at is not; a
+		-- format-1 key captured after upgraded_at marks nothing. Unix
+		-- seconds.
+		ALTER TABLE buckets ADD COLUMN format1_at INTEGER;
+		ALTER TABLE buckets ADD COLUMN format1_key TEXT;
+		ALTER TABLE buckets ADD COLUMN upgraded_at INTEGER;`,
+	},
 }

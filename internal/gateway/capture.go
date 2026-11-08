@@ -11,6 +11,7 @@ import (
 	"maps"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/versity/versitygw/backend"
@@ -29,7 +30,9 @@ const MetaCapture = "lendisk-capture"
 
 // Decorator wraps the store's backend (D4). It captures every successful
 // write and delete of an own bucket's key into the replication queue
-// (EP-2, EP-3), classified by the bucket's tool profile (EP-7);
+// (EP-2, EP-3), classified by the bucket's tool profile (EP-7); a stored
+// put of a key only Kopia format 1 writes marks the bucket, which is
+// shown and alerted but never refused (COMPAT-1, noteFormat);
 // tombstones are Lending's, above it (tomb.go, RET-1). A read of
 // an own bucket's key the store lacks is served through the read-through
 // (readthrough.go, EP-10, ID-6). Buckets that
@@ -59,6 +62,9 @@ type Decorator struct {
 	// Fetch opens objects at friends for the read-through (EP-10,
 	// readthrough.go); nil fetches nothing.
 	Fetch Fetcher
+	// Now is the clock a bucket's format-1 mark is taken on (COMPAT-1);
+	// nil means time.Now.
+	Now func() time.Time
 	// AfterStore, if set, is called after the store accepted a captured
 	// request and before its row is completed: the crash window startup
 	// settles. Tests only.
@@ -100,26 +106,59 @@ var (
 // state database could not be read; the request must fail rather than go
 // uncaptured.
 func (d *Decorator) classify(bucket, key *string) (profile.Class, error) {
-	c, _, err := d.kind(bucket, key)
-	return c, err
+	k, err := d.kind(bucket, key)
+	return k.class, err
 }
 
-// kind is classify and whether the bucket's profile names the key
-// rewritable (EP-7, #74), which a captured put records.
-func (d *Decorator) kind(bucket, key *string) (profile.Class, bool, error) {
+// keyKind is what a captured put records of its key: its class, whether
+// the bucket's profile names it rewritable (EP-7, #74), and what it
+// says of the repository's format (COMPAT-1, #79).
+type keyKind struct {
+	class      profile.Class
+	rewritable bool
+	format     profile.Format
+}
+
+// kind is classify, and the rest of keyKind.
+func (d *Decorator) kind(bucket, key *string) (keyKind, error) {
 	if d.DB == nil || bucket == nil || key == nil {
-		return "", false, nil
+		return keyKind{}, nil
 	}
 	b, err := d.DB.GetBucket(context.Background(), *bucket)
 	if errors.Is(err, state.ErrNotFound) {
-		return "", false, nil
+		return keyKind{}, nil
 	}
 	if err != nil {
 		d.Log.Error("capture: reading the bucket's profile failed; refusing the request", "bucket", *bucket, "err", err)
-		return "", false, errInternal
+		return keyKind{}, errInternal
 	}
 	p := d.Profiles.Get(b.Profile)
-	return p.Classify(*key), p.Rewritable(*key), nil
+	return keyKind{class: p.Classify(*key), rewritable: p.Rewritable(*key), format: p.Format(*key)}, nil
+}
+
+// noteFormat records, once the store has accepted a captured put, what
+// its key says of the repository's format (COMPAT-1, #79): a key only
+// Kopia format 1 writes marks the bucket, the upgrade's key ends the
+// mark. The write stands whatever this finds; a failure is logged.
+func (d *Decorator) noteFormat(bucket, key string, f profile.Format) {
+	now := time.Now
+	if d.Now != nil {
+		now = d.Now
+	}
+	switch f {
+	case profile.Format1:
+		marked, err := d.DB.MarkFormat1(context.Background(), bucket, key, now())
+		if err != nil {
+			d.Log.Error("capture: marking a bucket as holding a format-1 repository failed", "bucket", bucket, "key", key, "err", err)
+		} else if marked {
+			d.Log.Warn("bucket holds a Kopia repository in format version 1, which lendisk does not support; run `kopia repository set-parameters --upgrade`",
+				"bucket", bucket, "key", key)
+		}
+	case profile.Upgraded:
+		if err := d.DB.MarkUpgraded(context.Background(), bucket, now()); err != nil {
+			d.Log.Error("capture: recording a repository's format upgrade failed", "bucket", bucket, "key", key, "err", err)
+		}
+	}
 }
 
 // captured reports whether a class is queued: an own bucket's key that
@@ -128,8 +167,8 @@ func captured(c profile.Class) bool { return c != "" && c != profile.LocalOnly }
 
 // PutObject captures a successful put (EP-2) with the hash of its stream.
 func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
-	class, rewritable, err := d.kind(in.Bucket, in.Key)
-	if err != nil || !captured(class) {
+	k, err := d.kind(in.Bucket, in.Key)
+	if err != nil || !captured(k.class) {
 		if err != nil {
 			return s3response.PutObjectOutput{}, err
 		}
@@ -146,8 +185,8 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 		in.Metadata = map[string]string{}
 	}
 	in.Metadata[MetaCapture] = token
-	seq, err := d.begin(state.Capture{Bucket: *in.Bucket, Key: *in.Key, Op: state.OpPut, Class: string(class),
-		Rewritable: rewritable, Token: token})
+	seq, err := d.begin(state.Capture{Bucket: *in.Bucket, Key: *in.Key, Op: state.OpPut, Class: string(k.class),
+		Rewritable: k.rewritable, Token: token})
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
@@ -159,6 +198,7 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 		return out, err
 	}
 	d.stored()
+	d.noteFormat(*in.Bucket, *in.Key, k.format)
 	if _, err := d.DB.FinishPut(context.Background(), seq, h.n, h.hex()); err != nil {
 		// The object is stored and the row stays pending until it is
 		// settled against the store. The client sees a retryable error.
@@ -194,11 +234,11 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 // while it settles its row, and settles the claim as stored before it
 // hashes, so a retry never waits for that hash either (#62).
 func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
-	class, rewritable, err := d.kind(in.Bucket, in.Key)
+	k, err := d.kind(in.Bucket, in.Key)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
-	if !captured(class) || in.UploadId == nil || in.MultipartUpload == nil {
+	if !captured(k.class) || in.UploadId == nil || in.MultipartUpload == nil {
 		return d.Backend.CompleteMultipartUpload(ctx, in)
 	}
 	bucket, key, uploadID := *in.Bucket, *in.Key, *in.UploadId
@@ -217,7 +257,7 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 		}
 		f, mine := d.claim(id)
 		if mine {
-			return d.completeClaimed(ctx, in, class, rewritable, id, f)
+			return d.completeClaimed(ctx, in, k, id, f)
 		}
 		select {
 		case <-f.done:
@@ -236,7 +276,7 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 // has claimed. However it ends (a panic included), f is settled, the
 // claim and the key's lock released, and a row it wrote and did not
 // settle is stranded; on success the background hash does that.
-func (d *Decorator) completeClaimed(ctx context.Context, in *s3.CompleteMultipartUploadInput, class profile.Class, rewritable bool, id string, f *completion) (res s3response.CompleteMultipartUploadResult, ver string, err error) {
+func (d *Decorator) completeClaimed(ctx context.Context, in *s3.CompleteMultipartUploadInput, k keyKind, id string, f *completion) (res s3response.CompleteMultipartUploadResult, ver string, err error) {
 	bucket, key, uploadID := *in.Bucket, *in.Key, *in.UploadId
 	var (
 		unlock     func()
@@ -272,8 +312,8 @@ func (d *Decorator) completeClaimed(ctx context.Context, in *s3.CompleteMultipar
 	if err != nil {
 		return res, "", err
 	}
-	seq, err = d.begin(state.Capture{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(class),
-		Rewritable: rewritable, ETag: etag, UploadID: uploadID})
+	seq, err = d.begin(state.Capture{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(k.class),
+		Rewritable: k.rewritable, ETag: etag, UploadID: uploadID})
 	if err != nil {
 		return res, "", err
 	}
@@ -286,6 +326,7 @@ func (d *Decorator) completeClaimed(ctx context.Context, in *s3.CompleteMultipar
 	}
 	f.settle(true)
 	d.stored()
+	d.noteFormat(bucket, key, k.format)
 	open = false
 	if !d.hashes.start() {
 		return res, ver, nil // stopping: the row stays pending for startup
