@@ -708,7 +708,7 @@ func manyWaiting(t *testing.T, p *pool, rows int, barrier bool) {
 		qs = append(qs, `INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
 			VALUES ('laptop', 'index/new', 'put', 'metadata', 'done', 100, 'h', ?1)`,
 			`INSERT INTO placement (seq, place, bucket, key, op, state, size)
-			SELECT seq, 'C', bucket, key, 'put', 'queued', 4196 FROM queue WHERE key = 'index/new'`)
+			SELECT seq, f.peer_key, bucket, key, 'put', 'queued', 4196 FROM queue, friendship f WHERE key = 'index/new'`)
 	}
 	for _, q := range qs {
 		if _, err := tx.ExecContext(ctx, q, p.now.Unix(), rows); err != nil {

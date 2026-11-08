@@ -1505,8 +1505,11 @@ upstream bucket is Q-V.
   A copy that was `dropped` there (§3.4, a full friend for
   `reroute_after` with the row holding a barrier) and an object placed
   nowhere for want of room at capture (the deficit, D6) do not:
-  placing them again is re-placement (#26, REPL-13 "friends gain
-  room"). `TestBothNumbersRaisedResumeCopiesWithNoFurtherAction` covers
+  placing them again is re-placement (§3.4 REPL-13, #26), which a
+  changed quota starts at once, as it does when a lowering leaves a
+  friend holding more than its quota: copies are moved away, oldest
+  first, until what it keeps fits (PEER-6). Scenario 13 runs it end to
+  end (`TestScenarioFriendLeaves`). `TestBothNumbersRaisedResumeCopiesWithNoFurtherAction` covers
   the queued case with two daemons.
 - **PEER-4 (#24)** `peer list` (`--json` too, `PeerJSON`, fields only
   added) shows per friend: the quota; each side's number, the text
@@ -1653,9 +1656,14 @@ upstream bucket is Q-V.
   old objects: a window as long as one directory removal, at the end
   of a 30-day window, which nothing closes yet. On the
   borrower side "holding" is only that the placement rows stay, not
-  counted (§3.4), so a renewed friendship finds them. A new friendship
-  with the same node within the window deletes the `former_friend` row,
-  so nothing is purged and both replicas count again.
+  counted (§3.4), so a renewed friendship finds them. Re-placement
+  (§3.4 REPL-13, #26) places the copies it held elsewhere at once, and
+  once they are acknowledged marks its acknowledged rows `dropping`. A
+  new friendship with the same node within the window deletes the
+  `former_friend` row, so nothing is purged; its rows still
+  acknowledged count again, its `dropping` rows send it the deletes of
+  the copies moved away, and its `dropped` rows are not queued again
+  (#25 review).
 - **PEER-10** Peers are rows in `lendisk.db`; nothing in the control API
   or the S3 surface returns them. `redeem` answers with the inviting
   node's own terms only. `peer list` (`--json` too) shows each friend's
@@ -2043,9 +2051,9 @@ upstream bucket is Q-V.
   warning that is never suppressed, never an alert and never a
   daily-summary line: `bucket add` prints "Warning: copies = 1. Each
   object is held by one friend only, so if that friend's disk is lost,
-  this bucket has no offsite copy left. Add a second friend, or
-  recreate the bucket with --copies 2." (`bucket set` comes with
-  REPL-13), and `status` prints "! one copy: losing that friend's disk
+  this bucket has no offsite copy left. Add a second friend, or run
+  `lendisk bucket set <name> --copies 2`." (`bucket set` prints it
+  too, §3.4 REPL-13, #26), and `status` prints "! one copy: losing that friend's disk
   loses the offsite copy; 2 is recommended" under the bucket (`buckets[].single_copy` in
   `status --json`). `bucket add` also says when the pool has fewer
   places than `copies` (OPS-2), as does the `pool_too_small` alert
@@ -2305,9 +2313,10 @@ upstream bucket is Q-V.
     PiB, counts as 32 PiB, so that arithmetic never overflows 64
     bits). Free capacity is the
     friendship's quota less the borrower's count of the place's use
-    (below) less the bucket's live metadata with no row at that place
-    (a friend added later, which re-placement, #26, fills) less the
-    metadata reserve (below). A friend
+    (below) less the metadata reserve (below). A friend that lacks any
+    of the bucket's live metadata (a friend added later, until
+    re-placement queues it there, §3.4 REPL-13, #26) is not a candidate,
+    so its FIFO sends the metadata before data. A friend
     that is `removed`, whose last answer was `507` (condition `quota`,
     below), or that is gone past `replace_after` is not a candidate;
   - a delete first cancels the key's `queued` puts that no sender has
@@ -2434,7 +2443,9 @@ upstream bucket is Q-V.
   `placement`: `seq` (the queue row), `place` (the
   friend's node ID), `bucket`, `key` and `op` copied from the queue row
   so the index outlives it, `state` (`queued`, `acked`, `refused`,
-  from #19 `dropped`, and from #21 `abandoned`),
+  from #19 `dropped`, from #21 `abandoned`, and from #26 `dropping` and
+  `drained`, re-placement's copy being deleted and deleted, REPL-13
+  below, with `replaces` and `replaced_at`, schema 28),
   and on acknowledgement `sha256` and `acked_at`: acked put rows are
   the index of acknowledged hashes (REPL-10, `state.AckedHash`).
   `started_at` (schema 21) is set when the place's sender takes the row
@@ -2493,7 +2504,7 @@ upstream bucket is Q-V.
   `retrying`, `quota` and `removed` are the place's own last answer and
   stand until it answers again, at its next row (#61). A friend
   added after a row was placed gets no copy of it until re-placement
-  (#26).
+  (REPL-13 below, #26), which sends it the bucket's metadata first.
 - **REPL-1, the metadata barrier.** A metadata row at sequence `m` is
   eligible to send only when every data object before `m` has no
   `queued` placement row left: each is `acked` at every place it is
@@ -2700,34 +2711,167 @@ upstream bucket is Q-V.
   held, as S3's destination does, in a tomb for the window. A put the
   place never saw has nothing to keep, so it is cancelled, which a
   sender's claim makes safe against a send in flight.
-- **REPL-13, the re-placement worker.** It runs after every change to
-  the pool (friend added or removed, quota changed, a verification
-  failed, an overflow target added) and hourly. It computes for each
-  object the places that hold or will hold it (`acked`, `queued`, not
-  `dropping`; a `dropped` row is a copy that was never sent, §3.4) and:
-  - for each object with fewer than `copies` such places, places the
-    missing copies by D6's choice, excluding the current holders; the
-    put reads from the local store;
-  - for each metadata object missing at a friend, or at an overflow
-    target holding data of the bucket, adds the row. A new friend thus
-    receives the bucket's existing metadata, in sequence order and
-    ahead of any newer data, before the placer counts it as holding a
-    copy;
-  - for each copy at a place being drained (a friend removed, failed,
-    unreachable for longer than `replication.replace_after`, 7 days,
-    or above its lowered quota; an overflow target when a friend has
-    room; any place beyond `copies` after `copies` is lowered), first
-    places the replacement as above and, only when that is `acked`,
-    marks the old row `dropping` and queues a delete there. A copy
-    never drops below what it had, and an object never has fewer than
-    `copies` places except while there is nowhere to put one.
-  - Drain-back from overflow targets is lowest priority and runs only
-    inside the replication schedule (REPL-7), oldest objects first.
-  A friend that returns after `replace_after` has its rows already
-  `dropping`; its queue sends the deletes, and what it held becomes
-  tombstones for the window (RET-1) like any other delete. The worker
-  and the placer share one lock per bucket, so the two never decide
-  about one object at once.
+- **REPL-13, re-placement (#26).** `state.DB.Replace`
+  (`internal/state/replace.go`), run by the replication worker
+  (`replica.Worker.replace`) whenever the pool's fingerprint changes
+  (`state.DB.PoolFingerprint`: each friend with an address, its quota,
+  whether it refuses this node, is gone past `replace_after` or counts
+  more than its quota, and each bucket's `copies`; read every five
+  polls, so a friend added, removed (`peer remove` or its remove call,
+  §3.2), gone, back, or a quota or `copies` changed starts a pass
+  within seconds, whichever process wrote the change), and hourly
+  (`Worker.ReplaceEvery`) for what no change announces: a refusal, a
+  copy `Reroute` dropped, a deficit from capture. A pass looks at each
+  bucket's *live* objects only (the key's latest done write is a put,
+  not a change EP-11 held back, and not refused for the store): the
+  bytes of a new copy come from the local store, read by the place's
+  sender as for any row, so an object deleted or rewritten since is
+  never re-placed and no lender ever forwards (PEER-11). After
+  `recover` (§3.1 ID-5) a bucket is left alone until every friend's
+  list of it is read and settled: a copy that looks missing may be one
+  a friend not yet listed holds, and a row placed meanwhile would stand
+  in the way of the acknowledged row its list records
+  (`TestReplacementWaitsForRecoveryLists`,
+  `TestRecoverFromPhraseAndOneLendersAddress`). Verification
+  (#27) and overflow targets (#38, #40) are not built; their cases
+  join the drained places below when they are.
+  - *Metadata first.* Each live metadata object gets a row at every
+    friend with an address whose row of it is not `queued`, `acked`,
+    `refused` or `dropping` (a friend added later, one befriended again
+    whose unsent rows #25 dropped): inserted, or a `dropped`/`abandoned`
+    row queued again, at the object's own sequence, so the friend's
+    FIFO sends the bucket's existing metadata ahead of any newer data
+    (REPL-1, REPL-12). Until then the friend is no candidate for data:
+    D6's choice (`choose`), `Reroute` and the pass skip a friend that
+    lacks any of the bucket's live metadata (`unsentMetadata`, now
+    counting rows of the live version that hold, refuse or delete it),
+    so no data reaches it, and so counts there, before the metadata
+    (`TestANewFriendReceivesTheExistingMetadataFirst`). The pass places
+    each bucket's metadata before its data, so a new friend is a
+    candidate for data in the same pass.
+  - *Missing copies.* A data object's *good* copies are its `queued`
+    and `acked` rows at friends that are not being drained of it. A
+    friend is drained of everything when it refuses this node
+    (condition `removed`) or is gone past `replace_after`; of some
+    objects when it holds more live bytes than its quota (PEER-6: its
+    `queued` and `acked` puts of live objects, not the tombs it keeps,
+    which no move frees), oldest acknowledged data first until what it
+    keeps fits the quota (`overQuota`); a former friend (no friendship
+    row, #25) is a drained place too. With fewer good copies than
+    `copies`, the missing ones go where D6 would place them at capture:
+    reachable friends first, by largest free fraction, with room for
+    the object less what the pass already placed there (the room model
+    of `Reroute`, read once per pass), never a friend with a row of the
+    object that holds, refused or is deleting it, never one being
+    drained of it. A friend whose row was `dropped`, `abandoned` or
+    `drained` may be chosen again; that row is queued again (a taken
+    row stays taken, REPL-2). Each new copy names, in
+    `placement.replaces` (schema 28), a drained copy it replaces;
+    `placement.replaced_at` marks the row as re-placement's.
+    `Reroute` carries both when it moves the row.
+  - *Dropping, only after the replacement.* An acknowledged copy at a
+    drained place is marked `dropping` when its replacement is
+    acknowledged, in the transaction that records the acknowledgement
+    (`AckPlacement`), or by a pass that finds the object at `copies`
+    acknowledged good copies. So the object never has fewer copies than
+    it had, and a gone friend that returns does not count the copies
+    that were moved away: the watermark's `holds` reads `dropping` and
+    `drained` rows as the place's latest row of the key, and neither is
+    an acknowledged put (`TestAReturningFriendsMovedCopiesDoNotCount`).
+    Only the place's latest row of the key is marked, so a later
+    acknowledged write there is never deleted.
+    A `dropping` row is in its place's FIFO as a delete of the key at
+    the row's sequence (`NextPlacement` takes the lower of the queued
+    and dropping heads; index `placement_dropping`): any later write of
+    the key there comes after it. The sender takes, sends and
+    acknowledges it like any delete, which leaves the row `drained`:
+    the lender keeps the bytes as a tomb for the window (RET-1), and a
+    later write of the key there names that version (`ReplacedHash`,
+    `AckedPutHash`; `AckedHash`, the read-through's source and EP-11's
+    `ackedOther` read `drained` as deleted). A data delete is held by
+    the barrier only for metadata before it; a `dropping` row is a put's
+    row, so `Held` never holds it: its object stays at `copies` places,
+    so no N − c + 1 places lose a pack (REPL-1 AC). Its bytes leave
+    `place_use` when it is marked, and trigger `place_freed_dropping`
+    counts them back until the place's next quota answer, as a delete's
+    (#24): the lender keeps the tomb counted.
+    A friend gone past `replace_after` is no longer sent anything new,
+    but its sender keeps trying its FIFO: when it returns, it receives
+    the deletes of its moved copies and keeps them as tombstones
+    (`TestAFriendBackAfterReplaceAfterTombstonesItsMovedCopies`, real
+    daemons on A's injected clock). A removed friend has no sender; its
+    `dropping` rows are deletes it receives only if befriended again.
+  - *Surplus.* With more good copies than `copies` (lowered, EP-6; or a
+    gone friend back while its replacement waits), unsent ones no
+    sender holds are cancelled first, then acknowledged ones are marked
+    `dropping` while more than `copies` stay acknowledged, the fullest
+    place (smallest free fraction) first. A row a sender holds is left
+    alone and the worker looks again at its next re-routing tick
+    (`TestASurplusCopyBeingSentIsNotCancelled`).
+  - *Removed friends (#25 review).* A friend removed has no friendship
+    row, so its copies are not good copies and are replaced; once the
+    replacements are acknowledged its acknowledged rows are `dropping`.
+    If it is befriended again, its `dropped` data rows are not queued
+    again: those objects were placed elsewhere, and a data copy goes
+    there only if D6's choice picks it for an object still short; its
+    `dropping` rows send the deletes; live metadata it lacks is placed
+    there as at every friend (REPL-12)
+    (`TestARemovedFriendsDroppedRowsAreNotRequeuedWhenBefriendedAgain`).
+  - *Batched and bounded.* A pass reads each bucket's live data objects
+    in pages of 2048 (no transaction), keeps those with something to
+    do, and decides about each again in write transactions of at most
+    64 objects (`replaceBatch`) from its rows as they then are, with
+    prepared statements (`preparedTx`, §3.1), under the bucket's lock,
+    which the placer shares (`FinishPut` and `FinishDelete` take it
+    before their transaction, `DB.lockBucket`), and the worker's
+    sending lock, so neither decides about an object while the other
+    does, and no capture waits behind a pass for long. A batch that
+    fails is rolled back and the pass goes on, returning the errors.
+    `TestReplaceOfManyObjectsIsFast` (3000 objects to re-place in a
+    bucket with 1200 metadata objects) bounds a pass at 4 s without
+    `-race` and, under it, at 8 times a pass over a quarter of the
+    objects.
+  - *Below copies (OPS-2).* Each pass records per bucket since when it
+    has found live data objects it could not bring to `copies`
+    (`below_copies`, schema 28: the start is kept while some stay
+    below, the row goes when none are). The `below_copies` alert
+    (§3.8) fires once that is longer than `replace_after`. `status`
+    shows re-placement in progress under the bucket ("re-placement: N
+    copies (B bytes) placed after the pool changed wait to be sent; M
+    copies moved away wait to be deleted; objects below c copies with
+    nowhere to place them since …"; `buckets[].replacing` with
+    `queued`, `queued_bytes`, `dropping` and `below_since`), and each
+    place's copies to delete (`places[].dropping`); a re-placed row's
+    lag counts from `replaced_at`. Additive, schema 1.
+  - *`copies` changes (EP-6).* `lendisk bucket set <name> --copies N`
+    (`state.DB.SetCopies`, no daemon needed) changes it; the daemon's
+    next pass adds or removes copies
+    (`TestChangingCopiesAddsAndRemovesCopies`,
+    `TestTheWorkerAddsAndRemovesCopiesWhenCopiesChange`,
+    `TestBucketSetChangesCopies`).
+  - *Scenario 13* runs end to end with four daemons and restic
+    (`TestScenarioFriendLeaves`, at 24 MB per friendship raised to 32
+    MB); its `status` line naming the numbers that would cover the
+    deficit is LEND-7's protectable size (#37).
+  *Decision (#26): move a copy only after its replacement is
+  acknowledged, and trim the old place by an ordinary delete.*
+  Comparable systems differ in where the bytes come from and when the
+  old copy goes. Ceph's backfill copies a placement group to the new
+  OSDs of its acting set from a current replica, and the old OSD keeps
+  serving and is cleaned up only once the PG is active+clean on the new
+  set (`osd_max_backfills` bounds it); lendisk takes the order, but the
+  bytes come from the owner's store, since PEER-11 forbids a lender
+  forwarding and the owner always holds them (EP-9). Tahoe-LAFS's
+  repairer downloads and re-uploads only the shares missing on the
+  servers it can reach, never deleting a share; its leases expire
+  instead. lendisk deletes the moved copy explicitly, as a lender's
+  quota counts it until its tomb is purged. Syncthing sends a removal
+  as a new version ordered after the writes before it; a `dropping`
+  row is that, in the place's FIFO at the object's sequence. The pass
+  runs on a fingerprint of the pool rather than on events from every
+  path that can change it (CLI commands in another process, the quota
+  call, the passage of `replace_after`), as Ceph re-peers on each new
+  OSD map epoch, and hourly besides.
 - **The replica client.** One minio-go client per place in the pool, built from
   the configuration and the manifest. A friend is the friend's tunnel
   address as endpoint, path-style, the derived credential (NET-7a), the
@@ -3169,12 +3313,16 @@ upstream bucket is Q-V.
   (`TestWatermarkAdvancesAsAcknowledgementsArrive`,
   `TestWatermarkFollowsRewritesAndDeletes`):
   - *a put* counts while `copies` places still hold its bytes: the
-    place's latest `acked` or `abandoned` row of the key is an `acked`
-    put of the same SHA-256. An acknowledgement that a later
-    acknowledged delete or rewrite at that place ended no longer
-    counts; an older acknowledgement of the same bytes (a healing
-    re-upload's) does. An `abandoned` row in between counts against,
-    since its send may have landed other bytes. Metadata, placed at
+    place's latest `acked`, `abandoned`, `dropping` or `drained` row of
+    the key is an `acked` put of the same SHA-256. An acknowledgement
+    that a later acknowledged delete or rewrite at that place ended no
+    longer counts; an older acknowledgement of the same bytes (a
+    healing re-upload's) does. An `abandoned` row in between counts
+    against, since its send may have landed other bytes; so does a copy
+    re-placement moved away (`dropping`, then `drained`, #26), from the
+    moment its replacement is acknowledged, even while the delete has
+    not reached the place: a gone friend that returns does not count
+    the copies moved away (from the #20 review). Metadata, placed at
     every friend, needs `copies` of them like data.
   - *superseded, deleted and rewritten puts:* a put that fails the above
     is still no obstacle once a later done write of its key, rewrite or
@@ -3240,10 +3388,14 @@ upstream bucket is Q-V.
     becomes `abandoned`, every other queued row `dropped`), so none
     holds the metadata barrier. It may well keep the bytes for the
     retention window, but this node can no longer reach them, so an
-    offsite claim must not rest on them. Re-placement (#26) restores
-    `copies`; until then `status` says copies at an ended friendship
-    no longer count
-    (`TestARemovedFriendHoldsNoCopyAndNothingWaitsForIt`).
+    offsite claim must not rest on them. So it stops counting at the
+    removal, before its purge can happen, which is the #20 review's
+    checkbox met early. Re-placement (§3.4 REPL-13, #26) restores
+    `copies` at once; until then `status` says copies at an ended
+    friendship no longer count
+    (`TestARemovedFriendHoldsNoCopyAndNothingWaitsForIt`,
+    `TestARemovedFriendsCopiesArePlacedByTheChoiceExcludingHolders`,
+    `TestRemovingAFriendReplacesItsCopies`).
   - *local-only keys* are never queued, so never counted.
 
   `w` is valid when every put at or below it passes; the watermark is
@@ -4108,7 +4260,18 @@ the handler's own reads and is never cancelled; nothing below
     re-placed (#26). It raises at once: the worker calls `Alerted` when
     it drops one. A deficit from placement (the pool had no room for
     `copies` when the object was captured) shows in `status` as bytes
-    below `copies` but raises no alert until #26's threshold alert;
+    below `copies` and raises `below_copies` past the threshold;
+  - `below_copies`, subject the bucket: live data objects have been
+    below `copies` for longer than `replication.replace_after` (7
+    days, REPL-13's threshold; `alert.Service.BelowAfter`), as the
+    re-placement pass records them (`state.DB.BelowCopiesSince`, §3.4
+    REPL-13, #26): re-placement had nowhere to put the missing copies,
+    so the message says to add a friend, agree a higher quota or lower
+    `copies`. Per bucket, not per object: it says since when the bucket
+    has had some below, continuously. Cleared at the first pass that
+    finds none (`TestObjectsBelowCopiesPastTheThresholdAreAlerted`).
+    Precedent: Ceph's `PG_DEGRADED` health warning becomes "stuck" only
+    past `mon_pg_stuck_threshold`;
   - `friend_removed`, subject the former friend: it ended the
     friendship (its remove call, §3.2 PEER-5, #25); raised at once,
     cleared at the purge or when the two are friends again. This

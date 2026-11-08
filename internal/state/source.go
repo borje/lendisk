@@ -56,7 +56,7 @@ func (db *DB) Source(ctx context.Context, bucket, key string) (Source, bool, err
 	rows, err := db.QueryContext(ctx, `SELECT p.place, pl.last_ok FROM placement p LEFT JOIN place pl ON pl.place = p.place
 		WHERE p.bucket = ? AND p.key = ? AND p.state = 'acked' AND p.op = 'put' AND p.sha256 = ?
 		AND NOT EXISTS (SELECT 1 FROM placement l WHERE l.place = p.place AND l.bucket = p.bucket AND l.key = p.key
-			AND l.state = 'acked' AND l.seq > p.seq)
+			AND l.state IN ('acked', 'drained') AND l.seq > p.seq)
 		GROUP BY p.place
 		ORDER BY pl.last_ok IS NULL, pl.last_ok DESC, p.place`, bucket, key, s.SHA256)
 	if err != nil {

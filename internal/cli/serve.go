@@ -133,7 +133,7 @@ func (a *app) serveCmd() *cobra.Command {
 			// of their own: nothing else waits for them. Made before the
 			// gateway, whose captures may hold back a changed key (EP-11).
 			alerts := &alert.Service{DB: db, Log: log, Node: nodeID, Command: cfg.Alerts.Command, Webhook: cfg.Alerts.Webhook,
-				UnreachableAfter: cfg.UnreachableAfter(), Now: a.clock}
+				UnreachableAfter: cfg.UnreachableAfter(), BelowAfter: cfg.ReplaceAfter(), Now: a.clock}
 			if a.tuneAlerts != nil {
 				a.tuneAlerts(alerts)
 			}

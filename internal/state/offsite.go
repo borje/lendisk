@@ -284,11 +284,14 @@ func (db *DB) write(ctx context.Context, where string, args ...any) (Write, erro
 }
 
 // holds is true when place pl.place still holds the bytes of put q: its
-// latest acknowledged or abandoned row of the key (an abandoned send
-// may have landed other bytes) is an acknowledged put of q's hash.
+// latest acknowledged, abandoned, dropping or drained row of the key (an
+// abandoned send may have landed other bytes; a dropping or drained copy
+// was moved away by re-placement, #26) is an acknowledged put of q's
+// hash.
 const holds = `coalesce((SELECT a.state = 'acked' AND a.op = 'put' AND qa.sha256 = q.sha256
 	FROM placement a JOIN queue qa ON qa.seq = a.seq
-	WHERE a.place = pl.place AND a.bucket = q.bucket AND a.key = q.key AND a.state IN ('acked', 'abandoned')
+	WHERE a.place = pl.place AND a.bucket = q.bucket AND a.key = q.key
+	AND a.state IN ('acked', 'abandoned', 'dropping', 'drained')
 	ORDER BY a.seq DESC LIMIT 1), 0)`
 
 // shorts lists bucket's done puts that fewer than copies places hold,

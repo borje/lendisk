@@ -100,6 +100,11 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 // replaced, so a place holding them is acked at once and nothing is sent
 // again.
 func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (dup bool, err error) {
+	unlock, err := db.lockBuckets(ctx, seq) // shared with re-placement (#26)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
@@ -179,6 +184,11 @@ func (db *DB) FinishDelete(ctx context.Context, seqs ...int64) error {
 	if len(seqs) == 0 {
 		return nil
 	}
+	unlock, err := db.lockBuckets(ctx, seqs...) // shared with re-placement (#26)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err

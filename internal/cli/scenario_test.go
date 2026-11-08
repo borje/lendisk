@@ -40,6 +40,12 @@ type fourFriends struct {
 
 func newFourFriends(t *testing.T, aEnv ...string) *fourFriends {
 	t.Helper()
+	return newFourFriendsAt(t, "80M", aEnv...)
+}
+
+// newFourFriendsAt is newFourFriends with every friendship at quota.
+func newFourFriendsAt(t *testing.T, quota string, aEnv ...string) *fourFriends {
+	t.Helper()
 	if _, err := exec.LookPath("restic"); err != nil {
 		t.Skip("restic not installed")
 	}
@@ -67,7 +73,7 @@ func newFourFriends(t *testing.T, aEnv ...string) *fourFriends {
 	nodes := []*node{an, bn, cn, dn}
 	for i, lender := range nodes { // six invites
 		for _, borrower := range nodes[i+1:] {
-			s := lender.invite("--quota", "80M")
+			s := lender.invite("--quota", quota)
 			if code, _, errOut := borrower.run("\n", "", "peer", "add", s); code != 0 {
 				t.Fatalf("peer add: %d %s", code, errOut)
 			}

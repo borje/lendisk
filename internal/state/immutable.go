@@ -62,7 +62,7 @@ func ackedOther(ctx context.Context, q querier, bucket, key string, seq int64, s
 			AND d.op = 'delete' AND d.state = 'done' AND d.seq < ?3), 0)
 		AND a.state = 'acked' AND a.sha256 != ?4
 		AND a.seq = (SELECT max(x.seq) FROM placement x WHERE x.place = a.place AND x.bucket = ?1 AND x.key = ?2
-			AND x.state = 'acked' AND x.seq < ?3)
+			AND x.state IN ('acked', 'drained') AND x.seq < ?3)
 		ORDER BY a.seq DESC, a.place`, bucket, key, seq, sha)
 	if err != nil {
 		return nil, "", err
