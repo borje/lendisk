@@ -2852,7 +2852,10 @@ upstream bucket is Q-V.
     nowhere to place them since …"; `buckets[].replacing` with
     `queued`, `queued_bytes`, `dropping` and `below_since`), and each
     place's copies to delete (`places[].dropping`); a re-placed row's
-    lag counts from `replaced_at`. Additive, schema 1.
+    lag counts from `replaced_at`. Additive, schema 1. A removed
+    friend's moved copies are left out of the bucket's count (#26
+    review): it has no sender, and keeps them until its purge; its
+    place still lists them.
   - *`copies` changes (EP-6).* `lendisk bucket set <name> --copies N`
     (`state.DB.SetCopies`, no daemon needed) changes it; the daemon's
     next pass adds or removes copies

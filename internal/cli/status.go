@@ -225,10 +225,11 @@ func replacingLine(b StatusBucket) string {
 	r := b.Replacing
 	var parts []string
 	if r.Queued > 0 {
-		parts = append(parts, fmt.Sprintf("%d copies (%d bytes) placed after the pool changed wait to be sent", r.Queued, r.QueuedBytes))
+		parts = append(parts, fmt.Sprintf("%s (%d bytes) placed after the pool changed %s to be sent",
+			countCopies(r.Queued), r.QueuedBytes, waits(r.Queued)))
 	}
 	if r.Dropping > 0 {
-		parts = append(parts, fmt.Sprintf("%d copies moved away wait to be deleted", r.Dropping))
+		parts = append(parts, fmt.Sprintf("%s moved away %s to be deleted", countCopies(r.Dropping), waits(r.Dropping)))
 	}
 	if r.BelowSince != "" {
 		parts = append(parts, fmt.Sprintf("objects below %d copies with nowhere to place them since %s", b.Copies, r.BelowSince))
@@ -237,6 +238,20 @@ func replacingLine(b StatusBucket) string {
 		return ""
 	}
 	return "re-placement: " + strings.Join(parts, "; ")
+}
+
+func countCopies(n int64) string {
+	if n == 1 {
+		return "1 copy"
+	}
+	return fmt.Sprintf("%d copies", n)
+}
+
+func waits(n int64) string {
+	if n == 1 {
+		return "waits"
+	}
+	return "wait"
 }
 
 // placeStates are StatusPlace.State in words.
@@ -780,7 +795,7 @@ friend, or with no room in the pool), which status shows.`,
 					fmt.Fprintf(a.out, ", %d refused", p.Refused)
 				}
 				if p.Dropping > 0 {
-					fmt.Fprintf(a.out, ", %d moved copies to delete", p.Dropping)
+					fmt.Fprintf(a.out, ", %s moved away to delete", countCopies(p.Dropping))
 				}
 				if p.Detail != "" {
 					fmt.Fprintf(a.out, " (%s)", p.Detail)

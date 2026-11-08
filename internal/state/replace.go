@@ -204,14 +204,16 @@ type ReplacingStat struct {
 }
 
 // Replacing returns each bucket's re-placement in progress; buckets with
-// none are absent.
+// none are absent. Only friends count: a removed friend's moved copies
+// are kept there until its purge, and nothing waits to delete them.
 func (db *DB) Replacing(ctx context.Context) (map[string]ReplacingStat, error) {
 	rows, err := db.QueryContext(ctx, `SELECT p.bucket,
 		count(*) FILTER (WHERE p.state = 'queued'),
 		coalesce(sum(q.size) FILTER (WHERE p.state = 'queued'), 0),
 		count(*) FILTER (WHERE p.state = 'dropping')
 		FROM placement p JOIN queue q ON q.seq = p.seq
-		WHERE p.state = 'dropping' OR p.state = 'queued' AND p.replaced_at IS NOT NULL
+		WHERE (p.state = 'dropping' OR p.state = 'queued' AND p.replaced_at IS NOT NULL)
+		AND p.place IN (SELECT peer_key FROM friendship)
 		GROUP BY p.bucket`)
 	if err != nil {
 		return nil, err

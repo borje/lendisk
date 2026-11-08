@@ -83,20 +83,41 @@ func TestStatusShowsReplacementInProgress(t *testing.T) {
 		t.Fatalf("replacing %+v, want one copy queued", r)
 	}
 	_, text, _ := n.run("", "", "status")
-	if !strings.Contains(text, "re-placement: 1 copies (1000 bytes) placed after the pool changed wait to be sent") {
+	if !strings.Contains(text, "re-placement: 1 copy (1000 bytes) placed after the pool changed waits to be sent") {
 		t.Fatalf("status:\n%s", text)
 	}
 	if err := db.AckPlacement(ctx, "D", seqs[0], "h1", time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	// The copy moved away from C, a removed friend, is kept there until
+	// its purge: nothing waits to delete it.
 	st := n.status()
-	if r := bucketOf(t, st, "laptop").Replacing; r.Queued != 0 || r.Dropping != 1 {
-		t.Fatalf("replacing %+v, want the moved copy dropping", r)
+	if r := bucketOf(t, st, "laptop").Replacing; r.Queued != 0 || r.Dropping != 0 {
+		t.Fatalf("replacing %+v, want nothing in progress", r)
 	}
+	if _, text, _ := n.run("", "", "status"); strings.Contains(text, "re-placement:") {
+		t.Fatalf("status:\n%s", text)
+	}
+	// copies 1: the surplus copy at a friend waits to be deleted there.
+	if err := db.SetCopies(ctx, "laptop", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Replace(ctx, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	st = n.status()
+	if r := bucketOf(t, st, "laptop").Replacing; r.Dropping != 1 {
+		t.Fatalf("replacing %+v, want the surplus copy dropping", r)
+	}
+	dropping := 0
 	for _, p := range st.Places {
-		if p.Place == "C" && p.Dropping != 1 {
-			t.Fatalf("place %+v", p)
-		}
+		dropping += int(p.Dropping)
+	}
+	if dropping != 2 { // the surplus copy, and C's kept until its purge
+		t.Fatalf("places %+v", st.Places)
+	}
+	if _, text, _ := n.run("", "", "status"); !strings.Contains(text, "re-placement: 1 copy moved away waits to be deleted") {
+		t.Fatalf("status:\n%s", text)
 	}
 	// copies 4 with three places left: below copies with nowhere to go.
 	if err := db.SetCopies(ctx, "laptop", 4); err != nil {
