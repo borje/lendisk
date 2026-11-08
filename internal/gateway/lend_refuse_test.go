@@ -16,14 +16,37 @@ import (
 // is not the only wall. Lending is called directly with a nil Next and
 // no database: reaching either would panic.
 func TestLendingRefusesEveryRefusedMethodToABorrower(t *testing.T) {
+	if n := lendingRefuses(t, Refused); n == 0 {
+		t.Fatal("no Refused method")
+	}
+}
+
+// SEC-9, §3.9 (#76): the two methods only versitygw's admin API reaches
+// (Unreachable: ChangeBucketOwner, ListBucketsAndOwners) are refused to
+// a borrower's account too, so a route a versitygw upgrade adds to them
+// still meets Lending's wall.
+func TestLendingRefusesTheUnreachableMethodsToABorrower(t *testing.T) {
+	if n := lendingRefuses(t, Unreachable); n != 2 {
+		t.Fatalf("%d Unreachable methods checked, want ChangeBucketOwner and ListBucketsAndOwners", n)
+	}
+}
+
+// lendingRefuses calls every backend method of class on Lending as a
+// borrower's account, with a nil Next and no database, and fails the
+// test for each one not refused with AccessDenied before it touches
+// either; it returns how many it called.
+func lendingRefuses(t *testing.T, class Class) int {
+	t.Helper()
 	l := &Lending{}
+	n := 0
 	ctx := context.WithValue(context.Background(), "account", //nolint:staticcheck // versitygw's key
 		auth.Account{Access: newIdentity(t).NodeID().String(), Role: auth.RoleUserPlus})
 	v := reflect.ValueOf(l)
 	for name, m := range BackendMethods {
-		if m.Class != Refused {
+		if m.Class != class {
 			continue
 		}
+		n++
 		meth := v.MethodByName(name)
 		if !meth.IsValid() {
 			t.Fatalf("Lending has no %s", name)
@@ -61,4 +84,5 @@ func TestLendingRefusesEveryRefusedMethodToABorrower(t *testing.T) {
 			}
 		}()
 	}
+	return n
 }

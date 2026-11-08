@@ -1543,7 +1543,9 @@ upstream bucket is Q-V.
   quota count would go stale). Beyond those it refuses, as its first
   step, every other method SEC-9's table classifies Refused or
   Unreachable (#15 review), so NET-7's narrowing does not rest on the
-  gate alone (§3.7 NET-7, §3.9 SEC-9). `CreateBucket` creates the bucket with lendisk's own
+  gate alone (§3.7 NET-7, §3.9 SEC-9;
+  `TestLendingRefusesEveryRefusedMethodToABorrower`,
+  `TestLendingRefusesTheUnreachableMethodsToABorrower`). `CreateBucket` creates the bucket with lendisk's own
   private ACL owned by the borrower's account and `BucketOwnerEnforced`,
   whatever ACL headers came with it, then inserts the row; a retry that
   finds `BucketAlreadyOwnedByYou` inserts it too, so a crash between
@@ -3720,10 +3722,20 @@ the handler's own reads and is never cancelled; nothing below
   answers `RequestTimeout` (400), which the borrower retries. The
   deadline is cleared when the body ends and when the handler returns.
   So a stalled body releases its quota and floor reservation within
-  one stall period, and a body trickling at the minimum rate holds it
-  until it ends (Content-Length ÷ the minimum rate, which can be long,
-  but the reservation is within the borrower's own quota);
-  an honest borrower whose lender's store stops reading for a stall
+  one stall period. A body must also keep a floor rate
+  (`Bridge.FloorRate`, 8 KiB/s, averaged over each `FloorWindow` of
+  10 minutes from its start, #76): the first read after a window that
+  brought less fails, every later read on the connection fails at
+  once (so net/http does not drain the rest at the trickle's pace),
+  and the answer is the same `RequestTimeout`. 8 KiB/s is 64 kbit/s,
+  so a borrower keeping all 16 of its request slots (*Per-friend
+  caps*, §3.9) above it needs 1 Mbit/s of uplink; the window averages
+  out a brief stop. A trickling body thus holds its request slot for
+  at most Content-Length ÷ the floor rate plus one window
+  (`TestABodyTricklingBelowTheFloorRateIsEnded`). The rate is measured
+  as the bridge reads, so a lender's store that reads slower than the
+  floor ends its own requests too; such a store is failing anyway.
+  An honest borrower whose lender's store stops reading for a stall
   period gets `RequestTimeout` and retries. Nothing reads the body but
   the store. A body longer
   than its `Content-Length` ends the write in `Lending` with
@@ -4755,6 +4767,22 @@ the handler's own reads and is never cancelled; nothing below
   borrower's replica client moves one object per bucket at a time over
   a couple of connections (§3.4), well inside both. Loopback and LAN
   listeners are not counted. The caps are constants, not settings.
+  A request holds its slot until its answer is written, so neither
+  direction may hang on the friend (#76): a request body is bounded by
+  the stall bound and the floor rate (§3.5 LEND-2), and each write to
+  the connection gets a deadline `Caps.WriteStall` ahead (2 minutes,
+  the borrower's own stall watchdog), set by the tunnel connection
+  (`peerConn.Write`), so a friend that stops reading an answer loses
+  the connection, and the slot, once one chunk's write has waited that
+  long (`TestAFriendThatStopsReadingAnAnswerLosesItsSlot`). The
+  hijacked connections of the removed answer and the remove call
+  (§3.2) only read after their answer, so the deadline leaves their
+  linger alone. The accept loop only accepts: each connection's key
+  (`PeerOf`) and friend (`Caps.Of`, a database read of up to 5 s) are
+  resolved on a goroutine of their own, which counts it under the cap
+  and hands it to `Accept`, so a slow database holds up that
+  connection, not every tunnel accept
+  (`TestASlowCapLookupDoesNotStallOtherAccepts`).
 - **SEC-8** versitygw's web UI, website, metrics and event endpoints
   are not configured, and versitygw opens no TCP port at all. Its admin
   API cannot be left out: with `AdminPorts` empty, `embedgw` mounts it

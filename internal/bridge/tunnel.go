@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/versity/versitygw/s3err"
@@ -139,37 +140,93 @@ func isControlPath(r *http.Request) bool { return strings.HasPrefix(r.URL.Path, 
 
 // peerListener closes, unread, every connection without a peer key, and
 // every connection over its key's cap; it tracks the rest in conns.
+// Its accept loop only accepts: each connection's key and friend are
+// resolved on a goroutine of its own (admit), which hands it to Accept
+// once admitted, so one slow lookup holds up only its own connection
+// (#76).
 type peerListener struct {
 	net.Listener
 	peerOf PeerOf
 	caps   *Caps
 	conns  *Conns
 	log    *slog.Logger
+
+	start   sync.Once
+	stop    sync.Once
+	ready   chan net.Conn
+	errs    chan error
+	stopped chan struct{}
+}
+
+func newPeerListener(ln net.Listener, peerOf PeerOf, caps *Caps, conns *Conns, log *slog.Logger) *peerListener {
+	return &peerListener{Listener: ln, peerOf: peerOf, caps: caps, conns: conns, log: log,
+		ready: make(chan net.Conn), errs: make(chan error), stopped: make(chan struct{})}
 }
 
 func (l *peerListener) Accept() (net.Conn, error) {
+	l.start.Do(func() { go l.loop() })
+	select {
+	case c := <-l.ready:
+		return c, nil
+	case err := <-l.errs:
+		return nil, err
+	case <-l.stopped:
+		return nil, net.ErrClosed
+	}
+}
+
+// loop accepts until the listener fails for good, handing each
+// error to Accept (a temporary one, net/http retries).
+func (l *peerListener) loop() {
 	for {
 		c, err := l.Listener.Accept()
 		if err != nil {
-			return nil, err
+			select {
+			case l.errs <- err:
+			case <-l.stopped:
+				return
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Temporary() { //nolint:staticcheck // what net/http's Serve retries on
+				continue
+			}
+			return
 		}
-		p, err := l.peerOf(c)
-		if err != nil {
-			l.log.Warn("tunnel connection without a peer key; closed unread", "remote", c.RemoteAddr().String(), "err", err)
-			c.Close()
-			continue
-		}
-		friend := l.caps.friendOf(p)
-		if !l.caps.conn(friend) {
-			l.log.Warn("tunnel connection over the friend's cap; closed unread", "peer", friend.String(), "key", p.String())
-			c.Close()
-			continue
-		}
-		l.log.Debug("tunnel connection", "peer", p.String())
-		pc := &peerConn{Conn: c, peer: p, done: func() { l.caps.connDone(friend) }, conns: l.conns}
-		l.conns.add(pc)
-		return pc, nil
+		go l.admit(c)
 	}
+}
+
+// admit resolves c's key and friend, counts it under the friend's cap,
+// and hands it to Accept, or closes it unread.
+func (l *peerListener) admit(c net.Conn) {
+	p, err := l.peerOf(c)
+	if err != nil {
+		l.log.Warn("tunnel connection without a peer key; closed unread", "remote", c.RemoteAddr().String(), "err", err)
+		c.Close()
+		return
+	}
+	friend := l.caps.friendOf(p)
+	if !l.caps.conn(friend) {
+		l.log.Warn("tunnel connection over the friend's cap; closed unread", "peer", friend.String(), "key", p.String())
+		c.Close()
+		return
+	}
+	l.log.Debug("tunnel connection", "peer", p.String())
+	pc := &peerConn{Conn: c, peer: p, done: func() { l.caps.connDone(friend) }, conns: l.conns,
+		writeStall: l.caps.writeStall()}
+	l.conns.add(pc)
+	select {
+	case l.ready <- pc:
+	case <-l.stopped:
+		pc.Close()
+	}
+}
+
+// Close stops Accept and the loop, and closes the connections admitted
+// but not yet accepted.
+func (l *peerListener) Close() error {
+	l.stop.Do(func() { close(l.stopped) })
+	return l.Listener.Close()
 }
 
 // ServeTunnel serves h on the tunnel listener ln until ctx is cancelled.
@@ -206,7 +263,7 @@ func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, caps *Caps
 		defer cancel()
 		srv.Shutdown(shut)
 	}()
-	err := srv.Serve(&peerListener{Listener: ln, peerOf: peerOf, caps: caps, conns: conns, log: log})
+	err := srv.Serve(newPeerListener(ln, peerOf, caps, conns, log))
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

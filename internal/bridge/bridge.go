@@ -36,6 +36,11 @@ type Bridge struct {
 	// request (defaults DefaultStall, DefaultMinProgress).
 	Stall       time.Duration
 	MinProgress int64
+	// FloorRate and FloorWindow bound it further: one that brings fewer
+	// than FloorRate bytes a second over a FloorWindow ends the request
+	// (defaults DefaultFloorRate, DefaultFloorWindow).
+	FloorRate   int64
+	FloorWindow time.Duration
 	proxy       *httputil.ReverseProxy
 }
 
