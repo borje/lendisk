@@ -313,3 +313,40 @@ func mustRelists(t *testing.T, db *DB) []Relist {
 	}
 	return rs
 }
+
+// ID-5, REPL-2, RET-1 (#21): a key every place keeps only as a tomb
+// (deleted there, kept for the retention window) is not recovered: no
+// verdict, no source for the read-through, not in the bucket's
+// listing, nothing acknowledged at any place, and no metadata conflict
+// from a place that lacks it live. A key one place still holds live is
+// recovered from that place alone.
+func TestKeyTombstonedAtEveryPlaceIsNotRecovered(t *testing.T) {
+	ctx := context.Background()
+	db := recoveringWith(t, "B", "C")
+	gone := []Listed{
+		{Key: "data/ab/gone", Size: 3, SHA256: "h3", Class: "data", Tombstoned: true},
+		{Key: "index/old", Size: 2, SHA256: "h4", Class: "metadata", Tombstoned: true},
+		{Key: "snapshots/old", Size: 1, SHA256: "h5", Class: "snapshot", Tombstoned: true},
+	}
+	live := Listed{Key: "index/new", Size: 5, SHA256: "h6", Class: "metadata"}
+	list(t, db, "B", "laptop", append([]Listed{live}, gone...)...)
+	list(t, db, "C", "laptop", append([]Listed{live}, gone...)...)
+	ks, err := db.RecoveredKeys(ctx, "laptop")
+	if err != nil || len(ks) != 1 || ks[0].Key != "index/new" || ks[0].Verdict != VerdictHeld {
+		t.Fatalf("recovered keys %+v %v", ks, err)
+	}
+	for _, g := range gone {
+		if _, ok, err := db.Source(ctx, "laptop", g.Key); err != nil || ok {
+			t.Fatalf("source of tombstoned %s: %v %v", g.Key, ok, err)
+		}
+	}
+	lk, err := db.LiveKeys(ctx, "laptop", "", "", 100)
+	if err != nil || len(lk) != 1 || lk[0].Key != "index/new" {
+		t.Fatalf("live keys %+v %v", lk, err)
+	}
+	for _, p := range []string{"B", "C"} {
+		if a := ackedAt(t, db, p, "laptop"); len(a) != 1 || a["index/new"] != "h6" {
+			t.Fatalf("%s holds %v", p, a)
+		}
+	}
+}

@@ -99,6 +99,22 @@ func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 
 	return err
 }
 
+// StartPlacement records that place's sender took row seq to send it,
+// at now. ok is false when the row is no longer queued: a delete of the
+// key cancelled it (placeTx), or it was moved or refused, and it must
+// not be sent. A row taken once stays taken, as its send may have
+// landed: a later delete of the key follows it instead of cancelling it
+// (REPL-2, #21).
+func (db *DB) StartPlacement(ctx context.Context, place string, seq int64, now time.Time) (ok bool, err error) {
+	r, err := db.ExecContext(ctx, `UPDATE placement SET started_at = coalesce(started_at, ?)
+		WHERE place = ? AND seq = ? AND state = 'queued'`, now.Unix(), place, seq)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n == 1, err
+}
+
 // CancelPlacement removes a queued row that will not be sent.
 func (db *DB) CancelPlacement(ctx context.Context, place string, seq int64) error {
 	_, err := db.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, place, seq)

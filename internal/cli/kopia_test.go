@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"maps"
 	"os"
 	"os/exec"
@@ -184,6 +186,10 @@ func TestKopiaEndToEnd(t *testing.T) {
 //     window (LEND-4, RET-1), and there is no refusal, no alert and no
 //     refused object in status (EP-11). B then holds exactly what A
 //     holds. A second maintenance run does the same.
+//   - The second snapshot no longer has most of the first's files, and
+//     the first snapshot is deleted before that maintenance: every blob
+//     maintenance deletes that B held, packs among them, B keeps as a
+//     tombstone of the bytes it held (REPL-2, RET-1, #21).
 //   - A's machine is lost; a fresh machine recovers from B, and Kopia
 //     connects with the new credential and restores the latest snapshot
 //     through the read-through, from B.
@@ -227,6 +233,9 @@ func TestReplicateKopiaToFriend(t *testing.T) {
 		t.Error("Kopia wrote no logs; the local-only class went untested")
 	}
 
+	for i := 1; i < 6; i++ {
+		os.Remove(filepath.Join(src, fmt.Sprintf("one-%02d", i)))
+	}
 	randomFiles(t, src, "two", 4, 1<<20)
 	k.run("snapshot", "create", src)
 	an.drained(bKey, 90*time.Second)
@@ -245,6 +254,15 @@ func TestReplicateKopiaToFriend(t *testing.T) {
 
 	// Full maintenance, as a user would run it (safety=none so that it
 	// rewrites and deletes now rather than after its usual delays).
+	var snaps []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(k.run("snapshot", "list", src, "--json")), &snaps); err != nil || len(snaps) != 2 {
+		t.Fatalf("snapshots %+v %v", snaps, err)
+	}
+	k.run("snapshot", "delete", snaps[0].ID, "--delete")
+	an.drained(bKey, 90*time.Second)
+	heldBefore := lentObjects(t, bn, aID, "vault")
 	maintBefore := kopiaReplicable(t, an, "vault")["kopia.maintenance"]
 	t.Logf("kopia maintenance run:\n%s", k.run("maintenance", "run", "--full", "--safety=none"))
 	maintAfter := kopiaReplicable(t, an, "vault")["kopia.maintenance"]
@@ -269,6 +287,27 @@ func TestReplicateKopiaToFriend(t *testing.T) {
 		}
 	}
 	t.Logf("kopia.maintenance before %q, after %q; keys B holds differently from A: %v", maintBefore, maintAfter, differ)
+	// REPL-2, RET-1 (#21): what maintenance deleted at A, B keeps as a
+	// tomb of the bytes it held.
+	bTombs := openDB(t, bn)
+	deleted, packs := 0, 0
+	for key, h := range heldBefore {
+		if _, ok := local[key]; ok {
+			continue
+		}
+		deleted++
+		if strings.HasPrefix(key, "p") {
+			packs++
+		}
+		ts, err := bTombs.TombstonesOf(t.Context(), aID.NodeID().String(), aID.SealedName("vault"), key)
+		if err != nil || len(ts) != 1 || ts[0].SHA256 != h || ts[0].Rewrite {
+			t.Errorf("B's tombstones of %s, deleted by maintenance: %+v %v, want one of %s", key, ts, err, h)
+		}
+	}
+	t.Logf("maintenance deleted %d blobs B held, %d of them packs", deleted, packs)
+	if packs == 0 {
+		t.Error("maintenance deleted no pack B held; the deletes went untested")
+	}
 	if maintBefore == "" || maintBefore == maintAfter {
 		t.Fatalf("maintenance did not rewrite kopia.maintenance (%q, %q); the #74 finding no longer holds", maintBefore, maintAfter)
 	}

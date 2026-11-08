@@ -354,6 +354,16 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				continue
 			}
 		}
+		// Taken: from here the send may land, so a delete of the key
+		// follows the row instead of cancelling it. A row a delete has
+		// cancelled meanwhile is not sent (REPL-2, #21).
+		if ok, err := w.DB.StartPlacement(ctx, place, p.Seq, w.now()); err != nil || !ok {
+			if err != nil && ctx.Err() == nil {
+				log.Error("replication: recording a send's start failed", "err", err)
+				sleep(ctx, poll)
+			}
+			continue
+		}
 		err = w.send(ctx, place, r, p)
 		if ctx.Err() != nil {
 			return // stopping; the row stays queued

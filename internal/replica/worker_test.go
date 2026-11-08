@@ -32,8 +32,10 @@ type place struct {
 	log  []string          // op bucket/key, in order
 	// fail, if set, answers instead of storing.
 	fail func(op, key string) error
-	// hold, if set, blocks every request until closed.
+	// hold, if set, blocks every request until closed; only those for
+	// holdKey, if that is set too.
 	hold                  chan struct{}
+	holdKey               string
 	inFlight, maxInFlight int
 	bytesRead             int64
 	// world, if set, is held while a put stores, and check is then
@@ -46,11 +48,14 @@ type place struct {
 
 func newPlace(name string) *place { return &place{name: name, objs: map[string][]byte{}} }
 
-func (p *place) enter() func() {
+func (p *place) enter(key string) func() {
 	p.mu.Lock()
 	p.inFlight++
 	p.maxInFlight = max(p.maxInFlight, p.inFlight)
 	hold := p.hold
+	if p.holdKey != "" && p.holdKey != key {
+		hold = nil
+	}
 	p.mu.Unlock()
 	if hold != nil {
 		<-hold
@@ -59,7 +64,7 @@ func (p *place) enter() func() {
 }
 
 func (p *place) Put(ctx context.Context, o Object) error {
-	defer p.enter()()
+	defer p.enter(o.Key)()
 	// Like the HTTP transport, Put does not return while a read of the
 	// body is blocked, whatever ctx does.
 	b, err := io.ReadAll(o.Body)
@@ -89,7 +94,7 @@ func (p *place) Put(ctx context.Context, o Object) error {
 }
 
 func (p *place) Delete(ctx context.Context, bucket, key string) error {
-	defer p.enter()()
+	defer p.enter(key)()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.fail != nil {
@@ -289,7 +294,8 @@ func TestEachPlaceGetsItsFIFOInWriteOrder(t *testing.T) {
 }
 
 // A put whose key was written again or deleted before it was sent is
-// cancelled (the store no longer has its bytes); the delete is sent.
+// cancelled (the store no longer has its bytes). A delete of a key
+// whose put was never sent sends nothing (REPL-2, #21).
 func TestOverwrittenOrDeletedPutIsNotSent(t *testing.T) {
 	fx := newFixture(t, "B")
 	fx.write("laptop", "data/1", "first")
@@ -299,12 +305,52 @@ func TestOverwrittenOrDeletedPutIsNotSent(t *testing.T) {
 	fx.run()
 	fx.drained("B")
 	log, _, _, _ := fx.places["B"].snapshot()
-	want := []string{"put laptop/data/1", "delete laptop/data/2"}
-	if len(log) != 2 || log[0] != want[0] || log[1] != want[1] {
+	want := []string{"put laptop/data/1"}
+	if len(log) != 1 || log[0] != want[0] {
 		t.Fatalf("sent %v, want %v", log, want)
 	}
 	if b := fx.places["B"].objs["laptop/data/1"]; string(b) != "second" {
 		t.Fatalf("B holds %q", b)
+	}
+}
+
+// REPL-2 (#21): a delete never overtakes a write of the key before it,
+// nor does a write after it overtake the delete. At B the put is in
+// flight when the key is deleted and written again: B gets the put, the
+// delete, then the new put. At C the put had not started: it is
+// cancelled, no delete is sent, and C gets only the new put.
+func TestDeleteFollowsAPutInFlightAndPrecedesARewrite(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	b, c := fx.places["B"], fx.places["C"]
+	b.hold, b.holdKey = make(chan struct{}), "data/1" // B is sending data/1
+	c.hold, c.holdKey = make(chan struct{}), "data/0" // C has not reached it
+	fx.write("laptop", "data/0", "zero")
+	fx.write("laptop", "data/1", "first")
+	fx.run()
+	waitFor(t, "data/1 in flight at B and data/0 at C", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return b.inFlight == 1 && len(b.log) == 1 && c.inFlight == 1
+	})
+	fx.remove("laptop", "data/1")
+	fx.write("laptop", "data/1", "again")
+	close(b.hold)
+	close(c.hold)
+	fx.drained("B")
+	fx.drained("C")
+	for name, want := range map[string][]string{
+		"B": {"put laptop/data/0", "put laptop/data/1", "delete laptop/data/1", "put laptop/data/1"},
+		"C": {"put laptop/data/0", "put laptop/data/1"},
+	} {
+		log, _, _, _ := fx.places[name].snapshot()
+		if strings.Join(log, ", ") != strings.Join(want, ", ") {
+			t.Errorf("%s was sent %v, want %v", name, log, want)
+		}
+		if got := string(fx.places[name].objs["laptop/data/1"]); got != "again" {
+			t.Errorf("%s holds data/1 %q, want the new write", name, got)
+		}
 	}
 }
 

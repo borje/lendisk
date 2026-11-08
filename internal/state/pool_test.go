@@ -406,8 +406,8 @@ func TestTooLittleRoomPlacesWhatFits(t *testing.T) {
 	}
 }
 
-// REPL-2 (#19): a delete goes to every place the key was placed at, and
-// nowhere else.
+// REPL-2 (#19): a delete goes to every place that holds or may hold the
+// key, and nowhere else.
 func TestDeleteGoesWhereTheKeyIsPlaced(t *testing.T) {
 	p := newPool(t)
 	p.friend("B", 10)
@@ -416,12 +416,17 @@ func TestDeleteGoesWhereTheKeyIsPlaced(t *testing.T) {
 	p.bucket("laptop", 2)
 	d := p.put("laptop", "data/1", "data", 1)
 	p.wantPlaces("data/1", d, "B", "C")
+	p.ack("B", d)
+	p.start("C", d) // in flight: it may land (#21)
 	del := p.del("laptop", "data/1", "data")
 	p.wantPlaces("delete data/1", del, "B", "C")
 	never := p.del("laptop", "data/never", "data")
 	p.wantPlaces("delete of a key never placed", never)
 	m := p.put("laptop", "index/1", "metadata", 1)
 	p.wantPlaces("index/1", m, "B", "C", "D")
+	for _, f := range []string{"B", "C", "D"} {
+		p.ack(f, m)
+	}
 	del = p.del("laptop", "index/1", "metadata")
 	p.wantPlaces("delete index/1", del, "B", "C", "D")
 }
