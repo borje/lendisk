@@ -70,7 +70,13 @@ held by `--copies` friends (default 2); its metadata by every friend.
 `status` shows what is not yet offsite. *Not yet:* `status --wait`, which
 blocks until a backup is offsite.
 
-Profiles: `restic` and `generic` (any S3 tool). *Not yet:* `kopia`.
+Profiles: `restic`, `kopia` and `generic` (any S3 tool, such as rclone or
+Duplicacy). A generic bucket is not encrypted, so friends can read it;
+`bucket add` wants `--i-understand-no-encryption` for one. With rclone, pass
+`--disable Copy,Move --no-update-modtime`; `--backup-dir` and `--suffix` do
+not work against lendisk. Kopia rewrites `kopia.maintenance` on every
+maintenance run, which friends refuse, so a kopia bucket shows one refused
+object and a `place_refused` alert until #74 is settled.
 
 ## Restoring
 

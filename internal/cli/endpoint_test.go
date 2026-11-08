@@ -82,7 +82,11 @@ var (
 // addBucket runs `bucket add` and reads the credential from its output.
 func (n *node) addBucket(t *testing.T, name, profile string) creds {
 	t.Helper()
-	code, out, e := n.run("", "", "bucket", "add", name, "--profile", profile)
+	args := []string{"bucket", "add", name, "--profile", profile}
+	if profile == "generic" {
+		args = append(args, "--i-understand-no-encryption") // EP-8
+	}
+	code, out, e := n.run("", "", args...)
 	if code != 0 {
 		t.Fatalf("bucket add %s: %s", name, e)
 	}

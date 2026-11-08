@@ -260,7 +260,7 @@ func TestInterfaceEntryListed(t *testing.T) {
 	if !found {
 		t.Fatalf("status listeners: %+v", st.Endpoint.Listen)
 	}
-	_, out, _ := n.run("", "", "bucket", "add", "tools", "--profile", "generic")
+	_, out, _ := n.run("", "", "bucket", "add", "tools", "--profile", "generic", "--i-understand-no-encryption")
 	if !strings.Contains(out, "endpoint:   https://127.0.0.1:"+port) {
 		t.Fatalf("bucket add lines:\n%s", out)
 	}

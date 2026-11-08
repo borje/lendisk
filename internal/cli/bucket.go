@@ -47,16 +47,19 @@ func (a *app) bucketCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "bucket", Short: "Manage this node's buckets"}
 	var profile string
 	var copies int
+	var noEncryption bool
 	add := &cobra.Command{
 		Use:   "add <name>",
 		Short: "Create a bucket and print the lines to configure a backup tool",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return a.runBucketAdd(cmd.Context(), args[0], profile, copies, cmd.Flags().Changed("copies"))
+			return a.runBucketAdd(cmd.Context(), args[0], profile, copies, cmd.Flags().Changed("copies"), noEncryption)
 		},
 	}
 	add.Flags().StringVar(&profile, "profile", "", "backup tool: "+strings.Join(profiles, ", ")+" (required)")
 	add.Flags().IntVar(&copies, "copies", 0, "how many friends hold each object (default replication.copies, 2)")
+	add.Flags().BoolVar(&noEncryption, "i-understand-no-encryption", false,
+		"required for --profile generic: its tools do not encrypt, so friends can read what they hold (EP-8)")
 	list := &cobra.Command{
 		Use:   "list",
 		Short: "List buckets",
@@ -148,7 +151,7 @@ func (a *app) openState(ctx context.Context) (*config.Loaded, *state.DB, error) 
 	return cfg, db, nil
 }
 
-func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int, explicit bool) error {
+func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int, explicit, noEncryption bool) error {
 	if err := validBucketName(name); err != nil {
 		return usageError{err}
 	}
@@ -157,6 +160,10 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 	}
 	if explicit && copies < 1 {
 		return usageError{errors.New("--copies must be at least 1")}
+	}
+	if profile == "generic" && !noEncryption {
+		return usageError{errors.New("a generic bucket is not encrypted by its tool: every friend that holds a copy can read it. " +
+			"Use restic or Kopia, or add --i-understand-no-encryption")}
 	}
 	cfg, db, err := a.openState(ctx)
 	if err != nil {
@@ -195,6 +202,9 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 		return err
 	}
 	fmt.Fprintf(a.out, "Created bucket %s (profile %s, copies %d).\n", name, profile, copies)
+	if profile == "generic" {
+		fmt.Fprintln(a.out, noEncryptionWarning)
+	}
 	if copies == 1 {
 		fmt.Fprintln(a.out, singleCopyWarning)
 	}
@@ -217,6 +227,12 @@ const (
 	singleCopyWarning = "Warning: copies = 1. Each object is held by one friend only, so if that friend's disk is lost, this bucket has no offsite copy left. Add a second friend, or recreate the bucket with --copies 2."
 	singleCopyLine    = "! one copy: losing that friend's disk loses the offsite copy; 2 is recommended"
 	singleFriendLine  = "Friends (1: one lost disk loses every offsite copy)"
+)
+
+// What bucket add and status say of a generic bucket (EP-8, P-3).
+const (
+	noEncryptionWarning = "Warning: this bucket is not encrypted by its tool. Every friend that holds a copy can read it: it is outside lendisk's trust guarantee."
+	outsideTrustLine    = "! not encrypted: outside the trust guarantee; friends can read its objects"
 )
 
 // printToolLines prints the lines for loopback and, for each
@@ -284,6 +300,9 @@ func toolLines(w io.Writer, b state.Bucket, where, url, cacert string) {
 		fmt.Fprintf(w, "  access key: %s\n", b.AccessKey)
 		fmt.Fprintf(w, "  secret key: %s\n", b.SecretKey)
 		fmt.Fprintf(w, "\nThe key cannot create buckets; for rclone set no_check_bucket = true.\n")
+		fmt.Fprintf(w, "For rclone also pass --disable Copy,Move --no-update-modtime: lendisk refuses server-side copies,\n"+
+			"so rclone must re-upload instead of copying or moving and leave stored modtimes alone.\n"+
+			"rclone's --backup-dir and --suffix need a server-side copy and cannot be used here.\n")
 	}
 }
 

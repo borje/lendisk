@@ -1416,9 +1416,25 @@ upstream bucket is Q-V.
   address is the `endpoint.loopback` setting, refused at config load
   unless its host is a loopback IP or `localhost`; it exists for a
   second node on one machine and for tests. CI runs restic (`init`,
-  `backup`, `check --read-data`, `restore`), the AWS CLI and rclone
-  against it. A bucket credential cannot create buckets, so rclone
-  needs `no_check_bucket = true`, which the generic profile's lines say.
+  `backup`, `check --read-data`, `restore`), Kopia (`repository create
+  s3` from the lines `bucket add` prints, `repository
+  validate-provider`, two snapshots, `snapshot verify
+  --verify-files-percent=100`, `snapshot restore`, `maintenance run
+  --full`; `kopia_test.go`), the AWS CLI, rclone and Duplicacy
+  (`minio://` storage: `init -e`, two backups, `check -files`,
+  `restore`; `generic_test.go`) against it. CI installs Kopia and
+  Duplicacy from pinned GitHub releases checked against a pinned
+  SHA-256 (Kopia's `checksums.txt`; GitHub's asset digest for
+  Duplicacy, which publishes none), restic and rclone from apt; each
+  test skips when its tool is missing. Checked 2026-11-08 with restic
+  0.19.1, Kopia 0.23.1, rclone 1.76.0 and Duplicacy 3.3.0. A bucket
+  credential cannot create buckets, so rclone needs `no_check_bucket =
+  true`, which the generic profile's lines say. For a kopia bucket
+  `bucket add` and `bucket show` print `kopia repository create s3
+  --endpoint=<host:port> --disable-tls --bucket=<bucket>
+  --access-key=… --secret-access-key=…` (the same flags work for
+  `repository connect s3`); Kopia signs for `us-east-1` without a
+  `--region`, which is versitygw's.
 - **EP-5** versitygw is given the internal `gw.sock` (§3.7) and
   nothing else, whatever the configuration says; every TCP listener,
   loopback included, is lendisk's bridge, so no versitygw option or
@@ -1508,12 +1524,28 @@ upstream bucket is Q-V.
   copies refused for every profile, generic included: a copy is a new
   key that friends store and receive in full anyway, so capturing it
   would save only local I/O. rclone's server-side copy and move
-  (`--backup-dir`, `move`, `--track-renames`) and its in-place modtime
-  update fail against a lendisk bucket, so the generic profile's
-  `bucket add` lines tell rclone users to pass `--disable Copy,Move`
-  (download and re-upload instead) and `--no-update-modtime` (#7).
+  (`move`, `--track-renames`) and its in-place modtime update (a
+  same-key `CopyObject`, used whenever only a file's modtime changed)
+  fail against a lendisk bucket, so the generic profile's `bucket add`
+  and `bucket show` lines tell rclone users to pass `--disable
+  Copy,Move` (download and re-upload instead) and
+  `--no-update-modtime` (#7). Measured with rclone 1.76.0 (#7):
+  `--backup-dir` and `--suffix` cannot be made to work. rclone
+  allows them only on a remote with a server-side `Copy` or `Move`
+  and, with `--disable Copy,Move`, stops before touching the bucket
+  ("can't use --backup-dir on a remote which doesn't support
+  server-side move or copy", exit 7); without the flags each server-side
+  copy gets the 501 and rclone neither overwrites nor deletes
+  anything. Either way the bucket is unchanged, never half-synced
+  (`TestRcloneBackupDirRefusedWithoutHarm`), and the lines say these
+  two flags cannot be used. Whether to capture copies for generic
+  buckets after all, so that `--backup-dir` works, is open for the
+  user (#7 report).
   *Measured (EP-2 AC):* `TestCaptureOverhead` in `internal/gateway`
-  (opt-in, `LENDISK_OVERHEAD_MB`) times `restic backup` of random data
+  (opt-in, `LENDISK_OVERHEAD_MB`; `LENDISK_OVERHEAD_TOOL=restic|kopia`,
+  default each installed tool as a subtest) times `restic backup` or
+  `kopia snapshot create` (Kopia's own maintenance turned off, so it
+  stays out of the timed run) of random data
   through the gateway with capture on and off, alternating, after a
   warm-up run, and compares medians. On a 6-vCPU VM (Ryzen 7 8745HS,
   SHA-NI, 3 GB RAM), restic 0.19.1, 2026-11-06: 512 MiB to ext4, five
@@ -1524,7 +1556,22 @@ upstream bucket is Q-V.
   ±5%): the hash runs on the gateway's goroutine at SHA-NI speed and
   two SQLite writes per 16 MiB pack are noise. The AC's 10 GB did not
   fit on the test machine's disk; the gate machine (G-3) should repeat
-  it at that size, and for Kopia with #7.
+  it at that size.
+  *Kopia (#7),* Kopia 0.23.1, same VM, 2026-11-08, with restic in the
+  same session for comparison: 512 MiB to ext4, seven runs each,
+  1.996 s with capture and 2.036 s without (−2.0%; restic +2.8%); a
+  five-run set gave +15.4% (2.11 s, 1.83 s) with two pairs stalled by
+  writeback at 4.5–5.3 s, and a 1 GiB set was disk-bound
+  (3.8 s to 18.5 s per run, −35%), so neither says anything. On tmpfs,
+  256 MiB, capture costs Kopia more than noise: seven runs +5.4%
+  (890 ms, 844 ms), nine runs +11.1% (942 ms, 848 ms), about 50–95 ms
+  on a run of 27 queue rows; restic on tmpfs showed none (−1.7%). The
+  guess, not profiled, is a cost per request rather than per byte
+  (Kopia makes many small requests: index, session and format blobs,
+  and lookups of absent keys, which the read-through answers from the
+  database), which would shrink in proportion on a 10 GB snapshot.
+  G-3 must measure Kopia at 10 GB on the gate machine before EP-2's
+  AC counts as met for Kopia.
 - **EP-3** The decorator writes a pending queue row (bucket, key,
   operation, class) before calling the backend and marks it done after
   the backend returns success; on failure it deletes the row. A request
@@ -1747,6 +1794,18 @@ upstream bucket is Q-V.
   `status --json`). `bucket add` also says when the pool has fewer
   places than `copies` (OPS-2), as does the `pool_too_small` alert
   (§3.8).
+- **EP-8** `bucket add --profile generic` is a usage error (exit 2)
+  unless `--i-understand-no-encryption` is given, and nothing is
+  created; the flag means nothing for restic or kopia. A generic
+  `bucket add` prints "Warning: this bucket is not encrypted by its
+  tool. Every friend that holds a copy can read it: it is outside
+  lendisk's trust guarantee." `status` prints "! not encrypted:
+  outside the trust guarantee; friends can read its objects" under
+  every bucket whose profile is not `encrypted` (a generic one, or one
+  whose profile has no file), and `status --json` has
+  `buckets[].outside_trust`. The generic lines end with the rclone
+  advice of EP-2 above: `--disable Copy,Move --no-update-modtime`, why,
+  and that `--backup-dir` and `--suffix` cannot be used.
 - **EP-7** Profiles are TOML files compiled into the binary
   (`internal/profile/profiles/<name>.toml`) and overridable in
   `<config>/profiles/`: a file there replaces the compiled-in profile
@@ -1762,10 +1821,35 @@ upstream bucket is Q-V.
   `snapshots/*`; not `config` or `keys/*`), which recovery checks
   (§3.1 ID-5). A bucket whose
   profile has no file classifies every key as data. The compiled-in
-  files are `restic` and `generic`; `kopia` comes with #7. The
+  files are `restic`, `kopia` and `generic`. `kopia` (#7) is EP-7's
+  list as written: `local_only = ["_log*"]`, `snapshot = ["n*",
+  "xn*"]`, `metadata = ["kopia.repository", "kopia.blobcfg",
+  "kopia.maintenance", "n*", "x*", "s*"]`, `data = ["p*", "q*"]`,
+  `encrypted = true` and no `hash_named` key, since Kopia names blobs
+  by an HMAC of their content or at random. The patterns are as broad
+  as EP-7 states them (`s*` would take any key starting with `s`);
+  Kopia writes none outside these prefixes but `_log*` and the three
+  format blobs. A Kopia 0.23.1 repository after two snapshots holds
+  all four classes (`TestKopiaEndToEnd`). The
   decorator classifies a key at capture: a local-only key (restic
   `locks/*`, Kopia `_log*`) gets no queue row at all; the others get a
   queue row with their class, and placement rows as §3.4 says.
+  *Kopia rewrites `kopia.maintenance` in place (#74, measured #7).*
+  Kopia 0.23.1 writes it during the quick maintenance it runs itself
+  after a snapshot when one is due (a new repository has it after its
+  first two snapshots) and again on every later maintenance run, quick
+  or full, with new contents and no delete. Once the friend has acknowledged one
+  version, the next is a changed acknowledged key: the friend answers
+  412, A records the placement refused and raises `place_refused`,
+  `status` shows "1 refused" on the place, and the friend keeps the
+  old version. Nothing is stuck: the FIFO moves past it and drains,
+  and every other key maintenance writes or deletes replicates. But in
+  normal use the alert and the count never clear, since each run
+  rewrites the key again and only its latest row counts (stays 1),
+  and the friend's copy stays stale. A Kopia restore through the
+  friend after `recover` works with the stale copy
+  (`TestReplicateKopiaToFriend`). #74 holds the fix, which needs a
+  REQUIREMENTS change to EP-7 and EP-11.
 - **EP-10** The read-through (`gateway/readthrough.go`, #30). The
   decorator's `GetObject` and `HeadObject` turn the store's not-found
   for an own bucket's key (not a local-only one; `lent-*` buckets pass
