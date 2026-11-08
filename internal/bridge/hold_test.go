@@ -5,13 +5,17 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
 )
@@ -107,9 +111,11 @@ func TestAFriendThatStopsReadingAnAnswerLosesItsSlot(t *testing.T) {
 
 // #76, LEND-2, SEC-5: a PUT body trickling fast enough for the stall
 // bound but below the floor rate over a window is ended with
-// RequestTimeout, and gives its slot back; a body at speed is served.
+// RequestTimeout, and gives its slot back, with a warning that says so;
+// a body at speed is served.
 func TestABodyTricklingBelowTheFloorRateIsEnded(t *testing.T) {
-	br := New(streamingGateway(t), quiet)
+	var logged lockedBuffer
+	br := New(streamingGateway(t), slog.New(slog.NewTextHandler(&logged, nil)))
 	br.Stall, br.MinProgress = time.Minute, 1 // the stall bound never ends it
 	br.FloorRate, br.FloorWindow = 64<<10, 300*time.Millisecond
 	l := startLenderCaps(t, br.TunnelS3Handler(), &Caps{Requests: 1})
@@ -145,8 +151,65 @@ func TestABodyTricklingBelowTheFloorRateIsEnded(t *testing.T) {
 	if code, body := put(pr); code != http.StatusBadRequest || !strings.Contains(body, "RequestTimeout") {
 		t.Fatalf("a trickling body: %d %s; want 400 RequestTimeout", code, body)
 	}
+	if got := logged.String(); !strings.Contains(got, "level=WARN") || !strings.Contains(got, "slower than the floor rate") {
+		t.Fatalf("no warning that the upload was below the floor rate:\n%s", got)
+	}
 	if code, body := put(bytes.NewReader(make([]byte, size))); code != http.StatusOK {
 		t.Fatalf("a body at speed after it: %d %s", code, body)
+	}
+}
+
+// #76 review: connections being admitted (their key and friend looked
+// up) are bounded across the tunnel, so a friend or an invite holder
+// opening connections fast cannot start a lookup, and a database
+// connection, per connection: past the bound the accept loop waits,
+// and the rest are admitted as lookups end.
+func TestAdmitsInFlightAreBounded(t *testing.T) {
+	bob := newID(t)
+	var entered, most atomic.Int32
+	release := make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	defer free()
+	caps := &Caps{Conns: 1000, Of: func(ctx context.Context, key identity.NodeID) (identity.NodeID, state.Role, error) {
+		n := entered.Add(1)
+		for m := most.Load(); n > m && !most.CompareAndSwap(m, n); m = most.Load() {
+		}
+		<-release
+		entered.Add(-1)
+		return key, state.RolePeer, nil
+	}}
+	l := startLenderCaps(t, nil, caps)
+	const conns = maxAdmits + 36
+	var raws []net.Conn
+	for range conns {
+		raw, err := net.Dial("tcp", l.tun.ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw.Close()
+		l.tun.mu.Lock()
+		l.tun.keys[raw.LocalAddr().String()] = bob.NodeID()
+		l.tun.mu.Unlock()
+		raws = append(raws, raw)
+	}
+	for give := time.Now().Add(30 * time.Second); entered.Load() < maxAdmits; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(give) {
+			t.Fatalf("only %d lookups started of %d connections", entered.Load(), conns)
+		}
+	}
+	time.Sleep(300 * time.Millisecond) // a lookup past the bound would start now
+	if n := most.Load(); n > maxAdmits {
+		t.Fatalf("%d lookups in flight at once; the bound is %d", n, maxAdmits)
+	}
+	free()
+	// Every connection is admitted once the lookups end: each is served.
+	for i, raw := range raws {
+		raw.Write([]byte("GET " + control.VersionPath + " HTTP/1.1\r\nHost: lender\r\n\r\n"))
+		raw.SetReadDeadline(time.Now().Add(30 * time.Second))
+		if _, err := http.ReadResponse(bufio.NewReader(raw), nil); err != nil {
+			t.Fatalf("connection %d after the lookups: %v", i, err)
+		}
 	}
 }
 
@@ -205,4 +268,22 @@ func TestASlowCapLookupDoesNotStallOtherAccepts(t *testing.T) {
 	if got.StatusCode != http.StatusOK {
 		t.Fatalf("Bob after his lookup: %d", got.StatusCode)
 	}
+}
+
+// lockedBuffer is a log destination safe for concurrent writes.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }

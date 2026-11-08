@@ -91,6 +91,7 @@ type boundedBody struct {
 	got     int64     // bytes in the floor window
 	done    bool
 	stalled bool
+	slow    bool // ended for the floor rate
 }
 
 // errBelowFloor ends a body's read when it brought too little over a
@@ -140,7 +141,7 @@ func (bb *boundedBody) Read(p []byte) (int, error) {
 				// Every later read fails at once too, as a stalled
 				// one's does: net/http would otherwise drain the rest
 				// of the body at the trickle's pace.
-				bb.stalled = true
+				bb.stalled, bb.slow = true, true
 				bb.rc.SetReadDeadline(readEnded)
 				return 0, errBelowFloor
 			}
@@ -161,13 +162,13 @@ func (bb *boundedBody) finish() {
 }
 
 // stalledBody reports whether r's body ended for the stall bound or
-// the floor rate.
-func stalledBody(r *http.Request) bool {
+// the floor rate, and whether for the floor rate.
+func stalledBody(r *http.Request) (stalled, slow bool) {
 	bb, ok := r.Body.(*boundedBody)
 	if !ok {
-		return false
+		return false, false
 	}
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
-	return bb.stalled
+	return bb.stalled, bb.slow
 }

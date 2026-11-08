@@ -138,6 +138,11 @@ type peerKey struct{}
 
 func isControlPath(r *http.Request) bool { return strings.HasPrefix(r.URL.Path, control.Prefix) }
 
+// maxAdmits bounds the connections being admitted at once, across
+// every key: each holds a lookup, and a database connection, for up to
+// 5 s (Caps.friendOf). Past it the accept loop waits (#76 review).
+const maxAdmits = 64
+
 // peerListener closes, unread, every connection without a peer key, and
 // every connection over its key's cap; it tracks the rest in conns.
 // Its accept loop only accepts: each connection's key and friend are
@@ -156,11 +161,13 @@ type peerListener struct {
 	ready   chan net.Conn
 	errs    chan error
 	stopped chan struct{}
+	admits  chan struct{} // a slot per connection being admitted (maxAdmits)
 }
 
 func newPeerListener(ln net.Listener, peerOf PeerOf, caps *Caps, conns *Conns, log *slog.Logger) *peerListener {
 	return &peerListener{Listener: ln, peerOf: peerOf, caps: caps, conns: conns, log: log,
-		ready: make(chan net.Conn), errs: make(chan error), stopped: make(chan struct{})}
+		ready: make(chan net.Conn), errs: make(chan error), stopped: make(chan struct{}),
+		admits: make(chan struct{}, maxAdmits)}
 }
 
 func (l *peerListener) Accept() (net.Conn, error) {
@@ -176,7 +183,9 @@ func (l *peerListener) Accept() (net.Conn, error) {
 }
 
 // loop accepts until the listener fails for good, handing each
-// error to Accept (a temporary one, net/http retries).
+// error to Accept (a temporary one, net/http retries). It waits for
+// one of maxAdmits slots before it admits a connection, so a burst of
+// connections waits in the listener's backlog, not in lookups.
 func (l *peerListener) loop() {
 	for {
 		c, err := l.Listener.Accept()
@@ -192,7 +201,16 @@ func (l *peerListener) loop() {
 			}
 			return
 		}
-		go l.admit(c)
+		select {
+		case l.admits <- struct{}{}:
+		case <-l.stopped:
+			c.Close()
+			return
+		}
+		go func() {
+			defer func() { <-l.admits }()
+			l.admit(c)
+		}()
 	}
 }
 

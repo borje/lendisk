@@ -3765,7 +3765,9 @@ the handler's own reads and is never cancelled; nothing below
   10 minutes from its start, #76): the first read after a window that
   brought less fails, every later read on the connection fails at
   once (so net/http does not drain the rest at the trickle's pace),
-  and the answer is the same `RequestTimeout`. 8 KiB/s is 64 kbit/s,
+  and the answer is the same `RequestTimeout`, logged at warning
+  level ("the friend's upload was slower than the floor rate"), so a
+  path that never finishes an upload shows. 8 KiB/s is 64 kbit/s,
   so a borrower keeping all 16 of its request slots (*Per-friend
   caps*, §3.9) above it needs 1 Mbit/s of uplink; the window averages
   out a brief stop. A trickling body thus holds its request slot for
@@ -4821,7 +4823,16 @@ the handler's own reads and is never cancelled; nothing below
   resolved on a goroutine of their own, which counts it under the cap
   and hands it to `Accept`, so a slow database holds up that
   connection, not every tunnel accept
-  (`TestASlowCapLookupDoesNotStallOtherAccepts`).
+  (`TestASlowCapLookupDoesNotStallOtherAccepts`). At most 64
+  connections are being admitted at once across every key
+  (`maxAdmits`, #76 review): the accept loop takes a slot before it
+  starts one and waits when none is free, so a burst of connections
+  from a friend or an invite holder waits in the listener's backlog,
+  and holds at most 64 lookups, each with its own SQLite connection,
+  not one per connection (`TestAdmitsInFlightAreBounded`). The
+  database pool itself is left unbounded: a cap there would make any
+  path that reads through the pool while it holds a transaction wait on
+  itself, and nothing audits the daemon for such paths yet.
 - **SEC-8** versitygw's web UI, website, metrics and event endpoints
   are not configured, and versitygw opens no TCP port at all. Its admin
   API cannot be left out: with `AdminPorts` empty, `embedgw` mounts it
