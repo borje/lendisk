@@ -178,7 +178,12 @@ type QuotaAnswer struct {
 // purge, its own overheads). A delete queued there frees nothing until a
 // later answer: what deletes take off place_use from here is kept in
 // place_freed and counted back until then. The placement triggers move
-// both from there.
+// both from there. So that they do, place_freed starts at what the
+// place's queued and acknowledged deletes take off place_use, and
+// place_use at the answer less that: a delete acknowledged, or sized
+// anew by a late put (AckPlacement), after the answer then nets to
+// nothing, where a place_freed of 0 would floor at 0 and count it back
+// twice (#85).
 func (db *DB) QuotaAnswered(ctx context.Context, peer string, sent int64, sentAt time.Time, a QuotaAnswer, now time.Time) (Friendship, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -194,16 +199,43 @@ func (db *DB) QuotaAnswered(ctx context.Context, peer string, sent int64, sentAt
 	if err != nil {
 		return f, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO place_use (place, bytes) VALUES (?1,
-		?2 + (SELECT coalesce(sum(max(size, 0)), 0) FROM placement WHERE place = ?1 AND state = 'queued'))
-		ON CONFLICT (place) DO UPDATE SET bytes = excluded.bytes`, peer, capped(a.Lent)); err != nil {
+	var freed int64
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(-size), 0) FROM placement
+		WHERE place = ? AND state IN ('queued', 'acked') AND size < 0`, peer).Scan(&freed); err != nil {
 		return f, err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO place_freed (place, bytes) VALUES (?, 0)
-		ON CONFLICT (place) DO UPDATE SET bytes = 0`, peer); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO place_use (place, bytes) VALUES (?1,
+		?2 + (SELECT coalesce(sum(max(size, 0)), 0) FROM placement WHERE place = ?1 AND state = 'queued') - ?3)
+		ON CONFLICT (place) DO UPDATE SET bytes = excluded.bytes`, peer, capped(a.Lent), freed); err != nil {
+		return f, err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO place_freed (place, bytes) VALUES (?1, ?2)
+		ON CONFLICT (place) DO UPDATE SET bytes = excluded.bytes`, peer, freed); err != nil {
 		return f, err
 	}
 	return f, tx.Commit()
+}
+
+// PlaceSending reports whether a quota answer from place to a call sent
+// at since may or may not count a send (#85): place has a row its
+// sender took that is still in its FIFO, or one taken at or after
+// since (to the second). The lender's count may be taken before or
+// after such a send lands.
+func (db *DB) PlaceSending(ctx context.Context, place string, since time.Time) (bool, error) {
+	var sending bool
+	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM placement WHERE place = ?1
+		AND (state IN ('queued', 'dropping') AND started_at IS NOT NULL OR started_at >= ?2))`,
+		place, since.Unix()).Scan(&sending)
+	return sending, err
+}
+
+// PlaceIdle reports whether place's FIFO is empty: nothing queued or
+// dropping there.
+func (db *DB) PlaceIdle(ctx context.Context, place string) (bool, error) {
+	var busy bool
+	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM placement WHERE place = ?1 AND state = 'queued')
+		OR EXISTS (SELECT 1 FROM placement WHERE place = ?1 AND state = 'dropping')`, place).Scan(&busy)
+	return !busy, err
 }
 
 // QuotaFailed records at now why this node's last quota call to peer

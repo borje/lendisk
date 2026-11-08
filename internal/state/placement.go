@@ -144,15 +144,23 @@ func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 
 	} else if n > 0 {
 		return tx.Commit()
 	}
-	// A put acknowledged after a delete of its key was placed there (it
-	// was in flight) no longer counts: that delete removes it, and its
-	// own count did not include it (#21).
-	if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?1, acked_at = ?2,
-		size = CASE WHEN op = 'put' AND state != 'acked' AND EXISTS (SELECT 1 FROM placement d
-			WHERE d.place = placement.place AND d.bucket = placement.bucket AND d.key = placement.key
-			AND d.op = 'delete' AND d.seq > placement.seq) THEN 0 ELSE size END
+	var bucket, key, op, state string
+	var size int64
+	err = tx.QueryRowContext(ctx, `SELECT bucket, key, op, state, coalesce(size, 0) FROM placement
+		WHERE place = ? AND seq = ?`, place, seq).Scan(&bucket, &key, &op, &state, &size)
+	if errors.Is(err, sql.ErrNoRows) {
+		return tx.Commit()
+	} else if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?1, acked_at = ?2
 		WHERE place = ?3 AND seq = ?4 AND state != '`+PlacementDrained+`'`, nullStr(sha256), now.Unix(), place, seq); err != nil {
 		return err
+	}
+	if op == OpPut && state != PlacementAcked && state != PlacementDrained && size != 0 {
+		if err := freeLatePut(ctx, tx, place, bucket, key, seq, size); err != nil {
+			return err
+		}
 	}
 	var replaces sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT replaces FROM placement WHERE place = ? AND seq = ? AND state = 'acked' AND op = 'put'`,
@@ -165,6 +173,22 @@ func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 
 		}
 	}
 	return tx.Commit()
+}
+
+// freeLatePut handles a put of size bytes (row seq) acknowledged after a
+// delete of its key was placed at place (it was in flight, #21): it
+// landed, and the lender counts it, then its tomb, until the purge. The
+// put keeps its size, and the first delete after it at the place frees
+// it as well, as if it had been acknowledged before that delete was
+// placed (insertPlacement sized the delete then); the place_freed
+// triggers count it back until the place's next quota answer (#24,
+// #85).
+func freeLatePut(ctx context.Context, tx *sql.Tx, place, bucket, key string, seq, size int64) error {
+	_, err := tx.ExecContext(ctx, `UPDATE placement SET size = coalesce(size, 0) - ?1
+		WHERE place = ?2 AND seq = (SELECT min(d.seq) FROM placement d
+			WHERE d.place = ?2 AND d.bucket = ?3 AND d.key = ?4 AND d.op = 'delete' AND d.seq > ?5)`,
+		size, place, bucket, key, seq)
+	return err
 }
 
 // StartPlacement records that place's sender took row seq to send it,

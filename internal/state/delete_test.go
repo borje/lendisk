@@ -382,3 +382,108 @@ func TestHealingSkipsAnAbandonedPlace(t *testing.T) {
 	h := p.put("laptop", "data/1", "data", 1)
 	p.wantPlaces("the heal", h, "C")
 }
+
+// #85: a put acknowledged after a delete of its key was placed (its
+// send was in flight) landed at the lender, which counts it and then
+// its tomb until the purge. The borrower counts the same in every order
+// of the put's acknowledgement, the delete and the quota answers:
+// PlaceUse equals the lender's count until an answer says otherwise.
+func TestALateAcknowledgedPutCountsUntilTheLenderPurgesIt(t *testing.T) {
+	ctx := context.Background()
+	use := func(p *pool, lender int64, when string) {
+		p.t.Helper()
+		u, err := p.db.PlaceUse(ctx)
+		if err != nil {
+			p.t.Fatal(err)
+		}
+		if u["B"] != lender {
+			p.t.Fatalf("%s: B counted %d bytes, the lender %d", when, u["B"], lender)
+		}
+	}
+	answer := func(p *pool, lent int64) {
+		p.t.Helper()
+		if _, err := p.db.QuotaAnswered(ctx, "B", 10*unit, p.now, QuotaAnswer{Number: 10 * unit, Lent: lent}, p.now); err != nil {
+			p.t.Fatal(err)
+		}
+	}
+
+	t.Run("answer before the put", func(t *testing.T) {
+		p := newPool(t)
+		p.friend("B", 10)
+		p.bucket("laptop", 1)
+		answer(p, 0)
+		d := p.put("laptop", "data/1", "data", 2)
+		p.start("B", d)
+		del := p.del("laptop", "data/1", "data")
+		use(p, 2*unit, "put in flight, its delete queued")
+		p.ack("B", d)
+		use(p, 2*unit, "put acknowledged after its delete was placed")
+		p.ack("B", del)
+		use(p, 2*unit, "delete acknowledged: the lender keeps the tomb")
+		answer(p, 2*unit)
+		use(p, 2*unit, "an answer before the purge")
+		answer(p, 0)
+		use(p, 0, "the answer after the purge")
+	})
+
+	t.Run("answer while the put is in flight", func(t *testing.T) {
+		p := newPool(t)
+		p.friend("B", 10)
+		p.bucket("laptop", 1)
+		answer(p, 0)
+		d := p.put("laptop", "data/1", "data", 2)
+		p.start("B", d)
+		del := p.del("laptop", "data/1", "data")
+		answer(p, 0) // the put has not landed yet
+		use(p, 2*unit, "answer with the put still in flight")
+		p.ack("B", d)
+		use(p, 2*unit, "put acknowledged after the answer")
+		p.ack("B", del)
+		use(p, 2*unit, "delete acknowledged")
+		answer(p, 0)
+		use(p, 0, "the answer after the purge")
+	})
+
+	// A rewritable key's second version in flight behind a delete that
+	// already freed the first: the delete frees both once the second is
+	// acknowledged, and an answer between them does not count the first
+	// twice.
+	t.Run("a second version acknowledged late", func(t *testing.T) {
+		p := newPool(t)
+		p.friend("B", 10)
+		p.bucket("laptop", 1)
+		answer(p, 0)
+		m1 := p.put("laptop", "index/1", "metadata", 1)
+		p.ack("B", m1)
+		m2 := p.rewrite("laptop", "index/1", "metadata", 2)
+		p.start("B", m2)
+		del := p.del("laptop", "index/1", "metadata")
+		use(p, 3*unit, "the first version tombed, the second in flight")
+		answer(p, unit) // the lender: the first version, the second not landed
+		use(p, 3*unit, "answer with the second version in flight")
+		p.ack("B", m2)
+		use(p, 3*unit, "the second version acknowledged late")
+		p.ack("B", del)
+		use(p, 3*unit, "both versions tombed")
+		answer(p, 0)
+		use(p, 0, "the answer after the purge")
+	})
+
+	// A delete queued across an answer and acknowledged after it is not
+	// counted back on top of the lender's word.
+	t.Run("a delete acknowledged after an answer", func(t *testing.T) {
+		p := newPool(t)
+		p.friend("B", 10)
+		p.bucket("laptop", 1)
+		answer(p, 0)
+		d := p.put("laptop", "data/1", "data", 2)
+		p.ack("B", d)
+		del := p.del("laptop", "data/1", "data")
+		answer(p, 2*unit)
+		use(p, 2*unit, "answer with the delete queued")
+		p.ack("B", del)
+		use(p, 2*unit, "the delete acknowledged after the answer")
+		answer(p, 0)
+		use(p, 0, "the answer after the purge")
+	})
+}

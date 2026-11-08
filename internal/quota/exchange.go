@@ -7,7 +7,10 @@
 // process or another), on Due (the friend answered a write with 507),
 // and otherwise every Refresh, so each side keeps the other's number,
 // use and repository size, and this node's count of its use there is
-// reconciled from the friend's own (#68). A call that fails is repeated
+// reconciled from the friend's own (#68). An answer to a call that
+// crossed a send to the friend may or may not count it, so the friend
+// is called again once nothing is left to send there (#85). A call
+// that fails is repeated
 // after a backoff from MinBackoff doubling to MaxBackoff until the
 // friend answers. Each pass also compares every friendship's quota with
 // the one it last saw and passes a change to Changed, whatever made it
@@ -91,8 +94,12 @@ type Exchanger struct {
 	next     map[string]time.Time     // peer -> not before, after a failure
 	backoff  map[string]time.Duration // peer -> the wait after its next failure
 	due      map[string]bool          // peer -> asked for by Due
-	inflight map[string]bool
-	wg       sync.WaitGroup
+	// unsettled: peer -> its last answer crossed a send there, which the
+	// friend's count may or may not hold; called again once its FIFO is
+	// empty (#85).
+	unsettled map[string]bool
+	inflight  map[string]bool
+	wg        sync.WaitGroup
 }
 
 func or(d, def time.Duration) time.Duration {
@@ -108,6 +115,7 @@ func (x *Exchanger) init() {
 		x.quotas, x.answered, x.next = map[string]int64{}, map[string]time.Time{}, map[string]time.Time{}
 		x.early = map[string]time.Duration{}
 		x.backoff, x.due, x.inflight = map[string]time.Duration{}, map[string]bool{}, map[string]bool{}
+		x.unsettled = map[string]bool{}
 	})
 }
 
@@ -167,6 +175,23 @@ func (x *Exchanger) Pass(ctx context.Context) {
 		x.logErr(ctx, "quota: reading friendships failed", err)
 		return
 	}
+	// A place whose last answer crossed a send is called again once
+	// nothing is left to send there.
+	x.mu.Lock()
+	var unsettled []string
+	for p := range x.unsettled {
+		unsettled = append(unsettled, p)
+	}
+	x.mu.Unlock()
+	settle := map[string]bool{}
+	for _, p := range unsettled {
+		idle, err := x.DB.PlaceIdle(ctx, p)
+		if err != nil {
+			x.logErr(ctx, "quota: reading a friend's queue failed", err)
+			continue
+		}
+		settle[p] = idle
+	}
 	now := x.now()
 	type changed struct {
 		peer          string
@@ -189,7 +214,7 @@ func (x *Exchanger) Pass(ctx context.Context) {
 			continue
 		}
 		last, ok := x.answered[f.Peer]
-		if f.OwnNumber != f.ToldNumber || x.due[f.Peer] || !ok || now.Sub(last) >= or(x.Refresh, defaultRefresh)-x.early[f.Peer] {
+		if f.OwnNumber != f.ToldNumber || x.due[f.Peer] || settle[f.Peer] || !ok || now.Sub(last) >= or(x.Refresh, defaultRefresh)-x.early[f.Peer] {
 			delete(x.due, f.Peer)
 			x.inflight[f.Peer] = true
 			todo = append(todo, f)
@@ -203,6 +228,7 @@ func (x *Exchanger) Pass(ctx context.Context) {
 			delete(x.next, p)
 			delete(x.backoff, p)
 			delete(x.due, p)
+			delete(x.unsettled, p)
 		}
 	}
 	x.mu.Unlock()
@@ -242,6 +268,11 @@ func (x *Exchanger) Pass(ctx context.Context) {
 func (x *Exchanger) exchange(ctx context.Context, f state.Friendship, req control.QuotaRequest) {
 	defer x.wg.Done()
 	sentAt := x.now()
+	crossed, err := x.DB.PlaceSending(ctx, f.Peer, sentAt)
+	if err != nil {
+		x.logErr(ctx, "quota: reading the sends to a friend failed", err)
+		crossed = true
+	}
 	cctx, cancel := context.WithTimeout(ctx, or(x.Timeout, defaultTimeout))
 	resp, err := x.call(cctx, f, req)
 	cancel()
@@ -276,9 +307,20 @@ func (x *Exchanger) exchange(ctx context.Context, f state.Friendship, req contro
 	}
 	_, err = x.DB.QuotaAnswered(ctx, f.Peer, req.Number, sentAt, state.QuotaAnswer{Number: resp.Number, Use: resp.Use, Lent: resp.Lent,
 		RepositorySize: resp.RepositorySize, Protocol: resp.Protocol, Path: path}, now)
+	if err == nil && !crossed {
+		if crossed, err = x.DB.PlaceSending(ctx, f.Peer, sentAt); err != nil {
+			x.logErr(ctx, "quota: reading the sends to a friend failed", err)
+			crossed, err = true, nil
+		}
+	}
 	x.mu.Lock()
 	delete(x.inflight, f.Peer)
 	if err == nil {
+		if crossed {
+			x.unsettled[f.Peer] = true
+		} else {
+			delete(x.unsettled, f.Peer)
+		}
 		x.answered[f.Peer] = now
 		x.early[f.Peer] = x.jitter()
 		delete(x.backoff, f.Peer)
