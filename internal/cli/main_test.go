@@ -6,10 +6,12 @@ import (
 	"math/rand/v2"
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/borje/lendisk/internal/alert"
 	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
@@ -45,7 +47,28 @@ const (
 	// envListDelay is a pause before the daemon answers each page of a
 	// friend's list (a Go duration): a friend slow to list.
 	envListDelay = "LENDISK_TEST_LIST_DELAY"
+	// envClock names a file holding a Go duration the daemon's clock runs
+	// ahead of real time by (offsetClock): a test moves the daemon days
+	// ahead by rewriting it.
+	envClock = "LENDISK_TEST_CLOCK"
+	// envAlertInterval is the alert service's time between passes (a Go
+	// duration).
+	envAlertInterval = "LENDISK_TEST_ALERT_INTERVAL"
+	// envRerouteEvery is the replication worker's time between re-routing
+	// passes, on its clock (a Go duration).
+	envRerouteEvery = "LENDISK_TEST_REROUTE_EVERY"
 )
+
+// offsetClock is real time plus the duration in the file at path, read
+// at every call (0 while the file is missing or empty): an injected
+// clock a test can move for a daemon in another process.
+func offsetClock(path string) func() time.Time {
+	return func() time.Time {
+		b, _ := os.ReadFile(path)
+		d, _ := time.ParseDuration(strings.TrimSpace(string(b)))
+		return time.Now().Add(d)
+	}
+}
 
 // slowList is a lender's index that answers each page after a delay.
 type slowList struct {
@@ -74,6 +97,12 @@ func TestMain(m *testing.M) {
 			}
 		}
 		a.tuneReplication = tuneFromEnv
+		if f := os.Getenv(envClock); f != "" {
+			a.clock = offsetClock(f)
+		}
+		if d, err := time.ParseDuration(os.Getenv(envAlertInterval)); err == nil {
+			a.tuneAlerts = func(s *alert.Service) { s.Interval = d }
+		}
 		a.tuneManifest = func(p *manifest.Pusher) {
 			if os.Getenv(envReplFast) == "1" {
 				p.Poll, p.Timeout = 200*time.Millisecond, 10*time.Second
@@ -112,6 +141,9 @@ func fastReplication(w *replica.Worker) {
 func tuneFromEnv(w *replica.Worker) {
 	if os.Getenv(envReplFast) == "1" {
 		fastReplication(w)
+	}
+	if d, err := time.ParseDuration(os.Getenv(envRerouteEvery)); err == nil {
+		w.RerouteEvery = d
 	}
 	delay, _ := time.ParseDuration(os.Getenv(envSendDelay))
 	p, _ := strconv.ParseFloat(os.Getenv(envCrashMidSend), 64)

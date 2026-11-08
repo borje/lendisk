@@ -67,8 +67,15 @@ lendisk status                                # per friend: queue, held, last an
 
 Backups replicate to friends in the background. Each bucket's objects are
 held by `--copies` friends (default 2); its metadata by every friend.
-`status` shows what is not yet offsite. *Not yet:* `status --wait`, which
-blocks until a backup is offsite.
+`status` names each bucket's latest snapshot and whether it is offsite at
+its copies (for Kopia, the time by which every finished snapshot is; for a
+generic bucket, the last write that is), and what is still short. A backup
+script can block until the backup is offsite:
+
+```sh
+restic backup ~ && lendisk status --wait laptop --timeout 6h
+# 0 offsite; 3 timed out; 4 cannot be as things stand (status says why)
+```
 
 Profiles: `restic`, `kopia` and `generic` (any S3 tool, such as rclone or
 Duplicacy). A generic bucket is not encrypted, so friends can read it;

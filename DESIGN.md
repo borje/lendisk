@@ -1861,7 +1861,11 @@ upstream bucket is Q-V.
   `snapshots/*`; not `config` or `keys/*`), which recovery checks
   (§3.1 ID-5). A sixth, `rewritable` (v0.11.3, #74), names the few
   keys the tool rewrites in place in normal use; a rewritable key
-  keeps its class. A bucket whose
+  keeps its class. A flag, `names_snapshots` (#20), says a snapshot
+  key's last segment is the snapshot's ID as the tool shows it, so
+  `status` names the snapshot that is offsite (§3.4 REPL-11): `true`
+  for `restic`; off for `kopia`, whose snapshot keys are index blobs,
+  and `generic`, which has none. A bucket whose
   profile has no file classifies every key as data and none as
   rewritable. The compiled-in
   files are `restic`, `kopia` and `generic`. `kopia` (#7) is EP-7's
@@ -2701,11 +2705,127 @@ upstream bucket is Q-V.
   assembled object once at completion (EP-3), so every object has one
   whole-object SHA-256 whatever its part sizes, and EP-11 compares
   hashes directly.
-- **REPL-11** The bucket's watermark is the highest sequence `w` such
-  that every object up to `w` has `copies` `acked` placement rows; it
-  advances as acknowledgements arrive and is the offsite-complete point
-  (REPL-4). Per-place lag (the oldest `queued` row's age) is kept beside
-  it for `status` and OPS-2.
+- **REPL-11, the watermark (#20).** The bucket's watermark is the
+  highest sequence `w` up to which every object has `copies`
+  acknowledged placements; it is the offsite-complete point (REPL-4).
+  Nothing stores it: `state.DB.Offsite` computes it from `queue` and
+  `placement` whenever `status` asks (`internal/state/offsite.go`), so
+  it advances as each acknowledgement is recorded, needs no migration
+  and cannot drift from the rows. Per-place lag (the oldest `queued`
+  row's age) is kept beside it (`places[]`) for `status` and OPS-2.
+  How each row counts, against a candidate `w`
+  (`TestWatermarkAdvancesAsAcknowledgementsArrive`,
+  `TestWatermarkFollowsRewritesAndDeletes`):
+  - *a put* counts while `copies` places still hold its bytes: the
+    place's latest `acked` or `abandoned` row of the key is an `acked`
+    put of the same SHA-256. An acknowledgement that a later
+    acknowledged delete or rewrite at that place ended no longer
+    counts; an older acknowledgement of the same bytes (a healing
+    re-upload's) does. An `abandoned` row in between counts against,
+    since its send may have landed other bytes. Metadata, placed at
+    every friend, needs `copies` of them like data.
+  - *superseded, deleted and rewritten puts:* a put that fails the above
+    is still no obstacle once a later done write of its key, rewrite or
+    delete, is at or below `w`: as of `w` the bucket holds that write,
+    not this one. This is `current` evaluated as of `w`, not as of now:
+    a pack the prune deletes after `w` still counts at `w`, so while a
+    repack's new pack is unsent and the old one is already deleted at a
+    friend, the snapshots before both are not claimed offsite (the old
+    pack is no longer held, the new one not yet).
+  - *a delete* needs nothing: it adds no bytes to be offsite.
+  - *`queued`, `refused`, `dropped` and `abandoned` rows* are not
+    acknowledgements. *Decision (#20, the #57 review's finding): a
+    refusal holds the watermark honestly.* One friend refusing
+    everything (`BadDigest` for bytes that match, a `412`) does not
+    stall others' metadata (the barrier ignores refusals, above) and is
+    never counted as a copy, so the watermark stops before the first
+    object only it was to hold, and stays there until a later write of
+    the key or re-placement (#26, which places missing copies by D6's
+    choice, excluding holders) brings that object to `copies`: it is
+    not pinned forever, but never claims what is not offsite. Metadata
+    refused by one friend still reaches `copies` at the others. The
+    same holds for a `dropped` copy and for the pool's lack of room.
+    `Offsite` reports such objects as *stuck* (their key's latest write,
+    held and queued at fewer than `copies` places) with the reason
+    (refused, dropped, unplaced), so `status` says why the snapshot is
+    not offsite and `status --wait` stops instead of waiting silently
+    (`TestAFriendRefusingEverythingLeavesTheWatermarkHonest`,
+    `TestDroppedAndUnplacedCopiesAreStuckQueuedOnesWait`,
+    `TestStatusWaitStopsWhenAFriendRefusesEverything`). A copy still
+    `queued` at an unreachable friend is waiting, not stuck: `Reroute`
+    may move it.
+  - *local-only keys* are never queued, so never counted.
+
+  `w` is valid when every put at or below it passes; the watermark is
+  the highest valid `w` up to the bucket's latest done write. Each
+  failing put `r` rules out `[r, next)`, `next` its key's next done
+  write (none for the key's latest), so one pass over the failing puts
+  in descending order finds it. The query reads every done put of the
+  bucket once, with one indexed look-up per place (`placement_key`):
+  about 150 ms for 23 000 objects at three friends on the development
+  machine (`TestOffsiteOfALargeBucketIsFast`), read by each `status`
+  and every 2 s by `status --wait`; a stored watermark, advanced on
+  acknowledgement, is the optimisation if a large repository needs one.
+
+  *What `status` names (REPL-4, REPL-11).* Under each bucket, and in
+  `buckets[].offsite` of `status --json` (`complete`, `watermark`,
+  `latest`, `snapshot` and `latest_snapshot` with `key`, `id`, `seq`,
+  `captured_at` and `offsite`, `through`, and `waiting` and `stuck`
+  counts with reasons; additive, schema 1):
+  - *restic:* the latest snapshot key still live, `snapshots/<id>`, by
+    restic's short ID (its first 8 characters, as `restic snapshots`
+    prints): "snapshot 1a2b3c4d is offsite at 2 copies"; while the next
+    is on its way, "snapshot … is not offsite at 2 copies yet: N
+    objects, B bytes still to reach 2 places" with the stuck count and
+    reasons, and the earlier one that is offsite. The profile says its
+    keys name snapshots (`names_snapshots = true`, EP-7's profile data).
+  - *Kopia:* a snapshot key is an index blob (`xn0_<hash>-s<session>-c1`
+    in 0.23: one per session, each snapshot's session writing a `p`
+    data pack, a `q` pack holding the manifest and that index, and
+    maintenance writing its own), and Kopia's snapshot IDs (`k…`
+    manifest IDs) are inside encrypted `q` packs. *Decision (#20):*
+    `status` names the time, not a snapshot: "every snapshot finished
+    by 2026-11-08 10:00:00 UTC is offsite at 2 copies (through
+    xn0_…)", the capture time of the latest snapshot key at or below
+    the watermark, deleted since or not (compaction deletes `xn`
+    blobs). A snapshot Kopia finished by then has its manifest in a `q`
+    pack named by an index at or below the watermark. The user compares
+    it with `kopia snapshot list`'s start times.
+  - *generic:* no snapshot keys: "every write up to <time> is offsite
+    at 2 copies", the capture time of the latest put at or below the
+    watermark (the last fully placed write), and what later writes
+    still wait for.
+
+  How other tools report completeness, which this follows: restic
+  prints the ID of the snapshot it saved, and `restic snapshots` the
+  short IDs; Kopia's `snapshot list` shows start times and IDs, and
+  `maintenance info` times; `rclone check` counts the objects that
+  differ or are missing rather than a bare yes or no. lendisk names the
+  snapshot (or the time) and counts what is missing, with why.
+- **REPL-5, `status --wait <bucket>` (#20).** Waits until the latest
+  snapshot key captured before the wait began (for a bucket with none,
+  its latest write) is at or below the watermark, prints the `status`
+  phrase for it and exits 0; a snapshot captured during the wait is not
+  waited for. Exit codes, in `status --help`: 1 an error (no such
+  bucket, the daemon not running), 2 a usage error (with `--json`, a
+  negative `--timeout`), 3 timed out, 4 it cannot be offsite as things
+  stand (stuck objects, above), with the reason on stderr. `--timeout`
+  defaults to 24 hours (a nightly script's next run), 0 waiting without
+  a limit. *Decision (#20): it polls `lendisk.db`, not the daemon.*
+  The watermark is computed from the rows, which the daemon writes in
+  WAL mode, so a reader never blocks it and needs no control API call;
+  it reads every 2 s. It does need the daemon to make progress: it
+  tells one is running by connecting to the gateway's socket
+  (`<data>/run/gw.sock`), and with none at the start it exits 1 at
+  once, saying to start `lendisk serve`; one that stops during the wait
+  (a restart) is noted once on stderr and waited for within the
+  timeout. The clock and the pause between polls are the `app`'s
+  (`clock`, `sleep`), so tests run the timeout on injected time
+  (`TestStatusWaitTimesOut`). Scenario 1 and 2 run end to end with real
+  daemons and restic (`TestScenarioFirstBackupIsOffsiteAtTwoCopies`,
+  `TestScenarioFriendOfflineForThreeDays`, the latter on A's injected
+  clock: `serve` now gives the replication worker the `app`'s clock,
+  `replica.Worker.Now`, as it already gave `lendisk.db`'s).
 
 ### 3.5 Lending and quotas
 

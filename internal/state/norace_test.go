@@ -13,3 +13,6 @@ const (
 	settleKeys = 200_000
 	settleWait = time.Second
 )
+
+// offsiteObjects sizes the large-bucket watermark test.
+const offsiteObjects = 20_000

@@ -69,6 +69,9 @@ type app struct {
 	clock       func() time.Time
 	random      io.Reader
 	dialTimeout time.Duration
+	// sleep pauses `status --wait` between polls; nil means a timer.
+	// Tests advance their clock in it.
+	sleep func(ctx context.Context, d time.Duration) error
 	// redeemTransport, if set, wraps peer add's redeem transport, and
 	// beforeFriendship, if set, runs after the redeem answer and before
 	// the friendship row is written, its error ending peer add there:
@@ -114,12 +117,25 @@ func (a *app) run(args []string) int {
 		if errors.As(err, &ue) {
 			return 2
 		}
+		var ce codeError
+		if errors.As(err, &ce) {
+			return ce.code
+		}
 		return 1
 	}
 	return 0
 }
 
 type usageError struct{ error }
+
+// codeError is a failure with its own exit code, other than 1 and the
+// usage errors' 2 (`status --wait`: 3 timed out, 4 cannot complete).
+type codeError struct {
+	error
+	code int
+}
+
+func (e codeError) Unwrap() error { return e.error }
 
 func (a *app) rootCmd() *cobra.Command {
 	root := &cobra.Command{

@@ -252,3 +252,30 @@ func TestRewritableReadFromProfileFile(t *testing.T) {
 		t.Fatalf("empty rewritable pattern: %v", err)
 	}
 }
+
+// REPL-11 (#20): a profile says whether its snapshot keys name the
+// snapshot as the tool shows it. restic's do (snapshots/<id>); Kopia's
+// are index blobs, so status names the time instead; generic has no
+// snapshot keys. A profile file may say so too.
+func TestSnapshotIDsFromSnapshotKeys(t *testing.T) {
+	set, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, ok := set.Get("restic").SnapshotID("snapshots/0123456789abcdef"); !ok || id != "0123456789abcdef" {
+		t.Errorf("restic: SnapshotID = %q %v", id, ok)
+	}
+	for _, name := range []string{"kopia", "generic", "none"} {
+		if id, ok := set.Get(name).SnapshotID("xn0_0123"); ok {
+			t.Errorf("%s names snapshot %q", name, id)
+		}
+	}
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "mytool.toml"), []byte("snapshot = [\"snaps/*\"]\nnames_snapshots = true\n"), 0o600)
+	if set, err = Load(dir); err != nil {
+		t.Fatal(err)
+	}
+	if id, ok := set.Get("mytool").SnapshotID("snaps/s1"); !ok || id != "s1" {
+		t.Errorf("mytool: SnapshotID = %q %v", id, ok)
+	}
+}
