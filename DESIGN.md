@@ -2415,6 +2415,16 @@ upstream bucket is Q-V.
   `PutObject` (§3.9 SEC-9). A stale rewrite (an old request delayed or
   retried after a newer one landed) names a hash the key no longer
   holds and is refused.
+  *What the mark is not.* The mark is a consistency check between an
+  honest borrower and its lender, against delayed, duplicated or
+  reordered requests; it is not a security control against the
+  borrower. A borrower knows the hash of every version it stored, so a
+  hostile or compromised one can mark a rewrite of any key it likes,
+  and the lender, which does not know the borrower's profile, stores
+  it. What protects the data is the tomb: every version a rewrite
+  replaces is kept, counted and unreachable by the borrower until its
+  window passes, exactly as a deleted object is (RET-1, RET-2, §3.6;
+  `rewriteAttacks` in `TestHostilePeer`).
   *Where EP-11's alert will live (#22).* #22's rule, "a changed
   acknowledged key raises the alert and gets no new placement", belongs
   in `FinishPut`/`placeTx`, where a completed capture is placed (it has
