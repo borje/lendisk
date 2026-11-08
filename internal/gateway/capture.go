@@ -100,18 +100,26 @@ var (
 // state database could not be read; the request must fail rather than go
 // uncaptured.
 func (d *Decorator) classify(bucket, key *string) (profile.Class, error) {
+	c, _, err := d.kind(bucket, key)
+	return c, err
+}
+
+// kind is classify and whether the bucket's profile names the key
+// rewritable (EP-7, #74), which a captured put records.
+func (d *Decorator) kind(bucket, key *string) (profile.Class, bool, error) {
 	if d.DB == nil || bucket == nil || key == nil {
-		return "", nil
+		return "", false, nil
 	}
 	b, err := d.DB.GetBucket(context.Background(), *bucket)
 	if errors.Is(err, state.ErrNotFound) {
-		return "", nil
+		return "", false, nil
 	}
 	if err != nil {
 		d.Log.Error("capture: reading the bucket's profile failed; refusing the request", "bucket", *bucket, "err", err)
-		return "", errInternal
+		return "", false, errInternal
 	}
-	return d.Profiles.Get(b.Profile).Classify(*key), nil
+	p := d.Profiles.Get(b.Profile)
+	return p.Classify(*key), p.Rewritable(*key), nil
 }
 
 // captured reports whether a class is queued: an own bucket's key that
@@ -120,7 +128,7 @@ func captured(c profile.Class) bool { return c != "" && c != profile.LocalOnly }
 
 // PutObject captures a successful put (EP-2) with the hash of its stream.
 func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
-	class, err := d.classify(in.Bucket, in.Key)
+	class, rewritable, err := d.kind(in.Bucket, in.Key)
 	if err != nil || !captured(class) {
 		if err != nil {
 			return s3response.PutObjectOutput{}, err
@@ -138,7 +146,8 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 		in.Metadata = map[string]string{}
 	}
 	in.Metadata[MetaCapture] = token
-	seq, err := d.begin(state.Capture{Bucket: *in.Bucket, Key: *in.Key, Op: state.OpPut, Class: string(class), Token: token})
+	seq, err := d.begin(state.Capture{Bucket: *in.Bucket, Key: *in.Key, Op: state.OpPut, Class: string(class),
+		Rewritable: rewritable, Token: token})
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
@@ -185,7 +194,7 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 // while it settles its row, and settles the claim as stored before it
 // hashes, so a retry never waits for that hash either (#62).
 func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
-	class, err := d.classify(in.Bucket, in.Key)
+	class, rewritable, err := d.kind(in.Bucket, in.Key)
 	if err != nil {
 		return s3response.CompleteMultipartUploadResult{}, "", err
 	}
@@ -208,7 +217,7 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 		}
 		f, mine := d.claim(id)
 		if mine {
-			return d.completeClaimed(ctx, in, class, id, f)
+			return d.completeClaimed(ctx, in, class, rewritable, id, f)
 		}
 		select {
 		case <-f.done:
@@ -227,7 +236,7 @@ func (d *Decorator) CompleteMultipartUpload(ctx context.Context, in *s3.Complete
 // has claimed. However it ends (a panic included), f is settled, the
 // claim and the key's lock released, and a row it wrote and did not
 // settle is stranded; on success the background hash does that.
-func (d *Decorator) completeClaimed(ctx context.Context, in *s3.CompleteMultipartUploadInput, class profile.Class, id string, f *completion) (res s3response.CompleteMultipartUploadResult, ver string, err error) {
+func (d *Decorator) completeClaimed(ctx context.Context, in *s3.CompleteMultipartUploadInput, class profile.Class, rewritable bool, id string, f *completion) (res s3response.CompleteMultipartUploadResult, ver string, err error) {
 	bucket, key, uploadID := *in.Bucket, *in.Key, *in.UploadId
 	var (
 		unlock     func()
@@ -264,7 +273,7 @@ func (d *Decorator) completeClaimed(ctx context.Context, in *s3.CompleteMultipar
 		return res, "", err
 	}
 	seq, err = d.begin(state.Capture{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(class),
-		ETag: etag, UploadID: uploadID})
+		Rewritable: rewritable, ETag: etag, UploadID: uploadID})
 	if err != nil {
 		return res, "", err
 	}

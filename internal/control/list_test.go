@@ -52,7 +52,7 @@ func TestListCallPagesCallersOwnBucketOnly(t *testing.T) {
 	ctx := t.Context()
 	l := newLender(t)
 	a, b := newID(t), newID(t)
-	objs := []gateway.LentObject{{Key: "config", Size: 155, SHA256: "aa"}, {Key: "data/01/x", Size: 9, SHA256: "bb"},
+	objs := []gateway.LentObject{{Key: "config", Size: 155, SHA256: "aa", Replaced: []string{"a9", "a8"}}, {Key: "data/01/x", Size: 9, SHA256: "bb"},
 		{Key: "index/1", Size: 3, SHA256: "cc"}}
 	x := &index{held: map[identity.NodeID]map[string][]gateway.LentObject{a.NodeID(): {a.SealedName("laptop"): objs}}}
 	l.srv.Lent = x
@@ -73,7 +73,7 @@ func TestListCallPagesCallersOwnBucketOnly(t *testing.T) {
 		after = p.Next
 	}
 	if len(got) != 3 || got[0].Key != "config" || got[0].Size != 155 || got[0].SHA256 != "aa" || got[2].Key != "index/1" ||
-		got[0].TombstonedAt != nil {
+		got[0].TombstonedAt != nil || strings.Join(got[0].Replaced, " ") != "a9 a8" || got[1].Replaced != nil {
 		t.Fatalf("listed %+v", got)
 	}
 

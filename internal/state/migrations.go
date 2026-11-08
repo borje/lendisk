@@ -389,4 +389,20 @@ var migrations = []Migration{
 		CREATE INDEX tombstone_key ON tombstone (peer_key, sealed, key);
 		CREATE INDEX tombstone_purge ON tombstone (pending, purge_after);`,
 	},
+	{
+		Version: 20, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Rewritable keys (EP-7, LEND-4, RET-1, #74). A captured write of
+		-- a key its bucket's profile names rewritable: a changed version
+		-- is sent to each place as a rewrite. On the lender, a tombstone
+		-- of the version a rewrite replaced, which startup settles by
+		-- moving the bytes back if the new version was never published.
+		-- In recovery, whether a listed key is rewritable, and the
+		-- versions its place replaced by rewrites (hex hashes, space
+		-- separated), which name a newer version where places disagree.
+		ALTER TABLE queue ADD COLUMN rewritable INTEGER;    -- 1: rewritable in the bucket's profile
+		ALTER TABLE tombstone ADD COLUMN rewrite INTEGER;   -- 1: replaced by a rewrite, not deleted
+		ALTER TABLE listed ADD COLUMN rewritable INTEGER;   -- 1: rewritable in the bucket's profile
+		ALTER TABLE listed ADD COLUMN replaced TEXT;        -- hashes the place replaced by rewrites`,
+	},
 }

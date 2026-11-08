@@ -23,3 +23,8 @@ data = ["data/*"]
 # Named by the SHA-256 of their content: recovery accepts a friend's copy
 # only if its hash is the name (ID-5). config and keys/ are not so named.
 hash_named = ["data/*", "index/*", "snapshots/*"]
+
+# Rewritten in place by `restic migrate upgrade_repo_v2` (EP-7, #74).
+# Each lender keeps the version a rewrite replaces as a tombstone for
+# the retention window.
+rewritable = ["config"]

@@ -21,6 +21,8 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/invite"
+	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 )
 
@@ -45,6 +47,10 @@ func borrowOver(t *testing.T, key, borrower *identity.Identity, lender identity.
 //     A's own node ID as the access key is refused on either connection.
 //   - RET-2 AC over the tunnel: TestBorrowerCannotPurgeEarly's attack list,
 //     from both of B's keys, leaves B's tombstoned object as it was.
+//     The list includes rewrites (#74) marked with the tomb's hash.
+//   - #74: B marking rewrites of a live key loses nothing within the
+//     window: every version a rewrite replaced is a tomb with its bytes;
+//     a stale, false or absent mark is refused and changes nothing.
 //   - #69: a redeem cannot register another friend's dial key, a friend's
 //     node ID, its own node ID, the invite key or A's node ID as a dial
 //     key.
@@ -123,7 +129,10 @@ func TestHostilePeer(t *testing.T) {
 		if got, err := os.ReadFile(filepath.Join(bDir, filepath.FromSlash(tomb.Tomb))); err != nil || !bytes.Equal(got, body) {
 			t.Fatalf("after %s the tomb holds %q (%v)", when, got, err)
 		}
-		if ts, err := aDB.TombstonesOf(ctx, bID.NodeID().String(), bSealed, "data/ef/pack"); err != nil || len(ts) != 1 || ts[0].ID != tomb.ID {
+		// Kept: a rewrite marked with its hash stores other bytes beside it
+		// (#74), which a later delete tombs too; more tombs, never fewer.
+		if ts, err := aDB.TombstonesOf(ctx, bID.NodeID().String(), bSealed, "data/ef/pack"); err != nil ||
+			!slices.ContainsFunc(ts, func(x state.Tombstone) bool { return x.ID == tomb.ID }) {
 			t.Fatalf("after %s the tombstones are %+v (%v)", when, ts, err)
 		}
 	}
@@ -209,6 +218,11 @@ func TestHostilePeer(t *testing.T) {
 			tombIntact(name)
 		}
 	}
+
+	// #74: rewrites. Whatever B marks, every replaced version is a tomb
+	// holding its bytes, and a write without the mark of the version the
+	// key holds changes nothing.
+	rewriteAttacks(t, a, bS3, bID, bSealed)
 
 	// Squatting: B creating a bucket under C's sealed name makes one of
 	// its own, under its own prefix; C's bucket is untouched and B reads
@@ -321,8 +335,16 @@ func purgeAttacks(c *s3.Client, bucket, key, tomb, upload string, body []byte) m
 		},
 		"overwrite":               func() { put(key, other, other) },
 		"overwrite claiming hash": func() { put(key, other, body) },
-		"multipart other bytes":   func() { mpu(key, other) },
-		"complete an old upload":  func() { complete(key, k(upload), other) },
+		"rewrite marked with the tomb's hash": func() {
+			c.PutObject(ctx, &s3.PutObjectInput{Bucket: b, Key: k(key), Body: bytes.NewReader(other),
+				Metadata: rewriteMeta(other, body)})
+		},
+		"rewrite onto the tomb": func() {
+			c.PutObject(ctx, &s3.PutObjectInput{Bucket: b, Key: k(tomb), Body: bytes.NewReader(other),
+				Metadata: rewriteMeta(other, body)})
+		},
+		"multipart other bytes":  func() { mpu(key, other) },
+		"complete an old upload": func() { complete(key, k(upload), other) },
 		"abort an old upload": func() {
 			c.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: b, Key: k(key), UploadId: k(upload)})
 		},
@@ -351,6 +373,78 @@ func purgeAttacks(c *s3.Client, bucket, key, tomb, upload string, body []byte) m
 		},
 		"delete the bucket": func() { c.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: b}) },
 	}
+}
+
+// rewriteMeta is the metadata of a borrower's rewrite of a key holding
+// replaced (LEND-4, #74).
+func rewriteMeta(body, replaced []byte) map[string]string {
+	m := hashMeta(body)
+	m[replica.MetaReplaces] = sha256Hex(replaced)
+	return m
+}
+
+// rewriteAttacks is #74's part of the hostile-peer harness: borrower B,
+// with its stock client c at lender a, rewrites a live key of its bucket
+// again and again, marked rightly, stale, falsely and not at all. Every
+// version a stored rewrite replaced is a tomb at a holding its bytes,
+// and every other write changes nothing: B cannot lose data within the
+// window by rewriting (RET-2).
+func rewriteAttacks(t *testing.T, a *node, c *s3.Client, bID *identity.Identity, sealed string) {
+	t.Helper()
+	ctx := t.Context()
+	key := "config"
+	put := func(body []byte, meta map[string]string) error {
+		_, err := c.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(sealed), Key: aws.String(key),
+			Body: bytes.NewReader(body), Metadata: meta})
+		return err
+	}
+	v := [][]byte{[]byte("config v0"), []byte("config v1"), []byte("config v2"), []byte("config v3")}
+	if err := put(v[0], hashMeta(v[0])); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i < len(v); i++ {
+		if err := put(v[i], rewriteMeta(v[i], v[i-1])); err != nil {
+			t.Fatalf("B's rewrite to %s: %v", v[i], err)
+		}
+	}
+	dir := filepath.Join(a.data, "store", gateway.LentName(bID.NodeID(), sealed))
+	db := openDB(t, a)
+	check := func(when string) {
+		t.Helper()
+		if got, err := os.ReadFile(filepath.Join(dir, key)); err != nil || !bytes.Equal(got, v[3]) {
+			t.Fatalf("after %s the key holds %q (%v)", when, got, err)
+		}
+		ts, err := db.TombstonesOf(ctx, bID.NodeID().String(), sealed, key)
+		if err != nil || len(ts) != 3 {
+			t.Fatalf("after %s the tombstones are %+v (%v)", when, ts, err)
+		}
+		for i, tb := range ts {
+			got, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(tb.Tomb)))
+			if err != nil || !bytes.Equal(got, v[i]) || tb.SHA256 != sha256Hex(v[i]) || !tb.Rewrite {
+				t.Fatalf("after %s tomb %d holds %q (%v): %+v", when, i, got, err, tb)
+			}
+		}
+	}
+	check("the rewrites")
+	other := []byte("ransom note")
+	for name, meta := range map[string]map[string]string{
+		"unmarked":             hashMeta(other),
+		"stale mark":           rewriteMeta(other, v[1]),
+		"mark of a tomb":       rewriteMeta(other, v[0]),
+		"mark of the new":      rewriteMeta(other, other),
+		"mark claiming a hash": {replica.MetaSHA256: sha256Hex(v[2]), replica.MetaReplaces: sha256Hex(v[3])},
+		"malformed mark":       {replica.MetaSHA256: sha256Hex(other), replica.MetaReplaces: "../../x"},
+	} {
+		if err := put(other, meta); err == nil {
+			t.Errorf("B's %s rewrite was stored", name)
+		}
+		check(name)
+	}
+	if _, err := c.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{Bucket: aws.String(sealed), Key: aws.String(key),
+		Metadata: rewriteMeta(other, v[3])}); err == nil {
+		t.Error("B's marked multipart rewrite was begun")
+	}
+	check("a marked multipart rewrite")
 }
 
 // redeemAbuses runs #69's redeem abuses at a, which must be serving: a

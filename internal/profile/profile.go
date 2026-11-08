@@ -12,6 +12,9 @@
 //     classifies every key as data; Classify never fails.
 //   - Local-only keys are stored and served but never queued (EP-7).
 //   - A snapshot key is also metadata for placement (REPL-12).
+//   - A rewritable key keeps its class: Rewritable only says the tool
+//     rewrites it in place in normal use, so a changed version is sent
+//     to each place as a rewrite rather than refused (EP-7, EP-11).
 package profile
 
 import (
@@ -56,6 +59,22 @@ type Profile struct {
 	// content, in hex, as their last path segment: recovery rejects a
 	// listed hash that is not the name (ID-5).
 	HashNamedKeys []string `toml:"hash_named"`
+	// RewritableKeys are the few keys the tool rewrites in place in
+	// normal use (EP-7, v0.11.3): a changed version is replicated as a
+	// rewrite, which each lender stores, keeping the version it
+	// replaces as a tombstone (LEND-4, RET-1).
+	RewritableKeys []string `toml:"rewritable"`
+}
+
+// Rewritable reports whether the tool rewrites key in place in normal
+// use (EP-7).
+func (p *Profile) Rewritable(key string) bool {
+	for _, pat := range p.RewritableKeys {
+		if glob(pat, key) {
+			return true
+		}
+	}
+	return false
 }
 
 // HashNamed reports whether the tool names key by the SHA-256 of its
@@ -153,9 +172,9 @@ func (s Set) add(file string, b []byte) error {
 		return fmt.Errorf("%s: %w", file, err)
 	}
 	if un := md.Undecoded(); len(un) > 0 {
-		return fmt.Errorf("%s: unknown key %q (expected encrypted, local_only, snapshot, metadata, data, hash_named)", file, un[0].String())
+		return fmt.Errorf("%s: unknown key %q (expected encrypted, local_only, snapshot, metadata, data, hash_named, rewritable)", file, un[0].String())
 	}
-	for _, l := range [][]string{p.LocalOnly, p.Snapshot, p.Metadata, p.Data, p.HashNamedKeys} {
+	for _, l := range [][]string{p.LocalOnly, p.Snapshot, p.Metadata, p.Data, p.HashNamedKeys, p.RewritableKeys} {
 		for _, pat := range l {
 			if pat == "" {
 				return fmt.Errorf("%s: empty pattern", file)

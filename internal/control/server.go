@@ -289,7 +289,7 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, c Caller) {
 	}
 	page := ListPage{Objects: make([]ListObject, 0, len(objs)), Next: next}
 	for _, o := range objs {
-		lo := ListObject{Key: o.Key, Size: o.Size, SHA256: o.SHA256}
+		lo := ListObject{Key: o.Key, Size: o.Size, SHA256: o.SHA256, Replaced: o.Replaced}
 		if !o.TombstonedAt.IsZero() {
 			at := o.TombstonedAt.UTC()
 			lo.TombstonedAt = &at

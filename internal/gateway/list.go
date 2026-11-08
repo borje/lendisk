@@ -26,6 +26,11 @@ const MaxObjectSize = 5 << 40
 // a list from a lender may carry, too.
 func CheckKey(key string) error { return checkKey(key) }
 
+// MaxReplaced is the most replaced versions one listed key carries
+// (LentObject.Replaced), the newest; recovery ignores a key listed with
+// more.
+const MaxReplaced = 1000
+
 // LentObject is one key of a borrower's bucket as this lender holds it
 // (NET-7 list): its size, the SHA-256 it was stored with (REPL-10,
 // LEND-4) and, if it is tombstoned (RET-1), when.
@@ -34,6 +39,11 @@ type LentObject struct {
 	Size         int64
 	SHA256       string    // hex; "" if the object carries none
 	TombstonedAt time.Time // zero while live
+	// Replaced are, for a live key, the hashes of the versions the
+	// borrower's rewrites replaced here and whose tombs are kept, newest
+	// first, at most MaxReplaced (#74): recovery reads them as evidence
+	// of which version is newer where friends disagree.
+	Replaced []string
 }
 
 // ErrNoLentBucket means the borrower has no bucket of that sealed name
@@ -52,12 +62,19 @@ var ErrNoLentBucket = errors.New("no bucket of yours by that name here")
 type LentIndex struct {
 	Store backend.Backend
 	DB    *state.DB
+
+	// afterStoreList runs between the read of the store and the read of
+	// the tombstones. Tests only.
+	afterStoreList func()
 }
 
 // List returns up to limit keys of borrower's bucket sealed after the
 // key after, in key order, and the key the next page starts after: ""
 // when none follows. A tombstoned key is listed with its newest
-// tombstone, unless it is live again. Keys of lendisk's own and the
+// tombstone, unless it is live again; a key whose newest tombstone is a
+// rewrite's is looked up in the store again (the rewrite may have
+// published since the store was read) and, while the rewrite is still
+// in progress (pending), listed live as the version it still holds. Keys of lendisk's own and the
 // store's housekeeping (SEC-5's reserved prefixes) are not listed.
 func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, after string, limit int) ([]LentObject, string, error) {
 	if limit < 1 || limit > MaxListPage {
@@ -85,6 +102,9 @@ func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, 
 	}
 	if err != nil {
 		return nil, "", err
+	}
+	if x.afterStoreList != nil {
+		x.afterStoreList()
 	}
 	tombs, err := x.DB.TombstonedKeys(ctx, borrower.String(), sealed, after, limit)
 	if err != nil {
@@ -130,7 +150,46 @@ func (x *LentIndex) List(ctx context.Context, borrower identity.NodeID, sealed, 
 		if bounded && t.Key > bound || live[t.Key] {
 			continue // a key live again is listed live
 		}
+		if t.Rewrite {
+			// A rewrite's tomb as the newest, with the key not in the
+			// store's listing (#74): the rewrite may have published since
+			// the store was read; else it is between its move and its
+			// publication, and the key still holds the version it
+			// replaces. Either way the key is live, not deleted.
+			h, err := x.Store.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: &t.Key})
+			switch {
+			case err == nil:
+				lo := LentObject{Key: t.Key, SHA256: strings.ToLower(h.Metadata[metaSHA256])}
+				if h.ContentLength != nil {
+					lo.Size = *h.ContentLength
+				}
+				live[t.Key] = true
+				out = append(out, lo)
+				continue
+			case !notFound(err):
+				return nil, "", err
+			case t.Pending:
+				live[t.Key] = true
+				out = append(out, LentObject{Key: t.Key, Size: t.Size, SHA256: t.SHA256})
+				continue
+			}
+		}
 		out = append(out, LentObject{Key: t.Key, Size: t.Size, SHA256: t.SHA256, TombstonedAt: t.DeletedAt})
+	}
+	if len(out) > 0 {
+		upto := out[0].Key
+		for _, o := range out {
+			upto = max(upto, o.Key)
+		}
+		rs, err := x.DB.ReplacedVersions(ctx, borrower.String(), sealed, after, upto)
+		if err != nil {
+			return nil, "", err
+		}
+		for i := range out {
+			if r := rs[out[i].Key]; len(r) > 0 && out[i].TombstonedAt.IsZero() {
+				out[i].Replaced = r[:min(len(r), MaxReplaced)]
+			}
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	if len(out) > limit {

@@ -21,9 +21,13 @@ type Tombstone struct {
 	DeletedAt   time.Time
 	PurgeAfter  time.Time
 	Pending     bool
+	// Rewrite: the version a borrower's rewrite replaced (LEND-4, #74),
+	// not a deleted object. A pending one whose new version was never
+	// published is moved back at startup.
+	Rewrite bool
 }
 
-const tombCols = `id, peer_key, sealed, key, tomb, sha256, etag, size, deleted_at, purge_after, pending`
+const tombCols = `id, peer_key, sealed, key, tomb, sha256, etag, size, deleted_at, purge_after, pending, coalesce(rewrite, 0)`
 
 func scanTombs(rows *sql.Rows, err error) ([]Tombstone, error) {
 	if err != nil {
@@ -34,7 +38,7 @@ func scanTombs(rows *sql.Rows, err error) ([]Tombstone, error) {
 	for rows.Next() {
 		var t Tombstone
 		var del, purge int64
-		if err := rows.Scan(&t.ID, &t.Peer, &t.Sealed, &t.Key, &t.Tomb, &t.SHA256, &t.ETag, &t.Size, &del, &purge, &t.Pending); err != nil {
+		if err := rows.Scan(&t.ID, &t.Peer, &t.Sealed, &t.Key, &t.Tomb, &t.SHA256, &t.ETag, &t.Size, &del, &purge, &t.Pending, &t.Rewrite); err != nil {
 			return nil, err
 		}
 		t.DeletedAt, t.PurgeAfter = time.Unix(del, 0), time.Unix(purge, 0)
@@ -46,9 +50,9 @@ func scanTombs(rows *sql.Rows, err error) ([]Tombstone, error) {
 // AddTombstone records t, pending, before its bytes are moved; it
 // returns the row's ID.
 func (db *DB) AddTombstone(ctx context.Context, t Tombstone) (int64, error) {
-	res, err := db.ExecContext(ctx, `INSERT INTO tombstone (peer_key, sealed, key, tomb, sha256, etag, size, deleted_at, purge_after)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, t.Peer, t.Sealed, t.Key, t.Tomb, t.SHA256, t.ETag, t.Size,
-		t.DeletedAt.Unix(), ceilUnix(t.PurgeAfter))
+	res, err := db.ExecContext(ctx, `INSERT INTO tombstone (peer_key, sealed, key, tomb, sha256, etag, size, deleted_at, purge_after, rewrite)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, t.Peer, t.Sealed, t.Key, t.Tomb, t.SHA256, t.ETag, t.Size,
+		t.DeletedAt.Unix(), ceilUnix(t.PurgeAfter), nullTrue(t.Rewrite))
 	if err != nil {
 		return 0, err
 	}
@@ -132,6 +136,28 @@ func (db *DB) TombstonedKeys(ctx context.Context, peer, sealed, after string, li
 		WHERE peer_key = ? AND sealed = ? AND key > ? AND id = (SELECT id FROM tombstone u
 			WHERE u.peer_key = t.peer_key AND u.sealed = t.sealed AND u.key = t.key ORDER BY deleted_at DESC, id DESC LIMIT 1)
 		ORDER BY key LIMIT ?`, peer, sealed, after, limit))
+}
+
+// ReplacedVersions returns, for each key of peer's bucket sealed after
+// the key after and up to the key upto, the hashes of the versions
+// rewrites replaced there and whose tombs are kept, newest first (#74).
+func (db *DB) ReplacedVersions(ctx context.Context, peer, sealed, after, upto string) (map[string][]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT key, sha256 FROM tombstone
+		WHERE peer_key = ? AND sealed = ? AND key > ? AND key <= ? AND rewrite = 1 AND pending = 0
+		ORDER BY key, deleted_at DESC, id DESC`, peer, sealed, after, upto)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var k, h string
+		if err := rows.Scan(&k, &h); err != nil {
+			return nil, err
+		}
+		out[k] = append(out[k], h)
+	}
+	return out, rows.Err()
 }
 
 // ceilUnix is t in whole seconds, rounded up, so a stored purge time

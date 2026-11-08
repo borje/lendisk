@@ -75,6 +75,10 @@ type ListObject struct {
 	Size         int64      `json:"size"`
 	SHA256       string     `json:"sha256"`
 	TombstonedAt *time.Time `json:"tombstoned_at,omitempty"`
+	// Replaced are the hashes of the versions of a live key the
+	// borrower's rewrites replaced at the lender, newest first, while
+	// their tombs are kept (#74).
+	Replaced []string `json:"replaced,omitempty"`
 }
 
 // MaxManifest bounds one node manifest envelope (ID-4). A friend keeps

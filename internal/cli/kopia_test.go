@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"maps"
 	"os"
 	"os/exec"
@@ -12,8 +14,10 @@ import (
 	"time"
 
 	"github.com/borje/lendisk/internal/alert"
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/profile"
+	"github.com/borje/lendisk/internal/state"
 )
 
 // kopiaTool runs Kopia with a configuration, cache and logs of its own,
@@ -174,13 +178,17 @@ func TestKopiaEndToEnd(t *testing.T) {
 //   - A backs up with Kopia; every key but the logs reaches friend B,
 //     byte for byte; a second snapshot follows it.
 //   - `kopia maintenance run --full` after the second snapshot rewrites
-//     kopia.maintenance in place. That is what #74 is about: B refuses
-//     the new version (EP-11, LEND-4), A raises the immutability alert,
-//     and B keeps the old one. Everything else maintenance writes or
-//     deletes replicates, and the queue drains.
+//     kopia.maintenance in place, which the kopia profile names
+//     rewritable (EP-7, #74): A sends the new version as a rewrite, B
+//     stores it and keeps the old one as a tombstone for the retention
+//     window (LEND-4, RET-1), and there is no refusal, no alert and no
+//     refused object in status (EP-11). B then holds exactly what A
+//     holds. A second maintenance run does the same.
 //   - A's machine is lost; a fresh machine recovers from B, and Kopia
 //     connects with the new credential and restores the latest snapshot
 //     through the read-through, from B.
+//   - B's tombs of the replaced versions are purged once the window has
+//     passed (B started with its clock 31 days on), and not before.
 func TestReplicateKopiaToFriend(t *testing.T) {
 	k := newKopia(t)
 	if testing.Short() {
@@ -261,26 +269,66 @@ func TestReplicateKopiaToFriend(t *testing.T) {
 		}
 	}
 	t.Logf("kopia.maintenance before %q, after %q; keys B holds differently from A: %v", maintBefore, maintAfter, differ)
-	// #74: the rewritten kopia.maintenance is the one difference, and it
-	// is refused and alerted, not stuck in the queue. When #74 lets a
-	// profile declare rewritable keys, this part changes.
 	if maintBefore == "" || maintBefore == maintAfter {
 		t.Fatalf("maintenance did not rewrite kopia.maintenance (%q, %q); the #74 finding no longer holds", maintBefore, maintAfter)
 	}
-	if len(differ) != 1 || differ[0] != "kopia.maintenance" || lent["kopia.maintenance"] != maintBefore {
+	// #74: the rewrite reached B, with nothing refused or alerted.
+	if len(differ) != 0 || lent["kopia.maintenance"] != maintAfter {
 		t.Errorf("after maintenance B differs from A in %v", differ)
 	}
-	if p.Refused != 1 || !refusedAlert() {
-		t.Errorf("the refused rewrite: place %+v, alerts %+v", p, st.Alerts)
+	if p.Refused != 0 || refusedAlert() || strings.Contains(text, "refused") {
+		t.Errorf("a rewritable key's rewrite was refused: place %+v, alerts %+v, status:\n%s", p, st.Alerts, text)
 	}
-	// Every later maintenance run rewrites it again: the count stays at
-	// one (only the key's latest row counts) and the alert never clears.
+	bDB := openDB(t, bn)
+	sealed := aID.SealedName("vault")
+	tombs := func() []state.Tombstone {
+		t.Helper()
+		ts, err := bDB.TombstonesOf(t.Context(), aID.NodeID().String(), sealed, "kopia.maintenance")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ts
+	}
+	bBucket := filepath.Join(bn.data, "store", gateway.LentName(aID.NodeID(), sealed))
+	tombHolds := func(ts state.Tombstone, want string) {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(bBucket, filepath.FromSlash(ts.Tomb)))
+		if s := sha256.Sum256(b); err != nil || hex.EncodeToString(s[:]) != want {
+			t.Fatalf("B's tomb %s: %v", ts.Tomb, err)
+		}
+	}
+	// Kopia writes the key more than once in a run (and in the quick
+	// maintenance after a snapshot): every version B replaced is a tomb
+	// holding its bytes, the one before this run's among them.
+	replaced := func(want string) int {
+		t.Helper()
+		ts := tombs()
+		found := false
+		for _, tb := range ts {
+			if !tb.Rewrite || tb.Pending {
+				t.Fatalf("B's tombstone %+v", tb)
+			}
+			tombHolds(tb, tb.SHA256)
+			found = found || tb.SHA256 == want
+		}
+		if !found {
+			t.Fatalf("no tomb at B holds %s: %+v", want, ts)
+		}
+		return len(ts)
+	}
+	n := replaced(maintBefore)
+	// Every later maintenance run rewrites it again, and replicates.
 	k.run("maintenance", "run")
-	if again := kopiaReplicable(t, an, "vault")["kopia.maintenance"]; again == maintAfter {
+	again := kopiaReplicable(t, an, "vault")["kopia.maintenance"]
+	if again == maintAfter {
 		t.Fatal("a quick maintenance run did not rewrite kopia.maintenance")
 	}
-	if p = an.drained(bKey, 90*time.Second); p.Refused != 1 || !refusedAlert() {
+	if p = an.drained(bKey, 90*time.Second); p.Refused != 0 || refusedAlert() {
 		t.Errorf("after a second maintenance run: place %+v, alerts %+v", p, an.status().Alerts)
+	}
+	sameObjects(t, kopiaReplicable(t, an, "vault"), lentObjects(t, bn, aID, "vault"))
+	if m := replaced(maintAfter); m <= n {
+		t.Fatalf("B's tombstones after a second run: %d, before it %d", m, n)
 	}
 
 	// A's machine is gone; a fresh one recovers from B.
@@ -306,5 +354,30 @@ func TestReplicateKopiaToFriend(t *testing.T) {
 	logs, _ := os.ReadFile(fa.logf)
 	if !strings.Contains(string(logs), "read-through: fetched") {
 		t.Fatalf("no fetch logged:\n%s", tail(logs))
+	}
+
+	// RET-1: B purges the replaced versions once the window has passed.
+	// B is started with its clock 31 days on (Lending.Now), and purges
+	// at start.
+	fa.p.kill()
+	kept := tombs()
+	b.p.kill()
+	bn.clock = func() time.Time { return time.Now().Add(31 * 24 * time.Hour) }
+	stopB := bn.serveLogged()
+	defer stopB()
+	deadline := time.Now().Add(30 * time.Second)
+	for len(tombs()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("B kept %+v past the window", tombs())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for _, ts := range kept {
+		if _, err := os.Stat(filepath.Join(bBucket, filepath.FromSlash(ts.Tomb))); !os.IsNotExist(err) {
+			t.Fatalf("B's tomb %s after the window: %v", ts.Tomb, err)
+		}
+	}
+	if got := lentObjects(t, bn, aID, "vault")["kopia.maintenance"]; got != again {
+		t.Fatalf("B's live kopia.maintenance after the purge: %q, want %q", got, again)
 	}
 }

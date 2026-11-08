@@ -140,11 +140,15 @@ func (f *Friend) Put(ctx context.Context, o Object) error {
 	}
 	body := newWatchdog(o.Body, f.stall, cancel)
 	defer body.stop()
+	meta := map[string]string{
+		MetaSHA256:              o.SHA256,
+		"X-Amz-Checksum-Sha256": base64.StdEncoding.EncodeToString(sum),
+	}
+	if o.Replaces != "" {
+		meta[MetaReplaces] = o.Replaces
+	}
 	_, err = f.core.PutObject(ctx, sealed, o.Key, body, o.Size, "", "", minio.PutObjectOptions{
-		UserMetadata: map[string]string{
-			MetaSHA256:              o.SHA256,
-			"X-Amz-Checksum-Sha256": base64.StdEncoding.EncodeToString(sum),
-		},
+		UserMetadata:         meta,
 		DisableContentSha256: true,
 	})
 	if err != nil {
@@ -154,6 +158,23 @@ func (f *Friend) Put(ctx context.Context, o Object) error {
 		return classify(fmt.Errorf("sending %s: %w", o.Key, err))
 	}
 	return nil
+}
+
+// Head returns the hash the friend stores key with (its
+// x-amz-meta-lendisk-sha256, REPL-10); ok is false when it holds no
+// object there (a tombstoned key included).
+func (f *Friend) Head(ctx context.Context, bucket, key string) (string, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, f.stall)
+	defer cancel()
+	info, err := f.core.StatObject(ctx, f.self.SealedName(bucket), key, minio.StatObjectOptions{})
+	var er minio.ErrorResponse
+	if errors.As(err, &er) && (er.Code == "NoSuchKey" || er.Code == "NoSuchBucket" || er.StatusCode == http.StatusNotFound) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, classify(fmt.Errorf("asking for %s: %w", key, err))
+	}
+	return strings.ToLower(info.Metadata.Get("X-Amz-Meta-" + MetaSHA256)), true, nil
 }
 
 // Delete removes the key from the sealed bucket. A key or bucket the

@@ -889,9 +889,11 @@ func TestPartOverQuotaRefused(t *testing.T) {
 	}
 }
 
-// LEND-4: a completion is stored only if the key is still absent: a put
-// of the key that lands while the upload is being checked wins, and the
-// completion is refused as a changed key.
+// LEND-4: a completion is stored only if the key is still absent: an
+// object published at the key while the upload is being checked wins,
+// and the completion is refused as a changed key. A borrower's put now
+// waits for the key's lock the completion holds (#74 review), so the
+// object is published under the lock's back, straight into the store.
 func TestCompletionRefusedWhenAPutLandsFirst(t *testing.T) {
 	var putFirst func()
 	l := lendTo(t, 1<<30, func(h *harness) {
@@ -899,7 +901,14 @@ func TestCompletionRefusedWhenAPutLandsFirst(t *testing.T) {
 	})
 	mp, other := []byte("from the upload"), []byte("from a put")
 	putFirst = func() {
-		if err := l.putDirect("data/k", bytes.NewReader(other), int64(len(other)), hashMeta(other)); err != nil {
+		be, err := OpenBackend(l.h.store)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		n := int64(len(other))
+		if _, err := be.PutObject(context.Background(), s3response.PutObjectInput{Bucket: &l.store, Key: aws.String("data/k"),
+			ContentLength: &n, Body: bytes.NewReader(other), Metadata: hashMeta(other)}); err != nil {
 			t.Errorf("the put: %v", err)
 		}
 	}

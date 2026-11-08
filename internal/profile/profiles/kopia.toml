@@ -30,3 +30,9 @@ data = ["p*", "q*"]
 # Kopia names blobs by a keyed hash (HMAC) of their content or at random,
 # never by the plain SHA-256, so recovery has no name to check (ID-5).
 hash_named = []
+
+# Rewritten in place in normal use (EP-7, #74): kopia.maintenance after
+# every maintenance run, kopia.repository and kopia.blobcfg on a password
+# change or `kopia repository set-parameters`. Each lender keeps the
+# version a rewrite replaces as a tombstone for the retention window.
+rewritable = ["kopia.repository", "kopia.blobcfg", "kopia.maintenance"]

@@ -1,6 +1,6 @@
 # lendisk — design
 
-Status: draft v0.16, 2026-11-07. Companion to REQUIREMENTS.md v0.11.2.
+Status: draft v0.17, 2026-11-08. Companion to REQUIREMENTS.md v0.11.3.
 REQUIREMENTS.md v0.9 made the two requirement changes this design
 needed (Q-T, resolved); its later versions moved third-party
 credentials to the environment,
@@ -90,8 +90,15 @@ replication picks part sizes freely (EP-3, REPL-10); and dependencies
 are pinned by `go.sum` rather than vendored (OPS-8). v0.16 gives
 each node a dial key per friend for its tunnel clients, beside the
 identity key its server keeps, since a relay delivers a key's packets to the last
-of its connections to write (§3.1, §3.2, §3.7, §3.9; #69). The trust
-model is unchanged throughout.
+of its connections to write (§3.1, §3.2, §3.7, §3.9; #69). v0.17
+follows REQUIREMENTS v0.11.3 (#74): a profile names the keys its tool
+rewrites in place; the borrower sends a changed version of one as a
+rewrite marked with the hash of the version it replaces
+(`x-amz-meta-lendisk-replaces`); the lender stores it and keeps the
+replaced version as a tombstone for the retention window; and
+recovery reads those tombstones to tell the newest version where
+friends disagree (§3.3 EP-7, §3.4, §3.5 LEND-4, §3.6 RET-1, §3.1
+ID-5). The trust model is unchanged throughout.
 
 ## 1. Name
 
@@ -232,7 +239,9 @@ What changed versus a restic-only design, and the replacement for each:
 - *Name-equals-hash validation* (restic names every object by SHA-256;
   Kopia names pack blobs `p<random>`) is replaced by the **immutability
   policy** (EP-11): once a key is acknowledged by a replica, a write to
-  the same key with different content is a violation. The decorator
+  the same key with different content is a violation, unless the
+  bucket's profile names the key rewritable (EP-7: a rewrite, whose
+  replaced version each lender keeps as a tombstone). The decorator
   takes the SHA-256 of the write stream at capture and keeps it on the
   queue row; the hash travels with the object, and the lender verifies
   the bytes against it (LEND-4).
@@ -1115,7 +1124,39 @@ upstream bucket is Q-V.
   that of a friend added since recovery, which has no list at all. For a
   key not named by its hash, a colluding majority of friends therefore
   wins: that is the rule decided, and #70 covers restic's `config` and
-  `keys/*`. The
+  `keys/*`.
+  *Rewritable keys (#74).* Friends may hold different versions of a
+  key the profile names rewritable (one was offline for the last
+  Kopia maintenance run, or a password change), and with two friends
+  that is a tie. The tie is broken by the lenders' tombstones: each
+  place lists with a live key the versions its rewrites replaced and
+  still keeps (`replaced`, §3.6 RET-1), recorded per place
+  (`listed.replaced`, `listed.rewritable`, migration 20). A version
+  that a place listing another version replaced is older than that
+  one. If exactly one listed version is replaced by no place, it
+  counts (`state.VerdictNewest`, "newest"), held where it is listed,
+  and the read-through serves it; `bucket resolve` may still pick
+  another. The user sees each such key: `recover` prints them, naming
+  the friend whose replaced versions decided it, and `status` lists
+  them with every friend's hash and the `bucket resolve` command for
+  each other version (`recovery.newest` in `status --json`: bucket,
+  key, `sha256` used, `decided_by`, reason, places;
+  `state.NewestKeys`; `TestStatusAndRecoverShowNewestVerdicts`). If
+  none or more than one is left, the tie is a conflict as
+  before: a friend that lagged by more than the retention window (its
+  version's tomb is purged at the others), or places naming each
+  other's version, which only a lying friend does. Only ties are
+  broken: a strict majority still wins, so one hostile friend cannot
+  outvote honest ones by claiming to have replaced their version. In a
+  one-to-one tie it can make its own version count so; `bucket
+  resolve` undoes that, and a forged version fails the tool's MAC
+  (EP-8). The queue row recovery makes for the winner is marked
+  rewritable, so the node's next write of the key is sent as a
+  rewrite (§3.4), and a friend holding an older version takes it
+  through the worker's ask-and-retry. Tests:
+  `TestRewritableKeyTieBrokenByTheReplacedVersions` (`internal/state`),
+  `TestRecoveryCountsTheNewestRewrittenVersion` (`internal/recovery`).
+  The
   verdict is made again as each further list arrives (a friend
   returning breaks a tie 2 to 1), and whenever a list ends. Only the
   version that counts has a queue row (`put`, `done`, with the listed
@@ -1818,14 +1859,19 @@ upstream bucket is Q-V.
   `hash_named`, names the keys the tool names by the SHA-256 of their
   content as their last segment (restic: `data/*`, `index/*`,
   `snapshots/*`; not `config` or `keys/*`), which recovery checks
-  (§3.1 ID-5). A bucket whose
-  profile has no file classifies every key as data. The compiled-in
+  (§3.1 ID-5). A sixth, `rewritable` (v0.11.3, #74), names the few
+  keys the tool rewrites in place in normal use; a rewritable key
+  keeps its class. A bucket whose
+  profile has no file classifies every key as data and none as
+  rewritable. The compiled-in
   files are `restic`, `kopia` and `generic`. `kopia` (#7) is EP-7's
   list as written: `local_only = ["_log*"]`, `snapshot = ["n*",
   "xn*"]`, `metadata = ["kopia.repository", "kopia.blobcfg",
   "kopia.maintenance", "n*", "x*", "s*"]`, `data = ["p*", "q*"]`,
-  `encrypted = true` and no `hash_named` key, since Kopia names blobs
-  by an HMAC of their content or at random. The patterns are as broad
+  `encrypted = true`, no `hash_named` key, since Kopia names blobs
+  by an HMAC of their content or at random, and `rewritable =
+  ["kopia.repository", "kopia.blobcfg", "kopia.maintenance"]`;
+  `restic` has `rewritable = ["config"]`; `generic` has none. The patterns are as broad
   as EP-7 states them (`s*` would take any key starting with `s`);
   Kopia writes none outside these prefixes but `_log*` and the three
   format blobs. A Kopia 0.23.1 repository after two snapshots holds
@@ -1833,22 +1879,27 @@ upstream bucket is Q-V.
   decorator classifies a key at capture: a local-only key (restic
   `locks/*`, Kopia `_log*`) gets no queue row at all; the others get a
   queue row with their class, and placement rows as §3.4 says.
-  *Kopia rewrites `kopia.maintenance` in place (#74, measured #7).*
-  Kopia 0.23.1 writes it during the quick maintenance it runs itself
-  after a snapshot when one is due (a new repository has it after its
-  first two snapshots) and again on every later maintenance run, quick
-  or full, with new contents and no delete. Once the friend has acknowledged one
-  version, the next is a changed acknowledged key: the friend answers
-  412, A records the placement refused and raises `place_refused`,
-  `status` shows "1 refused" on the place, and the friend keeps the
-  old version. Nothing is stuck: the FIFO moves past it and drains,
-  and every other key maintenance writes or deletes replicates. But in
-  normal use the alert and the count never clear, since each run
-  rewrites the key again and only its latest row counts (stays 1),
-  and the friend's copy stays stale. A Kopia restore through the
-  friend after `recover` works with the stale copy
-  (`TestReplicateKopiaToFriend`). #74 holds the fix, under
-  REQUIREMENTS v0.11.3's rewritable keys (EP-7, EP-11, LEND-4, RET-1).
+  The decorator records at capture whether the bucket's profile names
+  the key rewritable (`queue.rewritable`, migration 20), beside its
+  class, so a profile changed later does not change what was captured.
+  *Rewritable keys (#74).* Kopia 0.23.1 writes `kopia.maintenance`
+  during the quick maintenance it runs itself after a snapshot when one
+  is due, and several times in every later maintenance run, quick or
+  full, with new contents and no delete; it rewrites `kopia.repository`
+  and `kopia.blobcfg` on a password change or `set-parameters`. restic
+  rewrites `config` in `restic migrate upgrade_repo_v2`. Under
+  v0.11.2 each was a changed acknowledged key the friend refused (412),
+  raising `place_refused` for good. Now each such write is sent as a
+  rewrite (§3.4), stored by the friend, whose replaced version becomes
+  a tombstone (§3.5 LEND-4, §3.6 RET-1): no refusal, no alert, and
+  `status` shows no refused object. `TestReplicateKopiaToFriend` runs a
+  full and a quick maintenance and finds B holding exactly A's
+  objects, each replaced `kopia.maintenance` in a tomb at B, and the
+  tombs purged once B's clock is past the window;
+  `TestResticMigrateReplicatesTheNewConfig` upgrades a version 1
+  restic repository and finds the new `config` at B and the old one in
+  a tomb. A changed key that is not rewritable is refused as before
+  (EP-11's alert is #22).
 - **EP-10** The read-through (`gateway/readthrough.go`, #30). The
   decorator's `GetObject` and `HeadObject` turn the store's not-found
   for an own bucket's key (not a local-only one; `lent-*` buckets pass
@@ -2297,8 +2348,9 @@ upstream bucket is Q-V.
   a friendship tells the other side (#25) such a place shows as
   `retrying` with a dial error, not `removed`; `removed` appears only
   on a connection opened before the removal, which the middleware
-  still refuses request by request (SEC-11). A `412` becomes an
-  immutability alert
+  still refuses request by request (SEC-11). A `412` to a put of a
+  rewritable key is handled as *Rewrites* says, below; any other `412`
+  becomes an immutability alert
   (EP-11); anything else is a retry with backoff. A `BadDigest` (also
   `InvalidDigest`, `XAmzContentSHA256Mismatch`) says the bytes the
   place received do not match the capture hash (REPL-10); the place's
@@ -2316,6 +2368,82 @@ upstream bucket is Q-V.
   `removed` place tries its head row again after an hour (LEND-2);
   other errors back off from 1 s, doubling to 5 minutes, with the place
   `retrying`.
+- **Rewrites (#74, EP-7, LEND-4).** A put whose queue row says the key
+  is rewritable (`queue.rewritable`, set at capture from the bucket's
+  profile, §3.3 EP-7; `state.Placement.Rewritable`) is sent to a place
+  that acknowledged another version of the key as a rewrite of that
+  version (`state.AckedPutHash`: the last put the place acknowledged,
+  deleted since or not, since a deleted version is in the lender's tomb
+  and a rewrite naming it is stored beside it, §3.5): `Object.Replaces`, which `Friend.Put` sends
+  as the user metadata `x-amz-meta-lendisk-replaces` with the
+  replaced version's SHA-256 (`replica.MetaReplaces`), signed like
+  every header. A first put, a put to a place that acknowledged the
+  same bytes, and every put of a key that is not rewritable carry no
+  mark. If the place refuses the rewrite all the same (`412`), it holds
+  a version the index does not show it acknowledged: a rewrite stored
+  there whose answer was lost before a later capture superseded and
+  cancelled its row, or, after `recover`, another friend's version
+  (§3.1 ID-5). The worker then asks the place what it holds
+  (`Replica.Head`: `Friend.Head` is a `StatObject` reading
+  `x-amz-meta-lendisk-sha256`; the lender admits `HeadObject`) and, if
+  that is another version, sends the rewrite once more marked with its
+  hash; a place already holding the row's bytes is an
+  acknowledgement. Only the key's latest capture is ever sent (a
+  superseded row is cancelled first), so asking does not let an older
+  version replace a newer one; and a friend that lies in its answer
+  gains nothing, since the mark only lets it store what this node
+  sends. If the place says it holds nothing live at the key (a deleted
+  object's tomb, or the `HEAD` fell inside the lender's own rewrite of
+  it), or holds exactly the version the refused rewrite named, that may
+  pass: the row waits with the network backoff, the place shows
+  `retrying`, and nothing is refused or alerted
+  (`TestRefusedRewriteWithNoNewsFromTheHeadIsRetried`), but only for
+  an hour (`Worker.RewriteRetry`, `replica.DefaultRewriteRetry`; kept
+  in memory, so a restart starts the hour again). It need not pass: a
+  tomb of a version other than the one named stands until its purge,
+  and a lender too old to read the mark refuses every rewrite. Past the
+  hour the row is refused for good at that place, `place_refused`, its
+  log line and alert saying the friend keeps refusing a rewrite of a
+  rewritable key, so the place's strict FIFO moves on instead of
+  stalling for the whole window
+  (`TestRewriteRefusedPastTheRetryWindowIsRefused`); a later write of
+  the key heals it as any refusal is healed. A rewrite
+  refused again after the retry with the place's hash is a refusal like
+  any other `412` (`place_refused`). Rewrites are single PUTs: rewritable keys are a
+  few KiB, and multipart replication (#23) would need the mark at
+  `CreateMultipartUpload`.
+  *Choice of mark (#74).* S3's conditional writes put `If-Match` with
+  the current version's ETag on a `PutObject` to replace only that
+  version; S3 Object Lock with versioning keeps the replaced version
+  until its retain-until date. lendisk binds the same way, to the
+  version's SHA-256 rather than its ETag: the hash is what LEND-4
+  already identifies a version by, what the borrower keeps for every
+  acknowledged row, and what the lender stores with every object; the
+  ETag is the lender's store's own (MD5 on posix), which the borrower
+  never learns. `If-Match` carrying a hash would misuse the header, and
+  posix would evaluate it against its ETag. A user-metadata header
+  reaches `Lending` in `PutObjectInput.Metadata`, which strips it
+  before the store; the gate admits it as part of an ordinary
+  `PutObject` (§3.9 SEC-9). A stale rewrite (an old request delayed or
+  retried after a newer one landed) names a hash the key no longer
+  holds and is refused.
+  *What the mark is not.* The mark is a consistency check between an
+  honest borrower and its lender, against delayed, duplicated or
+  reordered requests; it is not a security control against the
+  borrower. A borrower knows the hash of every version it stored, so a
+  hostile or compromised one can mark a rewrite of any key it likes,
+  and the lender, which does not know the borrower's profile, stores
+  it. What protects the data is the tomb: every version a rewrite
+  replaces is kept, counted and unreachable by the borrower until its
+  window passes, exactly as a deleted object is (RET-1, RET-2, §3.6;
+  `rewriteAttacks` in `TestHostilePeer`).
+  *Where EP-11's alert will live (#22).* #22's rule, "a changed
+  acknowledged key raises the alert and gets no new placement", belongs
+  in `FinishPut`/`placeTx`, where a completed capture is placed (it has
+  the key's acknowledged hashes in the same transaction); it must
+  exempt a row with `queue.rewritable` set. A lender's `412` to a
+  rewritable key that the *Rewrites* retry could not place stays a
+  `place_refused` refusal.
 - **Local errors (#50, #57).** The worker tells the store's failures apart
   from the network's and the place's. A row whose object the store
   definitely cannot supply as captured is a *local error*: the file is
@@ -2562,13 +2690,19 @@ capture decorator, so nothing stands between that and posix (#62).
   check happens before any byte is stored: the key's stored object
   carries its own `lendisk-sha256` (COMPAT-4), read with a `HEAD`;
   another hash is refused with `PreconditionFailed` (412), at
-  `PutObject`, `CreateMultipartUpload` and again at completion. With
+  `PutObject`, `CreateMultipartUpload` and again at completion, unless
+  the `PutObject` is a rewrite marked with the stored hash (*Rewrites*,
+  below). With
   the same hash the put is accepted without storing anything: its body
   is hashed and discarded, so a body that only claims the hash gets
   `BadDigest` and the stored copy is never touched; a completion with
   the same hash aborts the upload and answers with the stored object's
-  ETag. A put takes no key lock, since a body that stalls (a borrower
-  killed mid-transfer) would hold up its own retry. This relies on one
+  ETag. A put takes no key lock while its body streams, since a body
+  that stalls (a borrower killed mid-transfer) would hold up its own
+  retry; a put of an absent key takes the key's lock once its body has
+  ended and matched its hash, before the publication lock, and holds it
+  until the store has answered, so it cannot publish inside a
+  rewrite's gap (*Rewrites*, below; #74 review). This relies on one
   store feature: a put of an absent key, and a completion, is stored
   with `If-None-Match: *`, which posix evaluates under its publish lock
   together with the publication, so of two racing writes of one key
@@ -2584,6 +2718,60 @@ capture decorator, so nothing stands between that and posix (#62).
   A borrower's put or multipart create without the hash (64 hex
   digits) is refused with `InvalidRequest` (400); node-ID accounts are
   served on the tunnel only (SEC-12), so this is the tunnel side.
+  *Rewrites (v0.11.3, #74; `gateway/rewrite.go`).* A borrower's
+  `PutObject` carrying `x-amz-meta-lendisk-replaces` (§3.4 *Rewrites*;
+  64 hex digits, else `InvalidRequest`), to a key whose stored object
+  has exactly that hash and another than the put's, is a rewrite. The
+  mark is taken out of the metadata whatever happens, so it is never
+  stored; on `CreateMultipartUpload` it is dropped and the key refuses
+  other bytes as ever. A rewrite is admitted against quota like a new
+  object (its size plus the overhead), since both versions count until
+  the old one is purged (LEND-1). Its body streams to the store as any
+  put's; once it has read its declared length (or ended) and matched
+  its declared hash, and before the store has those last bytes, the
+  rewrite takes the key's lock and the borrower's publication lock
+  (held to the end) and heads the key again: if it holds the put's
+  bytes already (a retry whose answer was lost) the put is accepted
+  unstored; if it no longer holds the marked version (deleted, or
+  replaced by a racing rewrite, while the body streamed), `412`.
+  Otherwise the replaced version becomes a tombstone exactly as a
+  delete makes one (§3.6 RET-1), the row marked `rewrite` (migration
+  20) and left pending, and then the store publishes the new version,
+  unconditionally, because posix checks any condition once before the
+  body too, while the key still holds the old version. Nothing else can
+  publish at the key in between: every write that publishes there
+  holds the key's lock to do so (deletes, revivals, purges, multipart
+  creates and completions, and plain puts from the end of their
+  verified body until the store answers), and the rewrite holds it
+  from the move to its publication. A plain put whose body ends in
+  that gap waits, publishes after the rewrite under `If-None-Match: *`
+  and is refused `412` (or accepted for the same bytes);
+  `TestPlainPutCannotPublishInARewritesGap`. Once
+  published, the row is kept and the new bytes are counted. If the
+  store does not publish (its checksum check, a full disk), the
+  replaced version is moved back (`revive`), and the borrower retries.
+  *A deleted key written anew (#74, second review).* A `PutObject` to a
+  key that holds no object, marked with the hash of its newest tomb
+  (the version the borrower deleted), is stored as a new object beside
+  the tombs, which stay for their windows: this is a rewritable key
+  the tool deleted and wrote again with other bytes (a Kopia repository
+  made anew), and without it the lender would refuse every version
+  until the purge. A mark naming an older tomb is stale and refused,
+  as is any unmarked write of other bytes
+  (`TestRewriteOfADeletedKeyKeepsItsTomb`). A borrower's put of a key
+  whose multipart upload is completing waits for the completion's lock
+  and is then refused, or answered with the stored ETag for the same
+  bytes (`TestPutRacingACompletionWaitsForIt`); a put takes the key's
+  lock as soon as it has read its declared length, even from a store
+  that never reads the end of the body
+  (`TestPutTakesTheKeyLockWhenTheStoreStopsAtTheLength`).
+  The lender does not know the borrower's profile and needs not: a
+  borrower may mark any key, and whatever it marks, each replaced
+  version is kept for the window (RET-2,
+  `TestUnmarkedOrStaleRewriteRefused`,
+  `TestMarkedRewriteKeepsTheReplacedVersionAsATomb`,
+  `TestRewriteRacingDeleteLosesNothing`,
+  `TestRewriteOverQuotaRefused`).
 - **SEC-5** Every key a borrower names is checked, by every `Lending`
   method that takes one (writes, deletes, multipart calls, reads,
   heads, tagging, retention, legal hold, select; a test lists them all
@@ -2635,6 +2823,26 @@ capture decorator, so nothing stands between that and posix (#62).
   tombstoned key, with its newest tombstone's size, hash and
   `tombstoned_at`, merged in key order with the live keys; a key live
   again is listed live.
+  *Rewrites (#74):* the version a borrower's rewrite replaces becomes a
+  tombstone the same way, renamed into its tomb with its own window
+  from the rewrite, and marked `rewrite` (migration 20; §3.5 LEND-4
+  *Rewrites*). Both versions count against quota until the old one is
+  purged. A live key the borrower rewrote is listed with
+  `replaced`: the hashes of the versions its rewrites replaced whose
+  tombs are kept, newest first, at most 1,000
+  (`gateway.MaxReplaced`, `state.ReplacedVersions`), which recovery
+  reads (§3.1 ID-5). A delete's tomb is never listed as replaced. In
+  the moment between a rewrite's move and its publication, the key is
+  listed as the version it replaces, live, from the pending rewrite
+  row, so a recovery list read then does not record it as deleted
+  (`TestKeyInARewritesGapListsAsItsOldVersion`). The list reads the
+  store before the tombstones, so for any key whose newest tombstone is
+  a rewrite's and which the store's listing lacked, it heads the store
+  again: a rewrite that published in between is listed live with its
+  new version; one still pending as the version it replaces; only a
+  key the store still lacks after a kept rewrite row is listed
+  tombstoned. A key listed from a rewrite row carries its replaced
+  versions too (`TestListSeesARewriteFinishedBetweenItsReads`).
   *Window (#17):* the purge time is fixed at the delete: deleted at
   plus `gateway.Retention`, the longer of the friendship's two
   retention offers exchanged at redeem (`own_retention`, this node's
@@ -2661,7 +2869,9 @@ capture decorator, so nothing stands between that and posix (#62).
   revives the same way. Another hash is `PreconditionFailed` (412,
   LEND-4) before any byte is read, at `PutObject`,
   `CreateMultipartUpload` and completion, so a tombstoned key takes
-  only its own bytes back until it is purged.
+  only its own bytes back until it is purged, except a rewrite marked
+  with the newest tomb's hash, stored beside the tombs (§3.5
+  *Rewrites*, #74).
   *Crash safety:* the row is written, pending, before the rename and
   marked kept after it; a revival marks it pending before the link.
   At every start, before anything is served and before the reconcile,
@@ -2670,7 +2880,12 @@ capture decorator, so nothing stands between that and posix (#62).
   row, the object live where it was; a tomb beside a live object of
   the same hash (a revival linked back) unlinks the tomb and drops the
   row; a tomb alone, or beside other bytes, is kept. No order of steps
-  leaves bytes without either a key or a kept row. *Accepted race:* a
+  leaves bytes without either a key or a kept row. A rewrite writes its
+  row, pending, before the replaced version's rename and keeps it only
+  after the new version is published; `settleTombs` moves a pending
+  rewrite tomb whose key holds nothing back to its key (the new version
+  was never published), and keeps one beside other bytes (it was)
+  (`TestRewriteCrashOrderAndUndo`). *Accepted race:* a
   put of an absent key holds no key lock while its body streams, so a
   put that began before a delete of the same key can publish other
   bytes beside the new tomb; both are kept and counted, the list shows
@@ -2703,7 +2918,15 @@ capture decorator, so nothing stands between that and posix (#62).
   unchanged after each and after a purge one second before the window
   ends. `TestHostilePeer` (§3.9 SEC-7) runs the same list, in the same
   order, over the tunnel from both of the borrower's keys
-  (`purgeAttacks`). Completing the upload begun before the delete
+  (`purgeAttacks`). Since #74 the list includes a rewrite marked with
+  the tomb's hash, of the key (stored beside the tomb, which is kept:
+  §3.5 *Rewrites*) and of the tomb's own path (refused); the check after
+  each attack is that the tomb is kept with its bytes, since a rewrite
+  and a later delete may add tombs beside it. `TestHostilePeer` also
+  has the borrower rewrite a live key three times and then try stale,
+  false, malformed and absent marks and a marked multipart upload
+  (`rewriteAttacks`): every replaced version is a tomb holding its
+  bytes and nothing else changes. Completing the upload begun before the delete
   while it is still open revives the tombstoned object, since it
   declared that object's hash, and stores none of the parts' bytes:
   nothing is lost, and a later delete starts a new window
@@ -2838,8 +3061,10 @@ capture decorator, so nothing stands between that and posix (#62).
   `lendisk.db` (SEC-11). `manifest` (`PUT` and `GET`, the caller's own
   sealed manifest, §3.1 ID-4) is served (#28). `list` is served (#29):
   `GET /_lendisk/list?bucket=<sealed>&after=<key>&limit=<n>` pages the
-  lender's index for that borrower's bucket: key, size, SHA-256 and, if
-  tombstoned, when (`tombstoned_at`, §3.6), as
+  lender's index for that borrower's bucket: key, size, SHA-256, if
+  tombstoned, when (`tombstoned_at`, §3.6), and for a live key the
+  borrower rewrote, the hashes of the versions it replaced
+  (`replaced`, newest first, omitted when none; #74), as
   `{"objects": [...], "next": "<key>"}`, `next` absent after the last
   page; at most 1000 keys a page (`gateway.MaxListPage`), the default.
   Like `manifest` it is open to the `peer` role only and keyed by the
@@ -3224,7 +3449,7 @@ capture decorator, so nothing stands between that and posix (#62).
 
   | Class | S3 actions | Backend methods |
   |---|---|---|
-  | Admitted | `ListBuckets` (own only), `CreateBucket`, `HeadBucket`, `ListObjectsV2`, `PutObject`, `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`, `GetObject` (ranged), `HeadObject`, `DeleteObject` (no version id) | the same thirteen |
+  | Admitted | `ListBuckets` (own only), `CreateBucket`, `HeadBucket`, `ListObjectsV2`, `PutObject` (a rewrite too, marked with the user metadata `x-amz-meta-lendisk-replaces`, which `Lending` checks, not the gate: §3.5 LEND-4, #74; `TestGateAdmitsTheRewriteMark`), `CreateMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`, `ListParts`, `GetObject` (ranged), `HeadObject`, `DeleteObject` (no version id) | the same thirteen |
   | Refused at the gate | copies (`CopyObject`, `UploadPartCopy`), `DeleteObjects`, browser-form `PostObject`, `RenameObject`, `RestoreObject`, `SelectObjectContent`; list v1, `ListObjectVersions`, `ListMultipartUploads`, `GetObjectAttributes`, `GetBucketLocation`, torrent; ACLs, policy, ownership controls; bucket and object tagging; object-lock configuration, retention, legal hold; versioning; CORS and website; lifecycle, analytics, encryption, intelligent tiering, inventory, metrics, replication, public access block, logging, request payment, notification, accelerate; annotations; `DeleteBucket`; CORS preflight (`OPTIONS`); versitygw's error routes | every other method that an S3 action names |
   | Internal | none | `GetBucketAcl`, `GetBucketPolicy` (access check on every request), `GetBucketCors` (when a request carries `Origin`), `GetBucketVersioning`, `GetObjectLockConfiguration`, `GetObjectRetention`, `GetObjectLegalHold` (object-lock checks on writes and deletes), and `String`, `Shutdown`, `NormalizeObjectKey`, `StoresDotSegmentKeys`, `ValidateUploadID` |
   | Unreachable | none | `ChangeBucketOwner`, `ListBucketsAndOwners`: the admin API only, whose every route is a `PATCH` the gate refuses (SEC-8) |

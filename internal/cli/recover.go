@@ -215,11 +215,15 @@ func (a *app) runRecover(ctx context.Context, addr string, skip map[string]bool)
 	if err != nil {
 		return err
 	}
+	newest, err := db.NewestKeys(ctx)
+	if err != nil {
+		return err
+	}
 	unsettled, err := db.Unsettled(ctx)
 	if err != nil {
 		return err
 	}
-	a.printRecovered(w, m, restored, results, nodeAddress(ctx, cfg, id, log), held, conflicts, unsettled)
+	a.printRecovered(w, m, restored, results, nodeAddress(ctx, cfg, id, log), held, conflicts, newest, unsettled)
 	return nil
 }
 
@@ -284,7 +288,7 @@ func printFetched(w io.Writer, tried []recovery.Fetched, m *manifest.Manifest) {
 
 // printRecovered says what recover restored and what to run next.
 func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Restored, results []recovery.Result, addr string,
-	held map[string]map[string]int64, conflicts []state.RecoveredKey, unsettled int) {
+	held map[string]map[string]int64, conflicts, newest []state.RecoveredKey, unsettled int) {
 	fmt.Fprintf(w, "\nRecovered from manifest version %d.\n", m.Seq)
 	if addr != "" {
 		fmt.Fprintf(w, "Address: %s\n", addr)
@@ -331,6 +335,13 @@ func (a *app) printRecovered(w io.Writer, m *manifest.Manifest, r recovery.Resto
 	if len(conflicts) > 0 {
 		fmt.Fprintf(w, "\n%d objects are in conflict: the friends disagree about them, and none is used until you pick.\n", len(conflicts))
 		fmt.Fprintln(w, "`lendisk status` lists them; `lendisk bucket resolve <bucket> <key> <friend>` picks a friend's version.")
+	}
+	if len(newest) > 0 {
+		fmt.Fprintf(w, "\n%d object(s) the friends disagreed about use the newest version, which one friend's rewrites had replaced the others' with:\n", len(newest))
+		for _, k := range newest {
+			fmt.Fprintf(w, "  %s %s: the version %s holds, whose rewrites replaced the others'\n", k.Bucket, k.Key, k.DecidedBy)
+		}
+		fmt.Fprintln(w, "`lendisk status` lists them; `lendisk bucket resolve <bucket> <key> <friend>` picks another friend's version.")
 	}
 	if unsettled > 0 {
 		// The counts above can still change: the final settling ran out

@@ -296,7 +296,7 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		out = append(out, alertOf(KindObjectsNotReplicated, b, msg))
 	}
 	for _, p := range sortedKeys(places) {
-		msg := fmt.Sprintf("friend %s refused %s for good: it holds the key with another hash, or rejects bytes that match their capture hash (see the log)",
+		msg := fmt.Sprintf("friend %s refused %s for good: it holds the key with another hash, keeps refusing a rewrite of a rewritable key (a tomb of another version, or an older lendisk), or rejects bytes that match their capture hash (see the log)",
 			p, objects(places[p]))
 		out = append(out, alertOf(KindPlaceRefused, p, msg))
 	}

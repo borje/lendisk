@@ -26,6 +26,13 @@ import (
 // SHA-256 in hex (REPL-10), sent as x-amz-meta-lendisk-sha256.
 const MetaSHA256 = "lendisk-sha256"
 
+// MetaReplaces is the user metadata key that marks a put as a rewrite
+// (LEND-4, EP-7, #74): the SHA-256, in hex, of the version the place
+// holds and the put replaces, sent as x-amz-meta-lendisk-replaces. A
+// lender stores a marked put only if the key holds that version, which
+// it keeps as a tombstone for the retention window (RET-1).
+const MetaReplaces = "lendisk-replaces"
+
 // MaxPutSize is the largest object one S3 PUT carries (5 GiB). The
 // worker refuses a larger one until multipart replication (#23).
 const MaxPutSize = 5 << 30
@@ -36,7 +43,11 @@ type Object struct {
 	Bucket, Key string // the node's own bucket name; the client seals it
 	Size        int64
 	SHA256      string // hex, from the capture (EP-3)
-	Body        io.Reader
+	// Replaces, if set, marks the put as a rewrite of the version with
+	// this hash (MetaReplaces): only a key its profile names rewritable
+	// is sent so (EP-7, #74).
+	Replaces string
+	Body     io.Reader
 }
 
 // Replica is a place in the pool, as the worker uses it.
@@ -46,6 +57,10 @@ type Replica interface {
 	Put(ctx context.Context, o Object) error
 	// Delete removes a key; a key the place lacks is already deleted.
 	Delete(ctx context.Context, bucket, key string) error
+	// Head returns the hash the place stores a key with; ok is false
+	// when it holds none. The worker asks it only when a rewrite is
+	// refused (#74), and acts on the answer only by marking a rewrite.
+	Head(ctx context.Context, bucket, key string) (sha256 string, ok bool, err error)
 }
 
 // A place's refusals, as the worker acts on them (§3.4 Errors). Any
@@ -59,7 +74,8 @@ var (
 	// PEER-5, SEC-15).
 	ErrRemoved = errors.New("removed by the friend")
 	// ErrImmutable: the friend holds the key with another hash (412,
-	// LEND-4); an immutability alert (EP-11).
+	// LEND-4) and the put was not a rewrite of it; an immutability alert
+	// (EP-11), unless the key is rewritable (#74).
 	ErrImmutable = errors.New("immutability alert")
 	// ErrRejected: the friend found the bytes do not match the hash
 	// (BadDigest, LEND-4). The worker re-hashes the store's copy to
