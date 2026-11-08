@@ -155,6 +155,19 @@ const challengeable = `FROM placement p JOIN queue q ON q.seq = p.seq
 	WHERE p.place = ?1 AND p.bucket = ?2 AND p.state = 'acked' AND p.op = 'put'
 	AND q.state = 'done' AND q.immutable IS NULL AND coalesce(q.size, 0) > 0 AND ` + liveQ
 
+// StillChallengeable reports whether queue row seq is still an object a
+// challenge may name at place: its row there acked, and the key's
+// latest done write. A verifier reads it again before it records a
+// failure, since a delete, a rewrite or re-placement's drop that reached
+// the place mid-challenge explains a refusal (#27 review).
+func (db *DB) StillChallengeable(ctx context.Context, place string, seq int64) (bool, error) {
+	var ok bool
+	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM placement p JOIN queue q ON q.seq = p.seq
+		WHERE p.place = ?1 AND p.seq = ?2 AND p.state = 'acked' AND p.op = 'put'
+		AND q.state = 'done' AND q.immutable IS NULL AND `+liveQ+`)`, place, seq).Scan(&ok)
+	return ok, err
+}
+
 // ChallengeableCount returns how many objects a challenge may name at
 // place in bucket.
 func (db *DB) ChallengeableCount(ctx context.Context, place, bucket string) (int64, error) {

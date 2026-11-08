@@ -3985,7 +3985,16 @@ the handler's own reads and is never cancelled; nothing below
     or no longer matches its capture hash (VER-5's business; the HMAC
     cannot tell whose bytes changed) is skipped; a check that skipped
     every object is recorded as an error ("nothing to check")
-    (`TestTheLocalCopysOwnFaultsAreNotTheFriends`). An unverified
+    (`TestTheLocalCopysOwnFaultsAreNotTheFriends`). The friend is asked
+    first and the local copy read after its answer, after any wait for
+    its pacing. Before a failure is recorded, the object's row is read
+    again (`state.DB.StillChallengeable`): it must still be `acked` at
+    that place and its key's latest done write. A delete, a rewrite
+    (#74's gap) or re-placement's drop (`dropping`, then the delete
+    sent) that reached the friend while the challenge was in flight
+    explains a `404`, a `416` or other bytes, so the object is skipped,
+    not failed (`TestAnObjectThatChangesMidChallengeIsSkipped`, #27
+    review: a full check runs for hours beside backups). An unverified
     replica is not challenged daily any more; `lendisk verify --full`
     passing clears the mark (`RecordVerified` with full), a ranged pass
     does not.

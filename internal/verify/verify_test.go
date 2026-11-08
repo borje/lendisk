@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -28,9 +29,16 @@ type lender struct {
 	held  map[string][]byte
 	asked []control.ChallengeRequest
 	fail  error // answered instead, when set
+	// during, when set, runs inside each call before it is answered:
+	// what happens on the node and at the friend while a challenge is
+	// in flight.
+	during func(req control.ChallengeRequest)
 }
 
 func (l *lender) call(_ context.Context, _ state.Friendship, req control.ChallengeRequest) (control.ChallengeResponse, error) {
+	if l.during != nil {
+		l.during(req)
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.asked = append(l.asked, req)
@@ -351,5 +359,64 @@ func TestRunChallengesDailyAndOnRequest(t *testing.T) {
 	})
 	if o.Outcome != state.VerifyPassed || o.Checked != 3 {
 		t.Fatalf("outcome %+v", o)
+	}
+}
+
+// VER-1 (#27 review): an object that stops being the one the friend
+// holds while its challenge is in flight (the user deletes or rewrites
+// it, a prune's delete reaches the friend, re-placement drops the copy
+// there) is no failed proof, though the friend truthfully answers that
+// it no longer holds those bytes: the row is read again before a
+// failure is recorded, and the object is skipped.
+func TestAnObjectThatChangesMidChallengeIsSkipped(t *testing.T) {
+	for name, change := range map[string]func(n *node, key string){
+		"deleted": func(n *node, key string) {
+			ctx := n.t.Context()
+			seqs, err := n.db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: key, Op: state.OpDelete, Class: "data"}})
+			if err != nil {
+				n.t.Fatal(err)
+			}
+			if err := n.db.FinishDelete(ctx, seqs...); err != nil {
+				n.t.Fatal(err)
+			}
+			os.Remove(filepath.Join(n.store, "laptop", filepath.FromSlash(key)))
+			delete(n.b.held, key)
+		},
+		"rewritten": func(n *node, key string) {
+			ctx := n.t.Context()
+			body := bytes.Repeat([]byte{5}, 900)
+			os.WriteFile(filepath.Join(n.store, "laptop", filepath.FromSlash(key)), body, 0o600)
+			seqs, err := n.db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: key, Op: state.OpPut, Class: "data"}})
+			if err != nil {
+				n.t.Fatal(err)
+			}
+			sum := sha256.Sum256(body)
+			if _, err := n.db.FinishPut(ctx, seqs[0], int64(len(body)), hex.EncodeToString(sum[:])); err != nil {
+				n.t.Fatal(err)
+			}
+		},
+		"dropped there": func(n *node, key string) {
+			if _, err := n.db.Exec(`UPDATE placement SET state = 'dropping' WHERE place = ? AND key = ?`, peerB, key); err != nil {
+				n.t.Fatal(err)
+			}
+			delete(n.b.held, key)
+		},
+	} {
+		for _, full := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s, full %v", name, full), func(t *testing.T) {
+				n := newNode(t, 1)
+				n.b.during = func(req control.ChallengeRequest) {
+					n.b.during = nil
+					change(n, req.Key)
+				}
+				o := n.check(full)
+				if o.Outcome == state.VerifyFailed || o.Skipped != 1 || o.Checked != 0 {
+					t.Fatalf("outcome %+v", o)
+				}
+				if c := n.record(); c.Unverified() || n.alerts.Load() != 0 {
+					t.Fatalf("record %+v", c)
+				}
+			})
+		}
 	}
 }

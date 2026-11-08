@@ -300,3 +300,41 @@ func TestVerifyRequestsRoundTrip(t *testing.T) {
 		t.Fatalf("result %+v %v %v", r, done, err)
 	}
 }
+
+// VER-1 (#27 review): an object is still challengeable at a place while
+// the place's row of it is acked and it is its key's latest done write;
+// not once deleted, written again, or dropped there.
+func TestStillChallengeable(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.bucket("laptop", 1)
+	still := func(seq int64) bool {
+		t.Helper()
+		ok, err := p.db.StillChallengeable(ctx, "B", seq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	a := p.put("laptop", "data/a", "data", 0.1)
+	if still(a) {
+		t.Fatal("challengeable before it was acknowledged")
+	}
+	p.ackAll(a)
+	b := p.put("laptop", "data/b", "data", 0.1)
+	c := p.put("laptop", "data/c", "data", 0.1)
+	p.ackAll(b)
+	p.ackAll(c)
+	if !still(a) || !still(b) || !still(c) {
+		t.Fatal("an acknowledged live object is not challengeable")
+	}
+	p.del("laptop", "data/a", "data")
+	p.rewrite("laptop", "data/b", "data", 0.1)
+	if _, err := p.db.Exec(`UPDATE placement SET state = 'dropping' WHERE seq = ?`, c); err != nil {
+		t.Fatal(err)
+	}
+	if still(a) || still(b) || still(c) {
+		t.Fatalf("deleted %v, written again %v, dropping %v", still(a), still(b), still(c))
+	}
+}

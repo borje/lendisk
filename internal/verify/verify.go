@@ -72,8 +72,14 @@ const (
 	// callTimeout bounds one ranged challenge; a whole-object one gets
 	// a second more per MiB.
 	callTimeout = 30 * time.Second
-	// maxWait is the longest Retry-After a full check waits out.
+	// maxWait is how long a full check waits out the friend's pacing
+	// before one object, beyond what the largest object it read before
+	// takes at WholeRate.
 	maxWait = 5 * time.Minute
+	// DefaultWholeRate is the slowest pace of a friend's whole-object
+	// reads a full check waits for: a quarter of the lender's default
+	// (control.DefaultWholeRate).
+	DefaultWholeRate = 1 << 20
 	// pageSize is how many objects a full check reads from lendisk.db at
 	// once.
 	pageSize = 256
@@ -104,6 +110,11 @@ type Verifier struct {
 	// Samples and Range: DefaultSamples and DefaultRange when zero.
 	Samples int
 	Range   int64
+	// WholeRate is DefaultWholeRate when zero (bytes per second).
+	WholeRate int64
+	// Sleep waits out the friend's pacing; nil means a timer. Tests
+	// advance their clock in it.
+	Sleep func(ctx context.Context, d time.Duration) error
 	// Alerted, if set, is called after a replica is marked unverified,
 	// so the alert service reads it at once. It must not block.
 	Alerted func()
@@ -242,8 +253,13 @@ func (v *Verifier) check(ctx context.Context, place, bucket string, full bool) (
 	}
 	call, done := v.caller(f)
 	defer done()
+	var largest int64 // the largest object read whole so far: the friend's debt for it is waited out
 	try := func(c state.Challengeable, whole bool) (bool, error) {
-		failed, skipped, err := v.challenge(ctx, call, f, bucket, c, whole)
+		wait := maxWait + time.Duration(float64(largest)/float64(or(v.WholeRate, DefaultWholeRate))*float64(time.Second))
+		if whole {
+			largest = max(largest, c.Size)
+		}
+		failed, skipped, err := v.challenge(ctx, call, f, bucket, c, whole, wait)
 		switch {
 		case err != nil:
 			return false, err
@@ -361,11 +377,13 @@ func (v *Verifier) caller(f state.Friendship) (callFunc, func()) {
 	return cl.Challenge, tr.CloseIdleConnections
 }
 
-// challenge challenges f for object c of bucket, ranged or whole. It
-// returns what failed ("" when the answer was right), or skipped when
-// the local copy cannot tell, or an error when nothing was decided.
+// challenge challenges f for object c of bucket, ranged or whole,
+// waiting out the friend's pacing of whole-object reads for at most
+// wait. It returns what failed ("" when the answer was right), or
+// skipped when the local copy cannot tell or the object changed while
+// it was challenged, or an error when nothing was decided.
 func (v *Verifier) challenge(ctx context.Context, call callFunc, f state.Friendship, bucket string, c state.Challengeable,
-	whole bool) (failed string, skipped bool, err error) {
+	whole bool, wait time.Duration) (failed string, skipped bool, err error) {
 	nonce := make([]byte, 32)
 	if _, err := io.ReadFull(v.random(), nonce); err != nil {
 		return "", false, err
@@ -383,27 +401,26 @@ func (v *Verifier) challenge(ctx context.Context, call callFunc, f state.Friends
 		req.Length = 1 + r.Int64N(min(c.Size-req.Offset, or(v.Range, DefaultRange)))
 	}
 	path := filepath.Join(v.StoreDir, bucket, filepath.FromSlash(c.Key))
-	want, ok, err := localMAC(path, nonce, req.Offset, req.Length, whole)
-	if err != nil {
-		return "", false, fmt.Errorf("reading this node's copy of %s: %w", c.Key, err)
-	}
-	if !ok {
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 		return "", true, nil // no local copy to compare with
 	}
+	// The friend is asked first, and the local copy read after its
+	// answer: what the friend held is compared with what this node holds
+	// then, and any wait for the friend's pacing comes before both.
 	var resp control.ChallengeResponse
-	for tries := 0; ; tries++ {
+	waited := time.Duration(0)
+	for {
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		resp, err = call(cctx, req)
 		cancel()
 		var ce *control.CallError
-		if whole && errors.As(err, &ce) && ce.Status == http.StatusServiceUnavailable && ce.RetryAfter <= maxWait && tries < 10 {
-			// A full check is paced by the friend (control.ChallengeRate).
-			t := time.NewTimer(max(ce.RetryAfter, time.Second))
-			select {
-			case <-ctx.Done():
-				t.Stop()
-				return "", false, ctx.Err()
-			case <-t.C:
+		if whole && errors.As(err, &ce) && ce.Status == http.StatusServiceUnavailable && waited+ce.RetryAfter <= wait {
+			// A full check is paced by the friend (control's whole-object
+			// budget): wait as long as it says, within wait.
+			d := max(ce.RetryAfter, time.Second)
+			waited += d
+			if err := v.sleep(ctx, d); err != nil {
+				return "", false, err
 			}
 			continue
 		}
@@ -413,24 +430,60 @@ func (v *Verifier) challenge(ctx context.Context, call callFunc, f state.Friends
 	if whole {
 		what = c.Key
 	}
+	failed = fmt.Sprintf("friend %s answered for other bytes than it acknowledged at %s", f.Peer, what)
 	switch {
 	case control.FailedProof(err):
-		return fmt.Sprintf("friend %s does not hold %s, which it acknowledged: %v", f.Peer, what, err), false, nil
+		failed = fmt.Sprintf("friend %s does not hold %s, which it acknowledged: %v", f.Peer, what, err)
 	case err != nil:
 		return "", false, fmt.Errorf("%w: challenging %s: %w", errNoAnswer, what, err)
-	case hmac.Equal(resp.HMAC, want):
-		return "", false, nil
+	default:
+		want, ok, err := localMAC(path, req.Nonce, req.Offset, req.Length, whole)
+		if err != nil {
+			return "", false, fmt.Errorf("reading this node's copy of %s: %w", c.Key, err)
+		}
+		if !ok {
+			return "", true, nil // gone or shorter since: written again or deleted
+		}
+		if hmac.Equal(resp.HMAC, want) {
+			return "", false, nil
+		}
+		// A wrong answer: unless this node's own copy changed since
+		// capture (VER-5's to find), the friend holds other bytes.
+		if same, err := matches(path, c.SHA256); err != nil {
+			return "", false, fmt.Errorf("re-reading this node's copy of %s: %w", c.Key, err)
+		} else if !same {
+			v.Log.Warn("verification: this node's copy of an object no longer matches its capture hash; the friend's answer cannot be judged",
+				"bucket", bucket, "key", c.Key)
+			return "", true, nil
+		}
 	}
-	// A wrong answer: unless this node's own copy changed since capture
-	// (VER-5's to find), the friend holds other bytes.
-	if same, err := matches(path, c.SHA256); err != nil {
-		return "", false, fmt.Errorf("re-reading this node's copy of %s: %w", c.Key, err)
-	} else if !same {
-		v.Log.Warn("verification: this node's copy of an object no longer matches its capture hash; the friend's answer cannot be judged",
-			"bucket", bucket, "key", c.Key)
+	// Before a failure is recorded, the object must still be the one the
+	// friend holds: a delete, a rewrite or re-placement's drop that
+	// reached it while the challenge was in flight explains its answer.
+	still, err := v.DB.StillChallengeable(ctx, f.Peer, c.Seq)
+	if err != nil {
+		return "", false, err
+	}
+	if !still {
+		v.Log.Info("verification: the object changed while it was challenged; skipped", "bucket", bucket, "key", c.Key)
 		return "", true, nil
 	}
-	return fmt.Sprintf("friend %s answered for other bytes than it acknowledged at %s", f.Peer, what), false, nil
+	return failed, false, nil
+}
+
+// sleep waits d, or less if ctx ends.
+func (v *Verifier) sleep(ctx context.Context, d time.Duration) error {
+	if v.Sleep != nil {
+		return v.Sleep(ctx, d)
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
 }
 
 // localMAC is the challenge's HMAC over the local copy at path; ok is
