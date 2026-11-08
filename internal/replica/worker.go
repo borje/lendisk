@@ -528,7 +528,19 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	case ok && held != replaces:
 		return w.put(ctx, place, r, p, held)
 	}
-	return err
+	// The place holds nothing live at the key (a deleted object's tomb,
+	// or the Head fell inside the lender's own rewrite of it), or holds
+	// exactly the version the refused rewrite named (it changed under
+	// the request). Either may pass: the row waits with backoff, as for
+	// a network error, rather than being refused for good (#74 review).
+	return fmt.Errorf("the place refused a rewrite of %s (%v) but holds %s; trying again", p.Key, err, heldDesc(held, ok))
+}
+
+func heldDesc(held string, ok bool) string {
+	if !ok {
+		return "nothing live there"
+	}
+	return "the version it replaces (" + held + ")"
 }
 
 // put sends the row's object from the store, marked as a rewrite of the

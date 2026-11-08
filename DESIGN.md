@@ -2384,8 +2384,14 @@ upstream bucket is Q-V.
   superseded row is cancelled first), so asking does not let an older
   version replace a newer one; and a friend that lies in its answer
   gains nothing, since the mark only lets it store what this node
-  sends. A rewrite still refused is a refusal like any other `412`
-  (`place_refused`). Rewrites are single PUTs: rewritable keys are a
+  sends. If the place says it holds nothing live at the key (a deleted
+  object's tomb, or the `HEAD` fell inside the lender's own rewrite of
+  it), or holds exactly the version the refused rewrite named, that may
+  pass: the row waits with the network backoff, the place shows
+  `retrying`, and nothing is refused or alerted
+  (`TestRefusedRewriteWithNoNewsFromTheHeadIsRetried`). A rewrite
+  refused again after the retry with the place's hash is a refusal like
+  any other `412` (`place_refused`). Rewrites are single PUTs: rewritable keys are a
   few KiB, and multipart replication (#23) would need the mark at
   `CreateMultipartUpload`.
   *Choice of mark (#74).* S3's conditional writes put `If-Match` with
