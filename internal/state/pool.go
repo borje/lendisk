@@ -266,8 +266,10 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 
 // placeTx places the completed queue row seq (REPL-12), in the
 // transaction that completes it:
-//   - a delete goes to every friend whose latest row of the key is a
-//     put (REPL-2): every place that holds or will hold it;
+//   - a delete first cancels every queued put of the key that no
+//     sender has taken (StartPlacement), then goes to every friend
+//     whose latest row of the key is still a put (REPL-2, #21): every
+//     place that holds or may hold it;
 //   - a metadata or snapshot put goes to every friend;
 //   - a data put goes to `copies` friends by choose. A healing re-upload
 //     (heal, #57) goes where the row it heals was placed, topped up to
@@ -293,6 +295,14 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 	var targets []string
 	switch {
 	case op == OpDelete:
+		// A put no sender has taken is cancelled, not followed: nothing
+		// of it reached the place (REPL-2, #21), and the store no longer
+		// holds its bytes. One taken may have landed, and stays ahead of
+		// the delete in its FIFO.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE bucket = ? AND key = ? AND op = 'put'
+			AND state = 'queued' AND started_at IS NULL AND seq < ?`, bucket, key, seq); err != nil {
+			return err
+		}
 		targets, err = column(ctx, tx, `SELECT DISTINCT p.place FROM placement p JOIN friendship f ON f.peer_key = p.place
 			WHERE coalesce(f.address, '') != '' AND p.bucket = ?1 AND p.key = ?2 AND p.op = 'put'
 			AND p.seq = (SELECT max(x.seq) FROM placement x
@@ -303,7 +313,7 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 	default:
 		if heal {
 			targets, err = column(ctx, tx, `SELECT p.place FROM placement p JOIN friendship f ON f.peer_key = p.place
-				WHERE coalesce(f.address, '') != '' AND p.state != '`+PlacementDropped+`' AND p.seq = (SELECT max(l.seq) FROM queue l
+				WHERE coalesce(f.address, '') != '' AND p.state NOT IN ('`+PlacementDropped+`', '`+PlacementAbandoned+`') AND p.seq = (SELECT max(l.seq) FROM queue l
 					WHERE l.bucket = ?1 AND l.key = ?2 AND l.seq < ?3 AND l.state = 'done')
 				ORDER BY p.place`, bucket, key, seq)
 			if err != nil {
@@ -389,7 +399,7 @@ func column(ctx context.Context, tx querier, q string, args ...any) ([]string, e
 	return out, rows.Err()
 }
 
-// Held reports whether row seq is a metadata row the barrier holds back
+// Held reports whether row seq is a row the barrier holds back
 // (REPL-1): a metadata or snapshot row, put or delete, is sent to any
 // place only when no data put of its bucket before it has a queued
 // placement row left, each acked at every place it is placed at. Rows
@@ -399,14 +409,45 @@ func column(ctx context.Context, tx querier, q string, args ...any) ([]string, e
 // the metadata replaced will be cancelled, not sent, so it does not hold
 // it either; one replaced only after the metadata still does, as the
 // metadata was written while it was the key's bytes.
+//
+// The mirror holds a data delete (#21 review): it is sent to any place
+// only when no metadata or snapshot row of its bucket before it, put
+// or delete, is still queued at a place that answers, so no place
+// deletes a pack while another still holds live, or has yet to
+// replace or delete, metadata naming it. A place unreachable for
+// reroute_after, or full (507) for that long, does not hold deletes:
+// it would stop every place's FIFO for as long as it stays away (its
+// replica is behind until it returns, and its FIFO then brings it
+// level).
 func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
+	ps, err := poolPlaces(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	now := db.now()
+	answering := []string{}
+	for _, p := range ps {
+		if !p.unreachable(db, now) && !p.fullForLong(db, now) {
+			answering = append(answering, p.peer)
+		}
+	}
+	list, err := json.Marshal(answering)
+	if err != nil {
+		return false, err
+	}
 	var held bool
-	err := db.QueryRowContext(ctx, `SELECT q.class IN ('metadata', 'snapshot') AND EXISTS (
-		SELECT 1 FROM placement p JOIN queue d ON d.seq = p.seq
-		WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND p.op = 'put' AND d.class = 'data'
-		AND NOT EXISTS (SELECT 1 FROM queue l
-			WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.seq < q.seq AND l.state = 'done'))
-		FROM queue q WHERE q.seq = ?`, seq).Scan(&held)
+	err = db.QueryRowContext(ctx, `SELECT CASE
+		WHEN q.class IN ('metadata', 'snapshot') THEN EXISTS (
+			SELECT 1 FROM placement p JOIN queue d ON d.seq = p.seq
+			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND p.op = 'put' AND d.class = 'data'
+			AND NOT EXISTS (SELECT 1 FROM queue l
+				WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.seq < q.seq AND l.state = 'done'))
+		WHEN q.op = 'delete' THEN EXISTS (
+			SELECT 1 FROM placement p JOIN queue m ON m.seq = p.seq
+			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND m.class IN ('metadata', 'snapshot')
+			AND p.place IN (SELECT value FROM json_each(?2)))
+		ELSE 0 END
+		FROM queue q WHERE q.seq = ?1`, seq, string(list)).Scan(&held)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -628,13 +669,27 @@ func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(st
 			drops[op.from] = append(drops[op.from], op.seq)
 			continue
 		}
-		r, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, op.from, op.seq)
+		// A row a sender took may have landed: it stays, abandoned, so
+		// a later delete still reaches the friend (#21 review).
+		r, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementAbandoned+`'
+			WHERE place = ? AND seq = ? AND state = 'queued' AND started_at IS NOT NULL`, op.from, op.seq)
 		if err != nil {
 			return 0, 0, err
 		}
-		if n, err := r.RowsAffected(); err != nil {
+		n, err := r.RowsAffected()
+		if err != nil {
 			return 0, 0, err
-		} else if n == 0 {
+		}
+		if n == 0 {
+			r, err := tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, op.from, op.seq)
+			if err != nil {
+				return 0, 0, err
+			}
+			if n, err = r.RowsAffected(); err != nil {
+				return 0, 0, err
+			}
+		}
+		if n == 0 {
 			continue // sent, refused or cancelled since the scan
 		}
 		if err := db.insertPlacement(ctx, tx, op.seq, op.to, false); err != nil {

@@ -2025,11 +2025,13 @@ upstream bucket is Q-V.
     metadata reserve (below). A friend
     that is `removed`, whose last answer was `507` (condition `quota`,
     below), or that is gone past `replace_after` is not a candidate;
-  - a delete goes to every friend whose latest row of the key is a put,
-    in any state (REPL-2): every place that holds or will hold it, and
-    one that refused it, which may hold older bytes;
+  - a delete first cancels the key's `queued` puts that no sender has
+    taken (*Deletes*, below, #21), then goes to every friend whose latest remaining row of the
+    key is a put, in any state (REPL-2): every place that holds or may
+    hold it, and one that refused it, which may hold older bytes;
   - a healing re-upload of a data key (*Healing*, below) goes where the
-    row it heals was placed, topped up to `copies` by the choice.
+    row it heals was placed, except where that row was `dropped` or
+    `abandoned`, topped up to `copies` by the choice.
 
   *Decision (#19, the user, 2026-11-06): data leaves headroom for
   metadata.* The metadata reserve at a friend is the larger of
@@ -2075,11 +2077,14 @@ upstream bucket is Q-V.
   LEND-1), or 0 when the place's latest row of the key acknowledged the
   same hash (a healing re-upload, which the lender stores nothing for);
   a delete minus what the place acknowledged of the key since its last
-  delete there. SQLite triggers on `placement` keep it as rows are
+  delete there (a put a delete cancels leaves the count with its row).
+  SQLite triggers on `placement` keep it as rows are
   inserted, acknowledged, refused, re-queued, cancelled and moved, so
-  placing an object reads one row per friend. A row acknowledged after
-  its delete was placed (a send in flight) stays counted: the count
-  errs towards less room. A lender keeps a deleted object counted
+  placing an object reads one row per friend. A put acknowledged after
+  a delete of its key was placed at the place (a send in flight) is
+  acknowledged with size 0 (`AckPlacement`, #21): that delete removes
+  it, and the delete's own size did not include it
+  (`TestAPutAcknowledgedAfterItsDeleteIsFreed`). A lender keeps a deleted object counted
   until its purge (§3.6), so this count frees it a retention window
   early, erring towards more room until the `507` below or the `quota`
   answer corrects it. *Correction from the lender's answers:* the lender's only
@@ -2093,8 +2098,9 @@ upstream bucket is Q-V.
   corrects `place_use` but the rows, so it drifts from what the lender
   holds. Known sources: a send that landed but whose answer was lost
   (a network error), whose row is then re-routed, cancelled as
-  superseded or dropped, leaves bytes the count does not hold; a row
-  acknowledged after its delete was placed stays counted; a lender's
+  superseded or dropped, leaves bytes the count does not hold (an
+  `abandoned` row, #21, is not counted either, though a delete still
+  follows it); a lender's
   real per-object overhead and its retention of deleted objects (RET-1)
   differ from the fixed 4 KiB and the immediate free; a refused row's
   place may still hold older bytes of the key; and partial multipart
@@ -2105,7 +2111,8 @@ upstream bucket is Q-V.
   worker uploads one object at a time per place in sequence order,
   several places in parallel. A delete (REPL-2) is a row in the FIFO of
   every place whose `placement` row for the key is `acked` or
-  `queued`; a `queued` put that has not started is simply cancelled.
+  `queued`; a `queued` put that has not started is simply cancelled
+  (*Deletes*, below).
   The capture side is table `queue` (schema 4): `seq` (an
   autoincrement, the write sequence, assigned when the request reaches
   the decorator, so a tool that waits for its packs before writing the
@@ -2128,10 +2135,15 @@ upstream bucket is Q-V.
   place the row they complete in the same transaction (above). Table
   `placement`: `seq` (the queue row), `place` (the
   friend's node ID), `bucket`, `key` and `op` copied from the queue row
-  so the index outlives it, `state` (`queued`, `acked`, `refused`, and
-  from #19 `dropped`),
+  so the index outlives it, `state` (`queued`, `acked`, `refused`,
+  from #19 `dropped`, and from #21 `abandoned`),
   and on acknowledgement `sha256` and `acked_at`: acked put rows are
   the index of acknowledged hashes (REPL-10, `state.AckedHash`).
+  `started_at` (schema 21) is set when the place's sender takes the row
+  to send it (`state.DB.StartPlacement`) and never cleared; migration
+  21 sets it to 0 on every row queued when it runs, as an older lendisk
+  may have sent them. `abandoned` is a taken put that will not be sent
+  again and was never acknowledged (*Deletes*, below).
   `refused` (with `detail`) is a refusal that would repeat; the row
   leaves the FIFO. Its `cause` (schema 9) is NULL when the place
   refused (a `412`), `store` when the node's own store could not
@@ -2211,7 +2223,10 @@ upstream bucket is Q-V.
   target while the unreachable friend still has room (REPL-12).
   The moved row keeps its sequence, so it takes its turn in the new
   place's FIFO ahead of later rows. Re-routing an unsent row moves no
-  bytes. A row its sender has taken and not yet recorded an outcome for
+  bytes. A row a sender took before (a failed send that may have
+  landed) leaves its friend an `abandoned` row, so a later delete of
+  the key still goes there (*Deletes*, below;
+  `TestRerouteKeepsATakenRowsPlaceForItsDelete`). A row its sender has taken and not yet recorded an outcome for
   is not moved: should the send land, the place's row must be there to
   record it, or no later delete would reach the copy. The worker keeps
   that set (`Worker.sending`) under a lock that the sender takes its row
@@ -2255,9 +2270,114 @@ upstream bucket is Q-V.
   is sent there too; it is not a target for a healing re-upload.
   `dropped` is a copy never sent; it is not REPL-13's `dropping`, a
   copy the place holds that re-placement is deleting.
+  Data deletes have the mirror barrier: they wait for the metadata
+  before them (*Deletes*, below, #21).
   Restic and Kopia write packs, then indexes, then the snapshot or
   manifest, so the barrier costs one round of acknowledgements per
   backup run, not per object.
+- **REPL-2, deletes (#21).** The decorator captures a `DeleteObject`
+  (and each key of a `DeleteObjects`) as a queue row `op = delete`;
+  `FinishDelete` places it in the transaction that completes it
+  (`placeTx`):
+  - *Cancel what never left.* Each `queued` put of the key with
+    `started_at` NULL, at any place, is deleted from `placement`
+    (freeing its count) and gets no delete: nothing of it reached the
+    place. A sender takes its head row with `StartPlacement`, an
+    `UPDATE … WHERE state = 'queued'`, after the metadata barrier lets
+    it go and before it reads the store; a row a delete removed first
+    affects no row, and the sender moves on without sending it. SQLite
+    serialises the two writes, so a row is either cancelled or taken,
+    never both. A taken row stays taken, through a failed send, a
+    retry and a restart: a send whose answer was lost may have landed,
+    so the delete must follow it (`TestDeleteFollowsAPutInFlightAndPrecedesARewrite`).
+    The claim also outlives the row's leaving the FIFO unacknowledged:
+    a taken row cancelled as superseded (`CancelPlacement`) or
+    re-routed elsewhere (`Reroute`) becomes `abandoned`, not deleted,
+    and stays the place's row of the key, so a later delete still goes
+    there even when the write that superseded it went to another place
+    or was itself cancelled untaken
+    (`TestDeleteReachesAPlaceWhoseTakenPutWasSuperseded`,
+    `TestALostAnswerStillGetsItsDelete`). The sender checks
+    `Superseded` before it takes a row, so a row never sent is removed,
+    not abandoned. An `abandoned` row is out of the FIFO and out of the
+    count, and is never acknowledged.
+  - *Even what metadata waits for.* The cancel applies when metadata of
+    the bucket was captured between the put and the delete too: the
+    store no longer holds the put's bytes, so it could never be sent
+    (its sender would find it `Superseded` and cancel it). The barrier
+    then no longer waits for it, so that metadata can go offsite naming
+    a pack no friend got, until the prune's new index and the
+    metadata's own delete follow it; locally those bytes are gone
+    already. And RET-3's `undelete` can restore only what reached a
+    lender: a pack deleted before it was sent, a backlog's packs pruned
+    during an outage among them, is lost to it. Keeping the local bytes
+    until every place has them is a follow-up the coordinator files.
+  - *Then follow what remains.* The delete is queued at each friend
+    whose latest remaining row of the key is a put (taken, acked,
+    refused, dropped or abandoned), at its sequence, so it is behind every
+    earlier write of the key there and ahead of every later one; a
+    place whose latest row is a delete already gets no second one. A
+    put taken but superseded by the delete is abandoned at its next
+    try (`Superseded`), and the delete is sent after it; a key the
+    friend lacks counts as deleted.
+  - *Ordering across places: the delete barrier.* Per-place FIFO is not
+    enough. At copies 1 with friends B and C, a prune's new index, the
+    deletes of the old snapshot and index, and the pack deletes reach C
+    while B is still behind the new index: C deletes packs only it held
+    while B still holds, live, the old snapshot and index naming them,
+    so B and C together hold a snapshot whose packs are nowhere (REPL-1
+    AC). So the barrier has a mirror: a data delete at sequence `d` is
+    sent to any place only once no metadata or snapshot row of its
+    bucket before `d`, put or delete, is `queued` at any place
+    (`state.DB.Held`, which the sender checks for every delete at the
+    head of its FIFO, polling every second while it holds;
+    `TestPackDeleteWaitsForTheMetadataBeforeIt`,
+    `TestDataDeleteWaitsForEarlierMetadataAtFriendsThatAnswer`). A
+    prune's pack deletes thus wait until every friend holds the new
+    index and has deleted the old metadata. It cannot deadlock: a data
+    put is never held, a metadata row waits only for data puts before
+    it, and a data delete only for metadata before it, so the queued
+    row with the lowest sequence is always free to go.
+    *Decision (#21 review): a friend that is away does not hold
+    deletes.* Metadata queued at a friend unreachable for
+    `replication.reroute_after`, or full (`507`) for that long, is not
+    waited for, as `Reroute` does not wait for it either: otherwise one
+    friend away for days would hold every other friend's deletes, and,
+    since FIFOs are strict, every row behind them, new backups
+    included. The cost is the AC while it is away: its replica keeps
+    the old snapshot and index, while the packs they name may be
+    deleted elsewhere; once it returns its FIFO sends it the new index
+    and the deletes, in order. A friend that answers, however slowly,
+    holds them. Metadata and snapshot deletes are held like metadata
+    puts.
+  - *Bookkeeping.* A delete's row counts minus what the place
+    acknowledged of the key since its last delete there, from the
+    moment it is queued; its acknowledgement changes nothing more. The
+    key's latest done write is then a delete, so it leaves
+    `below_copies` and `LiveKeys`, and the place's queue shows the row
+    until it is acknowledged. The lender keeps the tomb counted until
+    its purge (§3.6), which the borrower's count does not follow; that
+    is #68's reconcile (*Follow-up*, above).
+  - *Recovery.* A lender lists a key held only as a tomb with
+    `tombstoned_at`, and recovery records nothing for it (§3.1 ID-5),
+    so a key tombstoned at every place is not recovered, served or
+    listed (`TestKeyTombstonedAtEveryPlaceIsNotRecovered`); `restic
+    forget --prune` and Kopia's full maintenance end to end:
+    `TestResticPruneTombstonesAtEveryFriend`, `TestReplicateKopiaToFriend`.
+  *Decision (#21): cancel only what never left, and follow the rest.*
+  Replicators differ here. rclone `sync` deletes on the destination
+  after its transfers by default (`--delete-after`), so a delete never
+  precedes the copies that replace what it removes. S3 Replication
+  replicates delete markers only when asked
+  (`DeleteMarkerReplication`) and never a delete of a version, so a
+  destination keeps what a source loses. Syncthing sends a delete as a
+  new version of the file, ordered after the writes it follows. lendisk
+  takes from each: per place the delete is ordered after the writes, as
+  Syncthing's versions are; across places after the metadata, as
+  rclone's deletes follow its transfers; and the lender keeps what it
+  held, as S3's destination does, in a tomb for the window. A put the
+  place never saw has nothing to keep, so it is cancelled, which a
+  sender's claim makes safe against a send in flight.
 - **REPL-13, the re-placement worker.** It runs after every change to
   the pool (friend added or removed, quota changed, a verification
   failed, an overflow target added) and hourly. It computes for each
@@ -2523,7 +2643,9 @@ upstream bucket is Q-V.
   sender per friend with an address, restarted when the address
   changes; a failed read keeps the senders as they are (#53). A sender takes the head of its FIFO (`state.NextPlacement`),
   sends it and waits for the answer before the next row, polling every
-  second when the FIFO is empty. A put whose key a later completed
+  second when the FIFO is empty; it takes the row (`StartPlacement`,
+  *Deletes* above) after the barrier lets it go, and a row a delete
+  cancelled meanwhile is not sent. A put whose key a later completed
   capture replaced or deleted (`state.Superseded`) is cancelled, since
   the store no longer holds its bytes; deletes are always sent, and a
   key or bucket the friend lacks counts as deleted. A put reads

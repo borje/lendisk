@@ -20,11 +20,17 @@ import (
 // reroute_after while it held a metadata barrier, with no other friend
 // with room (Reroute, #19); out of the FIFO, not counted in the place's
 // use, and the object is below copies until re-placement (#26).
+// abandoned is a taken put (StartPlacement) that will not be sent again
+// and was never acknowledged: cancelled as superseded, or re-routed
+// elsewhere. Its send may have landed, so it stays the place's row of
+// the key and a later delete follows it (REPL-2, #21); out of the FIFO
+// and not counted in the place's use.
 const (
-	PlacementQueued  = "queued"
-	PlacementAcked   = "acked"
-	PlacementRefused = "refused"
-	PlacementDropped = "dropped"
+	PlacementQueued    = "queued"
+	PlacementAcked     = "acked"
+	PlacementRefused   = "refused"
+	PlacementDropped   = "dropped"
+	PlacementAbandoned = "abandoned"
 )
 
 // Place conditions: how a place answered last (#18).
@@ -94,14 +100,44 @@ func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok 
 // AckPlacement records that place acknowledged the row, with the hash it
 // verified (empty for a delete). Acknowledging again is harmless.
 func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?, acked_at = ?
-		WHERE place = ? AND seq = ?`, nullStr(sha256), now.Unix(), place, seq)
+	// A put acknowledged after a delete of its key was placed there (it
+	// was in flight) no longer counts: that delete removes it, and its
+	// own count did not include it (#21).
+	_, err := db.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?1, acked_at = ?2,
+		size = CASE WHEN op = 'put' AND state != 'acked' AND EXISTS (SELECT 1 FROM placement d
+			WHERE d.place = placement.place AND d.bucket = placement.bucket AND d.key = placement.key
+			AND d.op = 'delete' AND d.seq > placement.seq) THEN 0 ELSE size END
+		WHERE place = ?3 AND seq = ?4`, nullStr(sha256), now.Unix(), place, seq)
 	return err
 }
 
-// CancelPlacement removes a queued row that will not be sent.
+// StartPlacement records that place's sender took row seq to send it,
+// at now. ok is false when the row is no longer queued: a delete of the
+// key cancelled it (placeTx), or it was moved or refused, and it must
+// not be sent. A row taken once stays taken, as its send may have
+// landed: a later delete of the key follows it instead of cancelling it
+// (REPL-2, #21).
+func (db *DB) StartPlacement(ctx context.Context, place string, seq int64, now time.Time) (ok bool, err error) {
+	r, err := db.ExecContext(ctx, `UPDATE placement SET started_at = coalesce(started_at, ?)
+		WHERE place = ? AND seq = ? AND state = 'queued'`, now.Unix(), place, seq)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n == 1, err
+}
+
+// CancelPlacement takes a queued row that will not be sent out of the
+// FIFO: removed if no sender ever took it, else abandoned, as a send of
+// it may have landed and a later delete must still reach the place
+// (#21 review).
 func (db *DB) CancelPlacement(ctx context.Context, place string, seq int64) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, place, seq)
+	_, err := db.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementAbandoned+`'
+		WHERE place = ? AND seq = ? AND state = 'queued' AND started_at IS NOT NULL`, place, seq)
+	if err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, place, seq)
 	return err
 }
 

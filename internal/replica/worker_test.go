@@ -32,8 +32,10 @@ type place struct {
 	log  []string          // op bucket/key, in order
 	// fail, if set, answers instead of storing.
 	fail func(op, key string) error
-	// hold, if set, blocks every request until closed.
+	// hold, if set, blocks every request until closed; only those for
+	// holdKey, if that is set too.
 	hold                  chan struct{}
+	holdKey               string
 	inFlight, maxInFlight int
 	bytesRead             int64
 	// world, if set, is held while a put stores, and check is then
@@ -46,11 +48,14 @@ type place struct {
 
 func newPlace(name string) *place { return &place{name: name, objs: map[string][]byte{}} }
 
-func (p *place) enter() func() {
+func (p *place) enter(key string) func() {
 	p.mu.Lock()
 	p.inFlight++
 	p.maxInFlight = max(p.maxInFlight, p.inFlight)
 	hold := p.hold
+	if p.holdKey != "" && p.holdKey != key {
+		hold = nil
+	}
 	p.mu.Unlock()
 	if hold != nil {
 		<-hold
@@ -59,7 +64,7 @@ func (p *place) enter() func() {
 }
 
 func (p *place) Put(ctx context.Context, o Object) error {
-	defer p.enter()()
+	defer p.enter(o.Key)()
 	// Like the HTTP transport, Put does not return while a read of the
 	// body is blocked, whatever ctx does.
 	b, err := io.ReadAll(o.Body)
@@ -89,7 +94,7 @@ func (p *place) Put(ctx context.Context, o Object) error {
 }
 
 func (p *place) Delete(ctx context.Context, bucket, key string) error {
-	defer p.enter()()
+	defer p.enter(key)()
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.fail != nil {
@@ -179,10 +184,13 @@ func (fx *fixture) capture(bucket, key string, size int64, content string) int64
 	return seqs[0]
 }
 
-func (fx *fixture) remove(bucket, key string) {
+func (fx *fixture) remove(bucket, key string) { fx.removeAs(bucket, key, "data") }
+
+// removeAs deletes key, captured in class, as the decorator does.
+func (fx *fixture) removeAs(bucket, key, class string) {
 	fx.t.Helper()
 	os.Remove(filepath.Join(fx.store, bucket, filepath.FromSlash(key)))
-	seqs, err := fx.db.BeginCaptures(fx.t.Context(), []state.Capture{{Bucket: bucket, Key: key, Op: state.OpDelete, Class: "data"}})
+	seqs, err := fx.db.BeginCaptures(fx.t.Context(), []state.Capture{{Bucket: bucket, Key: key, Op: state.OpDelete, Class: class}})
 	if err != nil {
 		fx.t.Fatal(err)
 	}
@@ -289,7 +297,8 @@ func TestEachPlaceGetsItsFIFOInWriteOrder(t *testing.T) {
 }
 
 // A put whose key was written again or deleted before it was sent is
-// cancelled (the store no longer has its bytes); the delete is sent.
+// cancelled (the store no longer has its bytes). A delete of a key
+// whose put was never sent sends nothing (REPL-2, #21).
 func TestOverwrittenOrDeletedPutIsNotSent(t *testing.T) {
 	fx := newFixture(t, "B")
 	fx.write("laptop", "data/1", "first")
@@ -299,12 +308,96 @@ func TestOverwrittenOrDeletedPutIsNotSent(t *testing.T) {
 	fx.run()
 	fx.drained("B")
 	log, _, _, _ := fx.places["B"].snapshot()
-	want := []string{"put laptop/data/1", "delete laptop/data/2"}
-	if len(log) != 2 || log[0] != want[0] || log[1] != want[1] {
+	want := []string{"put laptop/data/1"}
+	if len(log) != 1 || log[0] != want[0] {
 		t.Fatalf("sent %v, want %v", log, want)
 	}
 	if b := fx.places["B"].objs["laptop/data/1"]; string(b) != "second" {
 		t.Fatalf("B holds %q", b)
+	}
+}
+
+// REPL-2 (#21 review): B stores data/1 but its answer is lost, and its
+// retries keep failing; the key is written again (the new bytes go to
+// C) and then deleted. The retry finds the row superseded, but the
+// place may hold it, so the delete still goes to B and B ends up
+// without a live data/1.
+func TestALostAnswerStillGetsItsDelete(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	fx.bucket("laptop", 1)
+	b := fx.places["B"]
+	var mu sync.Mutex
+	failing, tries := true, 0
+	b.fail = func(op, key string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if op != "put" || key != "data/1" || !failing {
+			return nil
+		}
+		tries++
+		if tries == 1 { // landed; the answer is lost
+			b.objs["laptop/data/1"] = []byte("first")
+		}
+		return errors.New("connection reset")
+	}
+	p1 := fx.write("laptop", "data/1", "first")
+	fx.run()
+	waitFor(t, "B to store data/1 and lose the answer", func() bool { mu.Lock(); defer mu.Unlock(); return tries > 0 })
+	fx.write("laptop", "data/1", "second!")
+	waitFor(t, "B's sender to cancel the superseded row", func() bool {
+		var n int
+		fx.db.QueryRow(`SELECT count(*) FROM placement WHERE place = 'B' AND seq = ? AND state = 'queued'`, p1).Scan(&n)
+		return n == 0
+	})
+	fx.remove("laptop", "data/1")
+	mu.Lock()
+	failing = false
+	mu.Unlock()
+	fx.drained("B")
+	fx.drained("C")
+	if fx.holds("B", "laptop", "data/1") {
+		log, _, _, _ := b.snapshot()
+		t.Fatalf("B keeps the deleted data/1 live; it was sent %v", log)
+	}
+}
+
+// REPL-2 (#21): a delete never overtakes a write of the key before it,
+// nor does a write after it overtake the delete. At B the put is in
+// flight when the key is deleted and written again: B gets the put, the
+// delete, then the new put. At C the put had not started: it is
+// cancelled, no delete is sent, and C gets only the new put.
+func TestDeleteFollowsAPutInFlightAndPrecedesARewrite(t *testing.T) {
+	fx := newFixture(t, "B", "C")
+	b, c := fx.places["B"], fx.places["C"]
+	b.hold, b.holdKey = make(chan struct{}), "data/1" // B is sending data/1
+	c.hold, c.holdKey = make(chan struct{}), "data/0" // C has not reached it
+	fx.write("laptop", "data/0", "zero")
+	fx.write("laptop", "data/1", "first")
+	fx.run()
+	waitFor(t, "data/1 in flight at B and data/0 at C", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		return b.inFlight == 1 && len(b.log) == 1 && c.inFlight == 1
+	})
+	fx.remove("laptop", "data/1")
+	fx.write("laptop", "data/1", "again")
+	close(b.hold)
+	close(c.hold)
+	fx.drained("B")
+	fx.drained("C")
+	for name, want := range map[string][]string{
+		"B": {"put laptop/data/0", "put laptop/data/1", "delete laptop/data/1", "put laptop/data/1"},
+		"C": {"put laptop/data/0", "put laptop/data/1"},
+	} {
+		log, _, _, _ := fx.places[name].snapshot()
+		if strings.Join(log, ", ") != strings.Join(want, ", ") {
+			t.Errorf("%s was sent %v, want %v", name, log, want)
+		}
+		if got := string(fx.places[name].objs["laptop/data/1"]); got != "again" {
+			t.Errorf("%s holds data/1 %q, want the new write", name, got)
+		}
 	}
 }
 

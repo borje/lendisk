@@ -43,6 +43,9 @@ func TestDoneCapturesArePlacedAtEveryFriendInWriteOrder(t *testing.T) {
 	s1 := capture(t, db, "laptop", "data/1", OpPut)
 	pending, _ := db.BeginCaptures(ctx, []Capture{{Bucket: "laptop", Key: "data/p", Op: OpPut, Class: "data"}})
 	s2 := capture(t, db, "laptop", "index/1", OpPut)
+	for _, f := range []string{"B", "C"} {
+		db.StartPlacement(ctx, f, s1, time.Now()) // taken, so the delete follows it (#21)
+	}
 	s3 := capture(t, db, "laptop", "data/1", OpDelete)
 	for _, place := range []string{"B", "C"} {
 		var got []int64
@@ -114,6 +117,9 @@ func TestSupersededPutIsCancelled(t *testing.T) {
 		t.Fatal(later, err)
 	}
 	db.DropCaptures(ctx, pending...)
+	if ok, err := db.StartPlacement(ctx, "B", s1, time.Now()); err != nil || !ok {
+		t.Fatal(ok, err) // taken, so the delete follows it (#21)
+	}
 	s2 := capture(t, db, "laptop", "data/1", OpDelete)
 	if sup, err := db.Superseded(ctx, s1); err != nil || !sup {
 		t.Fatal(sup, err)
@@ -202,8 +208,11 @@ func TestPlaceStatsAndCondition(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t)
 	friend(t, db, "B")
-	capture(t, db, "laptop", "data/1", OpPut)
+	s1 := capture(t, db, "laptop", "data/1", OpPut)
 	capture(t, db, "laptop", "data/22", OpPut)
+	if _, err := db.StartPlacement(ctx, "B", s1, time.Now()); err != nil {
+		t.Fatal(err) // taken, so the delete follows it (#21)
+	}
 	capture(t, db, "laptop", "data/1", OpDelete)
 	later := time.Now().Add(90 * time.Second)
 	st, err := db.PlaceStats(ctx, later)

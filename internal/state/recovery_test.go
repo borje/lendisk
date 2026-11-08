@@ -313,3 +313,49 @@ func mustRelists(t *testing.T, db *DB) []Relist {
 	}
 	return rs
 }
+
+// ID-5, REPL-2, RET-1 (#21): a key every place keeps only as a tomb
+// (deleted there, kept for the retention window) is not recovered: no
+// verdict, no source for the read-through, not in the bucket's
+// listing, nothing acknowledged at any place, and no metadata conflict
+// from a place that lacks it live. A key one place still holds live is
+// recovered from that place alone.
+func TestKeyTombstonedAtEveryPlaceIsNotRecovered(t *testing.T) {
+	ctx := context.Background()
+	db := recoveringWith(t, "B", "C")
+	gone := []Listed{
+		{Key: "data/ab/gone", Size: 3, SHA256: "h3", Class: "data", Tombstoned: true},
+		{Key: "index/old", Size: 2, SHA256: "h4", Class: "metadata", Tombstoned: true},
+		{Key: "snapshots/old", Size: 1, SHA256: "h5", Class: "snapshot", Tombstoned: true},
+	}
+	live := Listed{Key: "index/new", Size: 5, SHA256: "h6", Class: "metadata"}
+	// data/cd/half: deleted at B, whose delete has not reached C yet.
+	half := Listed{Key: "data/cd/half", Size: 4, SHA256: "h7", Class: "data"}
+	halfGone := half
+	halfGone.Tombstoned = true
+	list(t, db, "B", "laptop", append([]Listed{live, halfGone}, gone...)...)
+	list(t, db, "C", "laptop", append([]Listed{live, half}, gone...)...)
+	ks, err := db.RecoveredKeys(ctx, "laptop")
+	if err != nil || len(ks) != 2 || ks[0].Key != "data/cd/half" || ks[0].Verdict != VerdictSingle ||
+		ks[1].Key != "index/new" || ks[1].Verdict != VerdictHeld {
+		t.Fatalf("recovered keys %+v %v", ks, err)
+	}
+	if src, ok, err := db.Source(ctx, "laptop", "data/cd/half"); err != nil || !ok || len(src.Places) != 1 || src.Places[0].Place != "C" {
+		t.Fatalf("source of data/cd/half: %+v %v %v", src, ok, err)
+	}
+	for _, g := range gone {
+		if _, ok, err := db.Source(ctx, "laptop", g.Key); err != nil || ok {
+			t.Fatalf("source of tombstoned %s: %v %v", g.Key, ok, err)
+		}
+	}
+	lk, err := db.LiveKeys(ctx, "laptop", "", "", 100)
+	if err != nil || len(lk) != 2 || lk[0].Key != "data/cd/half" || lk[1].Key != "index/new" {
+		t.Fatalf("live keys %+v %v", lk, err)
+	}
+	if a := ackedAt(t, db, "B", "laptop"); len(a) != 1 || a["index/new"] != "h6" {
+		t.Fatalf("B holds %v", a)
+	}
+	if a := ackedAt(t, db, "C", "laptop"); len(a) != 2 || a["index/new"] != "h6" || a["data/cd/half"] != "h7" {
+		t.Fatalf("C holds %v", a)
+	}
+}

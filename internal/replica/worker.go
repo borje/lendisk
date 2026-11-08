@@ -342,9 +342,10 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			sleep(ctx, poll)
 			continue
 		}
-		if p.Class == "metadata" || p.Class == "snapshot" {
-			// The barrier (REPL-1): not before every earlier data object
-			// of the bucket is acknowledged wherever it is placed.
+		if p.Class == "metadata" || p.Class == "snapshot" || p.Op == state.OpDelete {
+			// The barrier (REPL-1): metadata not before every earlier data object
+			// of the bucket is acknowledged wherever it is placed; a data
+			// delete not before the metadata before it (#21).
 			held, err := w.DB.Held(ctx, p.Seq)
 			if err != nil || held {
 				if err != nil && ctx.Err() == nil {
@@ -353,6 +354,31 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				sleep(ctx, poll)
 				continue
 			}
+		}
+		// A put a later write or delete replaced is cancelled before it
+		// is taken, so only a row once sent stays the place's row of the
+		// key for a later delete (#21).
+		if p.Op == state.OpPut {
+			if sup, err := w.DB.Superseded(ctx, p.Seq); err != nil || sup {
+				if err == nil {
+					err = w.DB.CancelPlacement(context.Background(), place, p.Seq)
+				}
+				if err != nil && ctx.Err() == nil {
+					log.Error("replication: cancelling a superseded row failed", "seq", p.Seq, "err", err)
+					sleep(ctx, poll)
+				}
+				continue
+			}
+		}
+		// Taken: from here the send may land, so a delete of the key
+		// follows the row instead of cancelling it. A row a delete has
+		// cancelled meanwhile is not sent (REPL-2, #21).
+		if ok, err := w.DB.StartPlacement(ctx, place, p.Seq, w.now()); err != nil || !ok {
+			if err != nil && ctx.Err() == nil {
+				log.Error("replication: recording a send's start failed", "err", err)
+				sleep(ctx, poll)
+			}
+			continue
 		}
 		err = w.send(ctx, place, r, p)
 		if ctx.Err() != nil {
