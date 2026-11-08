@@ -574,6 +574,18 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 		}
 		unlock = u
 		pub.take()
+		// The choice made on arrival (no tomb, or a write anew over the
+		// newest) must still hold: while the body streamed, another
+		// put or rewrite may have published the key and a delete tombed
+		// that version, and then this put is stale
+		// (TestStaleRewriteOfADeletedKeyRefused).
+		now, err := l.tombsOf(ctx, peer, sealed, key)
+		if err != nil {
+			return err
+		}
+		if newestTomb(now) != newestTomb(ts) {
+			return errKeyChanged
+		}
 		return nil
 	}
 	b.onEOF = func() error {

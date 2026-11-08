@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"io"
+	"sync"
 	"testing"
 	"time"
 )
@@ -73,5 +74,70 @@ func TestPlainPutCannotPublishInARewritesGap(t *testing.T) {
 	}
 	if got, _ := l.stored("k"); !bytes.Equal(got, v2) {
 		t.Fatalf("the key holds %q", got)
+	}
+}
+
+// LEND-4, RET-2 (#74; found by TestRewriteRacingDeleteLosesNothing on a
+// loaded runner): a marked put of an absent key decides on arrival that
+// it writes the key anew over its newest tomb, but publishes only once
+// its body has ended. If, meanwhile, another rewrite published the key
+// and a delete tombed that version, the mark names a tomb that is no
+// longer the newest: the put is stale and refused (412), as it would be
+// had it arrived then, and the key stays deleted.
+func TestStaleRewriteOfADeletedKeyRefused(t *testing.T) {
+	v1, v2, v3 := []byte("version one"), []byte("version two"), []byte("stale three")
+	pr, pw := io.Pipe()
+	answer := make(chan error, 1)
+	var l *lent
+	var once sync.Once
+	l = lendTo(t, 1<<30, func(h *harness) {
+		h.lending = func(ld *Lending) {
+			ld.afterRewriteMove = func() error {
+				once.Do(func() {
+					// v1 is in its tomb and v2 not yet published: B finds
+					// the key absent and v1 its newest tomb.
+					go func() { answer <- l.putDirect("k", pr, int64(len(v3)), rewriteMeta(v3, sum(v1))) }()
+					// B has passed its checks once it reads.
+					if _, err := pw.Write(v3[:1]); err != nil {
+						t.Error(err)
+					}
+				})
+				return nil
+			}
+		}
+	})
+	if err := l.put("k", v1, hashMeta(v1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.put("k", v2, rewriteMeta(v2, sum(v1))); err != nil {
+		t.Fatalf("rewrite: %v", err)
+	}
+	if err := l.del("k"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pw.Write(v3[1:]); err != nil {
+		t.Fatal(err)
+	}
+	pw.Close()
+	var errB error
+	select {
+	case errB = <-answer:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the stale rewrite never answered")
+	}
+	if !isCode(errB, "PreconditionFailed") {
+		t.Fatalf("the stale rewrite answered %v, want 412", errB)
+	}
+	if got, ok := l.stored("k"); ok {
+		t.Fatalf("the key holds %q, want it deleted", got)
+	}
+	held := map[string]bool{}
+	for _, ts := range l.tombs("k") {
+		if b, err := l.tombBytes(ts); err == nil {
+			held[string(b)] = true
+		}
+	}
+	if !held[string(v1)] || !held[string(v2)] {
+		t.Fatalf("tombs hold %v, want both versions", held)
 	}
 }

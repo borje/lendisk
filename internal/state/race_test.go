@@ -4,9 +4,14 @@ package state
 
 import "time"
 
-// passLimit bounds one re-routing pass in tests: the race detector
-// slows SQLite several times over.
-const passLimit = 5 * time.Second
+// passLimit and passGrowth bound one re-routing pass in tests: no limit
+// in time, as the race detector slows SQLite several times over and a
+// loaded CI runner several times again (5.5 s there for 3000 rows);
+// the pass must instead grow no worse than linearly with the rows.
+const (
+	passLimit  = 0
+	passGrowth = 8 // linear work grows 4 times for 4 times the rows
+)
 
 // settleKeys and settleWait size the large-bucket settling test: the
 // race detector makes SQLite about twenty times slower, so it settles a

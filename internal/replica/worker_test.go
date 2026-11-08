@@ -523,6 +523,12 @@ func TestChangedObjectDoesNotStallTheFIFO(t *testing.T) {
 		log, _, _, _ := fx.places["B"].snapshot()
 		return len(log) == 1
 	})
+	// The place logs data/fine before the worker records its
+	// acknowledgement: wait for the row to leave the queue.
+	waitFor(t, "data/fine acknowledged", func() bool {
+		st, _ := fx.db.PlaceStats(ctx, time.Now())
+		return st["B"].Queued == 1
+	})
 	if st, _ := fx.db.PlaceStats(ctx, time.Now()); fx.refused("laptop") != 2 || st["B"].Refused != 0 || st["B"].Queued != 1 {
 		t.Fatalf("stats %+v, bucket refused %d: want two refused against the bucket and the rewritten row waiting",
 			st["B"], fx.refused("laptop"))

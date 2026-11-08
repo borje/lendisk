@@ -3320,7 +3320,12 @@ the handler's own reads and is never cancelled; nothing below
   made anew), and without it the lender would refuse every version
   until the purge. A mark naming an older tomb is stale and refused,
   as is any unmarked write of other bytes
-  (`TestRewriteOfADeletedKeyKeepsItsTomb`). A borrower's put of a key
+  (`TestRewriteOfADeletedKeyKeepsItsTomb`). A put decides between these
+  paths on arrival, so once its body is verified and it holds the key's
+  lock it reads the key's tombs again: if the newest is no longer the
+  one it saw (another write published the key and a delete tombed that
+  version while the body streamed), it is refused `412`
+  (`TestStaleRewriteOfADeletedKeyRefused`). A borrower's put of a key
   whose multipart upload is completing waits for the completion's lock
   and is then refused, or answered with the stored ETag for the same
   bytes (`TestPutRacingACompletionWaitsForIt`); a put takes the key's
