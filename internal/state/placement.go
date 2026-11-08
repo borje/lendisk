@@ -50,8 +50,9 @@ const (
 
 // Causes of a refusal against the bucket (placement.cause): the node's
 // own store could not supply the object as captured. CauseOversize is
-// only that it is larger than one PUT carries, which multipart
-// replication (#23) lifts: RequeueOversize puts those rows back.
+// only that it is larger than the worker could send (one PUT before
+// multipart replication, #23; 5 TiB since): RequeueOversize puts those
+// rows back once it can.
 const (
 	CauseStore    = "store"
 	CauseOversize = "oversize"
@@ -258,20 +259,19 @@ func (db *DB) RefuseObject(ctx context.Context, seq int64, cause, detail string)
 }
 
 // RequeueOversize puts the rows refused only for being larger than one
-// PUT carries, and not replaced by a later write of the key, back into
-// their places' FIFOs, and returns how many. Multipart replication (#23)
-// calls it once it can send them, with putLimit the most one PUT
-// carried (replica.MaxPutSize). Those rows have CauseOversize, or, if
-// refused before the cause was told apart (#61), CauseStore and a size
-// above putLimit.
-func (db *DB) RequeueOversize(ctx context.Context, putLimit int64) (int64, error) {
+// PUT carries (CauseOversize), no larger than sendLimit and not replaced
+// by a later write of the key, back into their places' FIFOs, and
+// returns how many. Multipart replication (#23) calls it once at start,
+// with sendLimit the largest object it sends. Rows refused before #61
+// told the causes apart were given CauseOversize by migration 31, so the
+// cause alone decides: a store refusal of a large object stays refused.
+func (db *DB) RequeueOversize(ctx context.Context, sendLimit int64) (int64, error) {
 	r, err := db.ExecContext(ctx, `UPDATE placement SET state = 'queued', detail = NULL, cause = NULL
-		WHERE state = 'refused'
-		AND (cause = 'oversize' OR cause = 'store' AND op = 'put'
-			AND (SELECT q.size FROM queue q WHERE q.seq = placement.seq) > ?)
+		WHERE state = 'refused' AND cause = 'oversize'
+		AND (SELECT q.size FROM queue q WHERE q.seq = placement.seq) <= ?
 		AND NOT EXISTS (SELECT 1 FROM queue l
 			WHERE l.bucket = placement.bucket AND l.key = placement.key AND l.seq > placement.seq AND l.state = 'done')`,
-		putLimit)
+		sendLimit)
 	if err != nil {
 		return 0, err
 	}

@@ -619,4 +619,46 @@ var migrations = []Migration{
 		-- condition. Unix seconds; NULL before any refusal.
 		ALTER TABLE place ADD COLUMN refused_at INTEGER;`,
 	},
+	{
+		Version: 31, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Multipart replication (REPL-6, #23). Rows refused before #61 told
+		-- the causes apart have cause 'store' though the only reason was
+		-- their size: every object above one PUT (5 GiB) was refused for it
+		-- before its file was looked at. They become 'oversize', so
+		-- RequeueOversize matches the cause alone and never re-queues a
+		-- genuine store refusal of a large object.
+		UPDATE placement SET cause = 'oversize'
+			WHERE state = 'refused' AND cause = 'store' AND op = 'put'
+			AND (SELECT q.size FROM queue q WHERE q.seq = placement.seq) > 5368709120;
+		-- A placement row's open multipart upload at its place: the upload
+		-- ID, the part size it was begun with, and the version it was
+		-- marked as replacing (x-amz-meta-lendisk-replaces, #74; NULL for
+		-- none). Kept until the row is acknowledged or leaves the FIFO, so a
+		-- restart continues at the next part (REPL-6).
+		CREATE TABLE transfer (
+			place      TEXT NOT NULL,
+			seq        INTEGER NOT NULL,
+			upload_id  TEXT NOT NULL,
+			part_size  INTEGER NOT NULL,
+			replaces   TEXT,
+			started_at INTEGER NOT NULL, -- unix seconds
+			PRIMARY KEY (place, seq)
+		);
+		-- Each part the place acknowledged: its number, ETag, SHA-256 (hex,
+		-- the part's request checksum) and size.
+		CREATE TABLE transfer_part (
+			place  TEXT NOT NULL,
+			seq    INTEGER NOT NULL,
+			number INTEGER NOT NULL,
+			etag   TEXT NOT NULL,
+			sha256 TEXT NOT NULL,
+			size   INTEGER NOT NULL,
+			PRIMARY KEY (place, seq, number)
+		);
+		-- A borrower's multipart upload marked as replacing a version
+		-- (LEND-4, #74, #23): the hash it named at create, checked again at
+		-- completion. NULL for an upload of a new object.
+		ALTER TABLE lent_upload ADD COLUMN replaces TEXT;`,
+	},
 }

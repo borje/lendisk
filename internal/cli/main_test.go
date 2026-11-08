@@ -73,6 +73,12 @@ const (
 	// envFarewellInterval is the farewell's time between passes (a Go
 	// duration).
 	envFarewellInterval = "LENDISK_TEST_FAREWELL_INTERVAL"
+	// envCrashAtByte makes the daemon SIGKILL itself once a body it sends
+	// a friend has reached this byte of its object (#23).
+	envCrashAtByte = "LENDISK_TEST_CRASH_AT_BYTE"
+	// envReloadEvery is how often the daemon looks at its config file (a
+	// Go duration, #23).
+	envReloadEvery = "LENDISK_TEST_RELOAD_EVERY"
 )
 
 // offsetClock is real time plus the duration in the file at path, read
@@ -126,6 +132,9 @@ func TestMain(m *testing.M) {
 					s.QuotaHold = h
 				}
 			}
+		}
+		if d, err := time.ParseDuration(os.Getenv(envReloadEvery)); err == nil {
+			a.reloadEvery = d
 		}
 		if d, err := time.ParseDuration(os.Getenv(envFarewellInterval)); err == nil {
 			a.tuneEnding = func(f *farewell) { f.Interval = d }
@@ -191,6 +200,15 @@ func tuneFromEnv(w *replica.Worker) {
 	}
 	if d, err := time.ParseDuration(os.Getenv(envPauseRetry)); err == nil {
 		w.PauseRetry = d
+	}
+	if at, err := strconv.ParseInt(os.Getenv(envCrashAtByte), 10, 64); err == nil {
+		w.OnRead = func(_ string, _, read int64) {
+			if read >= at {
+				syscall.Kill(os.Getpid(), syscall.SIGKILL)
+				select {} // never record the part
+			}
+		}
+		return
 	}
 	delay, _ := time.ParseDuration(os.Getenv(envSendDelay))
 	p, _ := strconv.ParseFloat(os.Getenv(envCrashMidSend), 64)

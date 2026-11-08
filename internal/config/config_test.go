@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/spf13/pflag"
+
+	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/pace"
 )
 
 func env(m map[string]string) func(string) (string, bool) {
@@ -398,6 +401,71 @@ func TestLendingMaxTotal(t *testing.T) {
 	for _, bad := range []string{"lots", "-1G", "0"} {
 		if _, err := load(t, []string{"--config", none, "--lending-max-total", bad}, nil); err == nil {
 			t.Errorf("accepted max_total %q", bad)
+		}
+	}
+}
+
+// REPL-6, REPL-7, LEND-5 (#23): the part size, the schedule, the global
+// and per-friend limits of this node's replication, and per-borrower
+// limits on what it lends, as pace.Settings. A rate is bytes a second.
+func TestPacingSettings(t *testing.T) {
+	b, c := identity.NodeID{1}.String(), identity.NodeID{2}.String()
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.PartSize() != 16<<20 {
+		t.Fatalf("default part size %d", l.PartSize())
+	}
+	if s := l.Pace(); s.Up != 0 || s.Down != 0 || len(s.Peers) != 0 || len(s.Lend) != 0 || len(s.Schedule) != 0 {
+		t.Fatalf("default pacing %+v", s)
+	}
+	p := writeFile(t, `
+[replication]
+part_size = "32M"
+schedule = "01:00-07:00, 12:00-13:00"
+upload_limit = "20M"
+download_limit = "512K"
+
+[[replication.peer_limit]]
+peer = "`+b+`"
+upload = "8M"
+
+[lending]
+[[lending.borrower_limit]]
+peer = "`+c+`"
+receive = "1M"
+send = "2M"
+`)
+	l, err = load(t, []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := l.Pace()
+	if l.PartSize() != 32<<20 || s.Up != 20<<20 || s.Down != 512<<10 || s.Schedule.String() != "01:00-07:00,12:00-13:00" ||
+		s.Peers[b] != (pace.Rates{Up: 8 << 20}) || s.Lend[c] != (pace.Rates{Up: 2 << 20, Down: 1 << 20}) || len(l.Unknown) != 0 {
+		t.Fatalf("from the file: part %d, %+v, unknown %v", l.PartSize(), s, l.Unknown)
+	}
+	l, err = load(t, []string{"--config", p, "--replication-peer-limit", "peer=" + c + ",download=64K"},
+		map[string]string{"LENDISK_REPLICATION_SCHEDULE": ""})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s := l.Pace(); len(s.Schedule) != 0 || len(s.Peers) != 1 || s.Peers[c] != (pace.Rates{Down: 64 << 10}) {
+		t.Fatalf("from flags and the environment: %+v", s)
+	}
+	for _, bad := range [][]string{
+		{"--replication-part-size", "4M"}, {"--replication-part-size", "6G"}, {"--replication-part-size", "big"},
+		{"--replication-schedule", "01:00"}, {"--replication-schedule", "07:00-07:00"},
+		{"--replication-upload-limit", "8K"}, {"--replication-download-limit", "fast"},
+		{"--replication-peer-limit", "peer=bjorn,upload=8M"}, {"--replication-peer-limit", "upload=8M"},
+		{"--replication-peer-limit", "peer=" + b + ",upload=1K"},
+		{"--replication-peer-limit", "peer=" + b + ",upload=1M;peer=" + b + ",download=1M"},
+		{"--lending-borrower-limit", "peer=" + c + ",receive=10K"},
+	} {
+		if _, err := load(t, append([]string{"--config", none}, bad...), nil); err == nil {
+			t.Errorf("accepted %v", bad)
 		}
 	}
 }

@@ -17,6 +17,7 @@ require (
 	github.com/versity/versitygw v1.10.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sys v0.49.0
+	golang.org/x/time v0.16.0
 	modernc.org/sqlite v1.61.1
 	tailscale.com v1.105.0-pre.0.20261013225543-fb79793d99f5
 )
@@ -126,7 +127,6 @@ require (
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-	golang.org/x/time v0.16.0 // indirect
 	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	golang.zx2c4.com/wireguard/windows v1.0.1 // indirect
 	gopkg.in/ini.v1 v1.67.3 // indirect

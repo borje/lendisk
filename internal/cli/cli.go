@@ -107,6 +107,9 @@ type app struct {
 	// tuneVerify, if set, adjusts the daemon's verifier (VER-1, #27)
 	// before it starts (its poll); tests only.
 	tuneVerify func(*verify.Verifier)
+	// reloadEvery is how often serve looks at its config file for changed
+	// pacing settings; zero means defaultReloadEvery. Tests set it.
+	reloadEvery time.Duration
 	// lendStatfs reads the store's size for the default lending cap
 	// (maxTotal); nil means the store checker's Statfs. Tests set it.
 	lendStatfs func(dir string) (store.Space, error)

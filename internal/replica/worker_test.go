@@ -44,6 +44,11 @@ type place struct {
 	check func()
 	// delay is how long each put takes.
 	delay time.Duration
+	// uploads are the open multipart uploads, by ID (multipart_test.go).
+	uploads map[string]*upload
+	nextID  int
+	// onPart, if set, is called after each part is stored.
+	onPart func(key string, n int)
 }
 
 func newPlace(name string) *place { return &place{name: name, objs: map[string][]byte{}} }
@@ -555,7 +560,7 @@ func TestChangedObjectDoesNotStallTheFIFO(t *testing.T) {
 // captured is refused against its bucket, once for every place, with an
 // alert, and each place's FIFO moves on: a directory where an object
 // should be, a truncated object, a missing file, an object larger than
-// one PUT carries (until #23), a key that names no file in the store. A
+// can be sent (5 TiB, #23), a key that names no file in the store. A
 // directory marker (photos/ in a generic bucket, which the posix store
 // keeps as a directory) is an empty object and is sent as one.
 func TestPermanentLocalErrorsDoNotStallTheFIFO(t *testing.T) {
@@ -570,13 +575,12 @@ func TestPermanentLocalErrorsDoNotStallTheFIFO(t *testing.T) {
 	os.Truncate(filepath.Join(bucket, "data", "truncated"), 3)
 	fx.write("laptop", "data/missing", "m")
 	os.Remove(filepath.Join(bucket, "data", "missing"))
-	f, err := os.Create(filepath.Join(bucket, "data", "huge"))
-	if err != nil {
-		t.Fatal(err)
+	// Larger than any object can be sent: refused before its file is
+	// opened, so none is made.
+	if _, err := fx.db.ExecContext(t.Context(), `UPDATE friendship SET own_number = ?, peer_number = ?`, int64(1<<50), int64(1<<50)); err != nil {
+		t.Fatal(err) // room to place it
 	}
-	f.Truncate(MaxPutSize + 1) // sparse
-	f.Close()
-	fx.capture("laptop", "data/huge", MaxPutSize+1, "huge")
+	fx.capture("laptop", "data/huge", MaxObjectSize+1, "huge")
 	fx.capture("laptop", "a/../../escape", 1, "e")
 	fx.write("laptop", "data/fine", "fine")
 	fx.run()
@@ -595,9 +599,12 @@ func TestPermanentLocalErrorsDoNotStallTheFIFO(t *testing.T) {
 	if st["B"].Refused != 0 || st["C"].Refused != 0 || fx.refused("laptop") != 5 {
 		t.Fatalf("places %+v, bucket refused %d; want 5 against the bucket", st, fx.refused("laptop"))
 	}
-	// Only the huge object is refused as oversize, so multipart
-	// replication (#23) re-queues it and nothing else (#61).
-	if n, err := fx.db.RequeueOversize(t.Context(), MaxPutSize); err != nil || n != 2 {
+	// Only the huge object is refused as oversize (#61), and only a
+	// larger limit would re-queue it (#23).
+	if n, err := fx.db.RequeueOversize(t.Context(), MaxObjectSize); err != nil || n != 0 {
+		t.Fatalf("re-queued %d rows (%v), want none", n, err)
+	}
+	if n, err := fx.db.RequeueOversize(t.Context(), MaxObjectSize+1); err != nil || n != 2 {
 		t.Fatalf("re-queued %d rows (%v), want data/huge at B and C", n, err)
 	}
 }

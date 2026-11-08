@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/pace"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -20,6 +21,10 @@ type Fetcher struct {
 	Self   *identity.Identity
 	Dial   DialFunc
 	Client Options // a zero DialTimeout is DefaultFetchDial
+	// Pace paces each fetched body by the friend's and the global
+	// download limits (REPL-7); nil paces nothing. The schedule does not
+	// apply: a read waits for its bytes.
+	Pace *pace.Pacer
 
 	mu      sync.Mutex
 	clients map[string]fetchClient
@@ -49,7 +54,17 @@ func (x *Fetcher) Fetch(ctx context.Context, place, bucket, key string) (io.Read
 	if err != nil {
 		return nil, err
 	}
-	return c.Get(ctx, bucket, key)
+	body, err := c.Get(ctx, bucket, key)
+	if err != nil || x.Pace == nil {
+		return body, err
+	}
+	return pacedBody{Reader: x.Pace.Fetch(ctx, place, body), Closer: body}, nil
+}
+
+// pacedBody is a fetched body read through the pacer.
+type pacedBody struct {
+	io.Reader
+	io.Closer
 }
 
 func (x *Fetcher) client(place, addr string) (*Friend, error) {

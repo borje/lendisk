@@ -20,6 +20,7 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/pace"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
@@ -123,10 +124,14 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 10) // gateway, LAN, loopback, replication, verification, farewell, alerts, quota, manifest, recovery
+			errc := make(chan error, 11) // gateway, LAN, loopback, replication, verification, farewell, alerts, quota, manifest, recovery, reload
+			// Pacing (REPL-6, REPL-7, LEND-5): one pacer for every transfer
+			// over the tunnel, changed without a restart by the reloader.
+			pacer := pace.New(a.clock)
+			pacer.Set(paceSettings(&cfg.Config))
 			// The read-through (EP-10, ID-6) fetches what the store lacks
 			// from the friends holding it, over the tunnel.
-			fetch := &replica.Fetcher{DB: db, Self: id, Dial: tun.Dial}
+			fetch := &replica.Fetcher{DB: db, Self: id, Dial: tun.Dial, Pace: pacer}
 			if a.tuneFetch != nil {
 				a.tuneFetch(fetch)
 			}
@@ -161,6 +166,7 @@ func (a *app) serveCmd() *cobra.Command {
 			running := 1
 			var w *replica.Worker
 			br := bridge.New(gw.Socket, log)
+			br.Pace = pacer // LEND-5
 			if a.tuneBridge != nil {
 				a.tuneBridge(br)
 			}
@@ -203,7 +209,7 @@ func (a *app) serveCmd() *cobra.Command {
 				// Replication to friends (#18) never blocks the endpoint
 				// (REPL-9): it reads the store and lendisk.db only.
 				w = &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
-					Alerted: alerts.Check, Now: a.clock, Full: xch.Due, Fill: gw.Fill}
+					Alerted: alerts.Check, Now: a.clock, Full: xch.Due, Fill: gw.Fill, Pace: pacer}
 				if a.tuneReplication != nil {
 					a.tuneReplication(w)
 				}
@@ -284,6 +290,17 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 			running++
 			go func() { lister.Run(ctx); errc <- nil }()
+			// Pacing changes apply without a restart: the file is looked
+			// at every 10 s, and at once on SIGHUP (§3.4 REPL-7).
+			rl := &reloader{Load: a.flags.Load, Path: cfg.Path, Pace: pacer, Log: log, Every: a.reloadEvery, started: cfg.Config}
+			if a.ctx == nil {
+				hup := make(chan os.Signal, 1)
+				signal.Notify(hup, syscall.SIGHUP)
+				defer signal.Stop(hup)
+				rl.Hup = hup
+			}
+			running++
+			go func() { rl.Run(ctx); errc <- nil }()
 
 			var first error
 			for i := 0; i < running; i++ {
