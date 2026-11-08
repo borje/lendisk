@@ -1425,6 +1425,97 @@ upstream bucket is Q-V.
   and the OPS-2 alert name the friends with the smallest free fraction
   and, per friendship, the number that would cover the deficit at
   `copies`; the two people set it.
+  *Realised (#24).* `lendisk peer quota <node ID> <size>` commits
+  `state.DB.SetOwnNumber` (a malformed ID or size is a usage error, a
+  stranger "not a friend"); it refuses with `state.MaxTotalError` a
+  number that takes the sum past `lending.max_total`, the sum being
+  every friendship's own number, every unused, unexpired invite's
+  number and every redeem in progress (`state.DB.LentNumbers`), since
+  each becomes a friendship's number; `invite --quota` and `peer add`'s
+  number are checked the same way, in the transaction that stores the
+  invite or the redeem record (`state.DB.AddInviteWithin`,
+  `StartRedeemWithin`; write transactions are `IMMEDIATE`, so two
+  commands cannot both pass the check), a redeem leaving out other
+  redeems with the same inviter, which it settles; the comparison is
+  `n > max − others`, which cannot overflow. *Decision (#24 review):*
+  unset, `lending.max_total` is what the store's filesystem can hold:
+  its size, read with the store checker's `Statfs`, less the LEND-2
+  free-space floor (`app.maxTotal`). LEND-1 requires a cap, and the
+  disk is the one a node has before `init` asks for the repository
+  size (LEND-7, whose suggestion is the value to set); a set value
+  overrides it, for a filesystem that is shared or will grow. `peer
+  list` and `status` (`lending` in `status --json`: `max_total`,
+  `from`, `numbers`) show the effective cap and what the numbers and
+  open invites take of it. `peer quota` prints the new quota each way, says
+  when it stays until the friend raises theirs, and, when the quota is
+  now below what either side stores, that new objects stop and nothing
+  is deleted. Migration 25 adds to the friendship row what the quota
+  call learns: `told_number` (this node's number as the friend last
+  acknowledged it), `seen_at` (last call or answer either way),
+  `peer_repo_size`, `peer_use`, `lent_there`, `peer_protocol`, `path`
+  and `exchange_error`.
+  The quota call is `POST /_lendisk/quota` (§3.7), made by the daemon's
+  `quota.Exchanger` (`internal/quota`): a friend is called when its
+  `told_number` differs from the own number (a change, made by `peer
+  quota` in another process, is seen within the exchanger's 10 s poll,
+  or at once after a friend's call or a redeem in this process), on
+  `Exchanger.Due` (the replication worker's `Full`, on a `507`, #68),
+  and otherwise an hour after its last answer, less a random jitter of
+  up to a tenth of that (`Exchanger.Jitter`), so friends' calls spread
+  out. A failed call is repeated after 10 s, doubling to 5 minutes,
+  until answered.
+  *Decision (#24): the call is also the periodic exchange.* An hourly
+  call per friend is one small request and keeps the friend's number,
+  use, repository size, protocol and reachability fresh for `peer list`
+  and LEND-7, and feeds #68's reconcile. *Precedent:* HTTP/2's SETTINGS
+  (RFC 9113 §6.5) has each endpoint announce its own limit, applied by
+  the peer on receipt and acknowledged, and a lowered
+  `SETTINGS_MAX_CONCURRENT_STREAMS` refuses new streams without resetting
+  open ones, as a lowered quota refuses new objects and deletes
+  nothing; Tahoe-LAFS storage servers announce their available space in
+  the version answer a client fetches when it connects, rather than
+  negotiating it. lendisk keeps HTTP/2's shape (each side's own number,
+  the smaller in force, the change applied on receipt) and Tahoe's
+  (figures carried in a call each side makes anyway). The callee
+  applies the caller's number at once (`state.DB.QuotaReported`) and
+  answers with its own number, the quota, its use of the caller's
+  space, its lender's count of what the caller stores there
+  (`lent_usage`, §3.5) and its repository size; the caller applies the
+  answer (`state.DB.QuotaAnswered`), which marks the number it sent
+  told only if it is still the own number. An answer does not
+  overwrite the friend's number when the friend's own call applied one
+  at or after this call was sent (`friendship.reported_at`, migration
+  26, in nanoseconds): that number is newer, and an hourly call's
+  answer could otherwise restore the old one for an hour
+  (`TestAnAnswerOlderThanTheFriendsReportKeepsItsNumber`). Each pass compares every
+  friendship's quota with the last it saw and hands a change to
+  `Exchanger.Changed`, also when it first sees a friendship (before
+  −1, since a friendship made and lowered within one poll must still
+  reach writes in flight). The daemon then, on a lowering (or first
+  sight), calls `gateway.Gateway.Requota` (§3.5 *Lowering*, SEC-15);
+  on a raising, `state.DB.ResumePlace` (a place paused for quota is
+  `ok` again, so placement counts its room at once) and
+  `replica.Worker.Resume`, which wakes the place's sender from its
+  hour-long `PauseRetry` so the copies queued there are sent with no
+  further action (LEND-8 AC); and the alert service checks.
+  *What a raising resumes.* Rows still `queued` at the friend resume.
+  A copy that was `dropped` there (§3.4, a full friend for
+  `reroute_after` with the row holding a barrier) and an object placed
+  nowhere for want of room at capture (the deficit, D6) do not:
+  placing them again is re-placement (#26, REPL-13 "friends gain
+  room"). `TestBothNumbersRaisedResumeCopiesWithNoFurtherAction` covers
+  the queued case with two daemons.
+- **PEER-4 (#24)** `peer list` (`--json` too, `PeerJSON`, fields only
+  added) shows per friend: the quota; each side's number, the text
+  column saying `same` or both, and "(yours not told yet)" while
+  `told_number` differs; this node's use there (`place_use`, reconciled
+  from the friend's count, §3.4) and the friend's use here
+  (`lent_usage`); the remaining quota there (LEND-3); reachability
+  (`direct` or `relayed` from `Transport.PathInfo` after an answered
+  call, `offline` when the last call failed, `unknown` before the
+  first); last seen; last verified (`never` until VER-1, #27); the
+  friend's protocol version; its repository size as reported (rounded
+  up to a GiB); both retentions; and since when.
 - **PEER-8** Two walls. The decorator maps every bucket name through
   the borrower's own mapping table, so a borrower can only name its own
   buckets; and versitygw's bucket-ownership check refuses an account
@@ -2130,7 +2221,7 @@ upstream bucket is Q-V.
   and it would never free room. Residual risk: metadata that grows
   faster than the reserve between backups (a large first index, many
   snapshots at once) can still fill a friend; the reconcile from the
-  lender's own count (follow-up, #68) corrects the borrower's count, not
+  lender's own count (the quota answer, #24) corrects the borrower's count, not
   the room.
 
   With fewer candidates than `copies`, what fits is placed: the deficit
@@ -2171,25 +2262,38 @@ upstream bucket is Q-V.
   (`TestAPutAcknowledgedAfterItsDeleteIsFreed`). A lender keeps a deleted object counted
   until its purge (§3.6), so this count frees it a retention window
   early, erring towards more room until the `507` below or the `quota`
-  answer corrects it. *Correction from the lender's answers:* the lender's only
-  answer about room so far is `507` (LEND-2; the control API's `quota`
-  call is not built): a place whose last answer was `507` counts as
-  full, gets no new data and has its unsent data re-routed or dropped
-  (below), until it acknowledges a row again. Each backup run queues
-  metadata at every friend, so a full friend learns of freed room within
-  a `PauseRetry` (an hour) of the next run.
-  *Follow-up (#68): reconcile the count from the lender.* Nothing
-  corrects `place_use` but the rows, so it drifts from what the lender
-  holds. Known sources: a send that landed but whose answer was lost
-  (a network error), whose row is then re-routed, cancelled as
-  superseded or dropped, leaves bytes the count does not hold (an
-  `abandoned` row, #21, is not counted either, though a delete still
-  follows it); a lender's
-  real per-object overhead and its retention of deleted objects (RET-1)
-  differ from the fixed 4 KiB and the immediate free; a refused row's
-  place may still hold older bytes of the key; and partial multipart
-  uploads (#23) count nothing. The control API's `quota` answer (LEND-7)
-  is the source to reconcile against.
+  answer corrects it. *Correction from the lender's answers:* a place
+  whose last answer was `507` counts as full, gets no new data and has
+  its unsent data re-routed or dropped (below), until it acknowledges a
+  row again or the friendship's quota rises (`state.DB.ResumePlace`,
+  §3.2, #24). Each backup run queues metadata at every friend, so a
+  full friend learns of freed room within a `PauseRetry` (an hour) of
+  the next run.
+  *Reconciled from the lender (#24, for #68).* The rows alone drift
+  from what the lender holds: a send that landed but whose answer was
+  lost, whose row is then re-routed, cancelled as superseded or dropped
+  (an `abandoned` row, #21, is not counted either, though a delete
+  still follows it); a lender's real per-object overhead and its
+  retention of deleted objects (RET-1); a refused row's place that
+  still holds older bytes of the key; partial multipart uploads (#23).
+  So each answer to the quota call (§3.2: at least hourly, and at once
+  after a `507` through `Worker.Full`) replaces the place's
+  `place_use` with the lender's own count of this node there
+  (`lent`, its `lent_usage`), plus the bytes of the place's `queued`
+  rows that are puts (`state.DB.QuotaAnswered`, one transaction); the
+  triggers move it from there. An orphan copy the borrower does not
+  know of is so counted, not deleted. A delete stays counted until an
+  answer stops counting it (the lender purged the tomb): what a
+  delete's negative size takes off `place_use` after the place's last
+  answer is added up in `place_freed` (migration 26, triggers on
+  `placement` for rows of negative size) and counted back wherever the
+  use is read (`PlaceUse`, D6's pool), until the next answer sets it to
+  0. A place gets its `place_freed` row from its first answer; before
+  that its deletes free at once, as they did. A send in flight across the answer may be
+  counted twice (less room) or, if acknowledged between the lender's
+  count and the transaction, missed until the next answer
+  (`TestQuotaAnswerReconcilesThePlacesUse`). Left to #68: retrying a
+  failed re-routing batch row by row.
 - **REPL-1 to REPL-3** The queue is a SQLite table with one FIFO
   sequence per place, ordered by the bucket's write sequence. The
   worker uploads one object at a time per place in sequence order,
@@ -3193,12 +3297,33 @@ the handler's own reads and is never cancelled; nothing below
   dropped only when its upload is finished, aborted, or gone from the
   store; an upload begun long ago that still gets parts keeps it.
   `lending.max_total` bounds the sum of the node's own numbers;
-  `peer quota` refuses a value that would exceed it (LEND-8). The
+  `peer quota`, `invite` and `peer add` refuse a value that would
+  exceed it (LEND-8, §3.2); unset, it is the store's filesystem size less
+  the free-space floor (*decision, #24 review*, §3.2). The
   borrower side keeps its own count of what it has stored at each
   place, for D6's free fraction (`place_use`, §3.4), and corrects it
-  from the lender's answers: for now a `507`, which makes the place
-  full until it acknowledges again; the control API's `quota` answer
-  (LEND-7) will reconcile the count itself.
+  from the lender's answers: a `507`, which makes the place full until
+  it acknowledges again or the quota rises, and the `quota` answer,
+  which replaces the count with the lender's own (§3.4).
+- **PEER-6, SEC-15 (lowering a quota, #24)** `reserve` reads the
+  friendship on every write, so a lowered number is in force for the
+  next request on any connection. A write admitted before and still
+  streaming is checked again: `Lending.Requota(peer)` (through
+  `Gateway.Requota`, which the daemon calls when the quota exchanger
+  sees the quota fall, §3.2) counts up a per-borrower generation, and
+  each of that borrower's bodies (`watch`, on `PutObject`, rewrites
+  and `UploadPart`) re-reads the friendship at its next read once the
+  generation moved: if what the borrower stores plus what all its
+  writes in flight were admitted for exceeds the quota (#24 review:
+  several writes that each fit alone must not land together), the read fails with the `507`,
+  so the store never publishes it, and the count is unchanged. A body
+  that has ended is published as admitted. With `peer quota` run in
+  another process the exchanger's 10 s poll is the delay, so a running
+  transfer is refused within about 12 s
+  (`TestLoweringAQuotaEndsARunningTransfer`, the SEC-15 AC for a
+  lowering; `TestLoweredQuotaEndsAPutInFlight`). Nothing stored is
+  deleted. Connections are not cut: unlike a removal, the friend stays
+  a friend and every later request is answered under the new quota.
 - **LEND-2** `Lending` refuses a borrower's `PutObject`,
   `CreateMultipartUpload`, `UploadPart` and `CreateBucket` of a new
   bucket with S3 error code `QuotaExceeded`, HTTP 507, when the counter
@@ -3362,8 +3487,12 @@ the handler's own reads and is never cancelled; nothing below
   name (REPL-8, SEC-16).
 - **LEND-7** `init` suggests `lending.max_total` = `c × S` plus the
   retention margin of §4. The control API `quota` answer carries the
-  quota, both sides' use and the answering node's repository size (sum
-  of its own buckets' live bytes, rounded to 1 GB). The protectable
+  quota, both sides' use and the answering node's repository size
+  (`state.DB.RepositorySize`, the live bytes of its own buckets: each
+  key's latest done write, if a put), rounded up to a whole GiB
+  (`control.RoundSize`; *decision, #24*: up, so a small repository is
+  never reported as none, and to the GiB, so a friend learns no
+  closer). The request carries the caller's the same way. The protectable
   size is computed by bisection on `S` over Σ min(D, quotaⱼ − m) +
   Σ (overflow `max_bytes` − m) ≥ c × D, with `m` the bucket's metadata
   bytes from the index and `D = S − m`, and the fair-quota bound with
@@ -3626,7 +3755,26 @@ the handler's own reads and is never cancelled; nothing below
   `list`, `remove`) is plain HTTP under `/_lendisk/` on the same tunnel port,
   authenticated by the tunnel peer key and checked per request against
   `lendisk.db` (SEC-11). `manifest` (`PUT` and `GET`, the caller's own
-  sealed manifest, §3.1 ID-4) is served (#28). `list` is served (#29):
+  sealed manifest, §3.1 ID-4) is served (#28). `quota` is served
+  (#24): `POST /_lendisk/quota` with `{"number", "use",
+  "repository_size"}` (the caller's number for the friendship, its
+  count of what it stores at the callee, and its repository size in
+  whole GiB), answered with `{"number", "quota", "use", "lent",
+  "repository_size"}` after the callee applied the caller's number
+  (§3.2); open to the `peer` role only, keyed by the resolved caller; a
+  number outside 1 to 2^62, a negative or oversized use, or a size not
+  in whole GiB is `400`, an invite key `403`. *Rate limit (#24 review,
+  LEND-5):* a friend's call is applied at most once per
+  `Server.QuotaEvery` (`control.DefaultQuotaEvery`, 10 s); one sooner
+  is answered `503` with `Retry-After: 1` and changes nothing. Each
+  applied call writes `lendisk.db` and may change the quota, its
+  alerts and the writes in flight, so a hostile friend toggling its
+  number does so at most every 10 s; an honest one calls hourly or
+  once per change and retries after its backoff. The answered
+  repository size is a scan of the queue and is reused for a minute
+  (`control.SizeCache`). The caller checks the
+  answer the same way (`control.QuotaResponse.Check`) and reads the
+  callee's protocol from its header. `list` is served (#29):
   `GET /_lendisk/list?bucket=<sealed>&after=<key>&limit=<n>` pages the
   lender's index for that borrower's bucket: key, size, SHA-256, if
   tombstoned, when (`tombstoned_at`, §3.6), and for a live key the
@@ -3865,6 +4013,25 @@ the handler's own reads and is never cancelled; nothing below
     §3.4 REPL-1, #20), each holding the bucket's metadata and so every
     friend's queue; raised once, cleared when the rows settle
     (`TestAnUnmatchableUploadIsAlertedUntilItSettles`).
+  - `quota_high`, subject the friend: this node's use there
+    (`place_use`, reconciled from the friend's count) is above 90%
+    of the quota (`alert.QuotaHighPercent`, OPS-2, #24);
+  - `quota_exhausted`, subject the friend: the use is at or above the
+    quota (a lowering below use, PEER-6) or the friend's last answer
+    was `507`; it says no new copies go there and nothing is deleted.
+    The worker calls `Alerted` on a `507`;
+  - `lent_over_quota`, subject the friend: it stores more here
+    (`lent_usage`) than the quota, after a lowering: no new objects
+    are accepted from it and nothing is deleted. With the friend's
+    `quota_exhausted` this is PEER-6's "notifies both", as is `peer
+    quota`'s own output (`TestQuotaUseRaisesAlerts`).
+  The three quota alerts have hysteresis (#24 review): one stays raised
+  until its condition has been false for `alert.Service.QuotaHold`
+  (`DefaultQuotaHold`, 10 minutes), so a friend flipping it with every
+  quota call gets one delivery per window, not one per call
+  (`TestToggledNumbersRaiseAQuotaAlertOnce`); `quota_high` and
+  `quota_exhausted` of one friend are one condition at two levels, the
+  current one replacing the other at once.
   Later tickets add a kind to `alert.kinds` and its condition to the
   evaluator. Each raise is delivered at least once to each configured
   channel: success is recorded in `hook_at` or `webhook_at` against
@@ -4243,7 +4410,10 @@ the handler's own reads and is never cancelled; nothing below
   open connections for some seconds, and a connection closed after
   the disconnect never tells the client (Q-Q). So lendisk closes its
   own connections first, and SEC-11's per-request check refuses
-  anything that arrives meanwhile. Later requests are answered
+  anything that arrives meanwhile. *Realised for a lowered quota
+  (#24):* no connection is cut; the next request is checked against
+  the new quota, and a write in flight at its body's next read once
+  the daemon calls `Gateway.Requota` (§3.5). Later requests are answered
   according to the relationship's new state (PEER-5, PEER-6).
 - **SEC-16** The sealed name (§3, bucket naming) is the only bucket
   name that crosses the tunnel: in S3 paths and in any control API

@@ -94,6 +94,10 @@ func (a *app) runInvite(ctx context.Context, quota, retention, expires string) e
 	if _, err := db.PurgeInvites(ctx, now); err != nil {
 		return err
 	}
+	max, from, err := a.maxTotal(cfg)
+	if err != nil {
+		return err
+	}
 	inv, err := invite.New(a.rng(), addr, number, ret)
 	if err != nil {
 		return err
@@ -103,8 +107,9 @@ func (a *app) runInvite(ctx context.Context, quota, retention, expires string) e
 		return err
 	}
 	until := now.Add(exp)
-	if err := db.AddInvite(ctx, state.Invite{Key: key.NodeID().String(), Number: number, Retention: inv.Retention, ExpiresAt: until}); err != nil {
-		return err
+	if err := db.AddInviteWithin(ctx, state.Invite{Key: key.NodeID().String(), Number: number, Retention: inv.Retention, ExpiresAt: until},
+		max, now); err != nil {
+		return overMaxTotal(err, max, from)
 	}
 	fmt.Fprintln(a.out, inv.String())
 	fmt.Fprintf(a.errOut, "Single-use invite, valid until %s. Your friend runs `lendisk peer add <invite>`\n"+
@@ -152,7 +157,7 @@ Becoming friends again before then, with a new invite, keeps both.`,
 			return a.runPeerRemove(cmd.Context(), args[0])
 		},
 	}
-	cmd.AddCommand(add, list, remove)
+	cmd.AddCommand(add, list, remove, a.peerQuotaCmd())
 	return cmd
 }
 
@@ -275,12 +280,16 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 				return usageError{err}
 			}
 		}
-		err = db.StartRedeem(ctx, state.PendingRedeem{InviteKey: ikID, Peer: them.String(),
-			Number: number, Retention: ret, StartedAt: a.now()})
+		max, from, err := a.maxTotal(cfg)
+		if err != nil {
+			return err
+		}
+		err = db.StartRedeemWithin(ctx, state.PendingRedeem{InviteKey: ikID, Peer: them.String(),
+			Number: number, Retention: ret, StartedAt: a.now()}, max, a.now())
 		if errors.Is(err, state.ErrExists) {
 			return errors.New(redeemInProgress)
 		} else if err != nil {
-			return err
+			return overMaxTotal(err, max, from)
 		}
 	default:
 		return err
@@ -378,7 +387,8 @@ func (a *app) redeem(ctx context.Context, log *slog.Logger, key, self *identity.
 	return resp, err != nil && cctx.Err() != nil, err
 }
 
-// PeerJSON is one friend in `peer list --json`.
+// PeerJSON is one friend in `peer list --json` (PEER-4). Fields are
+// added, never renamed or removed.
 type PeerJSON struct {
 	ID                   string    `json:"id"`
 	Address              string    `json:"address"`
@@ -388,10 +398,33 @@ type PeerJSON struct {
 	OwnRetentionSeconds  int64     `json:"own_retention_seconds"`
 	PeerRetentionSeconds int64     `json:"peer_retention_seconds"`
 	Since                time.Time `json:"since"`
+	// UseThere is what this node stores at the friend, as it counts it
+	// (reconciled from the friend's own count by the quota call, #68);
+	// Remaining is the quota less that (LEND-3). UseHere is what the
+	// friend stores here, as this node counts it as lender (LEND-1).
+	UseThere  int64 `json:"use_there"`
+	UseHere   int64 `json:"use_here"`
+	Remaining int64 `json:"remaining"`
+	// NumberTold is false while this node's number is not yet told to
+	// the friend (the quota call, LEND-8).
+	NumberTold bool `json:"number_told"`
+	// Reachability is direct, relayed or offline, from the last quota
+	// call; unknown before the first, online if the path is not known.
+	Reachability string `json:"reachability"`
+	// LastSeen is when the friend last called or answered (RFC 3339);
+	// LastVerified when its replica last passed verification (VER-1,
+	// #27: never yet). Both absent when never.
+	LastSeen     *time.Time `json:"last_seen,omitempty"`
+	LastVerified *time.Time `json:"last_verified,omitempty"`
+	// Protocol is the friend's protocol version (NET-6), "" if unknown.
+	Protocol string `json:"protocol,omitempty"`
+	// RepositorySize is the friend's repository size as it reported it,
+	// rounded up to a GiB (LEND-7); absent before its first report.
+	RepositorySize *int64 `json:"repository_size,omitempty"`
 }
 
 func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
-	_, db, err := a.openState(ctx)
+	cfg, db, err := a.openState(ctx)
 	if err != nil {
 		return err
 	}
@@ -400,15 +433,33 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 	if err != nil {
 		return err
 	}
-	if asJSON {
-		out := []PeerJSON{}
-		for _, f := range fs {
-			out = append(out, PeerJSON{ID: f.Peer, Address: f.Address, Quota: f.Quota(),
-				OwnNumber: f.OwnNumber, PeerNumber: f.PeerNumber,
-				OwnRetentionSeconds:  int64(f.OwnRetention / time.Second),
-				PeerRetentionSeconds: int64(f.PeerRetention / time.Second),
-				Since:                f.CreatedAt.UTC()})
+	use, err := db.PlaceUse(ctx)
+	if err != nil {
+		return err
+	}
+	out := []PeerJSON{}
+	for _, f := range fs {
+		here, _, err := db.LentUsage(ctx, f.Peer)
+		if err != nil {
+			return err
 		}
+		there := max(use[f.Peer], 0)
+		p := PeerJSON{ID: f.Peer, Address: f.Address, Quota: f.Quota(),
+			OwnNumber: f.OwnNumber, PeerNumber: f.PeerNumber,
+			OwnRetentionSeconds:  int64(f.OwnRetention / time.Second),
+			PeerRetentionSeconds: int64(f.PeerRetention / time.Second),
+			Since:                f.CreatedAt.UTC(),
+			UseThere:             there, UseHere: here, Remaining: max(f.Quota()-there, 0),
+			NumberTold: f.ToldNumber == f.OwnNumber, Reachability: reachability(f), Protocol: f.PeerProtocol}
+		if !f.SeenAt.IsZero() {
+			seen := f.SeenAt.UTC()
+			p.LastSeen = &seen
+			size := f.PeerRepositorySize
+			p.RepositorySize = &size
+		}
+		out = append(out, p)
+	}
+	if asJSON {
 		enc := json.NewEncoder(a.out)
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
@@ -417,12 +468,34 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 		fmt.Fprintln(a.out, "No friends yet; `lendisk invite --quota 100G` makes an invite.")
 		return nil
 	}
+	if l, err := a.lendingStatus(ctx, cfg, db); err == nil {
+		fmt.Fprintf(a.out, "This node lends at most %s (%s); its numbers and open invites take %s.\n",
+			humanSize(l.MaxTotal), l.From, humanSize(l.Numbers))
+	} else {
+		fmt.Fprintf(a.out, "This node's lending cap is unknown: %v\n", err)
+	}
 	tw := tabwriter.NewWriter(a.out, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "FRIEND\tQUOTA\tYOU LEND\tTHEY LEND\tYOU KEEP\tTHEY KEEP\tSINCE")
-	for _, f := range fs {
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", f.Peer, formatSize(f.Quota()),
-			formatSize(f.OwnNumber), formatSize(f.PeerNumber),
-			formatDays(f.OwnRetention), formatDays(f.PeerRetention), f.CreatedAt.UTC().Format(time.DateOnly))
+	fmt.Fprintln(tw, "FRIEND\tQUOTA\tNUMBERS\tYOU USE THERE\tTHEY USE HERE\tREMAINING\tREACH\tLAST SEEN\tVERIFIED\tPROTOCOL\tTHEIR REPO\tYOU KEEP\tTHEY KEEP\tSINCE")
+	for _, p := range out {
+		numbers := "same"
+		if p.OwnNumber != p.PeerNumber {
+			numbers = "you " + formatSize(p.OwnNumber) + ", they " + formatSize(p.PeerNumber)
+		}
+		if !p.NumberTold {
+			numbers += " (yours not told yet)"
+		}
+		seen, repo, proto := "never", "unknown", p.Protocol
+		if p.LastSeen != nil {
+			seen = p.LastSeen.Format(time.RFC3339)
+			repo = humanSize(*p.RepositorySize)
+		}
+		if proto == "" {
+			proto = "unknown"
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.ID, formatSize(p.Quota), numbers,
+			humanSize(p.UseThere), humanSize(p.UseHere), humanSize(p.Remaining), p.Reachability, seen, "never", proto, repo,
+			formatDays(time.Duration(p.OwnRetentionSeconds)*time.Second), formatDays(time.Duration(p.PeerRetentionSeconds)*time.Second),
+			p.Since.Format(time.DateOnly))
 	}
 	return tw.Flush()
 }

@@ -246,16 +246,23 @@ func TestResticPruneTombstonesAtEveryFriend(t *testing.T) {
 		t.Fatalf("restic check of the pool's copy: %v\n%s", err, out)
 	}
 
-	// A's bookkeeping: each friend counted at what it holds live (its
-	// tombs are the lender's to count until purged, #68), nothing below
-	// copies, nothing queued.
+	// A's bookkeeping: each friend counted at what it holds live plus
+	// the tombs it keeps until the purge (#68, #24 review): the deletes
+	// free nothing at A until the friend's quota answer does; at most
+	// the friend's count of the bucket itself (one overhead) is missing,
+	// when A's last answer came before the bucket was made. Nothing is
+	// below copies or queued.
 	use, err := openDB(t, an).PlaceUse(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	for f, n := range friends {
-		if want := lentUse(t, n, aID, "laptop"); use[f] != want {
-			t.Errorf("A counts %d bytes at %s, which holds %d live", use[f], f, want)
+		lender, _, err := openDB(t, n).LentUsage(t.Context(), aID.NodeID().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if live := lentUse(t, n, aID, "laptop"); use[f] <= live || use[f] > lender || use[f] < lender-state.ObjectOverhead {
+			t.Errorf("A counts %d bytes at %s, which holds %d live and counts %d with its tombs", use[f], f, live, lender)
 		}
 	}
 	st := an.status()

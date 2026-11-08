@@ -24,6 +24,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/store"
@@ -99,6 +100,12 @@ type app struct {
 	// tuneEnding, if set, adjusts the daemon's farewell (ending
 	// friendships, #25) before it starts; tests only.
 	tuneEnding func(*farewell)
+	// tuneQuota, if set, adjusts the daemon's quota exchanger (#24)
+	// before it starts; tests only.
+	tuneQuota func(*quota.Exchanger)
+	// lendStatfs reads the store's size for the default lending cap
+	// (maxTotal); nil means the store checker's Statfs. Tests set it.
+	lendStatfs func(dir string) (store.Space, error)
 }
 
 func (a *app) checker() store.Checker {

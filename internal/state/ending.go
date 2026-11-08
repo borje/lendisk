@@ -176,6 +176,7 @@ func (db *DB) ForgetFormerFriend(ctx context.Context, peer string) error {
 	for _, q := range []string{
 		`DELETE FROM placement WHERE place = ?`,
 		`DELETE FROM place_use WHERE place = ?`,
+		`DELETE FROM place_freed WHERE place = ?`,
 		`DELETE FROM place WHERE place = ?`,
 		`DELETE FROM lent_part WHERE upload_id IN (SELECT upload_id FROM lent_upload WHERE peer_key = ?)`,
 		`DELETE FROM lent_upload WHERE peer_key = ?`,

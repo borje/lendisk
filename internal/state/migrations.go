@@ -462,4 +462,62 @@ var migrations = []Migration{
 			notify_error TEXT              -- why the last attempt to tell it failed
 		);`,
 	},
+	{
+		Version: 25, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The quota call (LEND-7, LEND-8, PEER-4, #24): what each side last
+		-- learnt of the other. told_number is this node's own number as
+		-- the friend last acknowledged it in an answer: while it differs
+		-- from own_number the change is still to be told. seen_at is when
+		-- the friend last called, or answered a call. The friend's
+		-- figures are its own report: its repository size (rounded up to
+		-- a GiB), its count of what it stores here (peer_use), and, from
+		-- an answer, its count as lender of what this node stores there
+		-- (lent_there). path is how the last answered call went (direct
+		-- or relayed); exchange_error why the last call failed, NULL once
+		-- one is answered.
+		ALTER TABLE friendship ADD COLUMN told_number INTEGER;
+		ALTER TABLE friendship ADD COLUMN seen_at INTEGER;
+		ALTER TABLE friendship ADD COLUMN peer_repo_size INTEGER;
+		ALTER TABLE friendship ADD COLUMN peer_use INTEGER;
+		ALTER TABLE friendship ADD COLUMN lent_there INTEGER;
+		ALTER TABLE friendship ADD COLUMN peer_protocol TEXT;
+		ALTER TABLE friendship ADD COLUMN path TEXT;
+		ALTER TABLE friendship ADD COLUMN exchange_error TEXT;`,
+	},
+	{
+		Version: 26, Compat: 1, Release: "0.1",
+		SQL: `
+		-- #24 review. reported_at is when the friend's own quota call last
+		-- applied its number (unix nanoseconds): an answer to a call this
+		-- node sent before then carries an older number and does not
+		-- overwrite it.
+		ALTER TABLE friendship ADD COLUMN reported_at INTEGER;
+		-- What deletes at a place have taken off place_use since the
+		-- place's last quota answer (#68): the lender keeps a deleted
+		-- object counted until it purges the tomb, so the borrower's use
+		-- there is place_use plus this until the next answer says
+		-- otherwise. A place has a row from its first answer
+		-- (state.DB.QuotaAnswered sets it to 0); before that its deletes
+		-- free at once, as before. The triggers mirror place_use's for
+		-- rows of negative size, and never take it below 0.
+		CREATE TABLE place_freed (
+			place TEXT PRIMARY KEY,
+			bytes INTEGER NOT NULL
+		);
+		CREATE TRIGGER place_freed_insert AFTER INSERT ON placement
+		WHEN NEW.state IN ('queued', 'acked') AND coalesce(NEW.size, 0) < 0 BEGIN
+			UPDATE place_freed SET bytes = bytes - NEW.size WHERE place = NEW.place;
+		END;
+		CREATE TRIGGER place_freed_update AFTER UPDATE OF place, state, size ON placement BEGIN
+			UPDATE place_freed SET bytes = max(bytes + OLD.size, 0)
+				WHERE place = OLD.place AND OLD.state IN ('queued', 'acked') AND coalesce(OLD.size, 0) < 0;
+			UPDATE place_freed SET bytes = bytes - NEW.size
+				WHERE place = NEW.place AND NEW.state IN ('queued', 'acked') AND coalesce(NEW.size, 0) < 0;
+		END;
+		CREATE TRIGGER place_freed_delete AFTER DELETE ON placement
+		WHEN OLD.state IN ('queued', 'acked') AND coalesce(OLD.size, 0) < 0 BEGIN
+			UPDATE place_freed SET bytes = max(bytes + OLD.size, 0) WHERE place = OLD.place;
+		END;`,
+	},
 }

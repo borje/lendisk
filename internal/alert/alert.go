@@ -5,7 +5,8 @@
 // past alerts.unreachable_after, this node's store unreadable, objects
 // the store could not supply (VER-5), objects a place refused (LEND-4),
 // keys changed after a friend acknowledged them (EP-11), a friendship
-// the friend ended and the purge of an ended one (PEER-5).
+// the friend ended and the purge of an ended one (PEER-5), and a
+// friendship's quota nearly or wholly used either way (PEER-6, #24).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -99,7 +100,37 @@ const (
 	// here and this node's there, are purged within PurgeWarning (PEER-5,
 	// #25). Subject: the former friend.
 	KindPurgeSoon = "replica_purge_soon"
+	// KindQuotaHigh: this node uses more than QuotaHighPercent of a
+	// friendship's quota at the friend (OPS-2, #24). Subject: the friend.
+	KindQuotaHigh = "quota_high"
+	// KindQuotaExhausted: this node uses all of a friendship's quota at
+	// the friend, or more after a lowering, or the friend's last answer
+	// was a 507 (OPS-2, LEND-2, PEER-6, #24): no new copies go there and
+	// nothing is deleted. Subject: the friend.
+	KindQuotaExhausted = "quota_exhausted"
+	// KindLentOverQuota: a friend stores more here than the friendship's
+	// quota, after a lowering (PEER-6, #24): no new objects are accepted
+	// from it and nothing is deleted. The friend gets quota_exhausted.
+	// Subject: the friend.
+	KindLentOverQuota = "lent_over_quota"
 )
+
+// QuotaHighPercent is the use of a quota above which KindQuotaHigh is
+// raised (OPS-2).
+const QuotaHighPercent = 90
+
+// DefaultQuotaHold is how long a quota alert stays raised after its condition
+// ends (#24 review): a friend can flip a quota alert's condition with
+// every quota call, and each raise is a delivery, so a quota alert
+// clears only once its condition has been false this long.
+const DefaultQuotaHold = 10 * time.Minute
+
+func (s *Service) quotaHold() time.Duration { return orDefault(s.QuotaHold, DefaultQuotaHold) }
+
+// quotaKind reports whether kind is a quota alert (hysteresis, QuotaHold).
+func quotaKind(kind string) bool {
+	return kind == KindQuotaHigh || kind == KindQuotaExhausted || kind == KindLentOverQuota
+}
 
 // PurgeWarning is how long before an ended friendship's purge
 // KindPurgeSoon is raised.
@@ -107,7 +138,8 @@ const PurgeWarning = 7 * 24 * time.Hour
 
 // kinds are the alert kinds the evaluator owns.
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
-	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindPurgeSoon}
+	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindPurgeSoon,
+	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -159,6 +191,9 @@ type Service struct {
 	MinBackoff, MaxBackoff time.Duration
 	// Timeout bounds one delivery attempt (default 30 s).
 	Timeout time.Duration
+	// QuotaHold is how long a quota alert stays raised after its
+	// condition ends (default DefaultQuotaHold).
+	QuotaHold time.Duration
 	// RunCommand runs the hook; nil means exec. Tests set it.
 	RunCommand func(ctx context.Context, command string, stdin []byte) error
 	// HTTP posts to the webhook; nil means a plain http.Client.
@@ -166,6 +201,9 @@ type Service struct {
 
 	once           sync.Once
 	wake, delivery chan struct{}
+	// held is, per quota alert's key, when its condition last held
+	// (QuotaHold); only evaluate touches it.
+	held map[string]time.Time
 }
 
 func (s *Service) init() {
@@ -235,6 +273,9 @@ func (s *Service) evaluate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if current, err = s.hold(ctx, current, now); err != nil {
+		return err
+	}
 	raised, cleared, err := s.DB.SyncAlerts(ctx, kinds, current, now)
 	if err != nil {
 		return err
@@ -249,6 +290,45 @@ func (s *Service) evaluate(ctx context.Context) error {
 		poke(s.delivery)
 	}
 	return nil
+}
+
+// hold keeps each raised quota alert whose condition held within
+// QuotaHold of now in current, as it stands, and notes when the quota
+// alerts in current hold.
+func (s *Service) hold(ctx context.Context, current []state.Alert, now time.Time) ([]state.Alert, error) {
+	if s.held == nil {
+		s.held = map[string]time.Time{}
+	}
+	in := map[string]bool{}
+	for _, a := range current {
+		in[a.Key] = true
+		if quotaKind(a.Kind) {
+			s.held[a.Key] = now
+		}
+	}
+	active, err := s.DB.ActiveAlerts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// quota_high and quota_exhausted of one friend are one condition at
+	// two levels: the current one replaces the other.
+	other := map[string]string{KindQuotaHigh: KindQuotaExhausted, KindQuotaExhausted: KindQuotaHigh}
+	for _, a := range active {
+		t, ok := s.held[a.Key]
+		if !ok || in[a.Key] || !quotaKind(a.Kind) || now.Sub(t) >= s.quotaHold() {
+			continue
+		}
+		if o, paired := other[a.Kind]; paired && in[o+":"+a.Subject] {
+			continue
+		}
+		current = append(current, a)
+	}
+	for k, t := range s.held {
+		if now.Sub(t) >= s.quotaHold() {
+			delete(s.held, k)
+		}
+	}
+	return current, nil
 }
 
 func alertOf(kind, subject, message string) state.Alert {
@@ -392,6 +472,11 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 			b, countObjects(d.Objects), d.Bytes)
 		out = append(out, alertOf(KindCopiesDropped, b, msg))
 	}
+	quota, err := s.quotaConditions(ctx, fs, conds)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, quota...)
 	formers, err := s.DB.FormerFriends(ctx)
 	if err != nil {
 		return nil, err
@@ -410,6 +495,51 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		}
 	}
 	return out, nil
+}
+
+// quotaConditions are the quota alerts of friendships fs (OPS-2,
+// PEER-6, #24): this node's use at each friend (its count, reconciled
+// from the friend's own in the quota call) against the quota, and what
+// each friend stores here against it.
+func (s *Service) quotaConditions(ctx context.Context, fs []state.Friendship, conds map[string]state.PlaceCondition) ([]state.Alert, error) {
+	use, err := s.DB.PlaceUse(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []state.Alert
+	for _, f := range fs {
+		q, u := f.Quota(), max(use[f.Peer], 0)
+		numbers := fmt.Sprintf("the smaller of this node's number %s and theirs %s", gb(f.OwnNumber), gb(f.PeerNumber))
+		switch {
+		case conds[f.Peer].Condition == state.ConditionQuota || q > 0 && u >= q:
+			msg := fmt.Sprintf("this node stores %s at friend %s, which has no room left for it: the quota is %s, %s. No new copies go there and nothing is deleted; copies go to other friends where there is room. Agree a higher number with them (lendisk peer quota on both sides)",
+				gb(u), f.Peer, gb(q), numbers)
+			out = append(out, alertOf(KindQuotaExhausted, f.Peer, msg))
+		case q > 0 && u*100 > q*QuotaHighPercent:
+			msg := fmt.Sprintf("this node uses %d%% of its quota at friend %s: %s of %s, %s. At the quota no new copies go there; agree a higher number with them (lendisk peer quota on both sides)",
+				u*100/q, f.Peer, gb(u), gb(q), numbers)
+			out = append(out, alertOf(KindQuotaHigh, f.Peer, msg))
+		}
+		lent, _, err := s.DB.LentUsage(ctx, f.Peer)
+		if err != nil {
+			return nil, err
+		}
+		if lent > q {
+			msg := fmt.Sprintf("friend %s stores %s here, more than the friendship's quota of %s (%s): no new objects are accepted from it and nothing is deleted; its node places them elsewhere",
+				f.Peer, gb(lent), gb(q), numbers)
+			out = append(out, alertOf(KindLentOverQuota, f.Peer, msg))
+		}
+	}
+	return out, nil
+}
+
+// gb writes bytes for a person: GiB with one decimal, or bytes below one
+// MiB.
+func gb(n int64) string {
+	if n < 1<<20 {
+		return fmt.Sprintf("%d bytes", n)
+	}
+	return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
 }
 
 func countObjects(n int64) string {

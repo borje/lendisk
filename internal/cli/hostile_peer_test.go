@@ -221,6 +221,14 @@ func TestHostilePeer(t *testing.T) {
 			if r.status != http.StatusOK && r.status != http.StatusNotFound {
 				t.Errorf("B's %s: %v", at.name, r)
 			}
+		case "quota", "quota out of range":
+			if r.status != http.StatusBadRequest {
+				t.Errorf("B's %s: %v", at.name, r)
+			}
+		case "quota by GET":
+			if r.status != http.StatusMethodNotAllowed {
+				t.Errorf("B's %s: %v", at.name, r)
+			}
 		case "list another's":
 			if r.status != http.StatusNotFound || r.code != control.CodeNoSuchBucket {
 				t.Errorf("B lists C's bucket: %v", r)

@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/profile"
+	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/state"
@@ -85,12 +87,32 @@ func (a *app) serveCmd() *cobra.Command {
 			// Ending friendships (PEER-5, SEC-15, #25): revoked, told and
 			// purged by the farewell, kicked by a friend's remove call.
 			fw := &farewell{DB: db, Log: log, Now: a.clock}
-			tun, err := a.startTunnel(ctx, cfg, id, db, log, push.Kick, fw.Kick)
+			// The quota call (LEND-8, #24): tells each friend this node's
+			// number, kicked by a friend's own call.
+			xch := &quota.Exchanger{DB: db, Now: a.clock, Log: log}
+			tun, err := a.startTunnel(ctx, cfg, id, db, log, func() { push.Kick(); xch.Kick() }, fw.Kick, func(string) { xch.Kick() })
 			if err != nil {
 				return err
 			}
 			defer tun.Close()
 			push.Dial = tun.Dial
+			xch.Dial = tun.Dial
+			xch.Path = func(ctx context.Context, peer string) string {
+				pid, err := identity.ParseNodeID(peer)
+				if err != nil {
+					return ""
+				}
+				pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				p, err := tun.PathInfo(pctx, pid)
+				switch {
+				case err != nil:
+					return ""
+				case p.Direct:
+					return "direct"
+				}
+				return "relayed"
+			}
 			if a.tuneManifest != nil {
 				a.tuneManifest(push)
 			}
@@ -100,7 +122,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 8) // gateway, LAN, loopback, replication, farewell, alerts, manifest, recovery
+			errc := make(chan error, 9) // gateway, LAN, loopback, replication, farewell, alerts, quota, manifest, recovery
 			// The read-through (EP-10, ID-6) fetches what the store lacks
 			// from the friends holding it, over the tunnel.
 			fetch := &replica.Fetcher{DB: db, Self: id, Dial: tun.Dial}
@@ -136,6 +158,7 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 
 			running := 1
+			var w *replica.Worker
 			br := bridge.New(gw.Socket, log)
 			if a.tuneBridge != nil {
 				a.tuneBridge(br)
@@ -178,8 +201,8 @@ func (a *app) serveCmd() *cobra.Command {
 
 				// Replication to friends (#18) never blocks the endpoint
 				// (REPL-9): it reads the store and lendisk.db only.
-				w := &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
-					Alerted: alerts.Check, Now: a.clock}
+				w = &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
+					Alerted: alerts.Check, Now: a.clock, Full: xch.Due}
 				if a.tuneReplication != nil {
 					a.tuneReplication(w)
 				}
@@ -215,6 +238,28 @@ func (a *app) serveCmd() *cobra.Command {
 			go func() { fw.Run(ctx); errc <- nil }()
 			running++
 			go func() { alerts.Run(ctx); errc <- nil }()
+			// A changed quota applies at once (PEER-6, SEC-15, LEND-8): a
+			// lowering to the friend's writes in flight here, a raising to
+			// this node's copies paused for quota there.
+			xch.Changed = func(peer string, before, after int64) {
+				if after < before || before < 0 { // lowered, or first seen
+					gw.Requota(peer)
+				}
+				if after > before && before >= 0 {
+					if err := db.ResumePlace(ctx, peer, a.now()); err != nil && ctx.Err() == nil {
+						log.Error("quota: resuming the friend's copies failed", "peer", peer, "err", err)
+					}
+					if w != nil {
+						w.Resume(peer)
+					}
+				}
+				alerts.Check()
+			}
+			if a.tuneQuota != nil {
+				a.tuneQuota(xch)
+			}
+			running++
+			go func() { xch.Run(ctx); errc <- nil }()
 			running++
 			go func() { push.Run(ctx); errc <- nil }()
 			// A recovered node lists each place it could not reach at
