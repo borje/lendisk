@@ -30,7 +30,9 @@ import (
 //   - tells a friend that this node ended it (Tell, the remove call),
 //     retried with a backoff from a minute to an hour until it answers;
 //   - at the end of the retention window purges the friend's replica
-//     here (Purge: its lent buckets and its manifest) and forgets it.
+//     here (Purge: its lent buckets and its manifest) and forgets it, on
+//     a goroutine of its own, one friend at a time, so a slow purge
+//     never delays a revocation.
 //
 // A pass is at most Interval apart (10 s), so a removal reaches open
 // connections well within SEC-15's 60 seconds.
@@ -58,6 +60,7 @@ type farewell struct {
 	next    map[string]time.Time     // peer -> when to tell it next
 	backoff map[string]time.Duration // peer -> the wait after its next failure
 	telling map[string]bool
+	purging bool // purges are running (startPurges)
 	wg      sync.WaitGroup
 }
 
@@ -109,7 +112,7 @@ func (f *farewell) Run(ctx context.Context) {
 	}
 }
 
-// wait waits for the tells in flight.
+// wait waits for the tells and purges in flight.
 func (f *farewell) wait() { f.wg.Wait() }
 
 // pass makes one pass over the former friends (type comment).
@@ -154,22 +157,57 @@ func (f *farewell) pass(ctx context.Context) {
 			f.tell(ctx, ff, now)
 		}
 	}
+	var due []string
 	for _, ff := range fs {
-		if now.Before(ff.PurgeAfter) {
-			continue
-		}
-		if err := f.purge(ctx, ff.Peer); err != nil {
-			if ctx.Err() == nil {
-				f.Log.Error("ending friendships: purging a former friend's replica failed; trying again at the next pass",
-					"peer", ff.Peer, "err", err)
-			}
-			continue
-		}
-		f.Log.Info("ended friendship purged: the former friend's replica here is deleted and it is forgotten", "peer", ff.Peer)
-		if f.Alerted != nil {
-			f.Alerted()
+		if !now.Before(ff.PurgeAfter) {
+			due = append(due, ff.Peer)
 		}
 	}
+	f.startPurges(ctx, due)
+}
+
+// startPurges purges each due former friend's replica, one at a time, on
+// a goroutine of its own: deleting a large replica can take minutes on a
+// slow disk, and revoking a removal made meanwhile must not wait for it
+// (SEC-15, #25 review). A pass that finds purges running starts none;
+// the next pass after they end picks up what is still due.
+func (f *farewell) startPurges(ctx context.Context, peers []string) {
+	if len(peers) == 0 {
+		return
+	}
+	f.mu.Lock()
+	if f.purging {
+		f.mu.Unlock()
+		return
+	}
+	f.purging = true
+	f.mu.Unlock()
+	f.wg.Add(1)
+	go func() {
+		defer f.wg.Done()
+		defer func() { f.mu.Lock(); f.purging = false; f.mu.Unlock() }()
+		for _, peer := range peers {
+			if ctx.Err() != nil {
+				return
+			}
+			err := f.purge(ctx, peer)
+			switch {
+			case errors.Is(err, state.ErrNotFormer):
+				f.Log.Info("ending friendships: purge stopped; the former friend is a friend again", "peer", peer)
+				continue
+			case err != nil:
+				if ctx.Err() == nil {
+					f.Log.Error("ending friendships: purging a former friend's replica failed; trying again at the next pass",
+						"peer", peer, "err", err)
+				}
+				continue
+			}
+			f.Log.Info("ended friendship purged: the former friend's replica here is deleted and it is forgotten", "peer", peer)
+			if f.Alerted != nil {
+				f.Alerted()
+			}
+		}
+	}()
 }
 
 // revoke applies removals already committed, in spike #3's order.

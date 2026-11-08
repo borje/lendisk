@@ -34,6 +34,100 @@ func (s *steps) take() []string {
 	return out
 }
 
+// SEC-15 (#25 review, M1): a purge runs on its own goroutine, so one that
+// takes minutes (a large replica on a slow disk) never delays revoking a
+// removal made meanwhile: the next pass still cuts it. Purges run one at
+// a time, and one that finds the peer a friend again (state.ErrNotFormer)
+// forgets nothing.
+func TestABlockedPurgeDoesNotHoldUpARevocation(t *testing.T) {
+	ctx := t.Context()
+	db, err := state.Open(ctx, t.TempDir(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	b, c, d := newID(t).NodeID(), newID(t).NodeID(), newID(t).NodeID()
+	for _, p := range []identity.NodeID{b, c, d} {
+		if err := db.AddFriendship(ctx, state.Friendship{Peer: p.String(), CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start := time.Unix(1_800_000_000, 0)
+	var mu sync.Mutex
+	now := start
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	for _, p := range []identity.NodeID{b, d} {
+		if _, err := db.RemoveFriendship(ctx, p.String(), true, start); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var s steps
+	release := make(chan struct{})
+	purging := make(chan string, 4)
+	fw := &farewell{DB: db, Log: slog.New(slog.DiscardHandler), Now: clock,
+		Clear: func() {},
+		Cut: func(keys ...identity.NodeID) int {
+			for _, k := range keys {
+				if k == c {
+					s.add("cut C")
+				}
+			}
+			return len(keys)
+		},
+		Disconnect: func(identity.NodeID) bool { return true },
+		Tell:       func(context.Context, state.FormerFriend) error { return nil },
+		Purge: func(_ context.Context, peer string) error {
+			purging <- peer
+			<-release
+			if peer == d.String() {
+				return state.ErrNotFormer
+			}
+			return nil
+		},
+	}
+	fw.pass(ctx)
+	mu.Lock()
+	now = start.Add(state.DefaultRetention)
+	mu.Unlock()
+	fw.pass(ctx) // starts the purges, the first blocked
+	first := <-purging
+	if _, err := db.RemoveFriendship(ctx, c.String(), false, now); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() { fw.pass(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		close(release)
+		t.Fatal("a pass waited for a purge")
+	}
+	if got := s.take(); !slices.Equal(got, []string{"cut C", "cut C"}) { // before and after the disconnect
+		close(release)
+		t.Fatalf("C's removal during a purge: %q", got)
+	}
+	select {
+	case p := <-purging:
+		close(release)
+		t.Fatalf("a second purge (%s) ran beside %s", p, first)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	<-purging // the other one, after the first
+	fw.wait()
+	fs, _ := db.FormerFriends(ctx)
+	var left []string
+	for _, f := range fs {
+		left = append(left, f.Peer)
+	}
+	slices.Sort(left)
+	want := []string{c.String(), d.String()}
+	slices.Sort(want)
+	if !slices.Equal(left, want) {
+		t.Fatalf("former friends after the purges: %v, want C (not due) and D (purge refused)", left)
+	}
+}
+
 // SEC-15 in spike #3's order (#25): a removal another process committed
 // (`peer remove`) is applied by the daemon's next pass as clear the
 // admission cache, cut the connections of both of the friend's keys

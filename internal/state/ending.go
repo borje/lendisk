@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -111,6 +112,10 @@ func (db *DB) RemoveFriendship(ctx context.Context, peer string, byPeer bool, no
 const formerCols = `peer_key, coalesce(dial_key, ''), coalesce(address, ''), removed_at, purge_after,
 	coalesce(by_peer, 0), notified_at, coalesce(notify_error, '')`
 
+// ErrNotFormer means a peer is not a former friend whose purge is due:
+// it is a friend again, was forgotten, or its window has not ended.
+var ErrNotFormer = errors.New("not a former friend due for its purge")
+
 // FormerFriends lists the friendships that ended and are not purged
 // yet, by removal time.
 func (db *DB) FormerFriends(ctx context.Context) ([]FormerFriend, error) {
@@ -152,18 +157,20 @@ func (db *DB) NoteFarewell(ctx context.Context, peer, failure string, now time.T
 // ForgetFormerFriend drops what is left of former friend peer once its
 // replica here is purged: its placement rows, its use and condition as
 // a place, its lent buckets, tombstones, uploads and usage, and the
-// former friend row. A peer that is a friend again keeps everything.
+// former friend row. A peer that is a friend again, or no former friend,
+// keeps everything.
 func (db *DB) ForgetFormerFriend(ctx context.Context, peer string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var friend bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM friendship WHERE peer_key = ?)`, peer).Scan(&friend); err != nil {
+	var former bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM former_friend WHERE peer_key = ?1)
+		AND NOT EXISTS (SELECT 1 FROM friendship WHERE peer_key = ?1)`, peer).Scan(&former); err != nil {
 		return err
 	}
-	if friend {
+	if !former {
 		return nil
 	}
 	for _, q := range []string{
@@ -182,4 +189,15 @@ func (db *DB) ForgetFormerFriend(ctx context.Context, peer string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// PurgeDue reports whether former friend peer's replica may be purged at
+// now: it is a former friend, its window has ended, and it is not a
+// friend again. The purge asks before each bucket it deletes (#25
+// review): a new invite redeemed meanwhile stops it.
+func (db *DB) PurgeDue(ctx context.Context, peer string, now time.Time) (bool, error) {
+	var due bool
+	err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM former_friend WHERE peer_key = ?1 AND purge_after <= ?2)
+		AND NOT EXISTS (SELECT 1 FROM friendship WHERE peer_key = ?1)`, peer, now.Unix()).Scan(&due)
+	return due, err
 }

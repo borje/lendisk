@@ -1496,7 +1496,18 @@ upstream bucket is Q-V.
   (`manifest.Store.Delete`), and `state.DB.ForgetFormerFriend` drops
   every row of it: placement, `place_use`, `place`, lent buckets,
   tombstones, uploads, usage and the former friend row
-  (`TestAFormerFriendsReplicaIsKeptForTheWindowThenPurged`). On the
+  (`TestAFormerFriendsReplicaIsKeptForTheWindowThenPurged`). Purges run
+  on a goroutine of their own, one friend at a time, so deleting a
+  large replica on a slow disk never delays revoking a removal made
+  meanwhile (`TestABlockedPurgeDoesNotHoldUpARevocation`). Before each
+  bucket the purge checks that the peer is still a former friend due
+  for it and not a friend again (`state.DB.PurgeDue`); one that
+  redeemed a new invite meanwhile keeps its remaining buckets, its
+  manifest and every row (`state.ErrNotFormer`;
+  `TestAPurgeStopsWhenTheFormerFriendIsBefriendedAgain`). A redeem
+  landing inside one bucket's deletion can still lose that bucket's
+  old objects: a window as long as one directory removal, at the end
+  of a 30-day window, which nothing closes yet. On the
   borrower side "holding" is only that the placement rows stay, not
   counted (§3.4), so a renewed friendship finds them. A new friendship
   with the same node within the window deletes the `former_friend` row,

@@ -83,10 +83,11 @@ type Lending struct {
 	// completed in the store; afterList when a reconcile has listed a
 	// borrower and not yet set its count; afterPartStored when a part is
 	// stored and not yet counted.
-	beforeComplete  func()
-	afterList       func()
-	afterPartStored func(part int32, size int64)
-	beforeTombMove  func() // a tombstone is recorded and its object not yet moved
+	beforeComplete   func()
+	afterList        func()
+	afterPartStored  func(part int32, size int64)
+	afterPurgeBucket func() // purgeFormer removed a former friend's bucket
+	beforeTombMove   func() // a tombstone is recorded and its object not yet moved
 	// afterRewriteMove runs when a rewrite has moved the replaced version
 	// into its tomb and the new one is not yet published; an error fails
 	// the rewrite there, as the store failing would.
