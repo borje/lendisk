@@ -55,7 +55,14 @@ type Config struct {
 	Alerts   Alerts   `toml:"alerts"`
 	// Replication is [replication] (D6, §3.4).
 	Replication Replication `toml:"replication"`
-	Log         Log         `toml:"log"`
+	// Lending is [lending]: what this node lends its friends (LEND-1).
+	Lending Lending `toml:"lending"`
+	Log     Log     `toml:"log"`
+}
+
+// Lending is the [lending] section (LEND-1, LEND-8).
+type Lending struct {
+	MaxTotal string `toml:"max_total" help:"the most this node lends all friends together: the sum of its numbers for its friendships, and of its open invites, may not exceed it (LEND-1, LEND-8), such as 240G; empty for no cap but the store's free-space floor"`
 }
 
 // Store is the [store] section: one store for the node's own buckets and
@@ -194,6 +201,16 @@ func (c *Config) ReplaceAfter() time.Duration {
 	return d
 }
 
+// MaxTotal is lending.max_total in bytes, which Validate checked; ok is
+// false when it is unset (no cap).
+func (c *Config) MaxTotal() (n int64, ok bool) {
+	if strings.TrimSpace(c.Lending.MaxTotal) == "" {
+		return 0, false
+	}
+	v, _ := ParseSize(c.Lending.MaxTotal)
+	return int64(v), true
+}
+
 // UnreachableAfter is alerts.unreachable_after, which Validate checked.
 func (c *Config) UnreachableAfter() time.Duration {
 	d, _ := time.ParseDuration(c.Alerts.UnreachableAfter)
@@ -251,6 +268,11 @@ func (c *Config) Validate() error {
 	} {
 		if v, err := time.ParseDuration(d.v); err != nil || v <= 0 {
 			errs = append(errs, fmt.Errorf("%s = %q: want a positive duration such as 1h or 168h", d.key, d.v))
+		}
+	}
+	if m := strings.TrimSpace(c.Lending.MaxTotal); m != "" {
+		if v, err := ParseSize(m); err != nil || v == 0 || v > 1<<62 {
+			errs = append(errs, fmt.Errorf("lending.max_total = %q: want a size above zero such as 240G, or empty for no cap", c.Lending.MaxTotal))
 		}
 	}
 	if c.Alerts.Webhook != "" {

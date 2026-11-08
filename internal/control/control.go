@@ -16,6 +16,9 @@
 //     by the resolved caller (Caller.Peer, the friend's node ID even on a
 //     dial-key connection); no parameter names whose (ID-4). list is
 //     keyed the same way: a friend pages its own buckets only (NET-7).
+//   - quota applies the caller's own number for its friendship with
+//     this node, keyed by the resolved caller, and nothing else; it
+//     answers with this node's figures for that friendship (LEND-8).
 //   - remove ends the caller's friendship on this side (PEER-5): the
 //     caller ended it on its own, and the call only tells this node.
 //   - Nothing here returns another peer, ever (PEER-10).
@@ -45,8 +48,9 @@ const Protocol = "0.1"
 // API request and response.
 const ProtocolHeader = "Lendisk-Protocol"
 
-// Paths of the control API. Only redeem, version, manifest, list and
-// remove are served so far; the others are refused as not yet served.
+// Paths of the control API. Only redeem, version, manifest, list, quota
+// (QuotaPath, quota.go) and remove are served so far; the others are
+// refused as not yet served.
 const (
 	Prefix       = gateway.ControlPrefix
 	RedeemPath   = Prefix + "redeem"

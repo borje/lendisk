@@ -69,6 +69,10 @@ type Worker struct {
 	// service reads it at once (alert.Service.Check, #13). It must not
 	// block.
 	Alerted func()
+	// Full, if set, is called after a place answered 507 (LEND-2), so
+	// the daemon asks it for its own count of this node's use (the quota
+	// call, #68). It must not block.
+	Full func(place string)
 	// OnRead, if set, is called after each read of a body sent to a
 	// place, with the bytes read so far. Tests only.
 	OnRead func(place string, seq, read int64)
@@ -89,6 +93,9 @@ type Worker struct {
 	// re-routing pass reads the set under it, so neither misses the other.
 	flight  sync.Mutex
 	sending map[string]int64 // place -> seq
+	// wakes are the senders' wake-ups from a pause (Resume), per place,
+	// under flight.
+	wakes map[string]chan struct{}
 	// rewriteSince is, per place and row, when a refused rewrite with no
 	// version to name instead was first seen (under flight).
 	rewriteSince map[string]map[int64]time.Time
@@ -106,6 +113,31 @@ func (w *Worker) next(ctx context.Context, place string) (state.Placement, bool,
 		w.sending[place] = p.Seq
 	}
 	return p, ok, err
+}
+
+// Resume wakes place's sender if it is paused for quota or removal, so
+// it tries its next row at once (LEND-8: the quota rose). It never
+// blocks.
+func (w *Worker) Resume(place string) {
+	select {
+	case w.wake(place) <- struct{}{}:
+	default:
+	}
+}
+
+// wake is place's wake-up channel.
+func (w *Worker) wake(place string) chan struct{} {
+	w.flight.Lock()
+	defer w.flight.Unlock()
+	if w.wakes == nil {
+		w.wakes = map[string]chan struct{}{}
+	}
+	c := w.wakes[place]
+	if c == nil {
+		c = make(chan struct{}, 1)
+		w.wakes[place] = c
+	}
+	return c
 }
 
 // done marks place's row as no longer being sent.
@@ -293,6 +325,17 @@ func sleep(ctx context.Context, d time.Duration) bool {
 	}
 }
 
+// pauseFor waits d, or until ctx ends or wake fires (Resume).
+func pauseFor(ctx context.Context, d time.Duration, wake <-chan struct{}) {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+	case <-t.C:
+	case <-wake:
+	}
+}
+
 // drain sends place's FIFO until ctx ends.
 func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	poll := orDefault(w.Poll, time.Second)
@@ -317,6 +360,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		stale = c == state.ConditionStore
 	}
 	defer w.done(place)
+	wake := w.wake(place)
 	for ctx.Err() == nil {
 		w.done(place) // the previous row's outcome is recorded
 		p, ok, err := w.next(ctx, place)
@@ -472,11 +516,15 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		case errors.Is(err, ErrQuota):
 			log.Warn("replication paused for quota: the friend refuses new objects; retrying later", append(row, "err", err, "retry_in", pause)...)
 			condition(state.ConditionQuota, err.Error())
-			sleep(ctx, pause)
+			if w.Full != nil {
+				w.Full(place)
+			}
+			w.alerted() // alert.KindQuotaExhausted
+			pauseFor(ctx, pause, wake)
 		case errors.Is(err, ErrRemoved):
 			log.Warn("replication stopped: the friend refuses this node (removed?); retrying later", append(row, "err", err, "retry_in", pause)...)
 			condition(state.ConditionRemoved, err.Error())
-			sleep(ctx, pause)
+			pauseFor(ctx, pause, wake)
 		default:
 			failing = "network"
 			level := slog.LevelDebug

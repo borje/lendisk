@@ -114,7 +114,8 @@ func TestDroppedCopiesAreAlerted(t *testing.T) {
 	}
 	as := active(t, db)
 	a, ok := as[KindCopiesDropped+":laptop"]
-	if !ok || !strings.Contains(a.Message, "1 object") || len(as) != 1 {
+	// C's 507 is its quota exhausted (#24).
+	if _, full := as[KindQuotaExhausted+":C"]; !ok || !strings.Contains(a.Message, "1 object") || !full || len(as) != 2 {
 		t.Fatalf("alerts %v", as)
 	}
 }

@@ -21,6 +21,17 @@ type Friendship struct {
 	// node-ID form, learnt at redeem; "" for a friendship made before
 	// it existed.
 	DialKey string
+
+	// What the quota call last learnt (LEND-7, LEND-8, #24); zero before
+	// the first. SeenAt is when the friend last called or answered.
+	ToldNumber         int64 // OwnNumber as the friend last acknowledged it
+	SeenAt             time.Time
+	PeerRepositorySize int64  // the friend's repository size, as it reported
+	PeerUse            int64  // the friend's count of what it stores here
+	LentThere          int64  // the friend's count, as lender, of what this node stores there
+	PeerProtocol       string // the friend's protocol version (NET-6)
+	Path               string // how the last answered call went: direct or relayed
+	ExchangeError      string // why the last call failed; "" once one is answered
 }
 
 // ErrDialKeyTaken means a dial key is already another friend's dial key
@@ -291,14 +302,16 @@ func addFriendship(ctx context.Context, x interface {
 	return forgetManifestPush(ctx, x, f.Peer)
 }
 
-const friendshipCols = `peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention, dial_key`
+const friendshipCols = `peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention, dial_key,
+	told_number, seen_at, peer_repo_size, peer_use, lent_there, peer_protocol, path, exchange_error`
 
 func scanFriendship(row interface{ Scan(...any) error }) (Friendship, error) {
 	var f Friendship
 	var created int64
-	var addr, dial sql.NullString
-	var own, peer, ownRet, peerRet sql.NullInt64
-	err := row.Scan(&f.Peer, &created, &addr, &own, &peer, &ownRet, &peerRet, &dial)
+	var addr, dial, proto, path, exErr sql.NullString
+	var own, peer, ownRet, peerRet, told, seen, size, use, there sql.NullInt64
+	err := row.Scan(&f.Peer, &created, &addr, &own, &peer, &ownRet, &peerRet, &dial,
+		&told, &seen, &size, &use, &there, &proto, &path, &exErr)
 	if errors.Is(err, sql.ErrNoRows) {
 		return f, ErrNotFound
 	} else if err != nil {
@@ -310,6 +323,11 @@ func scanFriendship(row interface{ Scan(...any) error }) (Friendship, error) {
 	f.OwnNumber, f.PeerNumber = own.Int64, peer.Int64
 	f.OwnRetention = time.Duration(ownRet.Int64) * time.Second
 	f.PeerRetention = time.Duration(peerRet.Int64) * time.Second
+	f.ToldNumber, f.PeerRepositorySize, f.PeerUse, f.LentThere = told.Int64, size.Int64, use.Int64, there.Int64
+	if seen.Valid {
+		f.SeenAt = time.Unix(seen.Int64, 0)
+	}
+	f.PeerProtocol, f.Path, f.ExchangeError = proto.String, path.String, exErr.String
 	return f, nil
 }
 

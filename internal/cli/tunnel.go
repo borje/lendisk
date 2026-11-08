@@ -50,9 +50,10 @@ type tunnel struct {
 // (§3.7) and, once tun.S3 is set, S3 for friends. changed, if set, is
 // called after the control API commits a friendship (the manifest
 // pusher's Kick, ID-4); ended, if set, after a friend's remove call
-// ended one (the farewell's Kick, #25).
+// ended one (the farewell's Kick, #25); reported, if set, after a
+// friend's quota call applied its number (the quota exchanger, #24).
 func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.Identity, db *state.DB, log *slog.Logger,
-	changed, ended func()) (*tunnel, error) {
+	changed, ended func(), reported func(peer string)) (*tunnel, error) {
 	region, chosen, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays())
 	if err != nil {
 		return nil, err
@@ -107,7 +108,7 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 				changed()
 			}
 		},
-		Ended: ended, Manifests: manifests}
+		Ended: ended, Reported: reported, Manifests: manifests}
 	if a.tuneControl != nil {
 		a.tuneControl(ctl)
 	}

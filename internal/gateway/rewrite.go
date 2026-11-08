@@ -66,6 +66,7 @@ func (l *Lending) rewriteLent(ctx context.Context, peer, sealed string, in s3res
 		return none, err
 	}
 	defer release()
+	l.watch(b, peer, size+itemOverhead)
 	pub := &published{u: l.use(peer)}
 	defer pub.release()
 	var unlock func()

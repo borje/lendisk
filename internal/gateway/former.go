@@ -68,3 +68,14 @@ func (l *Lending) purgeFormer(ctx context.Context, peer string) error {
 	l.log().Info("lending: purged a former friend's replica at the end of its retention window", "peer", peer, "buckets", len(bs))
 	return nil
 }
+
+// Requota tells the lending layer that the friendship with peer may
+// have a lower quota now (PEER-6, SEC-15, #24): each of peer's writes
+// whose body is still streaming checks the quota again at its next read,
+// and fails with 507 if it no longer fits. New requests read the quota
+// anyway. Before the gateway serves there is nothing in flight.
+func (g *Gateway) Requota(peer string) {
+	if l := g.running.Load(); l != nil {
+		l.Requota(peer)
+	}
+}

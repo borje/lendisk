@@ -368,3 +368,36 @@ func TestReplicationSettings(t *testing.T) {
 		}
 	}
 }
+
+// LEND-1, LEND-8 (#24): lending.max_total caps the sum of the node's
+// numbers; unset means no cap beyond the store's floor.
+func TestLendingMaxTotal(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := l.MaxTotal(); ok || n != 0 || l.Lending.MaxTotal != "" {
+		t.Fatalf("default max_total %q: %d %v", l.Lending.MaxTotal, n, ok)
+	}
+	p := writeFile(t, "[lending]\nmax_total = \"240G\"\n")
+	l, err = load(t, []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, ok := l.MaxTotal(); !ok || n != 240<<30 {
+		t.Fatalf("max_total from the file: %d %v", n, ok)
+	}
+	l, err = load(t, []string{"--config", p}, map[string]string{"LENDISK_LENDING_MAX_TOTAL": "1T"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := l.MaxTotal(); n != 1<<40 {
+		t.Fatalf("max_total from the environment: %d", n)
+	}
+	for _, bad := range []string{"lots", "-1G", "0"} {
+		if _, err := load(t, []string{"--config", none, "--lending-max-total", bad}, nil); err == nil {
+			t.Errorf("accepted max_total %q", bad)
+		}
+	}
+}

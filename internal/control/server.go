@@ -40,6 +40,10 @@ type Server struct {
 	// Lent is this node's index of what it holds for each friend
 	// (NET-7 list); nil answers the list call 404.
 	Lent LentLister
+	// Reported, if set, is called after a friend's quota call applied
+	// its number (LEND-8, #24), so the daemon applies a changed quota
+	// (the quota exchanger's Kick). It must not block.
+	Reported func(peer string)
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
@@ -84,6 +88,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case ListPath:
 		if s.method(w, r, http.MethodGet) {
 			s.list(w, r, c)
+		}
+	case QuotaPath:
+		if s.method(w, r, http.MethodPost) {
+			s.quota(w, r, c)
 		}
 	case RemovePath:
 		if s.method(w, r, http.MethodPost) {

@@ -89,7 +89,12 @@ func controlAttacks(own, other string) []attack {
 		{name: "list own", method: "GET", target: control.ListPath + "?bucket=" + own},
 		{name: "list another's", method: "GET", target: control.ListPath + "?bucket=" + other},
 		{name: "challenge", method: "POST", target: control.Prefix + "challenge", body: []byte("{}")},
-		{name: "quota", method: "POST", target: control.Prefix + "quota", body: []byte("{}")},
+		// From a friend these are refused 400 (#24): a valid number would
+		// change the friendship's quota for the phases after.
+		{name: "quota", method: "POST", target: control.QuotaPath, body: []byte("{}")},
+		{name: "quota out of range", method: "POST", target: control.QuotaPath,
+			body: []byte(`{"number":4611686018427387905,"use":-1,"repository_size":1}`)},
+		{name: "quota by GET", method: "GET", target: control.QuotaPath},
 		{name: "undelete", method: "POST", target: control.Prefix + "undelete", body: []byte("{}")},
 		{name: "an unknown call", method: "GET", target: control.Prefix + "admin"},
 		// Last: from a friend it ends the friendship (PEER-5, #25).

@@ -16,6 +16,7 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 )
@@ -61,6 +62,10 @@ const (
 	// the client has been answered for, is hashed (a Go duration): its
 	// queue row stays pending meanwhile.
 	envHashDelay = "LENDISK_TEST_HASH_DELAY"
+	// envPauseRetry is the replication worker's PauseRetry (a Go
+	// duration), overriding envReplFast's: how long a place paused for
+	// quota waits unless the quota rises.
+	envPauseRetry = "LENDISK_TEST_PAUSE_RETRY"
 )
 
 // offsetClock is real time plus the duration in the file at path, read
@@ -127,6 +132,12 @@ func TestMain(m *testing.M) {
 				f.Client = replica.Options{DialTimeout: 5 * time.Second, StallTimeout: 10 * time.Second}
 			}
 		}
+		a.tuneQuota = func(x *quota.Exchanger) {
+			if os.Getenv(envReplFast) == "1" {
+				x.Poll, x.Timeout = 200*time.Millisecond, 10*time.Second
+				x.MinBackoff, x.MaxBackoff = 200*time.Millisecond, time.Second
+			}
+		}
 		a.tuneRecovery = func(l *recovery.Lister) {
 			if os.Getenv(envReplFast) == "1" {
 				l.Poll, l.Timeout = 200*time.Millisecond, 10*time.Second
@@ -152,6 +163,9 @@ func tuneFromEnv(w *replica.Worker) {
 	}
 	if d, err := time.ParseDuration(os.Getenv(envRerouteEvery)); err == nil {
 		w.RerouteEvery = d
+	}
+	if d, err := time.ParseDuration(os.Getenv(envPauseRetry)); err == nil {
+		w.PauseRetry = d
 	}
 	delay, _ := time.ParseDuration(os.Getenv(envSendDelay))
 	p, _ := strconv.ParseFloat(os.Getenv(envCrashMidSend), 64)

@@ -165,9 +165,16 @@ func (c *Client) call(ctx context.Context, method, path string, in, out any) err
 // send makes one call and returns the body of a 200 answer, at most max
 // bytes; any other answer is a *CallError.
 func (c *Client) send(ctx context.Context, method, path string, body io.Reader, contentType string, max int64) ([]byte, error) {
+	b, _, err := c.sendProto(ctx, method, path, body, contentType, max)
+	return b, err
+}
+
+// sendProto is send, also returning the protocol version the peer's
+// answer carries (NET-6).
+func (c *Client) sendProto(ctx context.Context, method, path string, body io.Reader, contentType string, max int64) ([]byte, string, error) {
 	r, err := http.NewRequestWithContext(ctx, method, "http://lendisk"+path, body)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	r.Header.Set(ProtocolHeader, c.protocol())
 	if body != nil {
@@ -175,33 +182,33 @@ func (c *Client) send(ctx context.Context, method, path string, body io.Reader, 
 	}
 	resp, err := c.HTTP.Do(r)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	// Every answer from a lendisk control API, refusals included,
 	// carries the protocol header (NET-6); one without it is from
 	// something else on that port and is not trusted.
 	v := resp.Header.Get(ProtocolHeader)
 	if v == "" {
-		return nil, fmt.Errorf("the peer's answer to %s (%d) has no %s header: whatever answered is not a lendisk control API",
+		return nil, "", fmt.Errorf("the peer's answer to %s (%d) has no %s header: whatever answered is not a lendisk control API",
 			path, resp.StatusCode, ProtocolHeader)
 	}
 	if err := Compatible(c.protocol(), v); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if resp.StatusCode != http.StatusOK {
 		var e errorBody
 		if json.Unmarshal(b, &e) != nil || e.Error == "" {
 			e.Error = http.StatusText(resp.StatusCode)
 		}
-		return nil, &CallError{Status: resp.StatusCode, Message: e.Error, Code: e.Code}
+		return nil, v, &CallError{Status: resp.StatusCode, Message: e.Error, Code: e.Code}
 	}
 	if int64(len(b)) > max {
-		return nil, fmt.Errorf("the peer's answer to %s is over %d bytes", path, max)
+		return nil, "", fmt.Errorf("the peer's answer to %s is over %d bytes", path, max)
 	}
-	return b, nil
+	return b, v, nil
 }

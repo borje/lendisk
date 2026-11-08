@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -193,6 +194,9 @@ func isHash(s string) bool {
 // from its publication until it is counted, and exclusively by a
 // reconcile. used (once loaded) and reserved are under Lending.mu.
 type borrowerUse struct {
+	// requota counts the quota changes Requota announced; a write in
+	// flight that saw another value checks the quota again (watch).
+	requota  atomic.Int64
 	pub      sync.RWMutex
 	loaded   bool
 	used     int64 // what the borrower stores, as counted
@@ -303,6 +307,48 @@ func (l *Lending) reserve(ctx context.Context, peer string, n int64) (release fu
 	}, nil
 }
 
+// Requota makes each of peer's writes in flight check the friendship's
+// quota again at its body's next read (watch): the quota was lowered
+// (PEER-6, SEC-15, #24).
+func (l *Lending) Requota(peer string) {
+	l.use(peer).requota.Add(1)
+}
+
+// watch makes b, the body of a write of peer's admitted for n bytes,
+// check the friendship's quota again at its next read whenever Requota
+// was called since it last checked: if what peer stores plus n no
+// longer fits, the read fails with errQuotaExceeded, so the store never
+// publishes it (PEER-6, SEC-15, #24). A friendship gone by then fails it
+// as a stranger's. A body that has ended is published as admitted.
+func (l *Lending) watch(b *body, peer string, n int64) {
+	u := l.use(peer)
+	seen := u.requota.Load()
+	b.watch = func() error {
+		g := u.requota.Load()
+		if g == seen {
+			return nil
+		}
+		seen = g
+		f, err := l.DB.GetFriendship(context.Background(), peer)
+		if errors.Is(err, state.ErrNotFound) {
+			return errNotFriend
+		}
+		if err != nil {
+			l.log().Error("lending: reading the friendship for a write in flight failed; checking at the next change", "peer", peer, "err", err)
+			return nil
+		}
+		l.mu.Lock()
+		used := u.used
+		l.mu.Unlock()
+		if used+n > f.Quota() {
+			l.log().Info("lending: ended a write in flight: the friendship's quota was lowered below it", "peer", peer,
+				"used", used, "size", n, "quota", f.Quota())
+			return errQuotaExceeded
+		}
+		return nil
+	}
+}
+
 // reserveFloor admits n bytes against the floor alone: room the store
 // needs briefly for bytes already counted (a completion's copy).
 func (l *Lending) reserveFloor(n int64) (release func(), err error) {
@@ -375,6 +421,9 @@ type body struct {
 	// replaced version then, whether or not the store reads on to EOF.
 	onFull func() error
 	full   bool
+	// watch, if set, runs before each read; an error fails the body
+	// (Lending.watch).
+	watch func() error
 }
 
 func (l *Lending) body(r io.Reader, limit int64) *body {
@@ -392,6 +441,12 @@ func (b *body) Read(p []byte) (int, error) {
 	}
 	if b.ended {
 		return 0, io.EOF
+	}
+	if b.watch != nil {
+		if e := b.watch(); e != nil {
+			b.failed = e
+			return 0, e
+		}
 	}
 	n, err := b.r.Read(p)
 	b.n += int64(n)
@@ -548,6 +603,7 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 		return none, err
 	}
 	defer release()
+	l.watch(b, peer, size+itemOverhead)
 	pub := &published{u: l.use(peer)}
 	defer pub.release()
 	// Once the body is verified, the put takes the key's lock (in the
@@ -820,6 +876,7 @@ func (l *Lending) uploadPartLent(ctx context.Context, peer, sealed string, in *s
 		return err
 	}
 	b := l.body(in.Body, size)
+	l.watch(b, peer, size)
 	b.onEOF = lockAll
 	if size == 0 {
 		if err := lockAll(); err != nil {
