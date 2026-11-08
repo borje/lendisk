@@ -3311,8 +3311,9 @@ the handler's own reads and is never cancelled; nothing below
   sees the quota fall, §3.2) counts up a per-borrower generation, and
   each of that borrower's bodies (`watch`, on `PutObject`, rewrites
   and `UploadPart`) re-reads the friendship at its next read once the
-  generation moved: if what the borrower stores plus what the write
-  was admitted for exceeds the quota, the read fails with the `507`,
+  generation moved: if what the borrower stores plus what all its
+  writes in flight were admitted for exceeds the quota (#24 review:
+  several writes that each fit alone must not land together), the read fails with the `507`,
   so the store never publishes it, and the count is unchanged. A body
   that has ended is published as admitted. With `peer quota` run in
   another process the exchanger's 10 s poll is the delay, so a running

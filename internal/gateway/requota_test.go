@@ -76,3 +76,44 @@ func TestLoweredQuotaEndsAPutInFlight(t *testing.T) {
 	}
 	l.wantUsage(used + ov + 50)
 }
+
+// #24 review: the re-check counts the borrower's other writes in flight:
+// two puts that each fit under the lowered quota alone, but not
+// together, are not both stored.
+func TestLoweredQuotaCountsOtherWritesInFlight(t *testing.T) {
+	l := lendTo(t, 1<<30, nil)
+	used := l.usage()
+	type put struct {
+		pw   *io.PipeWriter
+		done chan error
+		body []byte
+	}
+	var puts []put
+	for i, c := range []byte("xy") {
+		body := bytes.Repeat([]byte{c}, 2000)
+		pr, pw := io.Pipe()
+		done := make(chan error, 1)
+		key := "data/" + string(rune('a'+i))
+		go func() { done <- l.putDirect(key, pr, int64(len(body)), hashMeta(body)) }()
+		if _, err := pw.Write(body[:10]); err != nil {
+			t.Fatal(err)
+		}
+		puts = append(puts, put{pw, done, body})
+	}
+	quota := used + 2*(2000+ov) - 1
+	l.lower(quota)
+	for _, p := range puts {
+		go func() { p.pw.Write(p.body[10:]); p.pw.Close() }()
+	}
+	stored := 0
+	for _, p := range puts {
+		if err := within(t, "a put in flight", p.done); err == nil {
+			stored++
+		} else if err != errQuotaExceeded {
+			t.Fatalf("a put in flight: %v", err)
+		}
+	}
+	if stored > 1 || l.usage() > quota {
+		t.Fatalf("%d puts stored, usage %d over the lowered quota %d", stored, l.usage(), quota)
+	}
+}

@@ -316,7 +316,8 @@ func (l *Lending) Requota(peer string) {
 
 // watch makes b, the body of a write of peer's admitted for n bytes,
 // check the friendship's quota again at its next read whenever Requota
-// was called since it last checked: if what peer stores plus n no
+// was called since it last checked: if what peer stores plus what all
+// its writes in flight were admitted for (this one's n among them) no
 // longer fits, the read fails with errQuotaExceeded, so the store never
 // publishes it (PEER-6, SEC-15, #24). A friendship gone by then fails it
 // as a stranger's. A body that has ended is published as admitted.
@@ -338,11 +339,11 @@ func (l *Lending) watch(b *body, peer string, n int64) {
 			return nil
 		}
 		l.mu.Lock()
-		used := u.used
+		used, inFlight := u.used, max(u.reserved, n)
 		l.mu.Unlock()
-		if used+n > f.Quota() {
+		if used+inFlight > f.Quota() {
 			l.log().Info("lending: ended a write in flight: the friendship's quota was lowered below it", "peer", peer,
-				"used", used, "size", n, "quota", f.Quota())
+				"used", used, "in_flight", inFlight, "size", n, "quota", f.Quota())
 			return errQuotaExceeded
 		}
 		return nil
