@@ -2732,7 +2732,17 @@ upstream bucket is Q-V.
   a friend not yet listed holds, and a row placed meanwhile would stand
   in the way of the acknowledged row its list records
   (`TestReplacementWaitsForRecoveryLists`,
-  `TestRecoverFromPhraseAndOneLendersAddress`). Verification
+  `TestRecoverFromPhraseAndOneLendersAddress`). A recovered node's
+  store starts empty, so the sender puts an object it holds no file for
+  there first through the read-through (`replica.Worker.Fill`, which
+  `serve` sets to `gateway.Gateway.Fill`: fetched from a friend that
+  acknowledged it and verified against the recorded hash, §3.3 EP-10),
+  and then sends it as usual; a failed fetch waits as an unreadable
+  store does, and only an object no friend is recorded holding is the
+  store's local error (`TestARecoveredNodeReplacesFromTheReadThrough`:
+  recover, then `peer add` and `peer remove`, with no refusal). This
+  heals an object that vanished from the store outside lendisk too, as
+  a read of it would. Verification
   (#27) and overflow targets (#38, #40) are not built; their cases
   join the drained places below when they are.
   - *Metadata first.* Each live metadata object gets a row at every

@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/borje/lendisk/internal/alert"
+	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -83,6 +86,102 @@ func TestScenarioFriendLeaves(t *testing.T) {
 			if got[k] != h {
 				t.Errorf("%s's copy of %s is %q, want %q", pid[:8], k, got[k], h)
 			}
+		}
+	}
+}
+
+// REPL-13, ID-5, EP-10 (#26 review): a recovered node's store holds
+// nothing, yet it re-places as any node does. A friend added after the
+// recovery receives the bucket's metadata, and a friend removed has its
+// copies placed at the new one: the bytes come from a friend holding
+// them through the read-through, verified against the recorded hash,
+// never refused as missing from the store.
+func TestARecoveredNodeReplacesFromTheReadThrough(t *testing.T) {
+	parallel(t, 4)
+	if testing.Short() {
+		t.Skip("long")
+	}
+	phraseA, _ := identity.NewPhrase()
+	an, bn, cn, dn := newNode(t), newNode(t), newNode(t), newNode(t)
+	for n, p := range map[*node]string{an: phraseA, bn: "", cn: "", dn: ""} {
+		n.regions = an.regions
+		if p == "" {
+			p, _ = identity.NewPhrase()
+		}
+		if code, _, e := n.run(p+"\n", "", "init", "--restore"); code != 0 {
+			t.Fatal(e)
+		}
+	}
+	own := an.addBucket(t, "laptop", "restic")
+	fast := envReplFast + "=1"
+	a, b, c, d := newProcNode(t, an, fast), newProcNode(t, bn, fast), newProcNode(t, cn, fast), newProcNode(t, dn, fast)
+	b.start()
+	c.start()
+	d.start()
+	a.start()
+	befriend(t, bn, an)
+	befriend(t, cn, an)
+	aID := an.identity()
+	bKey, cKey := bn.identity().NodeID().String(), cn.identity().NodeID().String()
+	dKey := dn.identity().NodeID().String()
+	bAddr := bn.status().Node.Address
+	s3c := s3client(a.addr, own)
+	body := make([]byte, 4096)
+	for _, k := range []string{"config", "keys/k1", "index/", "data/", "data/", "snapshots/"} {
+		rand.Read(body)
+		if h := sha256Hex(body); k == "data/" {
+			k += h[:2] + "/" + h
+		} else if strings.HasSuffix(k, "/") {
+			k += h
+		}
+		if _, err := s3c.PutObject(t.Context(), &s3.PutObjectInput{Bucket: aws.String("laptop"), Key: aws.String(k),
+			Body: bytes.NewReader(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	an.drained(bKey, 60*time.Second)
+	an.drained(cKey, 60*time.Second)
+	want := replicable(t, an, "laptop")
+	within(t, 60*time.Second, "the manifest at B", func() bool {
+		m, err := heldManifest(t, bn, aID)
+		return err == nil && len(m.Friends) == 2 && len(m.Buckets) == 1
+	})
+
+	// A's machine is gone; a fresh one recovers from B's address.
+	a.p.kill()
+	os.RemoveAll(filepath.Dir(filepath.Dir(an.config)))
+	fresh := newNode(t)
+	fresh.regions = an.regions
+	if code, out, e := fresh.run("y\n"+phraseA+"\n", "", "recover", bAddr); code != 0 {
+		t.Fatalf("recover: %s%s", out, e)
+	}
+	fa := newProcNode(t, fresh, fast)
+	fa.start()
+	within(t, 90*time.Second, "both lists read", func() bool { return len(fresh.status().Recovery.Pending) == 0 })
+
+	// D joins, and A ends its friendship with C.
+	befriend(t, dn, fresh)
+	if code, out, e := fresh.run("", "", "peer", "remove", cKey); code != 0 {
+		t.Fatalf("peer remove C: %s%s", out, e)
+	}
+	within(t, 120*time.Second, "D holds every object", func() bool {
+		got := lentObjects(t, dn, aID, "laptop")
+		for k, h := range want {
+			if got[k] != h {
+				return false
+			}
+		}
+		return true
+	})
+	fresh.drained(dKey, 60*time.Second)
+	st := fresh.status()
+	bk := bucketOf(t, st, "laptop")
+	if bk.Refused != 0 || bk.BelowCopies.Objects != 0 || !bk.Offsite.Complete {
+		t.Fatalf("after re-placement: %+v", bk)
+	}
+	for _, al := range st.Alerts {
+		if al.Kind == alert.KindObjectsNotReplicated || al.Kind == alert.KindStoreUnreadable {
+			t.Fatalf("alert %+v", al)
 		}
 	}
 }

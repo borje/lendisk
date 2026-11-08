@@ -75,6 +75,12 @@ type Worker struct {
 	// service reads it at once (alert.Service.Check, #13). It must not
 	// block.
 	Alerted func()
+	// Fill, if set, puts an own bucket's object the store lacks into it
+	// from a friend that holds it, verified (the gateway's read-through,
+	// EP-10): filled is false when no friend is recorded holding it, an
+	// error means it may pass. A recovered node's store starts empty, and
+	// its copies must still be re-placed (REPL-13, #26 review).
+	Fill func(ctx context.Context, bucket, key string) (filled bool, err error)
 	// Full, if set, is called after a place answered 507 (LEND-2), so
 	// the daemon asks it for its own count of this node's use (the quota
 	// call, #68). It must not block.
@@ -205,6 +211,10 @@ var errLocal = errors.New("the store cannot supply the captured object")
 // refused with cause oversize, which multipart replication (#23)
 // re-queues (state.RequeueOversize).
 var errOversize = fmt.Errorf("%w: larger than one PUT carries", errLocal)
+
+// errGone: the store holds no file for the object. A local error, unless
+// Worker.Fill can put it there from a friend (after recover, #26 review).
+var errGone = fmt.Errorf("%w: it is gone", errLocal)
 
 // errStore: the store cannot be read now: the bucket's directory is
 // missing (a disk not mounted), or opening, stating or reading the
@@ -779,7 +789,7 @@ func heldDesc(held string, ok bool) string {
 // put sends the row's object from the store, marked as a rewrite of the
 // version with hash replaces if that is set.
 func (w *Worker) put(ctx context.Context, place string, r Replica, p state.Placement, replaces string) error {
-	body, done, err := w.openCaptured(ctx, p)
+	body, done, err := w.openFilled(ctx, p)
 	if err != nil {
 		return err
 	}
@@ -811,6 +821,28 @@ func (w *Worker) put(ctx context.Context, place string, r Replica, p state.Place
 		return fmt.Errorf("%w (the store's copy matches its capture hash)", err)
 	}
 	return err
+}
+
+// openFilled is openCaptured, but an object the store holds no file for
+// is first put there by Fill, when set, from a friend that holds it:
+// after `recover` the store is empty, and re-placement must still send
+// copies (REPL-13, ID-5, #26 review). A fetch that fails may pass, so
+// the row waits as for an unreadable store; with no friend holding it,
+// its absence is the store's local error.
+func (w *Worker) openFilled(ctx context.Context, p state.Placement) (io.Reader, func(), error) {
+	body, done, err := w.openCaptured(ctx, p)
+	if !errors.Is(err, errGone) || w.Fill == nil {
+		return body, done, err
+	}
+	filled, ferr := w.Fill(ctx, p.Bucket, p.Key)
+	switch {
+	case ferr != nil:
+		return nil, nil, fmt.Errorf("%w: %s/%s is not in this node's store, and fetching it from a friend that holds it failed: %w",
+			errStore, p.Bucket, p.Key, ferr)
+	case !filled:
+		return nil, nil, err
+	}
+	return w.openCaptured(ctx, p)
 }
 
 // openCaptured opens the row's object in the store, checked against
@@ -865,7 +897,10 @@ func (w *Worker) openCaptured(ctx context.Context, p state.Placement) (io.Reader
 	case err != nil && o.doing == "":
 		return nil, nil, fmt.Errorf("%w: %w", errStore, err) // it stalled
 	case o.doing == "opening" && (errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)):
-		return nil, nil, local("it is gone")
+		if err := w.storeReadable(ctx, p.Bucket); err != nil {
+			return nil, nil, err
+		}
+		return nil, nil, errGone
 	case err != nil:
 		return nil, nil, w.unreadable(ctx, p, o.doing, err)
 	}
@@ -893,7 +928,7 @@ func (w *Worker) openCaptured(ctx context.Context, p state.Placement) (io.Reader
 // write outside lendisk changed it: VER-5), errStore when it cannot be
 // read now.
 func (w *Worker) verify(ctx context.Context, p state.Placement) error {
-	body, done, err := w.openCaptured(ctx, p)
+	body, done, err := w.openFilled(ctx, p)
 	if err != nil {
 		return err
 	}

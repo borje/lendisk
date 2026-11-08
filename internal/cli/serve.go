@@ -202,7 +202,7 @@ func (a *app) serveCmd() *cobra.Command {
 				// Replication to friends (#18) never blocks the endpoint
 				// (REPL-9): it reads the store and lendisk.db only.
 				w = &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
-					Alerted: alerts.Check, Now: a.clock, Full: xch.Due}
+					Alerted: alerts.Check, Now: a.clock, Full: xch.Due, Fill: gw.Fill}
 				if a.tuneReplication != nil {
 					a.tuneReplication(w)
 				}
