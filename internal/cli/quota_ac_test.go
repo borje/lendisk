@@ -82,7 +82,10 @@ func TestBothNumbersRaisedResumeCopiesWithNoFurtherAction(t *testing.T) {
 	if code, out, e := an.run("", "", "peer", "quota", bKey, "80M"); code != 0 || !strings.Contains(out, "stays 200K each way until they raise") {
 		t.Fatalf("A raises alone: %s%s", out, e)
 	}
-	within(t, 10*time.Second, "B learns A's number", func() bool { return bn.peerOf(aKey).PeerNumber == 80<<20 })
+	// The daemons see a `peer quota` from another process on their 10 s
+	// poll, so 10 s was the poll itself; LEND-8 asks for no further
+	// action, not a time.
+	within(t, 60*time.Second, "B learns A's number", func() bool { return bn.peerOf(aKey).PeerNumber == 80<<20 })
 	if q := bn.peerOf(aKey).Quota; q != 200<<10 {
 		t.Fatalf("B's quota after A alone raised: %d", q)
 	}
@@ -95,7 +98,7 @@ func TestBothNumbersRaisedResumeCopiesWithNoFurtherAction(t *testing.T) {
 		t.Fatalf("B raises: %s%s", out, e)
 	}
 	raised := time.Now()
-	within(t, 10*time.Second, "80M on both sides", func() bool {
+	within(t, 60*time.Second, "80M on both sides", func() bool {
 		return an.peerOf(bKey).Quota == 80<<20 && bn.peerOf(aKey).Quota == 80<<20
 	})
 	an.drained(bKey, 20*time.Second)
