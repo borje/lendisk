@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
+	"time"
 )
 
 // Queue operations (REPL-1, REPL-2).
@@ -80,13 +81,24 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 }
 
 // FinishPut marks a pending put done with its size and hash and places
-// it (REPL-12), in one transaction. If the
-// key's latest done row is a put with the same hash, the row is dropped
-// instead and dup is true: an identical re-upload, such as a client's
-// retry after a crash, is not queued twice (EP-3, EP-11). Unless that
-// row was refused at some place: then the re-upload is queued and
-// placed, which heals the refusal (#57), but acked at once where the
-// place acknowledged the very row it heals (placeTx, #61).
+// it (REPL-12), in one transaction. If the key's latest done row is a
+// put with the same hash, the row is dropped instead and dup is true: an
+// identical re-upload, such as a client's retry after a crash, is not
+// queued twice (EP-3, EP-11). Unless that row was refused at some place
+// for another reason than immutability (which the place would repeat):
+// then the re-upload is queued and placed, which heals the refusal
+// (#57), but acked at once where the place acknowledged the very row it
+// heals (placeTx, #61).
+//
+// The immutability policy (EP-11, #22): a put of a key that is not
+// rewritable (EP-7), whose bytes differ from what a place acknowledged
+// for the key since the key's last delete, is done (the local write
+// stands) but placed nowhere, and marked with the acknowledged hash
+// (queue.immutable). ChangedKeys reports it while it is the key's latest
+// write, and KeyChanged hears of it once committed. A write back to the
+// acknowledged bytes after such a change heals the row the change
+// replaced, so a place holding them is acked at once and nothing is sent
+// again.
 func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (dup bool, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -94,8 +106,10 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 	}
 	defer tx.Rollback()
 	var bucket, key string
-	if err := tx.QueryRowContext(ctx, `SELECT bucket, key FROM queue WHERE seq = ? AND state = 'pending'`, seq).
-		Scan(&bucket, &key); err != nil {
+	var rewritable bool
+	var at int64
+	if err := tx.QueryRowContext(ctx, `SELECT bucket, key, coalesce(rewritable, 0), created_at FROM queue
+		WHERE seq = ? AND state = 'pending'`, seq).Scan(&bucket, &key, &rewritable, &at); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, ErrNotFound
 		}
@@ -105,26 +119,58 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 	var prev sql.NullString
 	var refused bool
 	err = tx.QueryRowContext(ctx, `SELECT op, sha256,
-		EXISTS (SELECT 1 FROM placement p WHERE p.seq = q.seq AND p.state = 'refused')
+		EXISTS (SELECT 1 FROM placement p WHERE p.seq = q.seq AND p.state = 'refused'
+			AND p.cause IS NOT 'immutable')
 		FROM queue q
 		WHERE bucket = ? AND key = ? AND seq < ? AND state = 'done' ORDER BY seq DESC LIMIT 1`,
 		bucket, key, seq).Scan(&op, &prev, &refused)
-	switch {
-	case err == nil && op == OpPut && prev.String == sha256 && !refused:
-		dup = true
-		_, err = tx.ExecContext(ctx, `DELETE FROM queue WHERE seq = ?`, seq)
-	case err == nil || errors.Is(err, sql.ErrNoRows):
-		heal := err == nil && op == OpPut && prev.String == sha256
-		_, err = tx.ExecContext(ctx, `UPDATE queue SET state = 'done', size = ?, sha256 = ?, token = NULL WHERE seq = ?`,
-			size, sha256, seq)
-		if err == nil {
-			err = db.placeTx(ctx, tx, seq, heal)
-		}
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	return dup, tx.Commit()
+	if err == nil && op == OpPut && prev.String == sha256 && !refused {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM queue WHERE seq = ?`, seq); err != nil {
+			return false, err
+		}
+		return true, tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE queue SET state = 'done', size = ?, sha256 = ?, token = NULL WHERE seq = ?`,
+		size, sha256, seq); err != nil {
+		return false, err
+	}
+	var changed *ChangedKey
+	if !rewritable {
+		places, acked, err := ackedOther(ctx, tx, bucket, key, seq, sha256)
+		if err != nil {
+			return false, err
+		}
+		if len(places) > 0 {
+			if _, err := tx.ExecContext(ctx, `UPDATE queue SET immutable = ? WHERE seq = ?`, acked, seq); err != nil {
+				return false, err
+			}
+			changed = &ChangedKey{Bucket: bucket, Key: key, Seq: seq, CapturedAt: time.Unix(at, 0), SHA256: sha256,
+				Acknowledged: acked, Places: places}
+		}
+	}
+	if changed == nil {
+		// A healing re-upload carries the bytes of the row it heals: the
+		// key's latest done row that no change held back.
+		var base sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT CASE WHEN op = 'put' THEN sha256 END FROM queue
+			WHERE bucket = ? AND key = ? AND seq < ? AND state = 'done' AND immutable IS NULL
+			ORDER BY seq DESC LIMIT 1`, bucket, key, seq).Scan(&base); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+		if err := db.placeTx(ctx, tx, seq, base.Valid && base.String == sha256); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	if changed != nil && db.KeyChanged != nil {
+		db.KeyChanged(*changed)
+	}
+	return false, nil
 }
 
 // FinishDelete marks pending deletes done and places them, in one

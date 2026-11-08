@@ -416,7 +416,19 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			w.refuse(log, place, p, row, err, "replication alert: the friend keeps refusing a rewrite of this rewritable key; not replicated there")
 			condition(state.ConditionOK, "")
 		case errors.Is(err, ErrImmutable):
-			w.refuse(log, place, p, row, err, "immutability alert: the friend holds this key with another hash; not replicated")
+			// EP-11 (#22): the same condition as a change held back at
+			// capture, alerted as key_changed rather than place_refused.
+			var ce *changedError
+			held := ""
+			if errors.As(err, &ce) {
+				held = ce.held
+			}
+			log.Error("immutability alert: the friend holds this key with another hash; not replicated there",
+				append(row, "sha256", p.SHA256, "held", held, "alert", true, "err", err)...)
+			if err := w.DB.RefuseChanged(bg, place, p.Seq, held, err.Error()); err != nil {
+				log.Error("replication: recording a refusal failed", append(row, "err", err)...)
+			}
+			w.alerted()
 			condition(state.ConditionOK, "")
 		case errors.Is(err, errLocal):
 			if w.rewriting(ctx, p) {
@@ -555,6 +567,20 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		}
 	}
 	err := w.put(ctx, place, r, p, replaces)
+	if !p.Rewritable && errors.Is(err, ErrImmutable) && ctx.Err() == nil {
+		// A key that is not rewritable, held by the place with another
+		// hash the index does not show (EP-11, #22): ask which, for the
+		// alert and status. A place already holding the row's bytes has
+		// it; one whose answer cannot be had is refused all the same.
+		held, ok, herr := r.Head(ctx, p.Bucket, p.Key)
+		if herr == nil && ok && held == p.SHA256 {
+			return nil
+		}
+		if herr != nil || !ok {
+			held = ""
+		}
+		return &changedError{held: held, err: err}
+	}
 	if !p.Rewritable || !errors.Is(err, ErrImmutable) || ctx.Err() != nil {
 		w.rewriteDone(place, p.Seq)
 		return err
@@ -583,6 +609,17 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 	}
 	return fmt.Errorf("the place refused a rewrite of %s (%v) but holds %s; trying again", p.Key, err, heldDesc(held, ok))
 }
+
+// changedError is a place's immutability refusal (412) of a key that is
+// not rewritable, with the hash the place said it holds (empty if it
+// did not say). It wraps ErrImmutable.
+type changedError struct {
+	held string
+	err  error
+}
+
+func (e *changedError) Error() string { return e.err.Error() }
+func (e *changedError) Unwrap() error { return e.err }
 
 // DefaultRewriteRetry is how long a rewrite a place refuses without a
 // version to name instead is retried before it is refused for good

@@ -240,13 +240,16 @@ func TestReplicateKopiaToFriend(t *testing.T) {
 	k.run("snapshot", "create", src)
 	an.drained(bKey, 90*time.Second)
 	sameObjects(t, kopiaReplicable(t, an, "vault"), lentObjects(t, bn, aID, "vault"))
+	// Nor a changed key (EP-11, #22): maintenance rewrites only keys the
+	// kopia profile names rewritable.
 	refusedAlert := func() bool {
-		for _, al := range an.status().Alerts {
-			if al.Kind == alert.KindPlaceRefused {
+		st := an.status()
+		for _, al := range st.Alerts {
+			if al.Kind == alert.KindPlaceRefused || al.Kind == alert.KindKeyChanged {
 				return true
 			}
 		}
-		return false
+		return len(bucketOf(t, st, "vault").Changed) != 0
 	}
 	if p := an.place(bKey); p.Refused != 0 || refusedAlert() {
 		t.Fatalf("before maintenance: %+v, alerts %+v", p, an.status().Alerts)

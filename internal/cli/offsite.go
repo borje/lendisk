@@ -76,11 +76,15 @@ type StatusShortfall struct {
 	// Unmatchable: completed uploads whose rows cannot be matched to the
 	// object in the store (#62), which may never settle.
 	Unmatchable int64 `json:"unmatchable"`
+	// Immutable: keys written with other bytes than a friend
+	// acknowledged (EP-11, #22), replicated nowhere they would replace
+	// that version until written back or deleted.
+	Immutable int64 `json:"immutable"`
 }
 
 func shortfall(s state.Shortfall) StatusShortfall {
 	return StatusShortfall{Objects: s.Objects, Bytes: s.Bytes, Pending: s.Pending, Refused: s.Refused,
-		Dropped: s.Dropped, Gone: s.Gone, Unplaced: s.Unplaced, Unmatchable: s.Unmatchable}
+		Dropped: s.Dropped, Gone: s.Gone, Unplaced: s.Unplaced, Unmatchable: s.Unmatchable, Immutable: s.Immutable}
 }
 
 // offsiteStatus reads bucket b's offsite state.
@@ -189,6 +193,7 @@ func shortPhrase(waiting, stuck StatusShortfall, copies int) string {
 		what string
 	}{{stuck.Refused, "refused by a friend"}, {stuck.Dropped, "dropped at a full or gone friend"},
 		{stuck.Gone, "held by a friend removed or gone past replace_after"},
+		{stuck.Immutable, "changed after a friend acknowledged them (EP-11): write the acknowledged bytes back, or delete the key"},
 		{stuck.Unmatchable, "cannot be matched to the store: restore the store's xattrs or rewrite the key"},
 		{stuck.Unplaced, "with no room for them in the pool"}} {
 		if r.n > 0 {

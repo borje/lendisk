@@ -62,11 +62,13 @@ func (p *pool) put(bucket, key, class string, units float64) int64 {
 	return seqs[0]
 }
 
-// rewrite captures a completed put of key with other bytes than put's.
+// rewrite captures a completed put of key with other bytes than put's,
+// as of a key its profile names rewritable (EP-7), which EP-11 lets
+// replace an acknowledged version (#22).
 func (p *pool) rewrite(bucket, key, class string, units float64) int64 {
 	p.t.Helper()
 	ctx := context.Background()
-	seqs, err := p.db.BeginCaptures(ctx, []Capture{{Bucket: bucket, Key: key, Op: OpPut, Class: class}})
+	seqs, err := p.db.BeginCaptures(ctx, []Capture{{Bucket: bucket, Key: key, Op: OpPut, Class: class, Rewritable: true}})
 	if err != nil {
 		p.t.Fatal(err)
 	}

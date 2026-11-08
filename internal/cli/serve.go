@@ -102,6 +102,20 @@ func (a *app) serveCmd() *cobra.Command {
 			if a.tuneFetch != nil {
 				a.tuneFetch(fetch)
 			}
+			// Alerts (OPS-2, OPS-3) read state and deliver on goroutines
+			// of their own: nothing else waits for them. Made before the
+			// gateway, whose captures may hold back a changed key (EP-11).
+			alerts := &alert.Service{DB: db, Log: log, Node: nodeID, Command: cfg.Alerts.Command, Webhook: cfg.Alerts.Webhook,
+				UnreachableAfter: cfg.UnreachableAfter(), Now: a.clock}
+			if a.tuneAlerts != nil {
+				a.tuneAlerts(alerts)
+			}
+			db.KeyChanged = func(c state.ChangedKey) {
+				log.Error("immutability alert: a key was written with other bytes than a friend acknowledged; "+
+					"the local write stands but is not replicated", "alert", true, "bucket", c.Bucket, "key", c.Key,
+					"seq", c.Seq, "acknowledged_sha256", c.Acknowledged, "sha256", c.SHA256)
+				alerts.Check()
+			}
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore, BeforeHash: a.beforeHash, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
 				Fetch: fetch}
@@ -117,13 +131,6 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 
 			running := 1
-			// Alerts (OPS-2, OPS-3) read state and deliver on goroutines
-			// of their own: nothing else waits for them.
-			alerts := &alert.Service{DB: db, Log: log, Node: nodeID, Command: cfg.Alerts.Command, Webhook: cfg.Alerts.Webhook,
-				UnreachableAfter: cfg.UnreachableAfter(), Now: a.clock}
-			if a.tuneAlerts != nil {
-				a.tuneAlerts(alerts)
-			}
 			br := bridge.New(gw.Socket, log)
 			if a.tuneBridge != nil {
 				a.tuneBridge(br)

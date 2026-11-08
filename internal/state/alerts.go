@@ -127,9 +127,9 @@ func (db *DB) MarkAlertDelivered(ctx context.Context, a Alert, channel string, n
 }
 
 // RefusedAtPlaces returns, per place, how many rows the place itself
-// refused for good (EP-11, LEND-4) and not written again since: the
-// Refused of PlaceStats without the FIFO's scan. Places with none are
-// absent.
+// refused for good (LEND-4) and not written again since: the Refused of
+// PlaceStats without the FIFO's scan, less its immutability refusals,
+// which ChangedKeys reports (EP-11, #22). Places with none are absent.
 func (db *DB) RefusedAtPlaces(ctx context.Context) (map[string]int64, error) {
 	rows, err := db.QueryContext(ctx, `SELECT place, count(*) FROM placement p
 		WHERE state = 'refused' AND cause IS NULL AND `+current+` GROUP BY place`)

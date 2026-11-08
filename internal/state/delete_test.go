@@ -44,7 +44,7 @@ func TestDeleteCancelsAnUnstartedPutInsteadOfFollowingIt(t *testing.T) {
 	for _, f := range []string{"B", "C", "D"} {
 		p.ack(f, m1)
 	}
-	seqs, err := p.db.BeginCaptures(context.Background(), []Capture{{Bucket: "laptop", Key: "index/1", Op: OpPut, Class: "metadata"}})
+	seqs, err := p.db.BeginCaptures(context.Background(), []Capture{{Bucket: "laptop", Key: "index/1", Op: OpPut, Class: "metadata", Rewritable: true}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -254,7 +254,13 @@ func TestRowsQueuedBeforeTheUpgradeCountAsTaken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := old.FinishPut(ctx, seqs[0], 5, "h"); err != nil {
+	// Done and queued at B as that release did (this FinishPut reads
+	// columns of later migrations).
+	if _, err := old.ExecContext(ctx, `UPDATE queue SET state = 'done', size = 5, sha256 = 'h' WHERE seq = ?`, seqs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx, `INSERT INTO placement (seq, place, bucket, key, op, state, size)
+		VALUES (?, 'B', 'laptop', 'data/1', 'put', 'queued', ?)`, seqs[0], 5+ObjectOverhead); err != nil {
 		t.Fatal(err)
 	}
 	old.Close()

@@ -277,7 +277,8 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 //
 // A healing re-upload is acked at once, without sending, at a place that
 // acknowledged the very row it heals (the key's previous done row, a put
-// of the same hash) and has nothing of the key queued: exactly-once
+// of the same hash; a change EP-11 held back is passed over, since it was
+// never placed, #22) and has nothing of the key queued: exactly-once
 // holds for honest places while another place keeps refusing (#61). An
 // older acknowledgement of the hash is not enough: a row of other bytes
 // sent since may have landed with its answer lost and then been
@@ -291,6 +292,19 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 		return nil
 	} else if err != nil {
 		return err
+	}
+	// The row a healing re-upload heals: the key's latest done row that
+	// no change held back (EP-11, #22; such a change was never placed). A
+	// place that refused it as holding another version would refuse its
+	// bytes again, so it gets no copy.
+	const healed = `(SELECT max(l.seq) FROM queue l
+		WHERE l.bucket = ?1 AND l.key = ?2 AND l.seq < ?3 AND l.state = 'done' AND l.immutable IS NULL)`
+	var skip []string
+	if heal {
+		if skip, err = column(ctx, tx, `SELECT place FROM placement WHERE seq = `+healed+`
+			AND state = 'refused' AND cause = '`+CauseImmutable+`'`, bucket, key, seq); err != nil {
+			return err
+		}
 	}
 	var targets []string
 	switch {
@@ -310,11 +324,12 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 			ORDER BY p.place`, bucket, key, seq)
 	case class == "metadata" || class == "snapshot":
 		targets, err = column(ctx, tx, `SELECT peer_key FROM friendship WHERE coalesce(address, '') != '' ORDER BY peer_key`)
+		targets = slices.DeleteFunc(targets, func(p string) bool { return slices.Contains(skip, p) })
 	default:
 		if heal {
 			targets, err = column(ctx, tx, `SELECT p.place FROM placement p JOIN friendship f ON f.peer_key = p.place
-				WHERE coalesce(f.address, '') != '' AND p.state NOT IN ('`+PlacementDropped+`', '`+PlacementAbandoned+`') AND p.seq = (SELECT max(l.seq) FROM queue l
-					WHERE l.bucket = ?1 AND l.key = ?2 AND l.seq < ?3 AND l.state = 'done')
+				WHERE coalesce(f.address, '') != '' AND p.state NOT IN ('`+PlacementDropped+`', '`+PlacementAbandoned+`')
+				AND p.cause IS NOT '`+CauseImmutable+`' AND p.seq = `+healed+`
 				ORDER BY p.place`, bucket, key, seq)
 			if err != nil {
 				return err
@@ -326,7 +341,7 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 			return err
 		}
 		var more []string
-		more, err = db.choose(ctx, tx, bucket, size+ObjectOverhead, copies-len(targets), targets, false)
+		more, err = db.choose(ctx, tx, bucket, size+ObjectOverhead, copies-len(targets), append(slices.Clone(targets), skip...), false)
 		targets = append(targets, more...)
 	}
 	if err != nil {
@@ -350,7 +365,8 @@ func (db *DB) insertPlacement(ctx context.Context, tx *sql.Tx, seq int64, place 
 			AND EXISTS (SELECT 1 FROM placement a
 				WHERE a.place = ?2 AND a.state = 'acked' AND a.sha256 = q.sha256
 				AND a.seq = (SELECT max(l.seq) FROM queue l
-					WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq < q.seq AND l.state = 'done'))
+					WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq < q.seq AND l.state = 'done'
+					AND l.immutable IS NULL))
 			AND NOT EXISTS (SELECT 1 FROM placement w
 				WHERE w.place = ?2 AND w.bucket = q.bucket AND w.key = q.key
 				AND w.state = 'queued' AND w.seq < q.seq) AS held,

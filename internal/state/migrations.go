@@ -428,4 +428,17 @@ var migrations = []Migration{
 		-- Read only while the row is pending.
 		ALTER TABLE queue ADD COLUMN unmatchable TEXT;`,
 	},
+	{
+		Version: 23, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The immutability policy (EP-11, #22). On a done put of a key
+		-- that is not rewritable: the SHA-256 a place acknowledged for
+		-- the key, which this write changed; such a put is placed
+		-- nowhere. On a placement row refused with cause 'immutable' (a
+		-- lender's 412): the SHA-256 the place said it holds, '' if it
+		-- could not be learnt.
+		ALTER TABLE queue ADD COLUMN immutable TEXT;
+		ALTER TABLE placement ADD COLUMN held TEXT;
+		CREATE INDEX queue_immutable ON queue (bucket, key) WHERE immutable IS NOT NULL;`,
+	},
 }

@@ -49,6 +49,11 @@ type DB struct {
 	// before its unsent data goes elsewhere, and before it is no longer
 	// room at all. Zero means 1 hour and 7 days.
 	RerouteAfter, ReplaceAfter time.Duration
+	// KeyChanged, if set, is called after FinishPut commits a write that
+	// the immutability policy holds back (EP-11, #22), on the writer's
+	// goroutine: it must not block. The daemon logs it and asks the
+	// alert service to look.
+	KeyChanged func(ChangedKey)
 }
 
 func (db *DB) now() time.Time {

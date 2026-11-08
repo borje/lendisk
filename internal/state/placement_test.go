@@ -371,7 +371,8 @@ func TestHealingReuploadIsSentOnlyWhereTheHashIsNotHeld(t *testing.T) {
 // where the place acknowledged the very row it heals. An earlier
 // acknowledgement of the same hash proves nothing: a row of other bytes
 // sent since may have landed with its answer lost, and was then
-// cancelled as superseded, leaving no trace.
+// cancelled as superseded, leaving no trace. (The key is rewritable,
+// so EP-11 lets its versions replace each other, #22.)
 func TestHealingDoesNotTrustAnOlderAcknowledgement(t *testing.T) {
 	ctx := context.Background()
 	db := openTest(t)
@@ -379,7 +380,7 @@ func TestHealingDoesNotTrustAnOlderAcknowledgement(t *testing.T) {
 	friend(t, db, "Q")
 	put := func(hash string) int64 {
 		t.Helper()
-		s, err := db.BeginCaptures(ctx, []Capture{{Bucket: "laptop", Key: "data/1", Op: OpPut, Class: "data"}})
+		s, err := db.BeginCaptures(ctx, []Capture{{Bucket: "laptop", Key: "data/1", Op: OpPut, Class: "data", Rewritable: true}})
 		if err != nil {
 			t.Fatal(err)
 		}
