@@ -1539,8 +1539,7 @@ upstream bucket is Q-V.
   anything. Either way the bucket is unchanged, never half-synced
   (`TestRcloneBackupDirRefusedWithoutHarm`), and the lines say these
   two flags cannot be used. Whether to capture copies for generic
-  buckets after all, so that `--backup-dir` works, is open for the
-  user (#7 report).
+  buckets after all, so that `--backup-dir` works, is #77.
   *Measured (EP-2 AC):* `TestCaptureOverhead` in `internal/gateway`
   (opt-in, `LENDISK_OVERHEAD_MB`; `LENDISK_OVERHEAD_TOOL=restic|kopia`,
   default each installed tool as a subtest) times `restic backup` or
@@ -1848,8 +1847,8 @@ upstream bucket is Q-V.
   rewrites the key again and only its latest row counts (stays 1),
   and the friend's copy stays stale. A Kopia restore through the
   friend after `recover` works with the stale copy
-  (`TestReplicateKopiaToFriend`). #74 holds the fix, which needs a
-  REQUIREMENTS change to EP-7 and EP-11.
+  (`TestReplicateKopiaToFriend`). #74 holds the fix, under
+  REQUIREMENTS v0.11.3's rewritable keys (EP-7, EP-11, LEND-4, RET-1).
 - **EP-10** The read-through (`gateway/readthrough.go`, #30). The
   decorator's `GetObject` and `HeadObject` turn the store's not-found
   for an own bucket's key (not a local-only one; `lent-*` buckets pass
