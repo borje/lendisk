@@ -32,6 +32,9 @@ type friend struct {
 	lent   int64
 	down   bool
 	calls  []control.QuotaRequest
+	// during, if set, runs after the friend took its count and before
+	// its answer is back.
+	during func()
 }
 
 func (f *friend) call(_ context.Context, _ state.Friendship, req control.QuotaRequest) (control.QuotaResponse, error) {
@@ -40,6 +43,9 @@ func (f *friend) call(_ context.Context, _ state.Friendship, req control.QuotaRe
 	f.calls = append(f.calls, req)
 	if f.down {
 		return control.QuotaResponse{}, errors.New("dial: no route to the friend")
+	}
+	if f.during != nil {
+		f.during()
 	}
 	return control.QuotaResponse{Number: f.number, Quota: min(f.number, req.Number), Lent: f.lent,
 		RepositorySize: 7 << 30, Protocol: "0.1"}, nil
@@ -218,6 +224,61 @@ func TestTheQuotaCallIsRepeatedPeriodicallyAndOnDemand(t *testing.T) {
 	s.pass()
 	if s.b.count() != 3 {
 		t.Fatal("Due did not ask at once")
+	}
+}
+
+// #85: an answer to a call that crossed a send to the friend may or may
+// not count it; here the put lands after the friend's count and is
+// acknowledged before the answer, so the answer misses it. The friend
+// is called again once nothing is left to send there, and this node's
+// count settles on the friend's word; an answer that crossed nothing
+// is not repeated.
+func TestAnAnswerThatCrossedASendIsSettledOnceThePlaceIsIdle(t *testing.T) {
+	ctx := context.Background()
+	s := newSetup(t)
+	if err := s.db.AddBucket(ctx, state.Bucket{Name: "laptop", Profile: "restic", Copies: 1,
+		AccessKey: "AK", SecretKey: "s", CreatedAt: s.c.now()}); err != nil {
+		t.Fatal(err)
+	}
+	seqs, err := s.db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "data/1", Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.FinishPut(ctx, seqs[0], 100, "h"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.db.StartPlacement(ctx, "B", seqs[0], s.c.now()); err != nil || !ok {
+		t.Fatalf("start %v %v", ok, err)
+	}
+	use := func() int64 {
+		t.Helper()
+		u, err := s.db.PlaceUse(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u["B"]
+	}
+	held := int64(100 + state.ObjectOverhead)
+	s.b.during = func() {
+		if err := s.db.AckPlacement(ctx, "B", seqs[0], "h", s.c.now()); err != nil {
+			t.Error(err)
+		}
+	}
+	s.pass()
+	if use() != 0 {
+		t.Fatalf("the crossed answer: %d", use())
+	}
+	s.b.during = nil
+	s.b.lent = held
+	s.c.add(time.Second)
+	s.pass()
+	if s.b.count() != 2 || use() != held {
+		t.Fatalf("after %d calls this node counts %d at B, the friend %d", s.b.count(), use(), held)
+	}
+	s.c.add(time.Second)
+	s.pass()
+	if s.b.count() != 2 {
+		t.Fatal("a settled answer was asked again")
 	}
 }
 

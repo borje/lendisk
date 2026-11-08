@@ -2378,13 +2378,22 @@ upstream bucket is Q-V.
   SQLite triggers on `placement` keep it as rows are
   inserted, acknowledged, refused, re-queued, cancelled and moved, so
   placing an object reads one row per friend. A put acknowledged after
-  a delete of its key was placed at the place (a send in flight) is
-  acknowledged with size 0 (`AckPlacement`, #21): that delete removes
-  it, and the delete's own size did not include it
-  (`TestAPutAcknowledgedAfterItsDeleteIsFreed`). A lender keeps a deleted object counted
-  until its purge (§3.6), so this count frees it a retention window
-  early, erring towards more room until the `507` below or the `quota`
-  answer corrects it. *Correction from the lender's answers:* a place
+  a delete of its key was placed at the place (a send in flight, #21)
+  landed there, and the lender counts it and then its tomb until the
+  purge: it keeps its size, and `AckPlacement` adds that size to the
+  first delete after it at the place, as if the put had been
+  acknowledged before the delete was placed, so the delete frees it
+  through `place_freed` like any other (below). *#85:*
+  #21 acknowledged such a put with size 0, so the borrower counted
+  neither the object nor its tomb and stayed short of the lender, one
+  object and overhead per late put, until the next answer, which
+  `TestResticPruneTombstonesAtEveryFriend` caught under load as two
+  overheads (`TestALateAcknowledgedPutCountsUntilTheLenderPurgesIt`,
+  `TestAPutAcknowledgedAfterItsDeleteIsFreed`). Before a place's first
+  answer its deletes free at once (below), so this count frees a
+  deleted object a retention window early there, erring towards more
+  room until the `507` below or the `quota` answer corrects it.
+  *Correction from the lender's answers:* a place
   whose last answer was `507` counts as full, gets no new data and has
   its unsent data re-routed or dropped (below), until it acknowledges a
   row again or the friendship's quota rises (`state.DB.ResumePlace`,
@@ -2409,13 +2418,63 @@ upstream bucket is Q-V.
   delete's negative size takes off `place_use` after the place's last
   answer is added up in `place_freed` (migration 26, triggers on
   `placement` for rows of negative size) and counted back wherever the
-  use is read (`PlaceUse`, D6's pool), until the next answer sets it to
-  0. A place gets its `place_freed` row from its first answer; before
+  use is read (`PlaceUse`, D6's pool), until the next answer. The
+  answer sets `place_freed` to what the place's `queued` and `acked`
+  deletes take off `place_use`, and `place_use` to the lender's count
+  plus the queued puts less that, so the sum is the lender's word and
+  each delete then nets to nothing: one acknowledged, or sized anew by
+  a late put, after the answer moves bytes between the two and never
+  adds them (#85: the answer set `place_freed` to 0, and the triggers'
+  floor at 0 then counted such a delete back on top of the lender's
+  count, which already held it). A place gets its `place_freed` row from its first answer; before
   that its deletes free at once, as they did. A send in flight across the answer may be
   counted twice (less room) or, if acknowledged between the lender's
-  count and the transaction, missed until the next answer
-  (`TestQuotaAnswerReconcilesThePlacesUse`). Left to #68: retrying a
+  count and the transaction, missed
+  (`TestQuotaAnswerReconcilesThePlacesUse`). So such an answer does
+  not stand for the hour: when the place had a row taken and not yet
+  acknowledged as the call was sent, or one taken since or still in
+  flight at the answer (`state.DB.PlaceSending`, to the second), the
+  exchanger marks the friend unsettled and calls it again at the first
+  pass that finds the place's FIFO empty (`state.DB.PlaceIdle`): one
+  more call per busy spell, and the count settles on the lender's word
+  once the sends stop (#85,
+  `TestAnAnswerThatCrossedASendIsSettledOnceThePlaceIsIdle`). A place
+  whose FIFO never empties (a friend at quota) waits for the hourly
+  call. Left to #68: retrying a
   failed re-routing batch row by row.
+  *What each side counts (#85).* Between answers the borrower's count
+  of a place (`PlaceUse`: `place_use` plus `place_freed`) follows the
+  lender's rule (§3.5 LEND-1: an object's bytes plus 4 KiB until its
+  tomb is purged) row by row. S is a row's object plus
+  `ObjectOverhead`; "answer" is the place's next quota answer, which
+  replaces both sides' difference with the lender's count.
+
+  | Event at the place | Lender counts | Borrower counts |
+  |---|---|---|
+  | Put queued, not sent | 0 | S (queued) |
+  | Put sent, its answer not back | S once it lands | S (queued) |
+  | Put acknowledged | S | S |
+  | Put of the bytes the place's latest row acknowledged (a healing re-upload) | nothing more (accepted unstored) | 0 |
+  | Rewrite of an acknowledged version (#74) | both, the old as a tomb, until its purge | both rows' S; the old freed by the answer after the purge |
+  | Change held back (EP-11, #22): placed nowhere | the version it holds | that version's acknowledged row |
+  | Put refused (507, 412, LEND-4; or the node's store, #50) | nothing new | 0 (out of the count); a 412's other bytes only from the answer |
+  | Put dropped (never sent, #19, #25) | 0 | 0 |
+  | Put abandoned (taken, never acknowledged, #21) | S if a send landed, else 0 | 0 until the answer |
+  | Unstarted put cancelled by a delete | 0 | 0 (row removed) |
+  | Delete queued or acknowledged | the object, then its tomb, until the purge | S: −S in `place_use`, +S in `place_freed` |
+  | Put acknowledged after its delete was placed (#85) | S, then its tomb, until the purge | S: the put keeps S, its delete takes −S more, +S in `place_freed` |
+  | Delete refused | the object, live | S: the delete leaves both counts |
+  | Copy marked `dropping`, then `drained` (#26) | the copy, then its tomb, until the purge | S: out of `place_use`, +S in `place_freed` (`place_freed_dropping`) |
+  | A `drained` copy placed there again (re-placement) | the tomb and the new copy | the new S queued, plus the S still in `place_freed` |
+  | The bucket at the place | 4 KiB | 0 until an answer counts it |
+  | A quota answer | its count, `lent` | `lent` plus the place's queued puts, split so that `place_freed` holds its deletes |
+  | A delete queued across an answer, acknowledged after it | its tomb (in `lent`) | unchanged: the delete nets to nothing |
+  | Before the place's first answer | as above | deletes and drops free at once (no `place_freed` row) |
+
+  Only an abandoned put, the bucket's overhead, a refusal's other
+  bytes and a send in flight across an answer (above) leave the two
+  apart; the next answer settles each, and an answer that crossed a
+  send is followed by another as soon as the place's FIFO empties.
 - **REPL-1 to REPL-3** The queue is a SQLite table with one FIFO
   sequence per place, ordered by the bucket's write sequence. The
   worker uploads one object at a time per place in sequence order,
