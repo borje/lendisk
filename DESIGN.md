@@ -3030,11 +3030,21 @@ upstream bucket is Q-V.
   failing put `r` rules out `[r, next)`, `next` its key's next done
   write (none for the key's latest), so one pass over the failing puts
   in descending order finds it. The query reads every done put of the
-  bucket once, with one indexed look-up per place (`placement_key`):
-  about 7 µs per object at three friends on the development machine
-  (150 ms for 23 000, `TestOffsiteOfALargeBucketIsFast`; 1.6 s for
-  221 000 in the #20 review), so some 8 s at a million objects there
-  and several times that on a Pi. `status` reads it once per bucket and
+  bucket once, with one indexed look-up per place (`placement_key`),
+  counted once in a materialized CTE; a put's next write and queued
+  rows are read only when it is short. The snapshot look-ups name
+  `class IN ('metadata', 'snapshot')` so the partial index
+  `queue_metadata` serves them, and the latest-write look-ups walk the
+  queue backwards by sequence (`+q.bucket`) instead of sorting the
+  bucket. About 6 µs per object at three friends on the development
+  machine (140 ms for 23 000, was 175 ms; 1.35 s for 5 600 under
+  `-race`, was 1.6 s; 1.6 s for 221 000 in the #20 review), so some
+  6 s at a million objects there and several times that on a Pi.
+  `TestOffsiteOfALargeBucketIsFast` bounds it at 2 s without `-race`
+  and, everywhere, at 8 times a yardstick query (one `placement_key`
+  look-up per put and place) timed beside it, so a loaded CI runner
+  under `-race` (9.6 s on a7d636f) does not fail it but a query that
+  grows worse than linear does; it measures about 2.5 times. `status` reads it once per bucket and
   recounts what waits for the latest snapshot with `Offsite.For`, which
   reads nothing (`TestForRecountsLikeAFreshRead`); `status --wait`
   pauses ten times as long as its last read took, never less than 2 s

@@ -16,6 +16,13 @@ const (
 	settleWait = 10 * time.Second
 )
 
-// offsiteObjects sizes the large-bucket watermark test: a fifth of the
-// objects, as the race detector makes its query about forty times slower.
-const offsiteObjects = 4_000
+// offsiteObjects, offsiteLimit and offsiteFactor size and bound the
+// large-bucket watermark test: a fifth of the objects, as the race
+// detector makes its query about forty times slower, and no limit in
+// time, as a loaded CI runner is several times slower again (9.6 s
+// there for 1.6 s here); the yardstick bounds it instead.
+const (
+	offsiteObjects = 4_000
+	offsiteLimit   = 0
+	offsiteFactor  = 8 // it measures under 3 with or without -race
+)
