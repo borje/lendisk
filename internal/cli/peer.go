@@ -137,8 +137,62 @@ friendship, each way, is the smaller of the two (LEND-8).`,
 		},
 	}
 	list.Flags().BoolVar(&asJSON, "json", false, "print JSON")
-	cmd.AddCommand(add, list)
+	remove := &cobra.Command{
+		Use:   "remove <friend>",
+		Short: "End a friendship",
+		Long: `peer remove ends the friendship with a friend, named by its node ID
+(PEER-5). Both of its keys are refused from that moment; a running
+daemon closes its open connections within seconds and tells it, and it
+ends the friendship on its side too. Its copies of your data no longer
+count. What it stores here is kept, refused to it, until the retention
+window ends, then deleted; it does the same with what it holds of yours.
+Becoming friends again before then, with a new invite, keeps both.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runPeerRemove(cmd.Context(), args[0])
+		},
+	}
+	cmd.AddCommand(add, list, remove)
 	return cmd
+}
+
+// runPeerRemove ends the friendship with s (PEER-5, #25). It commits the
+// removal and returns; the daemon, from its next pass, cuts the friend's
+// connections and tells it (farewell).
+func (a *app) runPeerRemove(ctx context.Context, s string) error {
+	peer, err := identity.ParseNodeID(strings.TrimSpace(s))
+	if err != nil {
+		return usageError{fmt.Errorf("%q is not a node ID: %w; `lendisk peer list` shows your friends", s, err)}
+	}
+	_, db, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	f, err := db.RemoveFriendship(ctx, peer.String(), false, a.now())
+	if errors.Is(err, state.ErrNotFound) {
+		return fmt.Errorf("%s is not a friend of this node; `lendisk peer list` shows your friends", peer)
+	} else if err != nil {
+		return err
+	}
+	below, err := db.BelowCopies(ctx)
+	if err != nil {
+		return err
+	}
+	var objects int64
+	for _, b := range below {
+		objects += b.Objects
+	}
+	fmt.Fprintf(a.out, "Ended the friendship with %s. Both of its keys are refused from now on;\n"+
+		"a running `lendisk serve` closes its open connections within seconds and tells it.\n", peer)
+	if objects > 0 {
+		fmt.Fprintf(a.out, "Its copies of your data no longer count: %d objects are below their copies until\n"+
+			"re-placement (not built yet, #26); `lendisk status` shows them.\n", objects)
+	}
+	fmt.Fprintf(a.out, "What it stores here is kept, refused to it, until %s, then deleted;\n"+
+		"it deletes what it holds of yours then. A new invite before then keeps both.\n",
+		f.PurgeAfter.UTC().Format(time.RFC3339))
+	return nil
 }
 
 func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {

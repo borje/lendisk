@@ -37,6 +37,11 @@ type tunnel struct {
 	// S3 is the tunnel's S3 handler, set once the gateway serves; until
 	// then S3 on the tunnel answers 503.
 	S3 *bridge.Late
+	// Conns are the tunnel's open connections by key, which ending a
+	// friendship cuts (SEC-15).
+	Conns *bridge.Conns
+	// Manifests are the friends' manifests this node keeps (ID-4).
+	Manifests *manifest.Store
 }
 
 // startTunnel chooses the region if none is saved yet, starts the
@@ -44,9 +49,10 @@ type tunnel struct {
 // ends: the bridge's tunnel middleware in front of the control API
 // (§3.7) and, once tun.S3 is set, S3 for friends. changed, if set, is
 // called after the control API commits a friendship (the manifest
-// pusher's Kick, ID-4).
+// pusher's Kick, ID-4); ended, if set, after a friend's remove call
+// ended one (the farewell's Kick, #25).
 func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.Identity, db *state.DB, log *slog.Logger,
-	changed func()) (*tunnel, error) {
+	changed, ended func()) (*tunnel, error) {
 	region, chosen, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays())
 	if err != nil {
 		return nil, err
@@ -101,16 +107,17 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 				changed()
 			}
 		},
-		Manifests: manifests}
+		Ended: ended, Manifests: manifests}
 	if a.tuneControl != nil {
 		a.tuneControl(ctl)
 	}
 	s3 := &bridge.Late{}
 	caps := &bridge.Caps{Of: bridge.RolesIn(db, a.now)}
-	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, caps, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, caps, log), log)
+	conns := &bridge.Conns{}
+	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, caps, conns, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, caps, log), log)
 	go purgeInvites(ctx, db, adm, a.now, log)
 	log.Info("tunnel listening", "address", tc.Address(), "port", transport.Port, "region", region.RegionCode)
-	return &tunnel{Transport: tc, Admission: adm, S3: s3}, nil
+	return &tunnel{Transport: tc, Admission: adm, S3: s3, Conns: conns, Manifests: manifests}, nil
 }
 
 // purgeInvites deletes expired invites at start and every minute after

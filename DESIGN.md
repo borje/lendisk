@@ -993,8 +993,16 @@ upstream bucket is Q-V.
   `<store>/.lendisk/manifests/<node ID>`, 0600 in 0700 directories,
   through a synced temporary file (`.put-*`) renamed over the old one;
   `serve` sweeps temporary files an hour old at start, left by a crash.
-  A former friend's manifest stays until ending the friendship removes
-  it with its replica (#25). It is a
+  A former friend's manifest is kept, but no longer served: the
+  manifest call needs the `peer` role, and ending the friendship
+  refuses both of its keys (SEC-10). *Decision (#25):* a removed
+  friend cannot fetch its manifest here during the window; its other
+  friends hold the same manifest (every friend gets it), so recovery
+  does not need a former friend, and admitting the key for one call
+  would undo SEC-15. The file is deleted with the friend's replica at
+  the purge (`manifest.Store.Delete`, §3.2 PEER-5), and a push in
+  flight when a friendship ended records no delivery row
+  (`TestPusherStopsAtARemovedFriend`). It is a
   file, not an object in a `lendisk-manifests` bucket as planned: a
   name beginning with a dot is no valid bucket name, so versitygw
   serves it to no account at all (no borrower, no bucket key, not the
@@ -1443,6 +1451,67 @@ upstream bucket is Q-V.
   the bridge's tunnel listener only. Its friendship rows are like any other; the quota its
   friends lend it back has no buckets to fill, and `status` shows it as
   unused. Adding a bucket later is a change of `role` and a restart.
+- **PEER-5, PEER-12, ending a friendship (#25).** `lendisk peer
+  remove <node ID>` (a malformed ID is a usage error, a stranger "not
+  a friend") commits `state.DB.RemoveFriendship`: in one transaction
+  the friendship row and its `manifest_push` row are deleted, the
+  friend's unsent placement rows leave its FIFO (§3.4), and a
+  `former_friend` row (migration 24) keeps its node ID, dial key and
+  address, when it ended, whether the friend ended it (`by_peer`),
+  when it was told, and `purge_after`: removal plus the friendship's
+  retention window, the longer of the two sides' offers
+  (`state.Friendship.Retention`, which the lender's tombs use too), so
+  both sides purge at the same time. Both keys are refused from the
+  commit (SEC-10); the daemon cuts their open connections (§3.9
+  SEC-15). Only the one friendship changes (PEER-12, scenario 8:
+  `TestEndingAFriendshipTellsTheFriendAndLeavesTheOthers`, where C's
+  open connection at A is still served).
+  *Telling the other side.* The daemon's farewell calls the friend's
+  `POST /_lendisk/remove` over the tunnel, still admitted there,
+  retried with a backoff of a minute doubling to an hour while the
+  window lasts; a 403 means it holds no friendship either and counts
+  as told. The callee, in the `peer` role, ends the friendship on its
+  side with `by_peer` set (and so told), answers before its own cut
+  closes that very connection, and raises `friend_removed` (§3.8).
+  `status` lists ended friendships (`former_friends`, with who ended
+  it, whether the friend was told and the purge time).
+  *Decision (#25): the other side ends it too, automatically, and is
+  alerted.* PEER-3 has no one-way friendships and PEER-12 revokes a
+  friendship as a whole, so a side that kept its half would only keep
+  dialling a node that refuses it. *Precedent:* Syncthing removes a
+  device on one side only and sends nothing; the other side keeps
+  connecting and the remover's GUI keeps asking "device wants to
+  connect" (syncthing#4086), and an introducer's removals reach other
+  devices only when they connect. lendisk takes the opposite course
+  for the reason Syncthing's users complain of: one explicit call, and
+  an alert in place of a silent refusal. A side that never receives
+  the call (offline for the whole window) sees the friend as
+  `retrying` and then `friend_unreachable`; a refusal on an open
+  connection does not end anything by itself.
+  *Holding and purging.* The lender side keeps the former friend's lent
+  buckets, tombs and manifest, refused to it, so read-only, until
+  `purge_after`; seven days before, `replica_purge_soon` is raised.
+  Then the farewell deletes its lent buckets from the store
+  (`gateway.Gateway.PurgeFormer`) and its manifest
+  (`manifest.Store.Delete`), and `state.DB.ForgetFormerFriend` drops
+  every row of it: placement, `place_use`, `place`, lent buckets,
+  tombstones, uploads, usage and the former friend row
+  (`TestAFormerFriendsReplicaIsKeptForTheWindowThenPurged`). Purges run
+  on a goroutine of their own, one friend at a time, so deleting a
+  large replica on a slow disk never delays revoking a removal made
+  meanwhile (`TestABlockedPurgeDoesNotHoldUpARevocation`). Before each
+  bucket the purge checks that the peer is still a former friend due
+  for it and not a friend again (`state.DB.PurgeDue`); one that
+  redeemed a new invite meanwhile keeps its remaining buckets, its
+  manifest and every row (`state.ErrNotFormer`;
+  `TestAPurgeStopsWhenTheFormerFriendIsBefriendedAgain`). A redeem
+  landing inside one bucket's deletion can still lose that bucket's
+  old objects: a window as long as one directory removal, at the end
+  of a 30-day window, which nothing closes yet. On the
+  borrower side "holding" is only that the placement rows stay, not
+  counted (§3.4), so a renewed friendship finds them. A new friendship
+  with the same node within the window deletes the `former_friend` row,
+  so nothing is purged and both replicas count again.
 - **PEER-10** Peers are rows in `lendisk.db`; nothing in the control API
   or the S3 surface returns them. `redeem` answers with the inviting
   node's own terms only. `peer list` (`--json` too) shows each friend's
@@ -2496,11 +2565,13 @@ upstream bucket is Q-V.
   clocks differ by more than 15 minutes and to enable NTP, and
   `SignatureDoesNotMatch` and the rest name their S3 code (#53). A
   friend that removed this node normally refuses the tunnel
-  connection at admission (SEC-10) before any `403`, so until ending
-  a friendship tells the other side (#25) such a place shows as
-  `retrying` with a dial error, not `removed`; `removed` appears only
-  on a connection opened before the removal, which the middleware
-  still refuses request by request (SEC-11). A `412` to a put of a
+  connection at admission (SEC-10) before any `403`; it tells this
+  node with the remove call (§3.2 PEER-5, #25), which ends the
+  friendship here too, so the place becomes a former friend. Until that
+  call arrives (this node offline, the friend's daemon down) the place
+  shows as `retrying` with a dial error, not `removed`; `removed`
+  appears only on a connection opened before the removal, which the
+  middleware still refuses request by request (SEC-11). A `412` to a put of a
   rewritable key is handled as *Rewrites* says, below; any other `412`
   is refused at that place as a changed key, with the hash a `HEAD`
   reports, and raises `key_changed` and `place_refused` (*EP-11*,
@@ -2938,6 +3009,20 @@ upstream bucket is Q-V.
     within `replace_after`) still counts: scenario 2's friend away for
     three days holds its copies throughout
     (`TestARemovedOrGoneFriendHoldsNoCopy`, `TestHoldsRules`).
+    *Decision (#25, the #20 review's checkbox): a friend this node
+    removed, or that removed it, holds nothing from the commit.* Its
+    friendship row is gone, so it is no place at all: its
+    acknowledgements no longer count (stuck reason `gone`, "held by a
+    friend removed or gone"), `BelowCopies` counts only rows at
+    friends, so what it held shows as below copies, and its unsent rows
+    leave its FIFO in the removing transaction (a put a sender took
+    becomes `abandoned`, every other queued row `dropped`), so none
+    holds the metadata barrier. It may well keep the bytes for the
+    retention window, but this node can no longer reach them, so an
+    offsite claim must not rest on them. Re-placement (#26) restores
+    `copies`; until then `status` says copies at an ended friendship
+    no longer count
+    (`TestARemovedFriendHoldsNoCopyAndNothingWaitsForIt`).
   - *local-only keys* are never queued, so never counted.
 
   `w` is valid when every put at or below it passes; the watermark is
@@ -3504,7 +3589,7 @@ capture decorator, so nothing stands between that and posix (#62).
   `/%5Flendisk/x` and `/_lendisk%2Fx` are refused as `/_lendisk/x` is
   (`TestGateRefusesControlPathAsFiberDecodes`). The control API
   (`redeem`, `challenge`, `manifest`, `quota`, `version`, `undelete`,
-  `list`) is plain HTTP under `/_lendisk/` on the same tunnel port,
+  `list`, `remove`) is plain HTTP under `/_lendisk/` on the same tunnel port,
   authenticated by the tunnel peer key and checked per request against
   `lendisk.db` (SEC-11). `manifest` (`PUT` and `GET`, the caller's own
   sealed manifest, §3.1 ID-4) is served (#28). `list` is served (#29):
@@ -3732,6 +3817,15 @@ capture decorator, so nothing stands between that and posix (#62).
     it drops one. A deficit from placement (the pool had no room for
     `copies` when the object was captured) shows in `status` as bytes
     below `copies` but raises no alert until #26's threshold alert;
+  - `friend_removed`, subject the former friend: it ended the
+    friendship (its remove call, §3.2 PEER-5, #25); raised at once,
+    cleared at the purge or when the two are friends again. This
+    node's own `peer remove` raises nothing: its output says the same;
+  - `replica_purge_soon`, subject the former friend: an ended
+    friendship's replicas are purged within 7 days
+    (`alert.PurgeWarning`), naming the date and that a new invite
+    before then keeps both; cleared at the purge
+    (`TestEndingAFriendshipIsAlertedAndSoIsItsPurge`);
   - `upload_unmatchable`, subject the bucket: completed uploads whose
     pending rows cannot be matched to the store (`queue.unmatchable`,
     §3.4 REPL-1, #20), each holding the bucket's metadata and so every
@@ -3855,14 +3949,18 @@ capture decorator, so nothing stands between that and posix (#62).
   buckets; each answer on the dial key equals the answer on the node
   ID; a request signed with the dial key, C's credential or A's node ID
   as the access key is refused; B's own key respelled with whitespace (`respellings`), which versitygw still reads as B, is refused everything outside the list; RET-2's attack list leaves B's
-  tombstone intact; the redeem abuses of #69 are refused; and after B's
-  friendship row is deleted, both keys are refused everything on their
-  open connections. An unknown identity, and B at C (not its friend),
-  are refused the connection. The `admitall` build
+  tombstone intact; the redeem abuses of #69 are refused; after
+  `peer remove` B, both keys are refused everything on their open
+  connections, the remove call and the manifest included, and once the
+  daemon's farewell pass has cut them neither key connects. An unknown
+  identity is refused the connection with zero peers, two, one (after
+  B's removal) and zero again (after `peer remove` C), and B at C (not
+  its friend) is refused the connection. B's own remove call is left
+  out of the friend-phase list (`friendlyControl`): sending it ends the
+  friendship, which is its right. The `admitall` build
   (`TestMiddlewareAloneRefusesStranger`) sends the whole list from an
   unknown identity whose connection is admitted, and the middleware
-  refuses every request (SEC-11). `peer remove` (#25) replaces the
-  row deletion and adds the zero-peers-after-removal state of SEC-10.
+  refuses every request (SEC-11).
 - **Per-friend caps.** fasthttp's `MaxConnections` and `MaxRequests` at
   `gw.sock` are shared by every listener, so the tunnel bounds each
   friend before it gets there (`bridge.Caps`, #15): at most 32 open
@@ -4081,7 +4179,32 @@ capture decorator, so nothing stands between that and posix (#62).
   from that key and closes its connections (the bridge tracks them per
   key, including the proxied half to `gw.sock`), and, when no
   relationship is left, calls `Server.DisconnectClient` for both the
-  friend's node ID and its dial key, in that order. tailcat's disconnect alone resets nothing and cuts only the
+  friend's node ID and its dial key, in that order. *Realised for
+  ending a friendship (#25):* the commit is `peer remove` (a one-shot
+  process) or a friend's remove call; the daemon's farewell
+  (`internal/cli/ending.go`) applies it on its next pass, at most 10 s
+  later or at once after a remove call: `Admission.Clear`, then
+  `bridge.Conns.Cut` for the node ID and the dial key, then
+  `Transport.Disconnect` for each, then `Cut` once more for a
+  connection opened inside the still-standing tunnel between the two
+  (its requests were refused anyway). `bridge.Conns` tracks each
+  accepted tunnel connection under the key it authenticated with;
+  `ServeTunnel` gives each a connection context that `Cut` cancels with
+  the cause `bridge.ErrCut`, which ends the reverse proxy's request to
+  `gw.sock`, and sets its read deadline in the past (kept there, so
+  neither the body bound nor net/http's post-handler drain waits on the
+  client). A request whose answer had not started gets the removed
+  answer (403 `AccessDenied`, `state.NoRelationship`, `Connection:
+  close`, with its length) and the connection is then hijacked and
+  closed; an idle connection is closed at once; a busy one that does
+  not end within `Conns.Grace` (2 s) is closed anyway
+  (`TestCutCancelsInFlightRequestsAndClosesTheKeysConnections`; over
+  the real tunnel, spike #3's order, `TestCutThenDisconnect`;
+  `TestFarewellRevokesInOrderTellsAndPurges`). The SEC-15 AC,
+  `TestRemovingAFriendEndsItsRunningTransfer`: B's 2 MiB PUT trickling
+  on its dial key is answered 403 "no relationship" about 8 s after `peer
+  remove`, B's next request on its node-ID connection is refused at
+  once, nothing is stored, and neither key connects after. tailcat's disconnect alone resets nothing and cuts only the
   server-to-client direction: the client's packets still arrive on
   open connections for some seconds, and a connection closed after
   the disconnect never tells the client (Q-Q). So lendisk closes its

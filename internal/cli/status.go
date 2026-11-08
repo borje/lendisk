@@ -9,6 +9,7 @@ import (
 	"maps"
 	"path/filepath"
 	"slices"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -47,6 +48,24 @@ type Status struct {
 	Manifest StatusManifest `json:"manifest"`
 	// Recovery is what a recovered node still has to list (ID-5, #29).
 	Recovery StatusRecovery `json:"recovery"`
+	// FormerFriends are friendships that ended and whose replicas are
+	// kept until the retention window ends (PEER-5, #25).
+	FormerFriends []StatusFormer `json:"former_friends"`
+}
+
+// StatusFormer is one ended friendship in its retention window.
+type StatusFormer struct {
+	Peer      string `json:"peer"`
+	RemovedAt string `json:"removed_at"` // RFC 3339, UTC
+	// ByPeer is true when the friend ended it, false when this node did.
+	ByPeer bool `json:"by_peer"`
+	// NotifiedAt is when the friend was told (or told this node); empty
+	// until then, NotifyError saying why the last try failed.
+	NotifiedAt  string `json:"notified_at,omitempty"`
+	NotifyError string `json:"notify_error,omitempty"`
+	// PurgeAfter is when what it stored here is deleted, and it deletes
+	// what it holds of this node's.
+	PurgeAfter string `json:"purge_after"` // RFC 3339, UTC
 }
 
 // StatusRecovery is the lists of places a recovered node has not read
@@ -171,6 +190,9 @@ type StatusAlert struct {
 type StatusPlace struct {
 	Place string `json:"place"` // the friend's node ID
 	Kind  string `json:"kind"`  // friend
+	// Removed is true for a former friend (PEER-5, #25): its copies no
+	// longer count, and nothing more is sent there.
+	Removed bool `json:"removed,omitempty"`
 	// State is how the place answered last: ok, retrying, quota (paused
 	// for quota, LEND-2), removed (PEER-5); store when it waits because
 	// this node's store cannot be read, Detail saying why (#57); empty
@@ -230,7 +252,7 @@ func places(ctx context.Context, db *state.DB, now time.Time) ([]StatusPlace, er
 	out := []StatusPlace{}
 	for _, p := range append(names, rest...) {
 		st, c := stats[p], conds[p]
-		sp := StatusPlace{Place: p, Kind: "friend", State: c.Condition, Detail: c.Detail,
+		sp := StatusPlace{Place: p, Kind: "friend", Removed: !seen[p], State: c.Condition, Detail: c.Detail,
 			Queue:      StatusQueue{Objects: st.Queued, Bytes: st.QueuedBytes},
 			LagSeconds: int64(st.Lag / time.Second), Refused: st.Refused}
 		if !c.LastOK.IsZero() {
@@ -298,7 +320,8 @@ type StatusBucket struct {
 	Refused int64 `json:"refused"`
 	// BelowCopies counts the live objects that fewer than Copies places
 	// hold or will hold, and their bytes (REPL-4): the pool lacked room,
-	// a place refused them, or a friend gone past replace_after held them.
+	// a place refused them, or a friend gone past replace_after or
+	// removed (PEER-5) held them, until re-placement (#26).
 	BelowCopies StatusBelow `json:"below_copies"`
 	// SingleCopy is true when copies is 1: each object is held by one
 	// friend, so losing that friend's disk loses the offsite copy (EP-6).
@@ -474,6 +497,8 @@ friend, or with no room in the pool), which status shows.`,
 				Buckets:  []StatusBucket{},
 				Places:   []StatusPlace{},
 				Alerts:   []StatusAlert{},
+
+				FormerFriends: []StatusFormer{},
 			}
 			if cfg.Role == "full" {
 				st.Endpoint.S3 = "http://" + cfg.Endpoint.Loopback
@@ -549,6 +574,18 @@ friend, or with no room in the pool), which status shows.`,
 			if st.Manifest, err = manifestStatus(cmd.Context(), db); err != nil {
 				return err
 			}
+			formers, err := db.FormerFriends(cmd.Context())
+			if err != nil {
+				return err
+			}
+			for _, f := range formers {
+				sf := StatusFormer{Peer: f.Peer, RemovedAt: f.RemovedAt.UTC().Format(time.RFC3339), ByPeer: f.ByPeer,
+					NotifyError: f.NotifyError, PurgeAfter: f.PurgeAfter.UTC().Format(time.RFC3339)}
+				if !f.NotifiedAt.IsZero() {
+					sf.NotifiedAt = f.NotifiedAt.UTC().Format(time.RFC3339)
+				}
+				st.FormerFriends = append(st.FormerFriends, sf)
+			}
 			rls, err := db.Relists(cmd.Context())
 			if err != nil {
 				return err
@@ -616,6 +653,9 @@ friend, or with no room in the pool), which status shows.`,
 				if b.BelowCopies.Objects > 0 {
 					fmt.Fprintf(a.out, ", %d objects, %d bytes at fewer than %d places", b.BelowCopies.Objects,
 						b.BelowCopies.Bytes, b.Copies)
+					if len(st.FormerFriends) > 0 {
+						fmt.Fprint(a.out, " (copies at an ended friendship no longer count; re-placement is not built yet, #26)")
+					}
 				}
 				fmt.Fprintln(a.out)
 				if b.OutsideTrust {
@@ -638,6 +678,10 @@ friend, or with no room in the pool), which status shows.`,
 				fmt.Fprintf(a.out, "Places:  %d\n", len(st.Places))
 			}
 			for _, p := range st.Places {
+				if p.Removed {
+					fmt.Fprintf(a.out, "  %s (former friend): its copies no longer count; nothing more is sent there\n", p.Place)
+					continue
+				}
 				fmt.Fprintf(a.out, "  %s (%s): %s, queue %d objects, %d bytes, lag %s", p.Place, p.Kind, placeStates[p.State],
 					p.Queue.Objects, p.Queue.Bytes, time.Duration(p.LagSeconds)*time.Second)
 				if p.Refused > 0 {
@@ -697,6 +741,12 @@ friend, or with no room in the pool), which status shows.`,
 			}
 			for _, u := range st.Recovery.Unverified {
 				fmt.Fprintf(a.out, "Recovery: %d objects of %s came from one friend alone, unverified\n", u.Objects, u.Bucket)
+			}
+			if n := len(st.FormerFriends); n > 0 {
+				fmt.Fprintf(a.out, "Ended friendships: %d, replicas kept until the purge\n", n)
+				tw := tabwriter.NewWriter(a.out, 0, 4, 1, ' ', 0)
+				formerLines(tw, st.FormerFriends)
+				tw.Flush()
 			}
 			if len(st.Alerts) == 0 {
 				fmt.Fprintln(a.out, "Alerts:  none")

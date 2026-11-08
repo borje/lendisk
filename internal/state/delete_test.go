@@ -249,7 +249,12 @@ func TestRowsQueuedBeforeTheUpgradeCountAsTaken(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	friend(t, old, "B")
+	// As that release wrote it (AddFriendship reads tables of later
+	// migrations).
+	if _, err := old.ExecContext(ctx, `INSERT INTO friendship (peer_key, created_at, address, own_number, peer_number)
+		VALUES ('B', 0, 'tcB', ?, ?)`, int64(1<<40), int64(1<<40)); err != nil {
+		t.Fatal(err)
+	}
 	seqs, err := old.BeginCaptures(ctx, []Capture{{Bucket: "laptop", Key: "data/1", Op: OpPut, Class: "data"}})
 	if err != nil {
 		t.Fatal(err)

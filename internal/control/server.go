@@ -30,6 +30,10 @@ type Server struct {
 	// Changed is called after a friendship or invite is committed, so
 	// admission forgets its rejections (Admission.Clear, SEC-15).
 	Changed func()
+	// Ended is called after the remove call ended a friendship, so the
+	// daemon cuts the former friend's connections (SEC-15) at once. It
+	// must not block.
+	Ended func()
 	// Manifests keeps the manifests friends push (ID-4); nil answers
 	// the manifest call 404.
 	Manifests ManifestStore
@@ -80,6 +84,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case ListPath:
 		if s.method(w, r, http.MethodGet) {
 			s.list(w, r, c)
+		}
+	case RemovePath:
+		if s.method(w, r, http.MethodPost) {
+			s.remove(w, r, c)
 		}
 	default:
 		Error(w, http.StatusNotFound, "no such control API call on this node")
@@ -297,6 +305,44 @@ func (s *Server) list(w http.ResponseWriter, r *http.Request, c Caller) {
 		page.Objects = append(page.Objects, lo)
 	}
 	writeJSON(w, http.StatusOK, page)
+}
+
+// remove is the remove call (PEER-5, #25): the caller ended the
+// friendship on its side and tells this node, which ends it here too,
+// recorded as ended by the friend. It is keyed by the resolved caller
+// alone. The answer is written, with its length and Connection: close,
+// before Ended runs: ending the friendship cuts this very connection
+// (SEC-15). A caller that is no friend by now is answered as told; the
+// middleware refuses it before it gets here in any case.
+func (s *Server) remove(w http.ResponseWriter, r *http.Request, c Caller) {
+	if c.Role != state.RolePeer {
+		Error(w, http.StatusForbidden, "the remove call is only for a friend")
+		return
+	}
+	f, err := s.DB.RemoveFriendship(r.Context(), c.Peer.String(), true, s.now())
+	switch {
+	case errors.Is(err, state.ErrNotFound):
+	case err != nil:
+		s.Log.Error("remove: ending the friendship failed", "peer", c.Peer.String(), "err", err)
+		Error(w, http.StatusInternalServerError, "ending the friendship failed on this node; try again")
+		return
+	default:
+		s.Log.Warn("friendship ended by the friend; its replica here is kept until the purge", "peer", f.Peer,
+			"purge_after", f.PurgeAfter.UTC().Format(time.RFC3339))
+		if s.Changed != nil {
+			s.Changed()
+		}
+	}
+	body := []byte("{}\n")
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(http.StatusOK)
+	w.Write(body)
+	http.NewResponseController(w).Flush()
+	if err == nil && s.Ended != nil {
+		s.Ended()
+	}
 }
 
 // Error writes a control API error.

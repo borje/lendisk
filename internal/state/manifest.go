@@ -135,26 +135,29 @@ func forgetManifestPush(ctx context.Context, x execer, peer string) error {
 	return err
 }
 
-// ManifestDelivered records that peer acknowledged version seq.
+// ManifestDelivered records that peer acknowledged version seq. Nothing
+// is recorded for a peer that is no longer a friend: a push in flight
+// when the friendship ended (#25).
 func (db *DB) ManifestDelivered(ctx context.Context, peer string, seq int64, now time.Time) error {
 	_, err := db.ExecContext(ctx, `INSERT INTO manifest_push (peer_key, seq, delivered_at, tried_at, error, failures)
-		VALUES (?1, ?2, ?3, ?3, NULL, 0)
+		SELECT ?1, ?2, ?3, ?3, NULL, 0 WHERE EXISTS (SELECT 1 FROM friendship WHERE peer_key = ?1)
 		ON CONFLICT (peer_key) DO UPDATE SET seq = ?2, delivered_at = ?3, tried_at = ?3, error = NULL, failures = 0`,
 		peer, seq, now.Unix())
 	return err
 }
 
 // ManifestPushFailed records a failed push to peer, keeping the version
-// it acknowledged before.
+// it acknowledged before; nothing for a peer no longer a friend.
 func (db *DB) ManifestPushFailed(ctx context.Context, peer, msg string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO manifest_push (peer_key, tried_at, error, failures) VALUES (?1, ?2, ?3, 1)
+	_, err := db.ExecContext(ctx, `INSERT INTO manifest_push (peer_key, tried_at, error, failures)
+		SELECT ?1, ?2, ?3, 1 WHERE EXISTS (SELECT 1 FROM friendship WHERE peer_key = ?1)
 		ON CONFLICT (peer_key) DO UPDATE SET tried_at = ?2, error = ?3, failures = failures + 1`,
 		peer, now.Unix(), msg)
 	return err
 }
 
-// ManifestPushes reads every friend's delivery, by node ID. Rows of
-// former friends are kept and harmless.
+// ManifestPushes reads every friend's delivery, by node ID. Ending a
+// friendship drops its row (#25).
 func (db *DB) ManifestPushes(ctx context.Context) (map[string]ManifestPush, error) {
 	rows, err := db.QueryContext(ctx, `SELECT peer_key, seq, delivered_at, tried_at, error, failures FROM manifest_push`)
 	if err != nil {

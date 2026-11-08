@@ -441,4 +441,25 @@ var migrations = []Migration{
 		ALTER TABLE placement ADD COLUMN held TEXT;
 		CREATE INDEX queue_immutable ON queue (bucket, key) WHERE immutable IS NOT NULL;`,
 	},
+	{
+		Version: 24, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Ending a friendship (PEER-5, SEC-15, #25). The friendship row is
+		-- deleted, which refuses both of the friend's keys; this row keeps
+		-- what the retention window needs: both keys (to cut their open
+		-- connections), the address (to tell the friend), and when its
+		-- replica here, and the copies it holds of this node's data, are
+		-- purged. Deleted after the purge, or when the two become friends
+		-- again.
+		CREATE TABLE former_friend (
+			peer_key     TEXT PRIMARY KEY, -- the former friend's node ID
+			dial_key     TEXT,             -- the key it dialled this node with (#69)
+			address      TEXT,             -- its tc… address
+			removed_at   INTEGER NOT NULL, -- unix seconds
+			purge_after  INTEGER NOT NULL, -- unix seconds: removed_at plus the retention window
+			by_peer      INTEGER,          -- 1: the friend ended it (its remove call)
+			notified_at  INTEGER,          -- unix seconds: the friend was told, or told this node
+			notify_error TEXT              -- why the last attempt to tell it failed
+		);`,
+	},
 }

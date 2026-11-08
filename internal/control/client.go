@@ -49,6 +49,13 @@ func (c *Client) Redeem(ctx context.Context, req RedeemRequest) (RedeemResponse,
 	return resp, c.call(ctx, http.MethodPost, RedeemPath, req, &resp)
 }
 
+// Remove tells the peer that this node ended the friendship with it
+// (PEER-5, #25), so it ends it too.
+func (c *Client) Remove(ctx context.Context) error {
+	var resp struct{}
+	return c.call(ctx, http.MethodPost, RemovePath, struct{}{}, &resp)
+}
+
 // Version asks the peer's protocol version (NET-6).
 func (c *Client) Version(ctx context.Context) (VersionResponse, error) {
 	var resp VersionResponse

@@ -80,6 +80,12 @@ func startLenderS3(t *testing.T, s3 http.Handler) *lender { return startLenderCa
 // startLenderCaps is startLenderS3 with the given per-friend caps.
 func startLenderCaps(t *testing.T, s3 http.Handler, caps *Caps) *lender {
 	t.Helper()
+	return startLenderConns(t, s3, caps, nil)
+}
+
+// startLenderConns is startLenderCaps tracking connections in conns.
+func startLenderConns(t *testing.T, s3 http.Handler, caps *Caps, conns *Conns) *lender {
+	t.Helper()
 	db, err := state.Open(t.Context(), t.TempDir(), quiet)
 	if err != nil {
 		t.Fatal(err)
@@ -98,7 +104,7 @@ func startLenderCaps(t *testing.T, s3 http.Handler, caps *Caps) *lender {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
 	go func() {
-		done <- ServeTunnel(ctx, ln, l.tun.peerOf, caps, TunnelHandler(roles, ctl, s3, caps, quiet), quiet)
+		done <- ServeTunnel(ctx, ln, l.tun.peerOf, caps, conns, TunnelHandler(roles, ctl, s3, caps, quiet), quiet)
 	}()
 	t.Cleanup(func() { cancel(); <-done })
 	return l

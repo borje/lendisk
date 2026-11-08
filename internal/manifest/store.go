@@ -79,14 +79,23 @@ func (s *Store) Get(peer identity.NodeID) ([]byte, error) {
 	return b, err
 }
 
+// Delete removes peer's manifest, when its friendship ended and its
+// replica here is purged (PEER-5, #25); none stored is no error.
+func (s *Store) Delete(peer identity.NodeID) error {
+	if err := os.Remove(filepath.Join(s.Dir, peer.String())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 // sweepAge is how old a temporary file must be before Sweep removes
 // it: far longer than any Put takes, so none in progress is touched.
 const sweepAge = time.Hour
 
 // Sweep removes the temporary files a Put that crashed left, those an
 // hour old or more at now; `serve` calls it at start. A Dir not created
-// yet is no error. Manifests of former friends stay: removing them is
-// ending the friendship's job (#25).
+// yet is no error. Manifests of former friends stay: Delete removes
+// each at its friendship's purge (#25).
 func (s *Store) Sweep(now time.Time) error {
 	ents, err := os.ReadDir(s.Dir)
 	if errors.Is(err, fs.ErrNotExist) {
