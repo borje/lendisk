@@ -372,6 +372,25 @@ func TestEndpointListenRefused(t *testing.T) {
 	}
 }
 
+// PEER-9, OPS-4 (#41): the lender-only profile has no metrics listener,
+// so a metrics setting is refused at load, though no version knows one
+// yet (#43): a full node only reports it as unknown.
+func TestLenderOnlyRefusesMetricsSettings(t *testing.T) {
+	for _, body := range []string{
+		"[metrics]\nlisten = \"127.0.0.1:9100\"\n",
+		"[endpoint]\nmetrics = \"127.0.0.1:9100\"\n",
+	} {
+		_, err := load(t, []string{"--config", writeFile(t, "role = \"lender\"\n"+body)}, nil)
+		if err == nil || !strings.Contains(err.Error(), "metrics") || !strings.Contains(err.Error(), "PEER-9") {
+			t.Errorf("lender-only profile accepted %q: %v", body, err)
+		}
+		l, err := load(t, []string{"--config", writeFile(t, "role = \"full\"\n"+body)}, nil)
+		if err != nil || len(l.Unknown) != 1 {
+			t.Errorf("full node with %q: %v %v", body, l, err)
+		}
+	}
+}
+
 // OPS-2, OPS-3 (#13): the [alerts] section, its default threshold, and
 // refusals that never echo the webhook, which may hold a secret.
 func TestAlertSettings(t *testing.T) {

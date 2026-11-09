@@ -1603,16 +1603,63 @@ upstream bucket is Q-V.
   versitygw's `userplus` role, whose one addition to `user` is
   `CreateBucket`; own bucket keys keep `user`. Own bucket keys cannot
   reach a `lent-*` bucket, since the borrower owns it.
-- **PEER-9** The lender-only profile skips the loopback S3 listener,
-  the metrics listener and the replication worker, so nothing listens
-  on loopback (its AC); an `endpoint.listen` or `metrics` entry is
-  refused at config load in this profile. versitygw still runs, behind
-  the bridge's tunnel listener only. Its friendship rows are like any other; the quota its
-  friends lend it back has no buckets to fill, and `status` shows it as
-  unused: a "Lending only:" line with what it lends, what its friends
-  use of it and the quota received (`capacity.lent`, `lent_used`,
-  `received`, `received_unused`; #37, §3.5 LEND-7). Adding a bucket
-  later is a change of `role` and a restart.
+- **PEER-9** The lender-only profile (#41) is `role = "lender"`, which
+  `lendisk init --lender-only` writes into the config it creates. With
+  a config already there that sets another role, `--lender-only` is a
+  usage error naming the file, and so are `--repository-size` and
+  `--copies` beside it; nothing is written. Such an init asks nothing
+  about a repository (§3.5 LEND-7).
+  - *What does not run* (`cli/serve.go`): the loopback S3 listener,
+    the metrics listener (OPS-4, #43), the replication worker,
+    verification, undelete and the store reconciler (EP-14), all of
+    which serve or read the node's own buckets. Nothing listens on
+    loopback (its AC): the only socket is tailcat's UDP one, and S3 for
+    friends is versitygw behind the bridge's tunnel listener, inside
+    the tunnel. `bucket add` refuses, naming `role = "full"`. Once the
+    daemon lends it logs "lending only: nothing listens on loopback".
+  - *What runs*, as on a full node: the tunnel's S3 and control calls
+    (invites, redeem, quota, manifest, challenge, remove), the
+    gateway's purge and borrower-usage loops, the bit-rot sample, which
+    on a node with no buckets reads friends' replicas only (VER-5,
+    #31), the farewell and purge (PEER-5), the quota exchange (LEND-8),
+    alerts (the borrower-side conditions have nothing to raise), the
+    recovery lister and the manifest pusher.
+  - *Config.* An `endpoint.listen` entry is refused at load in this
+    profile (`Config.Validate`). No metrics setting exists yet, so a
+    `metrics` or `endpoint.metrics` key is one this version does not
+    know, which a full node only reports; for a lender it is refused at
+    load (`config.lenderUnknown`). #43 adds the settings and refuses
+    them in `Validate` instead.
+  - *Decision: the manifest is pushed* in both profiles: a lender-only
+    node has no buckets, but its manifest holds its friendships and
+    their quotas, which `lendisk recover` needs to rebuild it from its
+    phrase and one friend's address (ID-4, ID-5), and the push costs
+    one small file per friend.
+  - *Decision: what `status` and `peer list` show.* Its friendship rows
+    are like any other; the quota its friends lend it back has no
+    buckets to fill. `status` prints `Role: lender`, no `S3:` line, and
+    a "Lending only:" line with what it lends, what its friends use of
+    it and the quota received (`capacity.lent`, `lent_used`,
+    `received`, `received_unused`; #37, §3.5 LEND-7), then one line on
+    switching (set `role = "full"` and restart). The "Places:" block
+    and the single-friend warning are left out of the text: places are
+    where this node's copies go, and it sends none; `status --json`
+    keeps `places` and `pool` as they are (additive only). `peer list`
+    is the same table and JSON, with one line saying the node lends
+    only, and VERIFIED reads `n/a` for a friend never verified, since
+    nothing of this node's is there to verify.
+  - *Switching.* Adding a bucket later is `role = "full"` and a
+    restart; no friendship row changes, nor anything at the friends.
+    *Decision:* the reverse, `role = "lender"` on a node with buckets,
+    makes `serve` refuse to start, naming a bucket and the config file:
+    its buckets would otherwise silently stop going offsite.
+  - *Tests:* `TestInitLenderOnlyWritesTheRole`,
+    `TestLenderOnlyNothingListensOnLoopback` (serial: it reads the
+    process's sockets), `TestLenderOnlyNodeLendsThenAddsABucket` (B
+    lender-only invites A, holds A's backup and pushes its manifest,
+    then switches to full and replicates a bucket of its own to A with
+    both friendships unchanged), `TestLenderRoleRefusedWithBuckets`,
+    `TestLenderOnlyRefusesMetricsSettings`.
 - **PEER-5, PEER-12, ending a friendship (#25).** `lendisk peer
   remove <node ID>` (a malformed ID is a usage error, a stranger "not
   a friend") commits `state.DB.RemoveFriendship`: in one transaction
@@ -2380,7 +2427,9 @@ upstream bucket is Q-V.
   the backend's writes; on `posix` with NVMe this is file I/O. Measured
   with G-3.
 - **EP-14** The store reconciler (`gateway/reconcile.go`, #8) runs in
-  the gateway once it serves: a pass at start, one every
+  the gateway once it serves, in the full role only (a lender-only node
+  has no buckets, PEER-9; its store marker is written by the first pass
+  after a switch to full): a pass at start, one every
   `store.reconcile_every` (default 24h), and between them, every minute
   (`ReconcileSettings.Poll`), a pass of each bucket the user allowed
   deletes for (below). Passes run one at a time, over the node's own

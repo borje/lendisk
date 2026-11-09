@@ -1016,7 +1016,7 @@ friend, or with no room in the pool), which status shows.`,
 					fmt.Fprintf(a.out, "    %s\n", replicaLine(r))
 				}
 			}
-			if st.Pool.SingleFriend {
+			if st.Pool.SingleFriend && st.Node.Role != "lender" { // no copies to lose (PEER-9)
 				fmt.Fprintln(a.out, singleFriendLine)
 			}
 			if m := st.StoreMarkerMissing; m != "" {
@@ -1033,10 +1033,19 @@ friend, or with no room in the pool), which status shows.`,
 			for _, l := range capacityLines(st.Capacity, st.Node.Role) {
 				fmt.Fprintln(a.out, l)
 			}
-			if len(st.Places) > 0 {
+			if st.Node.Role == "lender" {
+				fmt.Fprintf(a.out, "  to back up here too, set role = \"full\" in %s and restart `lendisk serve`; friendships stay as they are\n", cfg.Path)
+			}
+			// Places are where this node's copies go; a lender-only node
+			// sends none (PEER-9), and its friends are in the lines above.
+			// status --json keeps them.
+			if len(st.Places) > 0 && st.Node.Role != "lender" {
 				fmt.Fprintf(a.out, "Places:  %d\n", len(st.Places))
 			}
 			for _, p := range st.Places {
+				if st.Node.Role == "lender" {
+					break
+				}
 				if p.Removed {
 					fmt.Fprintf(a.out, "  %s (former friend): its copies no longer count; nothing more is sent there\n", p.Place)
 					continue
