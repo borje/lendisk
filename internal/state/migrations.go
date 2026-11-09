@@ -855,4 +855,36 @@ var migrations = []Migration{
 			PRIMARY KEY (place, bucket)
 		);`,
 	},
+	{
+		Version: 40, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Overflow targets (S3-1, S3-3, S3-7, #38): external S3 buckets in
+		-- the pool, holding only the copies no friend has room for. The
+		-- place name is 'overflow:' || name. endpoint is a URL (scheme and
+		-- host); keys go under <prefix>/<sealed name>/ in bucket.
+		-- env_prefix names the environment variables holding the
+		-- credential (<env_prefix>ACCESS_KEY, <env_prefix>SECRET_KEY): the
+		-- credential itself is never in the database (SEC-3). retention is
+		-- the window in seconds; price_per_gb, per GB (10^9 bytes) and
+		-- month, NULL when not given. versioning, lifecycle and
+		-- version_removal are what overflow add found: versioning
+		-- 'enabled', 'suspended' or 'off'; lifecycle 'present', 'created',
+		-- 'absent' or 'unsupported'; version_removal 'allowed', 'denied'
+		-- or 'unknown'. added_at in unix seconds.
+		CREATE TABLE overflow (
+			name            TEXT PRIMARY KEY,
+			endpoint        TEXT NOT NULL,
+			region          TEXT NOT NULL DEFAULT '',
+			bucket          TEXT NOT NULL,
+			prefix          TEXT NOT NULL DEFAULT '',
+			max_bytes       INTEGER NOT NULL,
+			env_prefix      TEXT NOT NULL,
+			retention       INTEGER NOT NULL,
+			price_per_gb    REAL,
+			versioning      TEXT NOT NULL DEFAULT '',
+			lifecycle       TEXT NOT NULL DEFAULT '',
+			version_removal TEXT NOT NULL DEFAULT '',
+			added_at        INTEGER NOT NULL
+		);`,
+	},
 }

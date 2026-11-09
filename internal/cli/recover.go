@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/state"
@@ -383,7 +385,7 @@ func printOverflow(w io.Writer, targets []manifest.Overflow) {
 		return
 	}
 	fmt.Fprintf(w, "\nOverflow targets: %d. Their credentials are shown this once and not written anywhere;\n", len(targets))
-	fmt.Fprintln(w, "put each in the environment of `lendisk serve` (SEC-3).")
+	fmt.Fprintln(w, "put each in the environment of `lendisk serve`, which does not start until they are there (SEC-3).")
 	for _, o := range targets {
 		fmt.Fprintf(w, "  %s: %s, bucket %s", o.Name, o.Endpoint, o.Bucket)
 		if o.Prefix != "" {
@@ -391,7 +393,8 @@ func printOverflow(w io.Writer, targets []manifest.Overflow) {
 		}
 		fmt.Fprintln(w)
 		if o.AccessKey != "" || o.SecretKey != "" {
-			fmt.Fprintf(w, "    access key: %s\n    secret key: %s\n", o.AccessKey, o.SecretKey)
+			an, sn := overflow.EnvNames(cmp.Or(o.EnvPrefix, overflow.DefaultEnvPrefix(o.Name)))
+			fmt.Fprintf(w, "    access key: %s (as %s)\n    secret key: %s (as %s)\n", o.AccessKey, an, o.SecretKey, sn)
 		}
 	}
 }

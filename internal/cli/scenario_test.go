@@ -53,6 +53,13 @@ func newFourFriendsAt(t *testing.T, quota string, aEnv ...string) *fourFriends {
 // friends, each pair friends at quota.
 func newCircleAt(t *testing.T, size int, quota string, aEnv ...string) *fourFriends {
 	t.Helper()
+	return newCircleWith(t, size, quota, nil, aEnv...)
+}
+
+// newCircleWith is newCircleAt with extra flags for every invite and
+// peer add (such as --retention, which both take).
+func newCircleWith(t *testing.T, size int, quota string, peerAdd []string, aEnv ...string) *fourFriends {
+	t.Helper()
 	if _, err := exec.LookPath("restic"); err != nil {
 		t.Skip("restic not installed")
 	}
@@ -83,8 +90,8 @@ func newCircleAt(t *testing.T, size int, quota string, aEnv ...string) *fourFrie
 	f.a.start()
 	for i, lender := range nodes { // every pair: six invites for four
 		for _, borrower := range nodes[i+1:] {
-			s := lender.invite("--quota", quota)
-			if code, _, errOut := borrower.run("\n", "", "peer", "add", s); code != 0 {
+			s := lender.invite(append([]string{"--quota", quota}, peerAdd...)...)
+			if code, _, errOut := borrower.run("\n", "", append([]string{"peer", "add", s}, peerAdd...)...); code != 0 {
 				t.Fatalf("peer add: %d %s", code, errOut)
 			}
 		}

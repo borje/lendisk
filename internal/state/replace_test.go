@@ -280,10 +280,11 @@ func TestADrainedCopyIsDeletedOnlyAfterItsReplacementIsAcknowledged(t *testing.T
 	}
 }
 
-// REPL-13, REPL-12, REPL-1 (#26): a friend added later receives the
-// bucket's existing metadata, in sequence order, before data counts it
-// as a place: until its metadata rows are queued it gets no data, and
-// afterwards new data follows the metadata in its FIFO.
+// REPL-13, REPL-12, REPL-1 (#26, #38 review): a friend added later
+// receives the bucket's existing metadata, in sequence order, ahead of
+// any data in its FIFO: a capture that chooses it before re-placement
+// ran queues the bucket's metadata there in the same transaction, so it
+// is room at once and no copy falls through to an overflow target.
 func TestANewFriendReceivesTheExistingMetadataFirst(t *testing.T) {
 	p := newPool(t)
 	ctx := context.Background()
@@ -298,7 +299,8 @@ func TestANewFriendReceivesTheExistingMetadataFirst(t *testing.T) {
 	}
 	p.friend("D", 100) // by far the largest free fraction
 	d2 := p.put("laptop", "data/2", "data", 1)
-	p.wantPlaces("data/2 before D has the metadata", d2, "B", "C")
+	p.wantPlaces("data/2, with D's metadata queued with it", d2, "B", "D")
+	p.wantPlaces("index/1 queued at D by the capture", m1, "B", "C", "D")
 	p.replace()
 	p.wantPlaces("index/1", m1, "B", "C", "D")
 	p.wantPlaces("snapshots/1", m2, "B", "C", "D")
@@ -316,8 +318,8 @@ func TestANewFriendReceivesTheExistingMetadataFirst(t *testing.T) {
 		fifo = append(fifo, n.Seq)
 		p.ackRow("D", n.Seq)
 	}
-	if !slices.Equal(fifo, []int64{m1, m2, d3}) {
-		t.Fatalf("D's FIFO sent %v, want the metadata %d, %d before data %d", fifo, m1, m2, d3)
+	if !slices.Equal(fifo, []int64{m1, m2, d2}) {
+		t.Fatalf("D's FIFO sent %v, want the metadata %d, %d before data %d", fifo, m1, m2, d2)
 	}
 }
 

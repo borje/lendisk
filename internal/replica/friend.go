@@ -18,6 +18,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -56,20 +57,34 @@ const region = "us-east-1"
 // ignores it; the lender's versitygw checks the signature over it.
 const friendHost = "lendisk-friend:9000"
 
-// Friend is the replica client for a friend's node (D12, §3.4): S3
-// through the tailcat tunnel, signed with the derived per-pair
-// credential (NET-7a), each bucket under its sealed name (SEC-16).
-type Friend struct {
-	core    *minio.Core
-	seal    func(bucket string) string // the bucket's name on the wire
-	stall   time.Duration
-	mu      sync.Mutex
-	created map[string]bool // sealed names created at the friend by this client
+// Client is the one replica client (D12, §3.4): minio-go's low-level
+// calls with lendisk's checksums and stall bounds, for either kind of
+// place. A friend's node (NewFriend) is S3 through the tailcat tunnel,
+// signed with the derived per-pair credential (NET-7a), each bucket
+// under its sealed name (SEC-16), created on first use. An overflow
+// target (NewOverflow) is one bucket at an S3 provider, each of the
+// node's buckets under <prefix>/<sealed name>/ in it (S3-1, S3-2),
+// signed with the credential from the environment (SEC-3).
+type Client struct {
+	core *minio.Core
+	// where is a bucket's and key's name on the wire.
+	where func(bucket, key string) (string, string)
+	// overflow: an overflow target, which has one bucket, created by
+	// the user, and whose refusals classify reads as the provider's.
+	overflow bool
+	root     root                // an overflow target's bucket and prefix
+	cred     overflow.Credential // an overflow target's, to redact its errors (SEC-3)
+	stall    time.Duration
+	mu       sync.Mutex
+	created  map[string]bool // sealed names created at the friend by this client
 }
+
+// Friend is a Client for a friend's node.
+type Friend = Client
 
 // NewFriend builds the client for peer at its tunnel address addr,
 // dialling with dial. The secret is derived here and kept in memory only.
-func NewFriend(self *identity.Identity, peer identity.NodeID, addr string, dial DialFunc, o Options) (*Friend, error) {
+func NewFriend(self *identity.Identity, peer identity.NodeID, addr string, dial DialFunc, o Options) (*Client, error) {
 	secret, err := self.S3Secret(peer)
 	if err != nil {
 		return nil, err
@@ -85,11 +100,11 @@ func NewFriend(self *identity.Identity, peer identity.NodeID, addr string, dial 
 // dialling the lender's own gateway with dial, so every object passes
 // the lender's policy exactly as one sent over the tunnel does. Buckets
 // are named by their sealed names already: it seals nothing.
-func NewSeeder(borrower identity.NodeID, secret string, dial func(ctx context.Context) (net.Conn, error), o Options) (*Friend, error) {
+func NewSeeder(borrower identity.NodeID, secret string, dial func(ctx context.Context) (net.Conn, error), o Options) (*Client, error) {
 	return newFriend(borrower.String(), secret, dial, func(sealed string) string { return sealed }, o)
 }
 
-func newFriend(access, secret string, dial func(ctx context.Context) (net.Conn, error), seal func(string) string, o Options) (*Friend, error) {
+func newFriend(access, secret string, dial func(ctx context.Context) (net.Conn, error), seal func(string) string, o Options) (*Client, error) {
 	dt := o.dialTimeout()
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -115,12 +130,16 @@ func newFriend(access, secret string, dial func(ctx context.Context) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	return &Friend{core: core, seal: seal, stall: o.stallTimeout(), created: map[string]bool{}}, nil
+	where := func(bucket, key string) (string, string) { return seal(bucket), key }
+	return &Client{core: core, where: where, stall: o.stallTimeout(), created: map[string]bool{}}, nil
 }
 
 // ensureBucket creates the sealed bucket at the friend once per client;
 // a bucket already there is fine.
-func (f *Friend) ensureBucket(ctx context.Context, sealed string) error {
+func (f *Client) ensureBucket(ctx context.Context, sealed string) error {
+	if f.overflow {
+		return nil // the user's bucket, which overflow add checked
+	}
 	f.mu.Lock()
 	done := f.created[sealed]
 	f.mu.Unlock()
@@ -131,7 +150,7 @@ func (f *Friend) ensureBucket(ctx context.Context, sealed string) error {
 	if err != nil {
 		var er minio.ErrorResponse
 		if !errors.As(err, &er) || (er.Code != "BucketAlreadyOwnedByYou" && er.Code != "BucketAlreadyExists") {
-			return classify(fmt.Errorf("creating the bucket at the friend: %w", err))
+			return f.classify(fmt.Errorf("creating the bucket at the friend: %w", err))
 		}
 	}
 	f.mu.Lock()
@@ -144,15 +163,15 @@ func (f *Friend) ensureBucket(ctx context.Context, sealed string) error {
 // SHA-256 as x-amz-meta-lendisk-sha256 and as the request checksum, so
 // the friend verifies the bytes it stores (REPL-10, S3-3). The body is
 // read once. A put that moves no bytes for the stall timeout fails.
-func (f *Friend) Put(ctx context.Context, o Object) error {
+func (f *Client) Put(ctx context.Context, o Object) error {
 	sum, err := hex.DecodeString(o.SHA256)
 	if err != nil || len(sum) != 32 {
 		return fmt.Errorf("object %s has no SHA-256 to send (%q)", o.Key, o.SHA256)
 	}
-	sealed := f.seal(o.Bucket)
+	bucket, key := f.where(o.Bucket, o.Key)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	if err := f.ensureBucket(ctx, sealed); err != nil {
+	if err := f.ensureBucket(ctx, bucket); err != nil {
 		return err
 	}
 	ctx, abandon, ended := abandoning(ctx, cancel)
@@ -165,16 +184,16 @@ func (f *Friend) Put(ctx context.Context, o Object) error {
 	if o.Replaces != "" {
 		meta[MetaReplaces] = o.Replaces
 	}
-	_, err = f.core.PutObject(ctx, sealed, o.Key, body, o.Size, "", "", minio.PutObjectOptions{
+	_, err = f.core.PutObject(ctx, bucket, key, body, o.Size, "", "", minio.PutObjectOptions{
 		UserMetadata:         meta,
 		DisableContentSha256: true,
 	})
 	ended()
 	if err != nil {
 		if body.stalled() {
-			return fmt.Errorf("sending %s: no progress for %v: %w", o.Key, f.stall, err)
+			return f.redact(fmt.Errorf("sending %s: no progress for %v: %w", o.Key, f.stall, err))
 		}
-		return classify(fmt.Errorf("sending %s: %w", o.Key, err))
+		return f.classify(fmt.Errorf("sending %s: %w", o.Key, err))
 	}
 	return nil
 }
@@ -232,16 +251,17 @@ func abandoning(ctx context.Context, cancel context.CancelFunc) (_ context.Conte
 // Head returns the hash the friend stores key with (its
 // x-amz-meta-lendisk-sha256, REPL-10); ok is false when it holds no
 // object there (a tombstoned key included).
-func (f *Friend) Head(ctx context.Context, bucket, key string) (string, bool, error) {
+func (f *Client) Head(ctx context.Context, bucket, key string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
-	info, err := f.core.StatObject(ctx, f.seal(bucket), key, minio.StatObjectOptions{})
+	b, k := f.where(bucket, key)
+	info, err := f.core.StatObject(ctx, b, k, minio.StatObjectOptions{})
 	var er minio.ErrorResponse
 	if errors.As(err, &er) && (er.Code == "NoSuchKey" || er.Code == "NoSuchBucket" || er.StatusCode == http.StatusNotFound) {
 		return "", false, nil
 	}
 	if err != nil {
-		return "", false, classify(fmt.Errorf("asking for %s: %w", key, err))
+		return "", false, f.classify(fmt.Errorf("asking for %s: %w", key, err))
 	}
 	return strings.ToLower(info.Metadata.Get("X-Amz-Meta-" + MetaSHA256)), true, nil
 }
@@ -251,25 +271,29 @@ func (f *Friend) Head(ctx context.Context, bucket, key string) (string, bool, er
 // probe (#65), one small request signed like every other, so it also
 // tells a friend that refuses this node (ErrRemoved). It moves no
 // object and is bounded by the stall timeout.
-func (f *Friend) Probe(ctx context.Context) error {
+func (f *Client) Probe(ctx context.Context) error {
+	if f.overflow {
+		return f.probeOverflow(ctx)
+	}
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
 	if _, err := f.core.ListBuckets(ctx); err != nil {
-		return classify(fmt.Errorf("probing the friend: %w", err))
+		return f.classify(fmt.Errorf("probing the friend: %w", err))
 	}
 	return nil
 }
 
 // Delete removes the key from the sealed bucket. A key or bucket the
 // friend does not have is already deleted.
-func (f *Friend) Delete(ctx context.Context, bucket, key string) error {
-	err := f.core.RemoveObject(ctx, f.seal(bucket), key, minio.RemoveObjectOptions{})
+func (f *Client) Delete(ctx context.Context, bucket, key string) error {
+	b, k := f.where(bucket, key)
+	err := f.core.RemoveObject(ctx, b, k, minio.RemoveObjectOptions{})
 	var er minio.ErrorResponse
 	if errors.As(err, &er) && (er.Code == "NoSuchKey" || er.Code == "NoSuchBucket") {
 		return nil
 	}
 	if err != nil {
-		return classify(fmt.Errorf("deleting %s: %w", key, err))
+		return f.classify(fmt.Errorf("deleting %s: %w", key, err))
 	}
 	return nil
 }
@@ -279,12 +303,13 @@ func (f *Friend) Delete(ctx context.Context, bucket, key string) error {
 // verifies the bytes against the hash it expects; the friend's word is
 // not taken for it. A body that moves no bytes for the stall timeout
 // fails, so a friend switched off mid-transfer cannot hang the read.
-func (f *Friend) Get(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
+func (f *Client) Get(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	body, _, _, err := f.core.GetObject(ctx, f.seal(bucket), key, minio.GetObjectOptions{})
+	b, k := f.where(bucket, key)
+	body, _, _, err := f.core.GetObject(ctx, b, k, minio.GetObjectOptions{})
 	if err != nil {
 		cancel()
-		return nil, classify(fmt.Errorf("fetching %s: %w", key, err))
+		return nil, f.classify(fmt.Errorf("fetching %s: %w", key, err))
 	}
 	return &fetched{watchdog: newWatchdog(body, f.stall, cancel), body: body, cancel: cancel}, nil
 }

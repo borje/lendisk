@@ -25,6 +25,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
@@ -130,6 +131,17 @@ type app struct {
 	// lendStatfs reads the store's size for the default lending cap
 	// (maxTotal); nil means the store checker's Statfs. Tests set it.
 	lendStatfs func(dir string) (store.Space, error)
+	// env reads the environment, where overflow targets' credentials
+	// are (SEC-3); nil means os.LookupEnv. Tests set it.
+	env overflow.Getenv
+}
+
+// getenv is the environment overflow credentials are read from.
+func (a *app) getenv() overflow.Getenv {
+	if a.env != nil {
+		return a.env
+	}
+	return os.LookupEnv
 }
 
 func (a *app) checker() store.Checker {
@@ -188,7 +200,7 @@ func (a *app) rootCmd() *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.recoverCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
-	root.AddCommand(a.endpointCmd())
+	root.AddCommand(a.endpointCmd(), a.overflowCmd())
 	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd(), a.undeleteCmd(), a.recoverySheetCmd(), a.exportCmd(), a.importCmd())
 	usageArgs(root)
 	return root

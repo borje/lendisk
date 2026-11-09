@@ -25,6 +25,7 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -157,9 +158,13 @@ func needed(places, copies int) int {
 }
 
 // Build reads the node's sheet from its state, as its manifest says it
-// (ID-4).
-func Build(ctx context.Context, db *state.DB, self *identity.Identity, secrets bool) (Sheet, error) {
-	c, err := manifest.Build(ctx, db, self)
+// (ID-4). Overflow targets' keys are read with getenv only when secrets
+// is set (S3-8).
+func Build(ctx context.Context, db *state.DB, self *identity.Identity, secrets bool, getenv overflow.Getenv) (Sheet, error) {
+	if !secrets {
+		getenv = nil
+	}
+	c, err := manifest.Build(ctx, db, self, getenv)
 	if err != nil {
 		return Sheet{}, err
 	}
@@ -203,7 +208,7 @@ func Stale(ctx context.Context, db *state.DB, self *identity.Identity) (time.Tim
 	if err != nil || !ok {
 		return time.Time{}, nil, err
 	}
-	live, err := Build(ctx, db, self, false)
+	live, err := Build(ctx, db, self, false, nil)
 	if err != nil {
 		return time.Time{}, nil, err
 	}

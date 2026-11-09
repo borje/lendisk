@@ -69,8 +69,8 @@ func (p Plan) share() float64 {
 
 // feasible reports whether the pool holds a repository of size s at
 // Copies copies (DESIGN §4): with m its metadata, held at every place,
-// and D = s − m, Σ over friends of min(D, quota − m) plus each overflow
-// target's room less m is at least c × D. quota gives each friend's
+// and D = s − m, Σ over friends of min(D, quota − m) plus, over overflow
+// targets, min(D, max_bytes − m) is at least c × D. quota gives each friend's
 // quota.
 func (p Plan) feasible(s float64, quota func(Friend) int64) bool {
 	m := p.share() * s
@@ -80,7 +80,7 @@ func (p Plan) feasible(s float64, quota func(Friend) int64) bool {
 		room += math.Min(d, math.Max(float64(quota(f))-m, 0))
 	}
 	for _, o := range p.Overflow {
-		room += math.Max(float64(o)-m, 0)
+		room += math.Min(d, math.Max(float64(o)-m, 0)) // one copy of each object at most
 	}
 	return room >= float64(max(p.Copies, 1))*d
 }
@@ -124,6 +124,22 @@ func (p Plan) Protectable() int64 { return p.largest(func(f Friend) int64 { retu
 // quotas (LEND-7): each quota replaced by the friend's repository size,
 // since a friend has no use for more of this node's disk than that.
 func (p Plan) FairProtectable() int64 { return p.largest(func(f Friend) int64 { return f.Size }) }
+
+// Split reports whether placement is split (REPL-12 as of v0.11.5,
+// #38): the plan has an overflow target and its friends cannot hold
+// Copies copies of the repository (state.FriendsHold, the rule
+// placement applies), so each data object goes to Copies − 1 friends and
+// one overflow target.
+func (p Plan) Split() bool {
+	if len(p.Overflow) == 0 || p.Copies < 2 {
+		return false
+	}
+	var quotas []int64
+	for _, f := range p.Friends {
+		quotas = append(quotas, f.Quota)
+	}
+	return !state.FriendsHold(p.Data, p.Metadata, p.Copies, quotas)
+}
 
 // Alerting reports whether the repository is above AlertPercent of the
 // protectable size (OPS-2).
@@ -169,7 +185,7 @@ func (p Plan) Cover() (numbers map[string]int64, ok bool) {
 	d := t - m
 	need := float64(max(p.Copies, 1)) * d
 	for _, o := range p.Overflow {
-		need -= math.Max(float64(o)-m, 0)
+		need -= math.Min(d, math.Max(float64(o)-m, 0))
 	}
 	if need <= 0 {
 		return numbers, true // overflow alone holds it
@@ -229,9 +245,9 @@ func SuggestMaxTotal(size int64, copies int) int64 {
 	return RoundUp(int64(math.Ceil(float64(size) * float64(copies) * (100 + TombstoneMargin) / 100)))
 }
 
-// Read is the node's plan from db: its repository and every friendship
-// with an address (the pool, D6), with defaultCopies for a node with no
-// bucket.
+// Read is the node's plan from db: its repository, every friendship
+// with an address and every overflow target's max_bytes (the pool, D6),
+// with defaultCopies for a node with no bucket.
 func Read(ctx context.Context, db *state.DB, defaultCopies int) (Plan, error) {
 	use, err := db.RepositoryUse(ctx)
 	if err != nil {
@@ -250,6 +266,13 @@ func Read(ctx context.Context, db *state.DB, defaultCopies int) (Plan, error) {
 			continue
 		}
 		p.Friends = append(p.Friends, Friend{Peer: f.Peer, Quota: f.Quota(), Size: f.PeerRepositorySize})
+	}
+	targets, err := db.Overflows(ctx)
+	if err != nil {
+		return Plan{}, err
+	}
+	for _, o := range targets {
+		p.Overflow = append(p.Overflow, o.MaxBytes)
 	}
 	return p, nil
 }

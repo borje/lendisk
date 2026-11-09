@@ -65,7 +65,7 @@ removed); print it again then.`,
 				return err
 			}
 			defer db.Close()
-			s, err := sheet.Build(cmd.Context(), db, id, withSecrets)
+			s, err := sheet.Build(cmd.Context(), db, id, withSecrets, a.getenv())
 			if err != nil {
 				return err
 			}

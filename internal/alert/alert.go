@@ -194,7 +194,26 @@ const (
 	// says a friend or an overflow target is needed. A quota alert: it
 	// clears QuotaHold after its condition ends.
 	KindProtectable = "protectable_size"
+	// KindOverflowReceiving: an overflow target holds or has queued data
+	// copies, because no friend had room for them (S3-7, scenario 12,
+	// #38). Subject: the target's name. It costs money, so it is said;
+	// it clears when the copies move back to friends (#40).
+	KindOverflowReceiving = "overflow_receiving"
+	// KindOverflowHigh: an overflow target holds 90% or more of its
+	// max_bytes; KindOverflowFull: all of it, and no new copies go there
+	// (S3-7). Subject: the target's name. Quota alerts: they clear
+	// QuotaHold after their condition ends.
+	KindOverflowHigh = "overflow_high"
+	KindOverflowFull = "overflow_full"
+	// KindOverflowUnreachable: an overflow target has failed for as long
+	// as KindFriendUnreachable allows a friend (the provider refuses the
+	// credential, it is unset in the daemon's environment, or the
+	// network fails). Subject: the target's name.
+	KindOverflowUnreachable = "overflow_unreachable"
 )
+
+// OverflowHighPercent is where KindOverflowHigh is raised (S3-7).
+const OverflowHighPercent = 90
 
 // DefaultUncheckedAfter is Service.UncheckedAfter when zero.
 const DefaultUncheckedAfter = 3 * 24 * time.Hour
@@ -269,7 +288,8 @@ func (s *Service) quotaHold() time.Duration { return orDefault(s.QuotaHold, Defa
 
 // quotaKind reports whether kind is a quota alert (hysteresis, QuotaHold).
 func quotaKind(kind string) bool {
-	return kind == KindQuotaHigh || kind == KindQuotaExhausted || kind == KindLentOverQuota || kind == KindProtectable
+	return kind == KindQuotaHigh || kind == KindQuotaExhausted || kind == KindLentOverQuota || kind == KindProtectable ||
+		kind == KindOverflowHigh || kind == KindOverflowFull
 }
 
 // PurgeWarning is how long before an ended friendship's purge
@@ -281,7 +301,7 @@ var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotR
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindFriendRefuses, KindPurgeSoon,
 	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
 	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot, KindRecoverySheetStale,
-	KindProtectable}
+	KindProtectable, KindOverflowReceiving, KindOverflowHigh, KindOverflowFull, KindOverflowUnreachable}
 
 // Kinds are the alert kinds the evaluator owns, for the metrics that
 // count pending alerts by kind (OPS-4).
@@ -484,7 +504,8 @@ func (s *Service) hold(ctx context.Context, current []state.Alert, now time.Time
 	}
 	// quota_high and quota_exhausted of one friend are one condition at
 	// two levels: the current one replaces the other.
-	other := map[string]string{KindQuotaHigh: KindQuotaExhausted, KindQuotaExhausted: KindQuotaHigh}
+	other := map[string]string{KindQuotaHigh: KindQuotaExhausted, KindQuotaExhausted: KindQuotaHigh,
+		KindOverflowHigh: KindOverflowFull, KindOverflowFull: KindOverflowHigh}
 	for _, a := range active {
 		t, ok := s.held[a.Key]
 		if !ok || in[a.Key] || !quotaKind(a.Kind) || now.Sub(t) >= s.quotaHold() {
@@ -749,6 +770,11 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		return nil, err
 	}
 	out = append(out, quota...)
+	over, err := s.overflowConditions(ctx, conds, now)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, over...)
 	plan, err := capacity.Read(ctx, s.DB, cmp.Or(s.Copies, state.DefaultCopies))
 	if err != nil {
 		return nil, err
@@ -819,6 +845,57 @@ func (s *Service) quotaConditions(ctx context.Context, fs []state.Friendship, co
 				f.Peer, gb(lent), gb(q), numbers)
 			out = append(out, alertOf(KindLentOverQuota, f.Peer, msg))
 		}
+	}
+	return out, nil
+}
+
+// overflowConditions are the overflow targets' alerts (S3-7, #38): one
+// receiving copies, one at OverflowHighPercent or all of max_bytes, and
+// one failing for as long as a friend may before it is unreachable.
+func (s *Service) overflowConditions(ctx context.Context, conds map[string]state.PlaceCondition, now time.Time) ([]state.Alert, error) {
+	targets, err := s.DB.Overflows(ctx)
+	if err != nil || len(targets) == 0 {
+		return nil, err
+	}
+	holds, err := s.DB.OverflowHolds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []state.Alert
+	after := orDefault(s.UnreachableAfter, 24*time.Hour)
+	minRetrying := orDefault(s.MinRetrying, time.Hour)
+	for _, o := range targets {
+		h := holds[o.Name]
+		if h.DataObjects > 0 {
+			msg := fmt.Sprintf("overflow target %s is receiving copies that no friend has room for: %s (%s) of this node's data are there, %s of its %s in all; "+
+				"it costs money, and copies move back to friends once they have room: agree higher quotas or add a friend (lendisk peer quota, lendisk invite)",
+				o.Name, countObjects(h.DataObjects), gb(h.DataBytes), gb(h.Use), gb(o.MaxBytes))
+			out = append(out, alertOf(KindOverflowReceiving, o.Name, msg))
+		}
+		switch {
+		case o.MaxBytes > 0 && h.Use >= o.MaxBytes:
+			msg := fmt.Sprintf("overflow target %s holds %s, all of its max_bytes %s: no new copies go there, and copies no friend has room for stay below copies; raise max_bytes or add room at friends",
+				o.Name, gb(h.Use), gb(o.MaxBytes))
+			out = append(out, alertOf(KindOverflowFull, o.Name, msg))
+		case o.MaxBytes > 0 && h.Use*100 >= o.MaxBytes*OverflowHighPercent:
+			msg := fmt.Sprintf("overflow target %s holds %d%% of its max_bytes: %s of %s. At max_bytes no new copies go there",
+				o.Name, h.Use*100/o.MaxBytes, gb(h.Use), gb(o.MaxBytes))
+			out = append(out, alertOf(KindOverflowHigh, o.Name, msg))
+		}
+		c := conds[o.Place()]
+		if c.Condition != state.ConditionRetrying || now.Sub(c.Since) < minRetrying {
+			continue
+		}
+		from := c.LastOK
+		if from.IsZero() {
+			from = c.Since
+		}
+		if now.Sub(from) < after {
+			continue
+		}
+		msg := fmt.Sprintf("overflow target %s has failed since %s (longer than %v); copies to it wait: %s",
+			o.Name, from.UTC().Format(time.RFC3339), after, c.Detail)
+		out = append(out, alertOf(KindOverflowUnreachable, o.Name, msg))
 	}
 	return out, nil
 }

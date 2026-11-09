@@ -13,6 +13,7 @@ import (
 
 	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 )
@@ -37,6 +38,9 @@ type Pusher struct {
 	Self *identity.Identity
 	// Dial reaches a friend's tunnel port; Push uses it when nil.
 	Dial DialFunc
+	// Getenv reads overflow targets' credentials into the manifest
+	// (S3-1, SEC-3); nil carries none.
+	Getenv overflow.Getenv
 	// Push sends a sealed manifest to f; nil means the control API
 	// manifest call over Dial. Tests set it.
 	Push func(ctx context.Context, f state.Friendship, blob []byte) error
@@ -145,7 +149,7 @@ func (p *Pusher) Run(ctx context.Context) {
 // the pushes (Wait does).
 func (p *Pusher) Round(ctx context.Context) {
 	p.init()
-	c, err := Build(ctx, p.DB, p.Self)
+	c, err := Build(ctx, p.DB, p.Self, p.Getenv)
 	if err != nil {
 		p.logErr(ctx, "manifest: reading state failed", err)
 		return

@@ -59,6 +59,18 @@ type DB struct {
 	// bucketLocks holds a *sync.Mutex per bucket, shared by the placer
 	// and re-placement (lockBucket, #26).
 	bucketLocks sync.Map
+
+	// split caches overflowSplit (#38) for splitTTL (default
+	// splitCacheTTL; below zero, no cache: tests).
+	splitMu  sync.Mutex
+	splitAt  time.Time
+	splitVal bool
+	splitKey string
+	splitTTL time.Duration
+
+	// beforeApply, if set, runs before each re-placement batch takes the
+	// bucket's lock: a capture racing the pass. Tests only.
+	beforeApply func(bucket string, meta bool)
 }
 
 func (db *DB) now() time.Time {

@@ -25,43 +25,43 @@ import (
 // an unsigned trailer, taken as the part streams, so each byte is read
 // once (Q-Y.2). A rewrite (#74) carries its mark at the create.
 
-var _ Multipart = (*Friend)(nil)
+var _ Multipart = (*Client)(nil)
 
 const checksumHeader = "X-Amz-Checksum-Sha256"
 
 // Create begins an upload of o at the friend.
-func (f *Friend) Create(ctx context.Context, o Object) (string, error) {
+func (f *Client) Create(ctx context.Context, o Object) (string, error) {
 	if sum, err := hex.DecodeString(o.SHA256); err != nil || len(sum) != 32 {
 		return "", fmt.Errorf("object %s has no SHA-256 to send (%q)", o.Key, o.SHA256)
 	}
-	sealed := f.seal(o.Bucket)
+	bucket, key := f.where(o.Bucket, o.Key)
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
-	if err := f.ensureBucket(ctx, sealed); err != nil {
+	if err := f.ensureBucket(ctx, bucket); err != nil {
 		return "", err
 	}
 	meta := map[string]string{MetaSHA256: o.SHA256, "X-Amz-Checksum-Algorithm": "SHA256"}
 	if o.Replaces != "" {
 		meta[MetaReplaces] = o.Replaces
 	}
-	id, err := f.core.NewMultipartUpload(ctx, sealed, o.Key, minio.PutObjectOptions{UserMetadata: meta})
+	id, err := f.core.NewMultipartUpload(ctx, bucket, key, minio.PutObjectOptions{UserMetadata: meta})
 	if err != nil {
-		return "", classify(fmt.Errorf("beginning the upload of %s: %w", o.Key, err))
+		return "", f.classify(fmt.Errorf("beginning the upload of %s: %w", o.Key, err))
 	}
 	return id, nil
 }
 
 // Parts lists the parts the friend holds for the upload.
-func (f *Friend) Parts(ctx context.Context, bucket, key, uploadID string) (map[int]string, error) {
+func (f *Client) Parts(ctx context.Context, bucket, key, uploadID string) (map[int]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
-	sealed := f.seal(bucket)
+	b, k := f.where(bucket, key)
 	out := map[int]string{}
 	marker := 0
 	for {
-		res, err := f.core.ListObjectParts(ctx, sealed, key, uploadID, marker, 1000)
+		res, err := f.core.ListObjectParts(ctx, b, k, uploadID, marker, 1000)
 		if err != nil {
-			return nil, uploadErr(fmt.Errorf("listing the parts of %s: %w", key, err))
+			return nil, f.uploadErr(fmt.Errorf("listing the parts of %s: %w", key, err))
 		}
 		for _, p := range res.ObjectParts {
 			out[p.PartNumber] = p.ETag
@@ -76,7 +76,7 @@ func (f *Friend) Parts(ctx context.Context, bucket, key, uploadID string) (map[i
 // PutPart sends part n with an unsigned payload and its SHA-256 as an
 // unsigned trailer. A part that moves no bytes for the stall timeout
 // fails.
-func (f *Friend) PutPart(ctx context.Context, bucket, key, uploadID string, n int, body io.Reader, size int64) (Part, error) {
+func (f *Client) PutPart(ctx context.Context, bucket, key, uploadID string, n int, body io.Reader, size int64) (Part, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	trailer := http.Header{}
@@ -87,23 +87,24 @@ func (f *Friend) PutPart(ctx context.Context, bucket, key, uploadID string, n in
 	ctx, abandon, ended := abandoning(ctx, cancel)
 	wd := newWatchdog(h, f.stall, abandon)
 	defer wd.stop()
-	p, err := f.core.PutObjectPart(ctx, f.seal(bucket), key, uploadID, n, wd, size, minio.PutObjectPartOptions{
+	b, k := f.where(bucket, key)
+	p, err := f.core.PutObjectPart(ctx, b, k, uploadID, n, wd, size, minio.PutObjectPartOptions{
 		DisableContentSha256: true,
 		Trailer:              trailer,
 	})
 	ended()
 	if err != nil {
 		if wd.stalled() {
-			return Part{}, fmt.Errorf("sending part %d of %s: no progress for %v: %w", n, key, f.stall, err)
+			return Part{}, f.redact(fmt.Errorf("sending part %d of %s: no progress for %v: %w", n, key, f.stall, err))
 		}
-		return Part{}, uploadErr(fmt.Errorf("sending part %d of %s: %w", n, key, err))
+		return Part{}, f.uploadErr(fmt.Errorf("sending part %d of %s: %w", n, key, err))
 	}
 	return Part{Number: n, ETag: p.ETag, SHA256: hex.EncodeToString(h.h.Sum(nil)), Size: size}, nil
 }
 
 // Complete assembles the parts at the friend, which verifies the whole
 // object against the hash given at Create (LEND-4).
-func (f *Friend) Complete(ctx context.Context, bucket, key, uploadID string, parts []Part) error {
+func (f *Client) Complete(ctx context.Context, bucket, key, uploadID string, parts []Part) error {
 	cps := make([]minio.CompletePart, 0, len(parts))
 	for _, p := range parts {
 		cp := minio.CompletePart{PartNumber: p.Number, ETag: p.ETag}
@@ -120,29 +121,31 @@ func (f *Friend) Complete(ctx context.Context, bucket, key, uploadID string, par
 	}
 	ctx, cancel := context.WithTimeout(ctx, f.stall+timePerMiB(size))
 	defer cancel()
-	if _, err := f.core.CompleteMultipartUpload(ctx, f.seal(bucket), key, uploadID, cps, minio.PutObjectOptions{}); err != nil {
-		return uploadErr(fmt.Errorf("completing the upload of %s: %w", key, err))
+	b, k := f.where(bucket, key)
+	if _, err := f.core.CompleteMultipartUpload(ctx, b, k, uploadID, cps, minio.PutObjectOptions{}); err != nil {
+		return f.uploadErr(fmt.Errorf("completing the upload of %s: %w", key, err))
 	}
 	return nil
 }
 
 // Abort drops the upload at the friend.
-func (f *Friend) Abort(ctx context.Context, bucket, key, uploadID string) error {
+func (f *Client) Abort(ctx context.Context, bucket, key, uploadID string) error {
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
-	if err := f.core.AbortMultipartUpload(ctx, f.seal(bucket), key, uploadID); err != nil {
-		return uploadErr(fmt.Errorf("aborting the upload of %s: %w", key, err))
+	b, k := f.where(bucket, key)
+	if err := f.core.AbortMultipartUpload(ctx, b, k, uploadID); err != nil {
+		return f.uploadErr(fmt.Errorf("aborting the upload of %s: %w", key, err))
 	}
 	return nil
 }
 
 // uploadErr classifies err, with NoSuchUpload as ErrNoSuchUpload.
-func uploadErr(err error) error {
+func (f *Client) uploadErr(err error) error {
 	var er minio.ErrorResponse
 	if errors.As(err, &er) && (er.Code == "NoSuchUpload" || strings.EqualFold(er.Code, "NoSuchUpload")) {
-		return fmt.Errorf("%w: %w", ErrNoSuchUpload, err)
+		return f.redact(fmt.Errorf("%w: %w", ErrNoSuchUpload, err))
 	}
-	return classify(err)
+	return f.classify(err)
 }
 
 func timePerMiB(size int64) time.Duration { return time.Duration(size>>20) * time.Second }

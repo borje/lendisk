@@ -113,14 +113,16 @@ func mulSigned(x, y int64) (int64, uint64) {
 func (db *DB) rerouteAfter() time.Duration { return cmp.Or(db.RerouteAfter, time.Hour) }
 func (db *DB) replaceAfter() time.Duration { return cmp.Or(db.ReplaceAfter, 7*24*time.Hour) }
 
-// poolPlace is a friend with an address as placement sees it.
+// poolPlace is a friend with an address, or an overflow target, as
+// placement sees it.
 type poolPlace struct {
-	peer   string
-	quota  int64 // the friendship's quota (LEND-8)
-	use    int64 // place_use: what it holds or will hold
-	cond   string
-	since  time.Time // when cond began
-	lastOK time.Time // zero if never
+	peer     string
+	overflow bool  // an overflow target (overflow.go): peer is its place name
+	quota    int64 // the friendship's quota (LEND-8), or the target's max_bytes (S3-7)
+	use      int64 // place_use: what it holds or will hold
+	cond     string
+	since    time.Time // when cond began
+	lastOK   time.Time // zero if never
 	// failing is when its run of failing answers began (place.
 	// failing_since, or since if unset): the same as since unless it
 	// changed between retrying, quota and removed (#65).
@@ -201,13 +203,19 @@ type querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// poolPlaces lists the pool (D6): friends with an address, then
+// overflow targets, each in place name order.
 func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT f.peer_key,
-		min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)), coalesce(u.bytes, 0) + coalesce(fr.bytes, 0),
+	rows, err := tx.QueryContext(ctx, `SELECT x.place, x.overflow, x.quota,
+		coalesce(u.bytes, 0) + coalesce(fr.bytes, 0),
 		coalesce(c.condition, ''), coalesce(c.since, 0), c.last_ok, c.failing_since
-		FROM friendship f LEFT JOIN place_use u ON u.place = f.peer_key LEFT JOIN place c ON c.place = f.peer_key
-		LEFT JOIN place_freed fr ON fr.place = f.peer_key
-		WHERE coalesce(f.address, '') != '' ORDER BY f.peer_key`)
+		FROM (SELECT f.peer_key AS place, 0 AS overflow,
+				min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)) AS quota
+				FROM friendship f WHERE coalesce(f.address, '') != ''
+			UNION ALL SELECT '`+OverflowPrefix+`' || o.name, 1, o.max_bytes FROM overflow o) x
+		LEFT JOIN place_use u ON u.place = x.place LEFT JOIN place c ON c.place = x.place
+		LEFT JOIN place_freed fr ON fr.place = x.place
+		ORDER BY x.overflow, x.place`)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +225,7 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 		var p poolPlace
 		var since int64
 		var lastOK, failing sql.NullInt64
-		if err := rows.Scan(&p.peer, &p.quota, &p.use, &p.cond, &since, &lastOK, &failing); err != nil {
+		if err := rows.Scan(&p.peer, &p.overflow, &p.quota, &p.use, &p.cond, &since, &lastOK, &failing); err != nil {
 			return nil, err
 		}
 		p.since = time.Unix(since, 0)
@@ -259,15 +267,18 @@ func unsentMetadata(ctx context.Context, tx querier, bucket, place string) (int6
 // capacity for it (quota less use and the metadata reserve), reachable
 // ones first, each by largest free fraction
 // (free ÷ quota), ties by node ID. A friend gone past replace_after,
-// removed, or full by its last answer is not room, nor is one lacking
-// some of the bucket's live metadata (unsentMetadata: re-placement sends
-// it first, #26), nor one whose replica of the bucket failed a challenge
-// (VER-1, #27); with reachableOnly,
-// neither is an unreachable one (re-routing, so rows do not move between
-// friends that both stopped answering). Fewer than n means the pool
-// lacks room: what fits is placed, and the deficit shows as bytes below
-// copies (§3.4).
-func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64, n int, exclude []string, reachableOnly bool) ([]string, error) {
+// removed, or full by its last answer is not room, nor is one whose
+// replica of the bucket failed a challenge (VER-1, #27). A friend lacking
+// some of the bucket's live metadata is room less that metadata, which
+// the caller places there first (placeMetadata); with reachableOnly it is
+// not room (its metadata first, #26), and neither is an unreachable one
+// (re-routing, so rows do not move between friends that both stopped
+// answering). Friends take at most maxFriends of the n (all, when
+// negative), overflow targets that answer the rest by D6's step 3
+// (chooseOverflow), and friends again what no target can take. Fewer
+// than n means the pool lacks room: what fits is placed, and the deficit
+// shows as bytes below copies (§3.4).
+func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64, n, maxFriends int, exclude []string, reachableOnly bool) ([]string, error) {
 	if n <= 0 {
 		return nil, nil
 	}
@@ -290,19 +301,31 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 		free, quota int64 // free in hundredths of a byte
 	}
 	var cs []cand
+	var overflow []poolPlace
 	for _, p := range ps {
 		if slices.Contains(exclude, p.peer) || p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) ||
 			reachableOnly && p.unreachable(db, now) || unverified[p.peer] {
+			continue
+		}
+		if p.overflow {
+			// A failing target is no candidate: its queued copies would
+			// hold the metadata barrier everywhere (#38 review).
+			if !p.unreachable(db, now) {
+				overflow = append(overflow, p)
+			}
 			continue
 		}
 		meta, err := unsentMetadata(ctx, tx, bucket, p.peer)
 		if err != nil {
 			return nil, err
 		}
-		if meta > 0 {
+		if meta > 0 && reachableOnly {
 			continue // its metadata first (REPL-13, #26)
 		}
-		free := freeRoom(p.quota, p.use, 0, live)
+		// A friend lacking some of the bucket's metadata is room all the
+		// same: placeTx queues the metadata there first (#38 review), so a
+		// copy never goes to an overflow target for want of it.
+		free := freeRoom(p.quota, p.use, meta, live)
 		if !fits(free, need) {
 			continue
 		}
@@ -317,9 +340,62 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 		}
 		return byFraction(a.peer, a.free, a.quota, b.peer, b.free, b.quota)
 	})
+	friends := n
+	if maxFriends >= 0 {
+		friends = min(n, maxFriends)
+	}
+	var out []string
+	for _, c := range cs[:min(friends, len(cs))] {
+		out = append(out, c.peer)
+	}
+	if len(out) < n && !reachableOnly {
+		more, err := chooseOverflow(ctx, tx, bucket, need, n-len(out), overflow)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, more...)
+		// With no target to take it, the copy goes to a friend after all.
+		for _, c := range cs[min(friends, len(cs)):] {
+			if len(out) >= n {
+				break
+			}
+			out = append(out, c.peer)
+		}
+	}
+	return out, nil
+}
+
+// chooseOverflow is D6's step 3: up to n of the overflow targets ps for a
+// data copy of bucket that counts need bytes, by most free bytes (max_bytes
+// less use, less the bucket's metadata not
+// placed there yet, which goes there with it), ties by name. A target
+// with no room for it gets none: placement stops there at max_bytes
+// (S3-7).
+func chooseOverflow(ctx context.Context, q querier, bucket string, need int64, n int, ps []poolPlace) ([]string, error) {
+	type cand struct {
+		place string
+		free  int64
+	}
+	var cs []cand
+	for _, p := range ps {
+		meta, err := unsentMetadata(ctx, q, bucket, p.peer)
+		if err != nil {
+			return nil, err
+		}
+		free := capped(p.quota) - capped(max(p.use, 0)) - capped(meta)
+		if free >= capped(need) {
+			cs = append(cs, cand{p.peer, free})
+		}
+	}
+	slices.SortFunc(cs, func(a, b cand) int {
+		if c := cmp.Compare(b.free, a.free); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.place, b.place)
+	})
 	var out []string
 	for _, c := range cs[:min(n, len(cs))] {
-		out = append(out, c.peer)
+		out = append(out, c.place)
 	}
 	return out, nil
 }
@@ -377,18 +453,25 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 			AND state = 'queued' AND started_at IS NULL AND seq < ?`, bucket, key, seq); err != nil {
 			return err
 		}
-		targets, err = column(ctx, tx, `SELECT DISTINCT p.place FROM placement p JOIN friendship f ON f.peer_key = p.place
-			WHERE coalesce(f.address, '') != '' AND p.bucket = ?1 AND p.key = ?2 AND p.op = 'put'
+		targets, err = column(ctx, tx, `SELECT DISTINCT p.place FROM placement p
+			WHERE p.place IN (`+poolPlacesSQL+`) AND p.bucket = ?1 AND p.key = ?2 AND p.op = 'put'
 			AND p.seq = (SELECT max(x.seq) FROM placement x
 				WHERE x.place = p.place AND x.bucket = p.bucket AND x.key = p.key AND x.seq < ?3)
 			ORDER BY p.place`, bucket, key, seq)
 	case class == "metadata" || class == "snapshot":
+		// Every friend, and every overflow target holding data of the
+		// bucket (REPL-12).
 		targets, err = column(ctx, tx, `SELECT peer_key FROM friendship WHERE coalesce(address, '') != '' ORDER BY peer_key`)
+		if err == nil {
+			var held []string
+			held, err = overflowHolding(ctx, tx, bucket)
+			targets = append(targets, held...)
+		}
 		targets = slices.DeleteFunc(targets, func(p string) bool { return slices.Contains(skip, p) })
 	default:
 		if heal {
-			targets, err = column(ctx, tx, `SELECT p.place FROM placement p JOIN friendship f ON f.peer_key = p.place
-				WHERE coalesce(f.address, '') != '' AND p.state NOT IN ('`+PlacementDropped+`', '`+PlacementAbandoned+`')
+			targets, err = column(ctx, tx, `SELECT p.place FROM placement p
+				WHERE p.place IN (`+poolPlacesSQL+`) AND p.state NOT IN ('`+PlacementDropped+`', '`+PlacementAbandoned+`')
 				AND p.cause IS NOT '`+CauseImmutable+`' AND p.seq = `+healed+`
 				ORDER BY p.place`, bucket, key, seq)
 			if err != nil {
@@ -400,8 +483,36 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 			bucket, DefaultCopies).Scan(&copies); err != nil {
 			return err
 		}
+		// Split (REPL-12 as of v0.11.5): copies − 1 friends and one
+		// overflow target, while friends cannot hold copies of it all,
+		// for a bucket of two copies or more; a copies-1 bucket's one
+		// copy goes to a friend while one has room.
+		maxFriends := -1
+		var split bool
+		if split, err = db.overflowSplit(ctx, tx); err != nil {
+			return err
+		}
+		if split && copies >= 2 {
+			held := 0
+			for _, t := range targets {
+				if _, ok := OverflowName(t); !ok {
+					held++
+				}
+			}
+			maxFriends = max(copies-1-held, 0)
+		}
 		var more []string
-		more, err = db.choose(ctx, tx, bucket, size+ObjectOverhead, copies-len(targets), append(slices.Clone(targets), skip...), false)
+		more, err = db.choose(ctx, tx, bucket, size+ObjectOverhead, copies-len(targets), maxFriends, append(slices.Clone(targets), skip...), false)
+		// A place given its first data copy of the bucket gets every
+		// metadata object of the bucket it lacks first, ahead of it in
+		// its FIFO (REPL-12, S3-2): an overflow target, or a friend
+		// added since re-placement last ran (#38 review).
+		for _, place := range more {
+			if err != nil {
+				break
+			}
+			_, err = placeMetadata(ctx, tx, bucket, place, db.now().Unix())
+		}
 		targets = append(targets, more...)
 	}
 	if err != nil {
@@ -580,6 +691,12 @@ const seedHeld = `EXISTS (SELECT 1 FROM seed s WHERE s.place = p.place AND s.buc
 // errors together with what the others did. A busy or locked database
 // (busy) stops the pass at once: every row would wait out busy_timeout
 // in turn under lock, and the rest wait for the next pass.
+//
+// An overflow target is never a target of a move (#38): copies go
+// there only by D6's step 3, at capture or re-placement. As a source it
+// is like a friend: unsent data at one failing for reroute_after goes
+// to a friend that has room by now, and at one gone past replace_after
+// is dropped, so it holds no barrier for good.
 func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64) bool, lock sync.Locker) (moved, dropped int64, err error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
@@ -600,7 +717,7 @@ func (db *DB) Reroute(ctx context.Context, sending func(place string, seq int64)
 	}
 	var targets []*target
 	for _, p := range ps {
-		if p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) || p.unreachable(db, now) {
+		if p.overflow || p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) || p.unreachable(db, now) {
 			continue
 		}
 		if fits(freeRoom(p.quota, p.use, 0, live), ObjectOverhead) {
@@ -887,7 +1004,8 @@ func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(st
 
 // PoolSize is how many places the pool has for copies: friends with an
 // address that do not refuse this node and are not gone past
-// replace_after (OPS-2, EP-6).
+// replace_after, and overflow targets not gone past it (OPS-2, EP-6,
+// #38).
 func (db *DB) PoolSize(ctx context.Context) (int, error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
@@ -955,7 +1073,7 @@ func (db *DB) below(ctx context.Context, and string) (map[string]BelowStat, erro
 		AND NOT EXISTS (SELECT 1 FROM queue l
 			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
 		AND (SELECT count(*) FROM placement p WHERE p.seq = q.seq AND p.state IN ('queued', 'acked')
-			AND p.place IN (SELECT peer_key FROM friendship))
+			AND p.place IN (SELECT peer_key FROM friendship UNION ALL `+overflowPlaces+`))
 			< coalesce((SELECT copies FROM buckets WHERE name = q.bucket), ?) `+and+`
 		GROUP BY q.bucket`, DefaultCopies)
 	if err != nil {

@@ -52,6 +52,25 @@ jobs:
       - name: SEC-11 test build (admission admits everyone; the middleware alone refuses)
         run: go test -race -tags admitall -run TestMiddlewareAloneRefusesStranger ./internal/cli
 
+  # Scenario 12's first half against a real S3 provider (S3-1 to S3-3,
+  # S3-7, #38): a Garage container, DESIGN §3.11's tier 2. The test
+  # skips everywhere else.
+  overflow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: restic
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq restic
+      - name: Garage
+        run: .github/garage.sh lendisk-ci-garage "$RUNNER_TEMP/garage" >> "$GITHUB_ENV"
+      - run: go test -race -timeout 15m -run 'TestScenarioOverflowAtAnExternalProvider' -v ./internal/cli
+      - name: stop Garage
+        if: always()
+        run: docker rm -f lendisk-ci-garage
+
   build:
     runs-on: ubuntu-latest
     strategy:

@@ -23,6 +23,7 @@
 package recovery
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 )
@@ -139,6 +141,26 @@ func Restore(ctx context.Context, db *state.DB, m *manifest.Manifest) (Restored,
 			r.NoDialKey = append(r.NoDialKey, f.ID)
 		}
 		places = append(places, f.ID)
+	}
+	// Overflow targets come back as they were added, all but the
+	// credential, which the user puts in the daemon's environment (S3-1,
+	// SEC-3): so the rebuilt node's manifest still names them, and its
+	// daemon refuses to start until the credential is there (#38 review).
+	for _, o := range m.Overflow {
+		if err := overflow.CheckName(o.Name); err != nil {
+			return r, fmt.Errorf("the manifest lists an overflow target: %w", err)
+		}
+		prefix := cmp.Or(o.EnvPrefix, overflow.DefaultEnvPrefix(o.Name))
+		if err := overflow.CheckEnvPrefix(prefix); err != nil {
+			return r, fmt.Errorf("the manifest's overflow target %s: %w", o.Name, err)
+		}
+		err := db.AddOverflow(ctx, state.Overflow{Name: o.Name, Endpoint: o.Endpoint, Region: o.Region, Bucket: o.Bucket,
+			Prefix: o.Prefix, MaxBytes: o.MaxBytes, EnvPrefix: prefix,
+			Retention:  time.Duration(o.RetentionSeconds) * time.Second,
+			PricePerGB: o.PricePerGB, AddedAt: time.Now()})
+		if err != nil && !errors.Is(err, state.ErrExists) {
+			return r, fmt.Errorf("restoring overflow target %s: %w", o.Name, err)
+		}
 	}
 	for _, b := range m.Buckets {
 		buckets = append(buckets, b.Name)

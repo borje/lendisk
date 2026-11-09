@@ -34,6 +34,7 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 )
@@ -99,9 +100,10 @@ type Friend struct {
 	DialKey string `json:"dial_key,omitempty"`
 }
 
-// Overflow is an overflow target (S3-1). None exist before #38; the
-// field is in format 1 so recovery reads them once they do, credential
-// included (SEC-3 allows it here and nowhere else).
+// Overflow is an overflow target (S3-1), credential included (SEC-3
+// allows it here and nowhere else), so recovery through a friend also
+// recovers bucket access. The keys are absent when the daemon that
+// built it had them unset.
 type Overflow struct {
 	Name      string `json:"name"`
 	Endpoint  string `json:"endpoint"`
@@ -109,6 +111,13 @@ type Overflow struct {
 	Prefix    string `json:"prefix,omitempty"`
 	AccessKey string `json:"access_key,omitempty"`
 	SecretKey string `json:"secret_key,omitempty"`
+	// Added with #38, absent from older manifests (format stays 1):
+	// what a rebuilt node needs to add the target again.
+	Region           string  `json:"region,omitempty"`
+	MaxBytes         int64   `json:"max_bytes,omitempty"`
+	EnvPrefix        string  `json:"env_prefix,omitempty"`
+	RetentionSeconds int64   `json:"retention_seconds,omitempty"`
+	PricePerGB       float64 `json:"price_per_gb,omitempty"`
 }
 
 // Bucket is one of the node's own buckets with its sealed name, the
@@ -121,8 +130,10 @@ type Bucket struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-// Build reads the manifest's content from the node's state.
-func Build(ctx context.Context, db *state.DB, self *identity.Identity) (Content, error) {
+// Build reads the manifest's content from the node's state, and each
+// overflow target's credential with getenv (S3-1, SEC-3): a target
+// whose variables are unset is listed without it, and nil reads none.
+func Build(ctx context.Context, db *state.DB, self *identity.Identity, getenv overflow.Getenv) (Content, error) {
 	c := Content{Friends: []Friend{}, Overflow: []Overflow{}, Buckets: []Bucket{}}
 	region, err := transport.SavedRegion(ctx, db)
 	if err != nil {
@@ -143,6 +154,20 @@ func Build(ctx context.Context, db *state.DB, self *identity.Identity) (Content,
 		c.Friends = append(c.Friends, Friend{ID: f.Peer, Address: f.Address, OwnNumber: f.OwnNumber, PeerNumber: f.PeerNumber,
 			OwnRetentionSeconds: int64(f.OwnRetention / time.Second), PeerRetentionSeconds: int64(f.PeerRetention / time.Second),
 			Since: f.CreatedAt.UTC(), DialKey: f.DialKey})
+	}
+	targets, err := db.Overflows(ctx)
+	if err != nil {
+		return c, err
+	}
+	for _, o := range targets {
+		mo := Overflow{Name: o.Name, Endpoint: o.Endpoint, Bucket: o.Bucket, Prefix: o.Prefix, Region: o.Region,
+			MaxBytes: o.MaxBytes, EnvPrefix: o.EnvPrefix, RetentionSeconds: int64(o.Retention / time.Second), PricePerGB: o.PricePerGB}
+		if getenv != nil {
+			if cred, err := overflow.Lookup(getenv, o.EnvPrefix); err == nil {
+				mo.AccessKey, mo.SecretKey = cred.AccessKey, cred.SecretKey
+			}
+		}
+		c.Overflow = append(c.Overflow, mo)
 	}
 	bs, err := db.Buckets(ctx)
 	if err != nil {

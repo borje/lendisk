@@ -83,6 +83,10 @@ const (
 	// envBitrotEvery is the bit-rot sampler's time between steps (a Go
 	// duration, #31).
 	envBitrotEvery = "LENDISK_TEST_BITROT_EVERY"
+	// envReplaceEvery is the replication worker's ReplaceEvery (a Go
+	// duration): how often re-placement runs when the pool has not
+	// changed (#38).
+	envReplaceEvery = "LENDISK_TEST_REPLACE_EVERY"
 )
 
 // offsetClock is real time plus the duration in the file at path, read
@@ -212,6 +216,9 @@ func tuneFromEnv(w *replica.Worker) {
 	}
 	if d, err := time.ParseDuration(os.Getenv(envPauseRetry)); err == nil {
 		w.PauseRetry = d
+	}
+	if d, err := time.ParseDuration(os.Getenv(envReplaceEvery)); err == nil {
+		w.ReplaceEvery = d
 	}
 	if at, err := strconv.ParseInt(os.Getenv(envCrashAtByte), 10, 64); err == nil {
 		w.OnRead = func(_ string, _, read int64) {

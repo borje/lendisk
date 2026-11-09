@@ -103,6 +103,40 @@ func TestSealUsesInjectedRandomness(t *testing.T) {
 	}
 }
 
+// S3-1, SEC-3: an overflow target is in the manifest with its credential,
+// read from the environment, so recovery through a friend recovers
+// bucket access; with the variables unset it is listed without one, and
+// a changed credential is a new version.
+func TestBuildCarriesOverflowCredentialFromTheEnvironment(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	self := newID(t)
+	if err := db.AddOverflow(ctx, state.Overflow{Name: "b2", Endpoint: "https://s3.example", Bucket: "offsite",
+		Prefix: "lendisk", MaxBytes: 1 << 40, EnvPrefix: "LENDISK_OVERFLOW_B2_", AddedAt: time.Unix(1_800_000_000, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{"LENDISK_OVERFLOW_B2_ACCESS_KEY": "AK1", "LENDISK_OVERFLOW_B2_SECRET_KEY": "SK1"}
+	getenv := func(k string) (string, bool) { v, ok := env[k]; return v, ok }
+	c, err := Build(ctx, db, self, getenv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Overflow{Name: "b2", Endpoint: "https://s3.example", Bucket: "offsite", Prefix: "lendisk", AccessKey: "AK1", SecretKey: "SK1",
+		MaxBytes: 1 << 40, EnvPrefix: "LENDISK_OVERFLOW_B2_"}
+	if len(c.Overflow) != 1 || c.Overflow[0] != want {
+		t.Fatalf("overflow %+v", c.Overflow)
+	}
+	h := Hash(c)
+	env["LENDISK_OVERFLOW_B2_SECRET_KEY"] = "SK2"
+	if again, _ := Build(ctx, db, self, getenv); Hash(again) == h {
+		t.Fatal("a rotated credential left the version alone")
+	}
+	none, _ := Build(ctx, db, self, nil)
+	if len(none.Overflow) != 1 || none.Overflow[0].AccessKey != "" || none.Overflow[0].SecretKey != "" {
+		t.Fatalf("without the environment: %+v", none.Overflow)
+	}
+}
+
 // ID-4: the manifest is built from the state database: every friend
 // with its address and terms, every bucket with its copies and sealed
 // name (ID-7, from #14), the address settings; no placement and no
@@ -129,7 +163,7 @@ func TestBuildListsFriendsAndBucketsNotPlacement(t *testing.T) {
 		VALUES (1, ?, 'laptop', 'data/placed-object-key', 'put', 'queued')`, friend); err != nil {
 		t.Fatal(err)
 	}
-	c, err := Build(ctx, db, self)
+	c, err := Build(ctx, db, self, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,12 +186,12 @@ func TestBuildListsFriendsAndBucketsNotPlacement(t *testing.T) {
 	}
 	// The hash is of the content: stable, and moved by a change.
 	h := Hash(c)
-	again, _ := Build(ctx, db, self)
+	again, _ := Build(ctx, db, self, nil)
 	if Hash(again) != h {
 		t.Fatal("the same state hashed differently")
 	}
 	db.AddBucket(ctx, state.Bucket{Name: "desktop", Profile: "restic", Copies: 1, AccessKey: "A2", SecretKey: "s2", CreatedAt: created})
-	changed, _ := Build(ctx, db, self)
+	changed, _ := Build(ctx, db, self, nil)
 	if Hash(changed) == h {
 		t.Fatal("a new bucket left the hash alone")
 	}

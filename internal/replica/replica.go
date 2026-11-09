@@ -9,7 +9,11 @@
 //   - A client is built per place: for a friend, NewFriend, which dials
 //     through the tunnel, signs with the derived per-pair credential
 //     (NET-7a) and names each bucket by its sealed name (SEC-16). The
-//     secret is derived on demand and never written anywhere.
+//     secret is derived on demand and never written anywhere. For an
+//     overflow target, NewOverflow, with the credential the caller read
+//     from the environment (SEC-3), each bucket under
+//     <prefix>/<sealed name>/ in the target's bucket (S3-2); it keeps
+//     the credential in memory only.
 //   - Clients never retry (minio-go's MaxRetries is 1) and never use
 //     minio-go's signed trailer (Q-Y.2); the worker owns retries.
 //   - The worker only reads the store and lendisk.db; the endpoint never

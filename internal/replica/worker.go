@@ -50,6 +50,12 @@ type Worker struct {
 
 	// Connect builds a friend's client; nil means NewFriend over Dial.
 	Connect func(f state.Friendship) (Replica, error)
+	// ConnectOverflow builds an overflow target's client (#38): the
+	// daemon's reads the credential from the environment (SEC-3) and
+	// calls NewOverflow. An error, such as an unset credential, leaves
+	// the target retrying with the reason. Nil sends nothing to overflow
+	// targets.
+	ConnectOverflow func(o state.Overflow) (Replica, error)
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	// Poll is how often an idle sender looks at its FIFO (default 1 s);
@@ -346,6 +352,53 @@ func (w *Worker) Run(ctx context.Context) {
 			s := &sender{addr: f.Address, cancel: cancel, done: make(chan struct{})}
 			senders[f.Peer] = s
 			go func() { defer close(s.done); w.drain(sctx, f.Peer, r) }()
+		}
+		// Overflow targets (#38): a sender each, like a friend's.
+		if w.ConnectOverflow != nil {
+			targets, err := w.DB.Overflows(ctx)
+			if err != nil {
+				// As for friendships: keep their senders as they are.
+				if ctx.Err() == nil {
+					w.Log.Error("replication: reading overflow targets failed; keeping the current senders", "err", err)
+				}
+				for p := range senders {
+					if _, ok := state.OverflowName(p); ok {
+						seen[p] = true
+					}
+				}
+			}
+			for _, o := range targets {
+				place := o.Place()
+				seen[place] = true
+				addr := strings.Join([]string{o.Endpoint, o.Region, o.Bucket, o.Prefix, o.EnvPrefix}, "\x1f")
+				if s := senders[place]; s != nil {
+					if s.addr == addr {
+						continue
+					}
+					stop(s)
+					delete(senders, place)
+				}
+				r, err := w.ConnectOverflow(o)
+				if err != nil {
+					// Retrying, with the reason (an unset credential): so
+					// unreachable and alerted (#38).
+					if !unbuilt[place] {
+						w.Log.Error("replication: cannot build the overflow target's client; retrying", "place", place, "err", err)
+						if err := w.DB.SetPlaceCondition(context.Background(), place, state.ConditionRetrying,
+							"cannot build the overflow target's client: "+err.Error(), w.now()); err != nil {
+							w.Log.Error("replication: recording the place's condition failed", "place", place, "err", err)
+						} else {
+							unbuilt[place] = true
+						}
+					}
+					continue
+				}
+				delete(unbuilt, place)
+				sctx, cancel := context.WithCancel(ctx)
+				s := &sender{addr: addr, cancel: cancel, done: make(chan struct{})}
+				senders[place] = s
+				go func() { defer close(s.done); w.drain(sctx, place, r) }()
+			}
 		}
 		for p, s := range senders {
 			if !seen[p] {

@@ -314,8 +314,12 @@ type RepositoryUse struct {
 // RepositoryUse reads the node's repository as capacity planning
 // counts it: each key's latest done write, if a put.
 func (db *DB) RepositoryUse(ctx context.Context) (RepositoryUse, error) {
+	return repositoryUse(ctx, db)
+}
+
+func repositoryUse(ctx context.Context, q querier) (RepositoryUse, error) {
 	var u RepositoryUse
-	err := db.QueryRowContext(ctx, `SELECT
+	err := q.QueryRowContext(ctx, `SELECT
 		coalesce(sum(CASE WHEN q.class IN ('metadata', 'snapshot') THEN 0 ELSE q.size + ?1 END), 0),
 		coalesce(sum(CASE WHEN q.class IN ('metadata', 'snapshot') THEN q.size + ?1 ELSE 0 END), 0),
 		coalesce(max(CASE WHEN q.class IN ('metadata', 'snapshot') THEN NULL ELSE coalesce(b.copies, ?2) END), 0)
