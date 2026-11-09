@@ -96,7 +96,7 @@ func (a *app) bucketCmd() *cobra.Command {
 			} else if err != nil {
 				return err
 			}
-			printToolLines(a.out, cfg, b)
+			printToolLines(a.out, cfg, b, false)
 			return nil
 		},
 	}
@@ -173,7 +173,7 @@ objects back, and the hold ends.`,
 		},
 	}
 	reconcile.Flags().Int64Var(&allow, "allow-deletes", 0, "let the next pass delete up to this many missing objects (required)")
-	cmd.AddCommand(add, list, show, resolve, set, reconcile)
+	cmd.AddCommand(add, list, show, resolve, set, reconcile, a.bucketImportCmd())
 	return cmd
 }
 
@@ -254,14 +254,8 @@ func (a *app) openState(ctx context.Context) (*config.Loaded, *state.DB, error) 
 }
 
 func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int, explicit, noEncryption bool) error {
-	if err := validBucketName(name); err != nil {
-		return usageError{err}
-	}
-	if !contains(profiles, profile) {
-		return usageError{fmt.Errorf("--profile must be one of %s", strings.Join(profiles, ", "))}
-	}
-	if explicit && copies < 1 {
-		return usageError{errors.New("--copies must be at least 1")}
+	if err := checkBucketArgs(name, profile, profiles, copies, explicit); err != nil {
+		return err
 	}
 	if profile == "generic" && !noEncryption {
 		return usageError{errors.New("a generic bucket is not encrypted by its tool: every friend that holds a copy can read it. " +
@@ -272,28 +266,63 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 		return err
 	}
 	defer db.Close()
+	b, err := a.createBucket(ctx, cfg, db, name, profile, copies, explicit)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.out, "Created bucket %s (profile %s, copies %d).\n", name, profile, b.Copies)
+	if profile == "generic" {
+		fmt.Fprintln(a.out, noEncryptionWarning)
+	}
+	if err := a.copiesNotes(ctx, cfg, db, b.Copies); err != nil {
+		return err
+	}
+	fmt.Fprintln(a.out)
+	printToolLines(a.out, cfg, b, false)
+	return nil
+}
+
+// checkBucketArgs is bucket add's and import's usage check: a valid
+// name, a profile of allowed, and copies at least 1 if given.
+func checkBucketArgs(name, profile string, allowed []string, copies int, explicit bool) error {
+	if err := validBucketName(name); err != nil {
+		return usageError{err}
+	}
+	if !contains(allowed, profile) {
+		return usageError{fmt.Errorf("--profile must be one of %s", strings.Join(allowed, ", "))}
+	}
+	if explicit && copies < 1 {
+		return usageError{errors.New("--copies must be at least 1")}
+	}
+	return nil
+}
+
+// createBucket writes a new bucket's row with a fresh credential and
+// creates its directory through the posix backend, so no daemon is
+// needed (EP-6). copies is replication.copies unless explicit.
+func (a *app) createBucket(ctx context.Context, cfg *config.Loaded, db *state.DB, name, profile string, copies int, explicit bool) (state.Bucket, error) {
 	if !explicit {
 		copies = cfg.Replication.Copies.Int()
 	}
 	if cfg.Role == "lender" {
-		return errors.New("a lender-only node has no buckets of its own; set role = \"full\" first")
+		return state.Bucket{}, errors.New("a lender-only node has no buckets of its own; set role = \"full\" first")
 	}
 	access, err := newAccessKey(a.rng())
 	if err != nil {
-		return err
+		return state.Bucket{}, err
 	}
 	secret, err := newSecretKey(a.rng())
 	if err != nil {
-		return err
+		return state.Bucket{}, err
 	}
 	b := state.Bucket{
 		Name: name, Profile: profile, Copies: copies,
 		AccessKey: access, SecretKey: secret, CreatedAt: a.now(),
 	}
 	if err := db.AddBucket(ctx, b); errors.Is(err, state.ErrExists) {
-		return fmt.Errorf("bucket %q already exists; `lendisk bucket show %s` prints its lines", name, name)
+		return state.Bucket{}, fmt.Errorf("bucket %q already exists; `lendisk bucket show %s` prints its lines", name, name)
 	} else if err != nil {
-		return err
+		return state.Bucket{}, err
 	}
 	be, err := gateway.OpenBackend(cfg.StorePath())
 	if err == nil {
@@ -301,12 +330,14 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 	}
 	if err != nil {
 		db.DeleteBucket(ctx, name)
-		return err
+		return state.Bucket{}, err
 	}
-	fmt.Fprintf(a.out, "Created bucket %s (profile %s, copies %d).\n", name, profile, copies)
-	if profile == "generic" {
-		fmt.Fprintln(a.out, noEncryptionWarning)
-	}
+	return b, nil
+}
+
+// copiesNotes says what bucket add says of a bucket's copies: the
+// warning at copies 1, and a pool with fewer places (EP-6, OPS-2).
+func (a *app) copiesNotes(ctx context.Context, cfg *config.Loaded, db *state.DB, copies int) error {
 	if copies == 1 {
 		fmt.Fprintln(a.out, singleCopyWarning)
 	}
@@ -317,8 +348,6 @@ func (a *app) runBucketAdd(ctx context.Context, name, profile string, copies int
 		fmt.Fprintf(a.out, "Your pool has %d places, fewer than copies %d: objects are held at fewer places until more friends join (`lendisk invite --quota <size>`).\n",
 			places, copies)
 	}
-	fmt.Fprintln(a.out)
-	printToolLines(a.out, cfg, b)
 	return nil
 }
 
@@ -338,9 +367,11 @@ const (
 )
 
 // printToolLines prints the lines for loopback and, for each
-// [[endpoint.listen]] address, for another machine (EP-17).
-func printToolLines(w io.Writer, cfg *config.Loaded, b state.Bucket) {
-	toolLines(w, b, "on this machine", "http://"+cfg.Endpoint.Loopback, "")
+// [[endpoint.listen]] address, for another machine (EP-17). existing:
+// the bucket holds a repository already (bucket import), so the lines
+// open it rather than create one.
+func printToolLines(w io.Writer, cfg *config.Loaded, b state.Bucket, existing bool) {
+	toolLines(w, b, "on this machine", "http://"+cfg.Endpoint.Loopback, "", existing)
 	for _, e := range cfg.Endpoint.Listen {
 		addrs := bridge.Resolve([]config.Listen{e}, nil)
 		if len(addrs) == 0 {
@@ -359,7 +390,7 @@ func printToolLines(w io.Writer, cfg *config.Loaded, b state.Bucket) {
 					"`lendisk endpoint cert` prints its SHA-256 fingerprint to check the copy.\n\n",
 					filepath.Join(cfg.ConfigDir(), bridge.CertFile))
 			}
-			toolLines(w, b, "on another machine, at "+a.URL(), a.URL(), cacert)
+			toolLines(w, b, "on another machine, at "+a.URL(), a.URL(), cacert, existing)
 		}
 	}
 	fmt.Fprintf(w, "\nKeep the secret key private. `lendisk bucket show %s` prints these lines again.\n", b.Name)
@@ -367,7 +398,7 @@ func printToolLines(w io.Writer, cfg *config.Loaded, b state.Bucket) {
 
 // toolLines prints one endpoint's lines; cacert, if set, is the file the
 // tool must trust as the certificate authority.
-func toolLines(w io.Writer, b state.Bucket, where, url, cacert string) {
+func toolLines(w io.Writer, b state.Bucket, where, url, cacert string, existing bool) {
 	hostPort := strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://")
 	switch b.Profile {
 	case "restic":
@@ -375,10 +406,14 @@ func toolLines(w io.Writer, b state.Bucket, where, url, cacert string) {
 		fmt.Fprintf(w, "  export AWS_ACCESS_KEY_ID=%s\n", b.AccessKey)
 		fmt.Fprintf(w, "  export AWS_SECRET_ACCESS_KEY=%s\n", b.SecretKey)
 		fmt.Fprintf(w, "  export RESTIC_REPOSITORY=s3:%s/%s\n", url, b.Name)
+		verb := "init"
+		if existing {
+			verb = "snapshots"
+		}
 		if cacert != "" {
-			fmt.Fprintf(w, "  restic --cacert %s init\n", cacert)
+			fmt.Fprintf(w, "  restic --cacert %s %s\n", cacert, verb)
 		} else {
-			fmt.Fprintf(w, "  restic init\n")
+			fmt.Fprintf(w, "  restic %s\n", verb)
 		}
 	case "kopia":
 		tlsFlag := " --disable-tls"
@@ -389,7 +424,11 @@ func toolLines(w io.Writer, b state.Bucket, where, url, cacert string) {
 			}
 		}
 		fmt.Fprintf(w, "For Kopia 0.9 or later (repository format 2 or later) %s:\n\n", where)
-		fmt.Fprintf(w, "  kopia repository create s3 --endpoint=%s%s --bucket=%s \\\n", hostPort, tlsFlag, b.Name)
+		verb := "create"
+		if existing {
+			verb = "connect"
+		}
+		fmt.Fprintf(w, "  kopia repository %s s3 --endpoint=%s%s --bucket=%s \\\n", verb, hostPort, tlsFlag, b.Name)
 		fmt.Fprintf(w, "    --access-key=%s --secret-access-key=%s\n", b.AccessKey, b.SecretKey)
 	default:
 		fmt.Fprintf(w, "For any S3 client %s (path-style addressing):\n\n", where)
