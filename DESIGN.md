@@ -3916,13 +3916,110 @@ upstream bucket is Q-V.
   reload on SIGHUP. lendisk has no settings API (the CLI talks to the
   daemon through `lendisk.db`), so the file, watched and on SIGHUP,
   serves both the editor in a container and `systemctl reload`.
-- **REPL-8** `export --for <peer>` pages through the bucket through the
-  decorator and writes one file per key at its key path (or Kopia's
-  sharded layout), for each key with a `placement` row at that peer;
-  `import` on the lender walks the directory and puts each file into
-  the borrower's bucket through the decorator, and the borrower marks
-  those rows `acked` once the peer's `list` (§3.7) returns them with
-  the right hashes.
+- **REPL-8, seeding from a disk (#36, package `seed`).** Precedent:
+  restic, Kopia (`repository sync-to filesystem`), rclone and Syncthing
+  all seed with plain files in the tool's own layout, carried and copied
+  into the far side, which then compares hashes and sends only what
+  differs; none needs a special container. lendisk does the same, with
+  one manifest beside the files.
+  - *Export* (`lendisk export <bucket> --for <friend> <dir>`, on the
+    borrower, daemon running or not): each key whose latest done write
+    is a put with a `queued` or `acked` placement row at that friend
+    (`state.SeedObjects`): its share of the data and every metadata
+    object (REPL-12). The bytes are read from the store directory
+    (`<store>/<bucket>/<key>`) and hashed on the way; a key whose copy
+    no longer matches its capture hash (a write under way) is left out,
+    counted, for the network. Layout: one file per key at its key path,
+    or for a `kopia` bucket Kopia's sharded layout and `.shards`
+    (`export.KopiaPath`, as LEND-6's export); a directory marker is
+    skipped (no lender stores one). `<dir>` must be new or empty; files
+    0600, directories 0700, `O_EXCL` (LEND-6's rules; on a FAT or exFAT
+    disk the modes are the filesystem's). *Manifest*
+    `.lendisk/seed.json`: `{"seed": {format 1, borrower, lender, bucket
+    (sealed name, SEC-16), layout, exported_at, objects: [{key, size,
+    sha256}]}, "mac": HMAC-SHA256(pair secret, "lendisk-seed-v1\n" ||
+    seed)}`. `.lendisk/` is reserved (SEC-5), so it never collides with
+    a key, and restic and Kopia ignore it. The MAC uses the per-pair S3
+    secret (NET-7a): import knows the borrower from the manifest and
+    accepts it only if it authenticates for this node, so a stranger's
+    disk cannot fill a friend's quota, and a disk for another friend is
+    refused by name.
+  - *Hold.* Export first writes a `seed` row (migration 39: place,
+    bucket, `through` = the highest seq exported, counts, outcome). While
+    it is pending, `NextPlacement` skips that friend's queued rows of
+    the bucket, so the disk's objects are not also sent over the
+    network, and writes since queue behind them in order ("queued
+    operations continue from where the export ended"). Other buckets and
+    other friends are not held: rows a pending seed holds count in
+    neither of `Held`'s checks (the metadata barrier's data puts, the
+    delete mirror's metadata), as an unreachable place's do not (#21),
+    so metadata, snapshots and prunes reach every other friend and the
+    watermark advances as they and the seed's confirmations acknowledge
+    (decided in #36's review). The seeded friend's replica of the bucket
+    lags, as an offline friend's does; its own FIFO keeps the order,
+    since it is sent nothing of the bucket until the seed ends. A failed
+    export drops its row. A second
+    export of the same bucket for the same friend replaces the seed.
+    Reroute (#19) still applies to a friend unreachable past
+    `reroute_after`.
+  - *Import* (`lendisk import <dir>`, on the lender, daemon running):
+    reads and authenticates the manifest (at most `seed.MaxManifest`,
+    512 MiB, some 2.5 million objects), checks the borrower is a
+    friend, then puts each object through the lender's own gateway
+    socket (`gw.sock`) with `replica.NewSeeder`: the borrower's access
+    key and the pair secret the lender derives too, `x-amz-meta-lendisk-
+    sha256` and the checksum header exactly as the worker sends them.
+    So quota and floor (`reserve`), hash (`putLent`'s body check),
+    existing key (`putAgain`, 412) and key rules are the one network
+    path, with no second implementation (decided #36: not an
+    in-process `Lending`, whose usage counter and key locks live in the
+    daemon). A gateway that refuses before reading the body closes the
+    socket; the client's connection discards writes after EPIPE so it
+    reads that answer (`seed.answered`). An object refused alone
+    (`BadDigest`: damaged on the disk; 412: held with other bytes; a
+    file missing or of another size; anything but a regular file) is
+    reported and the import goes
+    on; quota, floor, a removed friend or a gateway failure stop it.
+    Run again, objects already stored answer as `putAgain` and are not
+    stored twice. Exit 1 if anything was refused or it stopped.
+    Objects go in one PUT each (the worker's multipart path is not
+    used), so an object over 5 GiB is not seeded; restic and Kopia
+    packs are far smaller. The disk is someone else's filesystem: files
+    and the manifest are opened under an `os.Root` of the directory,
+    every path component `Lstat`ed and refused if it is a symbolic
+    link, then opened `O_NOFOLLOW|O_NONBLOCK` and refused unless a
+    regular file (`seed.openPlain`), so no link is followed and no FIFO
+    or device blocks or is read; a manifest key that is absolute or has
+    `..` refuses the whole manifest.
+  - *Confirm* (`seed.Confirmer`, in the borrower's daemon, `full`
+    role): every minute each pending seed's friend is listed (§3.7
+    `list`; a 404 `NoSuchBucket` is "nothing yet"; failures back off
+    from the poll, doubling, to an hour). Each live listed key whose
+    hash equals the queue row's capture hash acknowledges that held put
+    (`AckPlacement`, with the hash: REPL-10's index); a key listed with
+    other bytes, tombstoned, or absent stays queued. The disk is never
+    trusted for this: only the friend's list. The seed ends (`done_at`,
+    `outcome`) when no held put up to `through` that is still its key's
+    latest write is queued (`confirmed`); when it confirmed some and no
+    listing has confirmed more for `state.SeedQuietAfter` (1 h:
+    `quiet`, an import ended or stopped part way); when nothing was
+    confirmed within `state.SeedExpiry` (30 days: `expired`, a disk
+    lost or never imported); or when the friend is no longer one
+    (`removed`). Then the FIFO sends what is left, in seq order.
+  - `status` shows each pending seed with its age and when its hold
+    ends at the latest if nothing more is confirmed (text, and
+    `expires_at` in `--json`'s `seeds`, which lists every seed);
+    `status --wait` that times out names each pending seed of the
+    bucket and the objects it holds.
+  - *Tests:* `TestSeedHoldsRowsUntilTheFriendsListConfirmsThem`,
+    `TestASeedHoldsOnlyTheSeededFriend` (`internal/state`);
+    `TestImportFollowsNoLinkAndOpensNoDevice`, `TestExportWritesExactlyTheKeysPlacedAtTheFriend`,
+    `TestExportOfAKopiaBucketIsInKopiasLayout`,
+    `TestOnlyRowsTheListShowsWithTheirHashAreAcknowledged`,
+    `TestSeedEnds` (`internal/seed`);
+    `TestScenarioSeedAFriendFromADisk` (quota stop and rerun, a damaged
+    object, a held key, confirmation, no re-upload by the worker's
+    metrics) and `TestSeedExportAndImportRefusals` (`internal/cli`).
 - **REPL-10** The hash is SHA-256, taken by the decorator from the
   write stream at capture (EP-3) and kept on the queue row; the worker
   sends it with the object as `x-amz-meta-lendisk-sha256` and stores

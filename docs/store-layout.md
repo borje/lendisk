@@ -158,6 +158,7 @@ lendisk uses the store alone. Tables:
 | `bitrot_sweep`, `bitrot` | the bit-rot sampler's progress and what it found |
 | `reconcile` | the store reconciler's guard against mass deletion |
 | `undelete_request`, `undelete_key` | `lendisk undelete` runs |
+| `seed` | `lendisk export <bucket> --for <friend>`: a friend seeded from a disk, whose rows of that bucket wait until its list confirms the import |
 | `alert` | raised alerts and their delivery |
 
 ## The export layout

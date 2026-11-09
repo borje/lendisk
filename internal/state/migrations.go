@@ -826,4 +826,33 @@ var migrations = []Migration{
 			done_at INTEGER NOT NULL
 		);`,
 	},
+	{
+		Version: 39, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Seeding from a removable disk (REPL-8, #36): one row per friend
+		-- and own bucket exported for it. While done_at is NULL the seed is
+		-- pending and the friend's queued rows of the bucket are held from
+		-- the network (NextPlacement); the daemon lists the friend and
+		-- acknowledges each put up to through (a queue seq) that the list
+		-- shows with the captured hash. objects: what the export wrote;
+		-- confirmed: rows acknowledged so; progress_at: the last listing
+		-- that acknowledged any; outcome: confirmed | quiet | expired |
+		-- removed | replaced. Unix seconds.
+		CREATE TABLE seed (
+			place       TEXT NOT NULL,
+			bucket      TEXT NOT NULL,
+			through     INTEGER NOT NULL,
+			objects     INTEGER NOT NULL,
+			bytes       INTEGER NOT NULL,
+			exported_at INTEGER NOT NULL,
+			confirmed   INTEGER NOT NULL DEFAULT 0,
+			progress_at INTEGER,
+			checked_at  INTEGER,
+			failures    INTEGER NOT NULL DEFAULT 0,
+			error       TEXT,
+			done_at     INTEGER,
+			outcome     TEXT,
+			PRIMARY KEY (place, bucket)
+		);`,
+	},
 }

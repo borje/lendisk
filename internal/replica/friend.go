@@ -61,7 +61,7 @@ const friendHost = "lendisk-friend:9000"
 // credential (NET-7a), each bucket under its sealed name (SEC-16).
 type Friend struct {
 	core    *minio.Core
-	self    *identity.Identity
+	seal    func(bucket string) string // the bucket's name on the wire
 	stall   time.Duration
 	mu      sync.Mutex
 	created map[string]bool // sealed names created at the friend by this client
@@ -74,12 +74,28 @@ func NewFriend(self *identity.Identity, peer identity.NodeID, addr string, dial 
 	if err != nil {
 		return nil, err
 	}
+	return newFriend(self.NodeID().String(), secret, func(ctx context.Context) (net.Conn, error) {
+		return dial(ctx, peer, addr)
+	}, self.SealedName, o)
+}
+
+// NewSeeder builds the client `lendisk import` puts a seeding disk's
+// objects with, on the lender (REPL-8, #36): signed as borrower with
+// the pair's secret, which the lender derives as well (NET-7a), and
+// dialling the lender's own gateway with dial, so every object passes
+// the lender's policy exactly as one sent over the tunnel does. Buckets
+// are named by their sealed names already: it seals nothing.
+func NewSeeder(borrower identity.NodeID, secret string, dial func(ctx context.Context) (net.Conn, error), o Options) (*Friend, error) {
+	return newFriend(borrower.String(), secret, dial, func(sealed string) string { return sealed }, o)
+}
+
+func newFriend(access, secret string, dial func(ctx context.Context) (net.Conn, error), seal func(string) string, o Options) (*Friend, error) {
 	dt := o.dialTimeout()
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			ctx, cancel := context.WithTimeout(ctx, dt)
 			defer cancel()
-			return dial(ctx, peer, addr)
+			return dial(ctx)
 		},
 		ResponseHeaderTimeout: o.stallTimeout(),
 		MaxIdleConnsPerHost:   2,
@@ -87,7 +103,7 @@ func NewFriend(self *identity.Identity, peer identity.NodeID, addr string, dial 
 		DisableCompression:    true,
 	}
 	core, err := minio.NewCore(friendHost, &minio.Options{
-		Creds:        credentials.NewStaticV4(self.NodeID().String(), secret, ""),
+		Creds:        credentials.NewStaticV4(access, secret, ""),
 		Region:       region,
 		BucketLookup: minio.BucketLookupPath,
 		Transport:    tr,
@@ -99,7 +115,7 @@ func NewFriend(self *identity.Identity, peer identity.NodeID, addr string, dial 
 	if err != nil {
 		return nil, err
 	}
-	return &Friend{core: core, self: self, stall: o.stallTimeout(), created: map[string]bool{}}, nil
+	return &Friend{core: core, seal: seal, stall: o.stallTimeout(), created: map[string]bool{}}, nil
 }
 
 // ensureBucket creates the sealed bucket at the friend once per client;
@@ -133,7 +149,7 @@ func (f *Friend) Put(ctx context.Context, o Object) error {
 	if err != nil || len(sum) != 32 {
 		return fmt.Errorf("object %s has no SHA-256 to send (%q)", o.Key, o.SHA256)
 	}
-	sealed := f.self.SealedName(o.Bucket)
+	sealed := f.seal(o.Bucket)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	if err := f.ensureBucket(ctx, sealed); err != nil {
@@ -219,7 +235,7 @@ func abandoning(ctx context.Context, cancel context.CancelFunc) (_ context.Conte
 func (f *Friend) Head(ctx context.Context, bucket, key string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
-	info, err := f.core.StatObject(ctx, f.self.SealedName(bucket), key, minio.StatObjectOptions{})
+	info, err := f.core.StatObject(ctx, f.seal(bucket), key, minio.StatObjectOptions{})
 	var er minio.ErrorResponse
 	if errors.As(err, &er) && (er.Code == "NoSuchKey" || er.Code == "NoSuchBucket" || er.StatusCode == http.StatusNotFound) {
 		return "", false, nil
@@ -247,7 +263,7 @@ func (f *Friend) Probe(ctx context.Context) error {
 // Delete removes the key from the sealed bucket. A key or bucket the
 // friend does not have is already deleted.
 func (f *Friend) Delete(ctx context.Context, bucket, key string) error {
-	err := f.core.RemoveObject(ctx, f.self.SealedName(bucket), key, minio.RemoveObjectOptions{})
+	err := f.core.RemoveObject(ctx, f.seal(bucket), key, minio.RemoveObjectOptions{})
 	var er minio.ErrorResponse
 	if errors.As(err, &er) && (er.Code == "NoSuchKey" || er.Code == "NoSuchBucket") {
 		return nil
@@ -265,7 +281,7 @@ func (f *Friend) Delete(ctx context.Context, bucket, key string) error {
 // fails, so a friend switched off mid-transfer cannot hang the read.
 func (f *Friend) Get(ctx context.Context, bucket, key string) (io.ReadCloser, error) {
 	ctx, cancel := context.WithCancel(ctx)
-	body, _, _, err := f.core.GetObject(ctx, f.self.SealedName(bucket), key, minio.GetObjectOptions{})
+	body, _, _, err := f.core.GetObject(ctx, f.seal(bucket), key, minio.GetObjectOptions{})
 	if err != nil {
 		cancel()
 		return nil, classify(fmt.Errorf("fetching %s: %w", key, err))

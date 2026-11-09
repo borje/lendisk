@@ -504,6 +504,12 @@ func column(ctx context.Context, tx querier, q string, args ...any) ([]string, e
 // it would stop every place's FIFO for as long as it stays away (its
 // replica is behind until it returns, and its FIFO then brings it
 // level).
+//
+// Rows a pending seed holds (REPL-8, seed.go) count in neither check,
+// as an unreachable place's do not (#21): the seeded friend's replica
+// of the bucket lags while the disk travels, and every other place goes
+// on. The seeded friend's own FIFO keeps the order, since it is sent
+// nothing of the bucket until the seed ends.
 func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
@@ -525,6 +531,7 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 		WHEN q.class IN ('metadata', 'snapshot') THEN EXISTS (
 			SELECT 1 FROM placement p JOIN queue d ON d.seq = p.seq
 			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND p.op = 'put' AND d.class = 'data'
+			AND NOT `+seedHeld+`
 			AND NOT EXISTS (SELECT 1 FROM queue l
 				WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.seq < q.seq AND l.state = 'done'))
 			OR EXISTS (SELECT 1 FROM queue u WHERE u.state = 'pending' AND u.bucket = q.bucket AND u.seq < q.seq
@@ -532,7 +539,7 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 		WHEN q.op = 'delete' THEN EXISTS (
 			SELECT 1 FROM placement p JOIN queue m ON m.seq = p.seq
 			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND m.class IN ('metadata', 'snapshot')
-			AND p.place IN (SELECT value FROM json_each(?2)))
+			AND p.place IN (SELECT value FROM json_each(?2)) AND NOT `+seedHeld+`)
 		ELSE 0 END
 		FROM queue q WHERE q.seq = ?1`, seq, string(list)).Scan(&held)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -540,6 +547,10 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 	}
 	return held, err
 }
+
+// seedHeld is true for placement row p while a pending seed holds it
+// (NextPlacement).
+const seedHeld = `EXISTS (SELECT 1 FROM seed s WHERE s.place = p.place AND s.bucket = p.bucket AND s.done_at IS NULL)`
 
 // Reroute moves the unsent data rows of every friend that is failing
 // for longer than reroute_after, or whose last answer was 507, to

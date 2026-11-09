@@ -96,8 +96,9 @@ type Placement struct {
 
 // NextPlacement returns the head of place's FIFO: its queued or
 // dropping row with the lowest sequence. A dropping row (re-placement,
-// #26) is returned as a delete of its key. ok is false when the FIFO is
-// empty.
+// #26) is returned as a delete of its key. A queued row of a bucket
+// with a pending seed at place is held (REPL-8, seed.go). ok is false
+// when the FIFO is empty.
 func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok bool, err error) {
 	head := func(state string) (Placement, bool, error) {
 		var p Placement
@@ -105,7 +106,9 @@ func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok 
 		err := db.QueryRowContext(ctx, `SELECT p.seq, p.place, p.bucket, p.key, p.op, q.class, coalesce(q.size, 0),
 			coalesce(q.sha256, ''), p.state, q.created_at, coalesce(q.rewritable, 0)
 			FROM placement p JOIN queue q ON q.seq = p.seq
-			WHERE p.place = ? AND p.state = ? ORDER BY p.seq LIMIT 1`, place, state).
+			WHERE p.place = ?1 AND p.state = ?2 AND (?2 != 'queued' OR p.bucket NOT IN
+				(SELECT s.bucket FROM seed s WHERE s.place = ?1 AND s.done_at IS NULL))
+			ORDER BY p.seq LIMIT 1`, place, state).
 			Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Class, &p.Size, &p.SHA256, &p.State, &created, &p.Rewritable)
 		if errors.Is(err, sql.ErrNoRows) {
 			return p, false, nil
