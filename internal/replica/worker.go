@@ -418,8 +418,9 @@ func (w *Worker) reroute(ctx context.Context) {
 
 // replace runs a re-placement pass (REPL-13, state.DB.Replace): copies
 // of a pool that changed are placed elsewhere, surplus copies removed.
-// It reports whether the pass left a copy alone because it was being
-// sent, or failed, so the next re-routing tick looks again.
+// It reports whether the pass left a copy alone because its sender took
+// it or is sending it (it may land, and its acknowledgement changes no
+// fingerprint), or failed, so the next re-routing tick looks again.
 func (w *Worker) replace(ctx context.Context) bool {
 	// Called with w.flight held, as Replace applies its batches.
 	sending := func(place string, seq int64) bool {

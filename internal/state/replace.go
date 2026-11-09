@@ -73,7 +73,7 @@ type ReplaceStats struct {
 	Cancelled  int64 // unsent surplus copies cancelled
 	Below      int64 // live data objects still below copies
 	BelowBytes int64 // their bytes
-	Skipped    int64 // surplus copies left alone as being sent: a later pass looks again
+	Skipped    int64 // copies left alone as taken or being sent, which may land: a later pass looks again
 }
 
 func (s *ReplaceStats) add(o ReplaceStats) {
@@ -518,16 +518,19 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 		}
 		for _, o := range objs {
 			after = o.seq
-			ops, short, err := m.decide(ctx, bucket, o, copies, false)
+			ops, short, left, err := m.decide(ctx, bucket, o, copies, false)
 			if err != nil {
 				return st, errors.Join(append(errs, err)...)
 			}
 			switch {
 			case len(ops) > 0:
-				work = append(work, job{o.seq, o.size, short})
+				work = append(work, job{o.seq, o.size, short}) // its batch counts what it leaves
 			case short:
 				below++
 				belowBytes += o.size
+			}
+			if len(ops) == 0 {
+				m.skipped += left
 			}
 		}
 	}
@@ -616,14 +619,19 @@ func (m *replacer) fullness(a, b string) int {
 }
 
 // decide is what one data object needs (file comment above): the rows
-// to change, and whether it stays below copies. With commit, the room
+// to change, whether it stays below copies, and how many queued rows it
+// would have cancelled or drained but left alone because a sender took
+// them or is sending them: such a copy may land, and once it is
+// acknowledged no change to the pool announces that it must go, so the
+// worker looks again at its next tick (Skipped). With commit, the room
 // the new copies take is counted for the rest of the pass, and the
 // sending set is consulted; without, decide only asks whether there is
 // anything to do.
-func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int, commit bool) ([]rop, bool, error) {
+func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int, commit bool) ([]rop, bool, int64, error) {
 	if storeRefused(o.rows) {
-		return nil, false, nil // the store cannot supply it: objects_not_replicated says so
+		return nil, false, 0, nil // the store cannot supply it: objects_not_replicated says so
 	}
+	var left int64
 	var good, drain []prow
 	var ops []rop
 	at := map[string]prow{}
@@ -635,7 +643,9 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 		case m.unverified[r.place] && r.state == PlacementQueued:
 			// Not sent yet to a replica that failed a challenge: it goes
 			// elsewhere instead, unless its sender holds it (#27).
-			if !r.taken && !(commit && m.sending != nil && m.sending(r.place, o.seq)) {
+			if r.taken || commit && m.sending != nil && m.sending(r.place, o.seq) {
+				left++ // drained once acknowledged
+			} else {
 				ops = append(ops, rop{kind: opCancel, place: r.place})
 			}
 		case f == nil || f.drainAll || f.drain[o.seq] || m.unverified[r.place]:
@@ -660,7 +670,7 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 	case len(good) < copies:
 		to, err := m.choose(ctx, bucket, o, at, copies-len(good), commit)
 		if err != nil {
-			return nil, false, err
+			return nil, false, 0, err
 		}
 		var pending []string // drained copies with no replacement yet
 		for _, d := range drain {
@@ -706,7 +716,6 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 				break
 			}
 			if commit && m.sending != nil && m.sending(r.place, o.seq) {
-				m.skipped++
 				continue
 			}
 			ops = append(ops, rop{kind: opCancel, place: r.place})
@@ -720,13 +729,16 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 			surplus--
 			acked--
 		}
+		// What is still surplus is queued and taken or being sent, so
+		// not cancelled, and keeps as many acknowledged copies.
+		left += int64(surplus)
 	}
 	if acked >= copies {
 		for _, d := range drain {
 			ops = append(ops, rop{kind: opDrop, place: d.place})
 		}
 	}
-	return ops, below, nil
+	return ops, below, left, nil
 }
 
 // choose is D6's choice of up to n friends for a new copy of o, in
@@ -834,9 +846,11 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 			ops = m.metadataOps(o)
 		} else {
 			var below bool
-			if ops, below, err = m.decide(ctx, bucket, o, copies, true); err != nil {
+			var left int64
+			if ops, below, left, err = m.decide(ctx, bucket, o, copies, true); err != nil {
 				return st, err
 			}
+			m.skipped += left
 			if below {
 				st.Below++
 				st.BelowBytes += size
