@@ -84,12 +84,14 @@ func (f *Friend) PutPart(ctx context.Context, bucket, key, uploadID string, n in
 	// long as the final value (Q-Y.2).
 	trailer.Set(checksumHeader, base64.StdEncoding.EncodeToString(make([]byte, sha256.Size)))
 	h := &trailerHasher{r: body, h: sha256.New(), trailer: trailer}
-	wd := newWatchdog(h, f.stall, cancel)
+	ctx, abandon, ended := abandoning(ctx, cancel)
+	wd := newWatchdog(h, f.stall, abandon)
 	defer wd.stop()
 	p, err := f.core.PutObjectPart(ctx, f.self.SealedName(bucket), key, uploadID, n, wd, size, minio.PutObjectPartOptions{
 		DisableContentSha256: true,
 		Trailer:              trailer,
 	})
+	ended()
 	if err != nil {
 		if wd.stalled() {
 			return Part{}, fmt.Errorf("sending part %d of %s: no progress for %v: %w", n, key, f.stall, err)

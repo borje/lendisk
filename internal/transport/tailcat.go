@@ -9,14 +9,18 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/tailscale/tailcat"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -603,6 +607,33 @@ func (tc *tunnelConn) Close() error {
 		last.shut()
 	})
 	return err
+}
+
+// Reset closes the connection with a TCP reset (linger 0), discarding
+// what it has not sent: the peer's next read fails at once, instead of
+// reading on what the tunnel still holds and then a FIN behind it. A
+// sender abandoning a request body uses it, so the friend ends that
+// request, and gives back what it reserved for it, at once (#89). A
+// connection that is not gVisor's, or whose internals have changed, is
+// closed as usual.
+func (tc *tunnelConn) Reset() error {
+	if c, ok := tc.Conn.(*gonet.TCPConn); ok {
+		if ep := gonetEndpoint(c); ep != nil {
+			ep.SocketOptions().SetLinger(tcpip.LingerOption{Enabled: true, Timeout: 0})
+		}
+	}
+	return tc.Close()
+}
+
+// gonetEndpoint returns c's unexported gVisor endpoint, nil if gonet no
+// longer has it (tailcat reaches it the same way, closeProxyConn).
+func gonetEndpoint(c *gonet.TCPConn) tcpip.Endpoint {
+	f := reflect.ValueOf(c).Elem().FieldByName("ep")
+	if !f.IsValid() || f.Type() != reflect.TypeFor[tcpip.Endpoint]() {
+		return nil
+	}
+	ep, _ := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Interface().(tcpip.Endpoint)
+	return ep
 }
 
 // PeerOf returns the key of the client that opened an accepted connection.

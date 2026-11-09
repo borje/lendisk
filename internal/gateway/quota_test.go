@@ -1115,3 +1115,47 @@ func TestStartupSettlesAPendingCompletionWithQuotaInPlace(t *testing.T) {
 }
 
 var _ backend.Backend = ignoringReads{}
+
+// #89, LEND-2: a write that fits the quota and the floor, but not beside
+// the borrower's writes still in flight, is answered 503 SlowDown, which
+// the borrower retries, not the 507 that pauses it for quota: a send it
+// abandoned may still hold its reservation for a moment. One that does
+// not fit even alone is still 507, and the retry fits once the write in
+// flight has ended.
+func TestAWriteThatFitsButForWritesInFlightIsRetried(t *testing.T) {
+	const total, floor = 1_000_000, 50_000 // the default floor is 5%
+	var free atomic.Uint64
+	free.Store(total)
+	l := lendTo(t, 3*ov+100, func(h *harness) {
+		h.statfs = func(string) (store.Space, error) { return store.Space{Total: total, Free: free.Load()}, nil }
+	})
+	// An abandoned send: admitted for 60 bytes, it ends short.
+	s := newStalledReader([]byte("cut short"))
+	done := make(chan error, 1)
+	go func() { done <- l.putDirect("data/abandoned", s, 60, hashMeta(bytes.Repeat([]byte("a"), 60))) }()
+	within(t, "the abandoned put reading", s.reading)
+
+	second := bytes.Repeat([]byte("b"), 60)
+	if err := l.put("data/two", second, hashMeta(second)); code(err) != "SlowDown" || status(err) != 503 {
+		t.Fatalf("a put over the quota only beside a write in flight: %v (status %d)", err, status(err))
+	}
+	big := bytes.Repeat([]byte("c"), int(ov)+200)
+	if err := l.put("data/big", big, hashMeta(big)); code(err) != "QuotaExceeded" || status(err) != 507 {
+		t.Fatalf("a put over the quota alone: %v (status %d)", err, status(err))
+	}
+	small := []byte("pack")
+	free.Store(uint64(floor + ov + 4 + 30)) // room for it, not for the write in flight too
+	if err := l.put("data/small", small, hashMeta(small)); code(err) != "SlowDown" || status(err) != 503 {
+		t.Fatalf("a put below the floor only beside a write in flight: %v (status %d)", err, status(err))
+	}
+	free.Store(total)
+
+	close(s.release)
+	if err := within(t, "the abandoned put", done); err == nil {
+		t.Fatal("the short body was stored")
+	}
+	if err := l.put("data/two", second, hashMeta(second)); err != nil {
+		t.Fatalf("the retry once the write in flight ended: %v", err)
+	}
+	l.wantUsage(2*ov + 60)
+}

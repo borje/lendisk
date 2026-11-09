@@ -3028,8 +3028,8 @@ upstream bucket is Q-V.
   (`Held`'s rule): a full friend would refuse it, and while queued it
   would hold every place's metadata and the full friend's later
   deletes for as long as the friend stays full. A shorter `507` is
-  not enough, since the lender's count includes writes in flight and
-  its floor (LEND-2) and may pass, and a dropped copy stays dropped
+  not enough, since the lender's count and its floor (LEND-2) may
+  pass, and a dropped copy stays dropped
   until re-placement; a row that holds no barrier waits for the friend
   to accept it. The object is then below `copies`, which
   `status` shows and the `copies_dropped` alert raises (§3.8);
@@ -3385,7 +3385,25 @@ upstream bucket is Q-V.
   before its first put to it (`BucketAlreadyOwnedByYou` is success).
   The dial is bounded by 30 s, the wait for a response's headers by
   2 minutes, and a body the transport takes no bytes from for 2 minutes
-  cancels the request (a friend switched off mid-transfer).
+  cancels the request (a friend switched off mid-transfer). *Decision
+  (#89):* such an abandoned send first resets its connection
+  (`replica.abandoning`: the request's connection, from an
+  `httptrace` `GotConn`, is the tunnel's, and `transport`'s
+  `tunnelConn.Reset` closes it with linger 0, so gVisor sends a RST
+  and discards what it had not sent). A plain cancel closes it with a
+  FIN queued behind the rest of the body the tunnel still holds, which
+  a busy friend went on reading at its own pace, holding its
+  reservation for the write and answering this node's retries over it
+  until its stall bound (2 minutes) ended the body. With the reset the
+  friend reads only what had reached it, then fails
+  (`TestAnAbandonedSendResetsItsConnection`,
+  `TestARetryAfterAnAbandonedSendSucceeds`). A path that is down
+  carries the reset no better than the FIN; the friend's stall bound
+  ends that body, and its 503s (§3.5 LEND-2) keep this node retrying
+  meanwhile rather than paused for quota. `gonet.TCPConn` exposes no
+  linger, so the endpoint is reached by reflection, as tailcat's own
+  `closeProxyConn` does; if gonet changes, the reset degrades to a
+  plain close.
 - **Operations.** `Put` streams the object from the store into
   `PutObject`; an object larger than the part size (or than one PUT,
   5 GiB) goes into the low-level multipart calls (`replica.Multipart`:
@@ -3413,7 +3431,9 @@ upstream bucket is Q-V.
   `List` is the control API call of §3.7 and `Undelete` is §3.6.
 - **Errors.** The client's S3 errors are mapped to the replica
   interface's: a `507 QuotaExceeded` from a friend's decorator becomes
-  "paused for quota" (LEND-2); a `403` that says this node is not a
+  "paused for quota" (LEND-2), while its `503 SlowDown` (fits, but not
+  beside the writes in flight, §3.5 LEND-2) is retried like any other
+  error; a `403` that says this node is not a
   friend becomes "removed" (PEER-5, SEC-15): the tunnel middleware's
   `AccessDenied` whose message is `state.NoRelationship`, or
   versitygw's `InvalidAccessKeyId` (its IAM no longer resolves the
@@ -4190,12 +4210,21 @@ the handler's own reads and is never cancelled; nothing below
 - **LEND-2** `Lending` refuses a borrower's `PutObject`,
   `CreateMultipartUpload`, `UploadPart` and `CreateBucket` of a new
   bucket with S3 error code `QuotaExceeded`, HTTP 507, when the counter
-  plus what the borrower's admitted writes in flight may add plus the
-  request (its `Content-Length`, plus the overhead for a new object,
-  bucket or upload) would exceed quota, or when `statfs` on the store,
-  less what every borrower's writes in flight may add and less the
-  request, is below the floor (`store.free_space_floor`, default 5%).
-  The check reads the counter under the same lock that admits the
+  plus the request (its `Content-Length`, plus the overhead for a new
+  object, bucket or upload) would exceed quota, or when `statfs` on
+  the store less the request is below the floor
+  (`store.free_space_floor`, default 5%). A request that fits on its
+  own but not beside the writes in flight (the counter plus what the
+  borrower's admitted writes in flight may add plus the request over
+  quota, or `statfs` less what every borrower's writes in flight may
+  add less the request below the floor) is answered `SlowDown`, HTTP
+  503 (`errInFlight`), which the borrower retries with backoff:
+  *decision (#89),* the writes in flight may yet fail (a send the
+  borrower abandoned holds its reservation until its body ends), so
+  a 507, which pauses the borrower for quota for an hour, would be
+  wrong for them (`TestAWriteThatFitsButForWritesInFlightIsRetried`).
+  Once they have stored, the retry is answered 507 if it no longer
+  fits. The check reads the counter under the same lock that admits the
   write. A completion is checked against the floor alone, for the size
   of its parts: posix assembles the object in a staging file while the
   parts still exist, so it needs that much again for a while; the

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strings"
 	"sync"
 	"time"
@@ -138,7 +139,8 @@ func (f *Friend) Put(ctx context.Context, o Object) error {
 	if err := f.ensureBucket(ctx, sealed); err != nil {
 		return err
 	}
-	body := newWatchdog(o.Body, f.stall, cancel)
+	ctx, abandon, ended := abandoning(ctx, cancel)
+	body := newWatchdog(o.Body, f.stall, abandon)
 	defer body.stop()
 	meta := map[string]string{
 		MetaSHA256:              o.SHA256,
@@ -151,6 +153,7 @@ func (f *Friend) Put(ctx context.Context, o Object) error {
 		UserMetadata:         meta,
 		DisableContentSha256: true,
 	})
+	ended()
 	if err != nil {
 		if body.stalled() {
 			return fmt.Errorf("sending %s: no progress for %v: %w", o.Key, f.stall, err)
@@ -158,6 +161,46 @@ func (f *Friend) Put(ctx context.Context, o Object) error {
 		return classify(fmt.Errorf("sending %s: %w", o.Key, err))
 	}
 	return nil
+}
+
+// resetter is a connection that can end with a TCP reset
+// (transport's tunnel connection).
+type resetter interface{ Reset() error }
+
+// abandoning traces the connection ctx's one request gets and returns
+// the function the request's watchdog calls when its body stalls: it
+// resets that connection, then cancels. Cancelling alone closes it with
+// a FIN queued behind what the tunnel still holds of the body, which
+// the friend goes on reading until its own stall bound ends it, holding
+// what it reserved for the write and answering this node's retries 507
+// meanwhile (#89). The caller calls ended once the request has
+// returned: its connection may be back in the pool, another request's,
+// and is never reset after that.
+func abandoning(ctx context.Context, cancel context.CancelFunc) (_ context.Context, abandon, ended func()) {
+	var mu sync.Mutex
+	var conn net.Conn
+	done := false
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) {
+		mu.Lock()
+		if !done {
+			conn = i.Conn
+		}
+		mu.Unlock()
+	}})
+	abandon = func() {
+		mu.Lock()
+		if r, ok := conn.(resetter); ok && !done {
+			r.Reset()
+		}
+		mu.Unlock()
+		cancel()
+	}
+	ended = func() {
+		mu.Lock()
+		done, conn = true, nil
+		mu.Unlock()
+	}
+	return ctx, abandon, ended
 }
 
 // Head returns the hash the friend stores key with (its
