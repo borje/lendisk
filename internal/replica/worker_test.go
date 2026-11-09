@@ -660,13 +660,17 @@ func TestUnreadableStoreWaitsWithoutRefusing(t *testing.T) {
 		t.Fatal(err)
 	}
 	fx.run()
-	time.Sleep(200 * time.Millisecond)
+	// The place shows the store as the cause, not the friend (#57). A
+	// slow runner may take a while to try the send.
+	c := fx.condition("B")
+	for deadline := time.Now().Add(20 * time.Second); c.Condition != state.ConditionStore && time.Now().Before(deadline); c = fx.condition("B") {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if c.Condition != state.ConditionStore || !strings.Contains(c.Detail, "bucket laptop") {
+		t.Fatalf("condition %+v", c)
+	}
 	if st, _ := fx.db.PlaceStats(t.Context(), time.Now()); st["B"].Queued != 1 || fx.refused("laptop") != 0 {
 		t.Fatalf("stats %+v, refused %d", st["B"], fx.refused("laptop"))
-	}
-	// The place shows the store as the cause, not the friend (#57).
-	if c := fx.condition("B"); c.Condition != state.ConditionStore || !strings.Contains(c.Detail, "bucket laptop") {
-		t.Fatalf("condition %+v", c)
 	}
 	if err := os.Rename(aside, bucket); err != nil {
 		t.Fatal(err)
