@@ -25,12 +25,16 @@ import (
 // day is a retention unit.
 const day = 24 * time.Hour
 
-// clock is a test's injected clock, in whole seconds.
+// clock is a test's injected clock, in whole seconds. It starts at the
+// wall clock: the store stamps an upload's last part (posix's
+// Initiated) with the wall clock, and the reconcile compares that stamp
+// with Lending's clock, so a clock started years ahead made every open
+// upload look abandoned and any reconcile abort it (LEND-1).
 type clock struct{ now atomic.Int64 }
 
 func newClock() *clock {
 	c := &clock{}
-	c.now.Store(time.Unix(1_900_000_000, 0).Unix())
+	c.now.Store(time.Now().Unix())
 	return c
 }
 func (c *clock) Now() time.Time          { return time.Unix(c.now.Load(), 0) }
