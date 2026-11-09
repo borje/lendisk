@@ -26,6 +26,7 @@ import (
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/state"
+	"github.com/borje/lendisk/internal/undelete"
 	"github.com/borje/lendisk/internal/verify"
 	"github.com/borje/lendisk/internal/version"
 )
@@ -124,7 +125,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 11) // gateway, LAN, loopback, replication, verification, farewell, alerts, quota, manifest, recovery, reload
+			errc := make(chan error, 12) // gateway, LAN, loopback, replication, verification, undelete, farewell, alerts, quota, manifest, recovery, reload
 			// Pacing (REPL-6, REPL-7, LEND-5): one pacer for every transfer
 			// over the tunnel, changed without a restart by the reloader.
 			pacer := pace.New(a.clock)
@@ -159,6 +160,7 @@ func (a *app) serveCmd() *cobra.Command {
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore, BeforeHash: a.beforeHash, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
 				Fetch: fetch, Reconcile: rec}
+			tun.Undeleter.Set(gw) // the undelete call (RET-3)
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
 			select {
@@ -234,6 +236,16 @@ func (a *app) serveCmd() *cobra.Command {
 				}
 				running++
 				go func() { ver.Run(ctx); errc <- nil }()
+
+				// Undelete (RET-3, #32): the previews and undeletes
+				// `lendisk undelete` asks for through lendisk.db, run here
+				// so only the daemon dials with this node's keys.
+				und := &undelete.Runner{DB: db, Self: id, Dial: tun.Dial, Profiles: profiles, Now: a.clock, Log: log}
+				if a.tuneUndelete != nil {
+					a.tuneUndelete(und)
+				}
+				running++
+				go func() { und.Run(ctx); errc <- nil }()
 			}
 			fw.Clear, fw.Cut, fw.Disconnect = tun.Admission.Clear, tun.Conns.Cut, tun.Disconnect
 			fw.Tell = func(ctx context.Context, f state.FormerFriend) error {

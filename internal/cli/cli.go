@@ -30,6 +30,7 @@ import (
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/store"
 	"github.com/borje/lendisk/internal/transport"
+	"github.com/borje/lendisk/internal/undelete"
 	"github.com/borje/lendisk/internal/verify"
 	"github.com/borje/lendisk/internal/version"
 )
@@ -111,6 +112,9 @@ type app struct {
 	// tuneVerify, if set, adjusts the daemon's verifier (VER-1, #27)
 	// before it starts (its poll); tests only.
 	tuneVerify func(*verify.Verifier)
+	// tuneUndelete, if set, adjusts the daemon's undelete runner (RET-3,
+	// #32) before it starts (its poll); tests only.
+	tuneUndelete func(*undelete.Runner)
 	// reloadEvery is how often serve looks at its config file for changed
 	// pacing settings; zero means defaultReloadEvery. Tests set it.
 	reloadEvery time.Duration
@@ -176,7 +180,7 @@ func (a *app) rootCmd() *cobra.Command {
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.recoverCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
 	root.AddCommand(a.endpointCmd())
-	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd())
+	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd(), a.undeleteCmd())
 	usageArgs(root)
 	return root
 }

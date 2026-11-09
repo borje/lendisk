@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"time"
 
 	"github.com/borje/lendisk/internal/bridge"
@@ -42,6 +43,9 @@ type tunnel struct {
 	Conns *bridge.Conns
 	// Manifests are the friends' manifests this node keeps (ID-4).
 	Manifests *manifest.Store
+	// Undeleter answers the undelete call (RET-3) once Set to the
+	// gateway; until then it asks the friend to retry.
+	Undeleter *lateUndeleter
 }
 
 // startTunnel chooses the region if none is saved yet, starts the
@@ -103,7 +107,8 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 		be.Shutdown()
 	}()
 	lent := &gateway.LentIndex{Store: be, DB: db}
-	ctl := &control.Server{DB: db, Self: id, Log: log, Lent: lent, Held: lent,
+	undeleter := &lateUndeleter{}
+	ctl := &control.Server{DB: db, Self: id, Log: log, Lent: lent, Held: lent, Undeleter: undeleter,
 		Changed: func() {
 			adm.Clear()
 			if changed != nil {
@@ -120,7 +125,26 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, caps, conns, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, caps, log), log)
 	go purgeInvites(ctx, db, adm, a.now, log)
 	log.Info("tunnel listening", "address", tc.Address(), "port", transport.Port, "region", region.RegionCode)
-	return &tunnel{Transport: tc, Admission: adm, S3: s3, Conns: conns, Manifests: manifests}, nil
+	return &tunnel{Transport: tc, Admission: adm, S3: s3, Conns: conns, Manifests: manifests, Undeleter: undeleter}, nil
+}
+
+// lateUndeleter is the control API's undelete (RET-3) through the
+// gateway, which serve makes after the tunnel listens: until Set, the
+// call is answered as a node still starting.
+type lateUndeleter struct {
+	gw atomic.Pointer[gateway.Gateway]
+}
+
+// Set makes g answer the undelete call.
+func (u *lateUndeleter) Set(g *gateway.Gateway) { u.gw.Store(g) }
+
+func (u *lateUndeleter) Undelete(ctx context.Context, borrower identity.NodeID, sealed string, since time.Time,
+	rewrites bool, after string, limit int) (gateway.Undeleted, error) {
+	g := u.gw.Load()
+	if g == nil {
+		return gateway.Undeleted{}, gateway.ErrNotServing
+	}
+	return g.Undelete(ctx, borrower, sealed, since, rewrites, after, limit)
 }
 
 // purgeInvites deletes expired invites at start and every minute after

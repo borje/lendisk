@@ -709,4 +709,41 @@ var migrations = []Migration{
 			window_seq   INTEGER
 		);`,
 	},
+	{
+		Version: 34, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Undelete (RET-3, #32): what the undelete command asks the daemon,
+		-- which dials the friends. stage: 'asked' (the daemon previews it from
+		-- the friends' lists), 'previewed' (preview holds the JSON the
+		-- command shows), 'confirmed' (the user said yes: the daemon asks
+		-- every friend to restore), then 'done' or 'failed' with the JSON
+		-- result. since is unix seconds (0: every tomb in the window);
+		-- rewrites is 1 when rewrites' tombs count too. requested_at and
+		-- updated_at are unix seconds.
+		CREATE TABLE undelete_request (
+			id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			bucket       TEXT NOT NULL,
+			since        INTEGER NOT NULL,
+			rewrites     INTEGER,
+			requested_at INTEGER NOT NULL,
+			stage        TEXT NOT NULL,
+			preview      TEXT,
+			result       TEXT,
+			updated_at   INTEGER
+		);`,
+	},
+	{
+		Version: 35, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The keys an undelete's preview listed (#32 review): what the user
+		-- confirmed. A key a friend says it restored that this node has no
+		-- history of is taken only if its request's preview listed it, so a
+		-- friend cannot add keys the bucket never had. Dropped with the
+		-- request.
+		CREATE TABLE undelete_key (
+			request INTEGER NOT NULL,
+			key     TEXT NOT NULL,
+			PRIMARY KEY (request, key)
+		) WITHOUT ROWID;`,
+	},
 }

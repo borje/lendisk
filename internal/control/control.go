@@ -25,6 +25,11 @@
 //     friend's challenges are read one at a time and paced in bytes
 //     (ChallengeRate, ChallengeBurst), so a friend cannot make this node
 //     read without bound.
+//   - undelete brings back the caller's own tombs of one of its buckets
+//     only, keyed by the resolved caller, through Undeleter (Lending:
+//     never another friend's bucket, never over a live object), RET-3.
+//     Each friend's calls run one at a time and are paced in keys
+//     looked at (UndeleteRate, UndeleteBurst).
 //   - remove ends the caller's friendship on this side (PEER-5): the
 //     caller ended it on its own, and the call only tells this node.
 //   - Nothing here returns another peer, ever (PEER-10).
@@ -55,8 +60,8 @@ const Protocol = "0.1"
 const ProtocolHeader = "Lendisk-Protocol"
 
 // Paths of the control API: redeem, version, manifest, list, quota
-// (QuotaPath, quota.go), challenge (ChallengePath, challenge.go) and
-// remove. undelete (RET-3) is not served yet.
+// (QuotaPath, quota.go), challenge (ChallengePath, challenge.go),
+// undelete (UndeletePath, undelete.go) and remove.
 const (
 	Prefix       = gateway.ControlPrefix
 	RedeemPath   = Prefix + "redeem"

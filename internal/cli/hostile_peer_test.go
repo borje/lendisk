@@ -225,7 +225,19 @@ func TestHostilePeer(t *testing.T) {
 			if r.status != http.StatusBadRequest {
 				t.Errorf("B's %s: %v", at.name, r)
 			}
-		case "quota by GET", "challenge by GET":
+		case "undelete", "undelete a huge page":
+			if r.status != http.StatusBadRequest {
+				t.Errorf("B's %s: %v", at.name, r)
+			}
+		case "undelete own, from 2100":
+			if r.status != http.StatusOK || !strings.Contains(r.message, `"restored":[]`) {
+				t.Errorf("B's %s: %v", at.name, r)
+			}
+		case "undelete another's":
+			if r.status != http.StatusNotFound || r.code != control.CodeNoSuchBucket {
+				t.Errorf("B undeletes C's bucket: %v", r)
+			}
+		case "quota by GET", "challenge by GET", "undelete by GET":
 			if r.status != http.StatusMethodNotAllowed {
 				t.Errorf("B's %s: %v", at.name, r)
 			}
