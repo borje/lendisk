@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -341,7 +342,13 @@ func TestManifestOnLenderSurvivesItsDatabaseLoss(t *testing.T) {
 	if len(m.Friends) != 1 || m.Friends[0].ID != bKey || !strings.HasPrefix(m.Friends[0].Address, "tc") {
 		t.Fatalf("friends %+v", m.Friends)
 	}
-	if got, _ := os.ReadFile(file); !bytes.Equal(got, held) {
-		t.Fatal("the manifest fetched is not the one B holds")
+	// B's copy as it stands now A is gone: the running A may have pushed
+	// the same version again after held was read, sealed afresh.
+	got, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hm, err := manifest.Open(aID, got); err != nil || !reflect.DeepEqual(hm, m) {
+		t.Fatalf("the manifest fetched is not the one B holds: %+v %v", hm, err)
 	}
 }
