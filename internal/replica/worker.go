@@ -863,7 +863,17 @@ func (w *Worker) issueTombs(ctx context.Context, place string, r Replica, log *s
 		return
 	}
 	for i, t := range ts {
-		if err := r.Delete(ctx, t.Bucket, t.Key); err != nil {
+		err := r.Delete(ctx, t.Bucket, t.Key)
+		if errors.Is(err, ErrDeleteDenied) {
+			// S3-5 (#40): kept, counted, and tried again daily.
+			if derr := w.DB.DenyOverflowDelete(context.Background(), place, t.Seq, w.now()); derr != nil {
+				log.Error("replication: recording a held delete the target refused failed", "bucket", t.Bucket, "key", t.Key, "err", derr)
+			}
+			log.Warn("replication: the overflow target's credential may not delete; the copy stays there, counted in status, and the delete is tried again daily",
+				"bucket", t.Bucket, "key", t.Key, "err", err)
+			continue
+		}
+		if err != nil {
 			seqs := make([]int64, 0, len(ts)-i)
 			for _, u := range ts[i:] {
 				seqs = append(seqs, u.Seq)
@@ -952,7 +962,19 @@ func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Plac
 		if held, err := w.DB.HoldOverflowDelete(ctx, place, p.Seq, w.now()); err != nil || held {
 			return err
 		}
-		return r.Delete(ctx, p.Bucket, p.Key)
+		err := r.Delete(ctx, p.Bucket, p.Key)
+		if _, target := state.OverflowName(place); target && errors.Is(err, ErrDeleteDenied) {
+			// S3-5 (#40): a credential without delete permission. The
+			// copy stays, counted in status, and the delete is tried
+			// again daily; the FIFO goes on.
+			if err := w.DB.DenyOverflowDelete(ctx, place, p.Seq, w.now()); err != nil {
+				return err
+			}
+			w.Log.Warn("replication: the overflow target's credential may not delete; the copy stays there, counted in status, and the delete is tried again daily",
+				"place", place, "bucket", p.Bucket, "key", p.Key, "err", err)
+			return nil
+		}
+		return err
 	}
 	if sup, err := w.DB.Superseded(ctx, p.Seq); err != nil {
 		return err

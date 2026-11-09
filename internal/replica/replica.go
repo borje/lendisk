@@ -142,4 +142,9 @@ var (
 	// reroute_after on end is rerouted, and for unreachable_after
 	// alerted (#92).
 	ErrBusy = errors.New("busy: the friend asks to send again shortly")
+	// ErrDeleteDenied: an overflow target refused a delete with 403
+	// AccessDenied, as a credential without delete permission does
+	// (S3-5, #40). The copy stays there, counted, and the delete is
+	// tried again daily (state.DenyOverflowDelete); the FIFO goes on.
+	ErrDeleteDenied = errors.New("the overflow target's credential may not delete")
 )

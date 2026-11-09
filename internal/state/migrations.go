@@ -931,4 +931,26 @@ var migrations = []Migration{
 			owed    INTEGER NOT NULL
 		);`,
 	},
+	{
+		Version: 42, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Drain-back's hysteresis (REPL-13, #40): the largest repository
+		-- seen each day (days since the Unix epoch, UTC), its data and
+		-- metadata bytes with the object overhead and its largest copies,
+		-- each the day's maximum. Copies at overflow targets move back to
+		-- friends only while the friends hold the largest of the last
+		-- days, so a prune and the growth after it do not move them back
+		-- and forth. Rows older than the window are deleted.
+		CREATE TABLE repository_peak (
+			day      INTEGER PRIMARY KEY,
+			data     INTEGER NOT NULL,
+			metadata INTEGER NOT NULL,
+			copies   INTEGER NOT NULL
+		);
+		-- A delete an overflow target refused for want of permission
+		-- (S3-5, #40): the copy stays there, counted in its use and in
+		-- status, and the delete is tried again daily (due_at). Unix
+		-- seconds; NULL for a tomb never refused.
+		ALTER TABLE overflow_tomb ADD COLUMN denied_at INTEGER;`,
+	},
 }

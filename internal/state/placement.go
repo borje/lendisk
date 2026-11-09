@@ -92,24 +92,35 @@ type Placement struct {
 	Rewritable bool
 	State      string
 	CreatedAt  time.Time // when the write was captured
+	// DrainBack: a queued copy moving back from an overflow target to
+	// this friend (#40), the lowest priority in its FIFO.
+	DrainBack bool
 }
+
+// drainBack is true for placement row p while it is a queued drain-back
+// copy: one that replaces a copy at an overflow target (REPL-13, #40).
+// It comes last in its place's FIFO and holds no metadata barrier.
+const drainBack = `(p.state = 'queued' AND coalesce(p.replaces, '') GLOB '` + OverflowPrefix + `*')`
 
 // NextPlacement returns the head of place's FIFO: its queued or
 // dropping row with the lowest sequence. A dropping row (re-placement,
 // #26) is returned as a delete of its key. A queued row of a bucket
-// with a pending seed at place is held (REPL-8, seed.go). ok is false
-// when the FIFO is empty.
+// with a pending seed at place is held (REPL-8, seed.go). A drain-back
+// copy (drainBack: a copy moving back from an overflow target, #40) has
+// the lowest priority: it comes after every other row, in sequence
+// order among its kind. ok is false when the FIFO is empty.
 func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok bool, err error) {
 	head := func(state string) (Placement, bool, error) {
 		var p Placement
 		var created int64
 		err := db.QueryRowContext(ctx, `SELECT p.seq, p.place, p.bucket, p.key, p.op, q.class, coalesce(q.size, 0),
-			coalesce(q.sha256, ''), p.state, q.created_at, coalesce(q.rewritable, 0)
+			coalesce(q.sha256, ''), p.state, q.created_at, coalesce(q.rewritable, 0), `+drainBack+`
 			FROM placement p JOIN queue q ON q.seq = p.seq
 			WHERE p.place = ?1 AND p.state = ?2 AND (?2 != 'queued' OR p.bucket NOT IN
 				(SELECT s.bucket FROM seed s WHERE s.place = ?1 AND s.done_at IS NULL))
-			ORDER BY p.seq LIMIT 1`, place, state).
-			Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Class, &p.Size, &p.SHA256, &p.State, &created, &p.Rewritable)
+			ORDER BY `+drainBack+`, p.seq LIMIT 1`, place, state).
+			Scan(&p.Seq, &p.Place, &p.Bucket, &p.Key, &p.Op, &p.Class, &p.Size, &p.SHA256, &p.State, &created, &p.Rewritable,
+				&p.DrainBack)
 		if errors.Is(err, sql.ErrNoRows) {
 			return p, false, nil
 		}
@@ -124,7 +135,7 @@ func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok 
 	if err != nil {
 		return p, false, err
 	}
-	if dok && (!ok || d.Seq < p.Seq) {
+	if dok && (!ok || p.DrainBack || d.Seq < p.Seq) {
 		d.Op, d.Size = OpDelete, 0
 		return d, true, nil
 	}

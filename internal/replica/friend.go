@@ -292,6 +292,10 @@ func (f *Client) Delete(ctx context.Context, bucket, key string) error {
 	if errors.As(err, &er) && (er.Code == "NoSuchKey" || er.Code == "NoSuchBucket") {
 		return nil
 	}
+	if f.overflow && errors.As(err, &er) && er.Code == "AccessDenied" {
+		// S3-5: a credential without delete permission (#40).
+		return f.redact(fmt.Errorf("deleting %s: %w: %w", key, ErrDeleteDenied, err))
+	}
 	if err != nil {
 		return f.classify(fmt.Errorf("deleting %s: %w", key, err))
 	}

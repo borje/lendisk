@@ -25,8 +25,10 @@ import (
 // metadata object of the bucket in the same transaction, ahead of the
 // data in its FIFO; it then receives each later metadata put and every
 // delete of a key it holds; it is never a target or a source of
-// re-routing; and it counts towards `copies`, the pool size and the
-// offsite holders like a friend.
+// re-routing; it counts towards `copies`, the pool size and the
+// offsite holders like a friend; and its copies move back to friends
+// by drain-back (REPL-13, #40: overflowDrain here, replace.go), with
+// its metadata once it holds no data of a bucket.
 
 // OverflowPrefix begins every overflow target's place name.
 const OverflowPrefix = "overflow:"
@@ -251,9 +253,81 @@ func (db *DB) overflowSplit(ctx context.Context, q querier) (bool, error) {
 			}
 		}
 		split = !FriendsHold(u.Data, u.Metadata, cmp.Or(u.Copies, DefaultCopies), quotas)
+		// Every look at the repository is a sample for drain-back's
+		// hysteresis (overflowDrain), where q can write: a capture's
+		// transaction, or the database.
+		if x, ok := q.(execer); ok {
+			if err := recordPeak(ctx, x, u, db.now()); err != nil {
+				return false, err
+			}
+		}
 	}
 	db.splitAt, db.splitVal, db.splitKey = time.Now(), split, key
 	return split, nil
+}
+
+// DrainWindow is how long drain-back remembers the repository's largest
+// size (overflowDrain, #40).
+const DrainWindow = 30 * 24 * time.Hour
+
+// overflowDrain reports whether copies at overflow targets may move back
+// to friends (REPL-13, §4.11, #40): there is an overflow target, and
+// the node's friends hold `copies` copies (FriendsHold, with their
+// quotas now) of the largest the repository has been in the last
+// DrainWindow, each of its data bytes, metadata bytes and copies taken
+// at its largest that day. That is the hysteresis against the split
+// (overflowSplit), which turns on as soon as they cannot hold the
+// repository as it is now: a prune shrinking the repository, and the
+// growth that follows it, never move copies back and forth, since
+// drain-back waits until the friends hold what the repository was
+// before the prune, or until the window has passed. A friend added or a
+// quota raised counts at once (scenario 12). It records the repository
+// as it is now first.
+func (db *DB) overflowDrain(ctx context.Context) (bool, error) {
+	var targets int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM overflow`).Scan(&targets); err != nil || targets == 0 {
+		return false, err
+	}
+	u, err := repositoryUse(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	now := db.now()
+	if err := recordPeak(ctx, db, u, now); err != nil {
+		return false, err
+	}
+	var peak RepositoryUse
+	if err := db.QueryRowContext(ctx, `SELECT coalesce(max(data), 0), coalesce(max(metadata), 0), coalesce(max(copies), 0)
+		FROM repository_peak WHERE day > ?`, peakDay(now.Add(-DrainWindow))).Scan(&peak.Data, &peak.Metadata, &peak.Copies); err != nil {
+		return false, err
+	}
+	ps, err := poolPlaces(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	var quotas []int64
+	for _, p := range ps {
+		if !p.overflow {
+			quotas = append(quotas, p.quota)
+		}
+	}
+	return FriendsHold(peak.Data, peak.Metadata, cmp.Or(peak.Copies, DefaultCopies), quotas), nil
+}
+
+// peakDay is t's day in repository_peak: days since the Unix epoch.
+func peakDay(t time.Time) int64 { return t.Unix() / 86400 }
+
+// recordPeak keeps u as a sample of the repository at now in
+// repository_peak (its day's largest of each), and deletes the days
+// past DrainWindow.
+func recordPeak(ctx context.Context, x execer, u RepositoryUse, now time.Time) error {
+	if _, err := x.ExecContext(ctx, `INSERT INTO repository_peak (day, data, metadata, copies) VALUES (?, ?, ?, ?)
+		ON CONFLICT (day) DO UPDATE SET data = max(data, excluded.data), metadata = max(metadata, excluded.metadata),
+			copies = max(copies, excluded.copies)`, peakDay(now), u.Data, u.Metadata, u.Copies); err != nil {
+		return err
+	}
+	_, err := x.ExecContext(ctx, `DELETE FROM repository_peak WHERE day <= ?`, peakDay(now.Add(-DrainWindow)))
+	return err
 }
 
 // splitKey is what overflowSplit's answer depends on besides the
