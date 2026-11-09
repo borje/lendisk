@@ -1051,7 +1051,9 @@ upstream bucket is Q-V.
   Buckets are restored with new S3 credentials of their own (SEC-3:
   those are not in the manifest), printed by `bucket show`, and created
   empty in the store; nothing is downloaded (ID-6 reads on demand,
-  #30). The identity key is saved after everything else recover writes
+  #30). The queue rows recovery writes are not held locally
+  (`queue.local`), so the store reconciler never takes a recovered
+  object's absence for a delete (§3.3 EP-14, #8). The identity key is saved after everything else recover writes
   but `initialised_at` and the initial config file, and `recover`
   refuses a directory holding an identity key: so a `recover` that
   stopped before saving the key runs again on the same directories and
@@ -2271,7 +2273,9 @@ upstream bucket is Q-V.
     decorator, so it gets no queue row and no placement: the places it
     came from hold it already. It carries no `lendisk-capture` token,
     which nothing needs, since only queue rows are settled against the
-    store.
+    store. Its row is marked held locally (`queue.local`,
+    `state.MarkLocal`), so losing it from the store afterwards is a
+    delete to the store reconciler (EP-14), as it is not before.
   - *Then served.* The request is answered from the store. A ranged
     `GetObject` fetches the whole object, verifies and stores it, then
     serves the range: restic's packs are about 16 MiB, so the simple way
@@ -2324,8 +2328,143 @@ upstream bucket is Q-V.
 - **EP-13** Throughput is versitygw's chunk-signature verification plus
   the backend's writes; on `posix` with NVMe this is file I/O. Measured
   with G-3.
-- **EP-14** The reconciler pages through `ListObjectsV2` of every bucket
-  through the backend and compares with the index in `lendisk.db`.
+- **EP-14** The store reconciler (`gateway/reconcile.go`, #8) runs in
+  the gateway once it serves: a pass at start, one every
+  `store.reconcile_every` (default 24h), and between them, every minute
+  (`ReconcileSettings.Poll`), a pass of each bucket the user allowed
+  deletes for (below). Passes run one at a time, over the node's own
+  buckets (rows in `buckets`) only: `lent-*` buckets, and store
+  directories no bucket row names, are never looked at; keys under
+  `.lendisk/` and `.sgwtmp/` are skipped (posix lists neither).
+  - *Paging.* A pass lists a bucket with the posix backend's
+    `ListObjectsV2` under the decorator (so neither the read-through
+    nor the index merge of §3.3 EP-10 is in the way), 1,000 keys a page
+    (`MaxListPage`), and walks the index beside it
+    (`state.IndexedKeys`: each key whose latest done row is a put, in
+    byte order, 1,000 at a time) over the range the store's page covers,
+    up to its largest key. Neither side is ever held whole. The store's
+    order need not match the index's: whatever the walk finds is checked
+    again under the key's lock before anything is written.
+  - *Writes.* An object the index does not hold is a write that reached
+    the store outside the endpoint: under the key's lock (`keyLocks`,
+    as a capture takes it), if no row of the key is pending and the store
+    still has it, the reconciler writes a pending put row in the key's
+    class with its profile's `rewritable` flag (`queue.reconciled` = 1,
+    migration 33), reads the object once to hash it (`hashStored`), and
+    finishes the row with `FinishPut`, so EP-11's held-back changed keys,
+    rewritable keys, placement and the format-1 mark (`noteFormat`)
+    apply exactly as to a capture. Local-only keys get no row. A crash
+    between the row and its finish leaves a pending row with no token,
+    which startup's `ResolvePending` settles as landed (the object
+    carries no other write's token) and hashes.
+  - *Held locally* (`queue.local`, migration 33, unix seconds): set on a
+    done put when this node knew its object to be in its own store:
+    `FinishPut` (a capture stored it, also startup's settling; an
+    identical re-upload marks the row it repeats), the read-through
+    after storing a verified fetch (`state.MarkLocal`, for the version
+    it fetched), and a pass that lists an indexed key's object
+    (`MarkLocalSeqs`). Recovery's rows (§3.1 ID-5) are never marked: a
+    recovered node's store is empty by design and fills only through
+    the read-through. A captured delete ends the key's index entry, so
+    the mark goes with it; a recovery verdict that replaces a row leaves
+    the new row unmarked until the next pass sees the object.
+    Rows of an earlier release are unmarked until a pass lists their
+    objects, so a pass right after the upgrade only marks.
+  - *Deletes.* An indexed key whose object the store lacks is a delete
+    only if it is held locally; a recovered key not yet read is not
+    (`TestRecoveredNodeDeletesNothingItNeverHeld`). A first walk counts
+    such keys; if the pass may delete them (below), a second walk
+    enqueues each, under the key's lock, only if no row of the key is
+    pending, its latest done row is still the one the walk saw, the
+    store's `HEAD` says `NoSuchKey` (not `NoSuchBucket`), and nothing is
+    at the key's path (`Lstat`: a directory where the object was, or an
+    object whose attributes were lost, answers `NoSuchKey` too, and is
+    logged and left; `TestSomethingAtThePathIsNoDelete`): a delete row
+    with `reconciled` = 1, finished by `FinishDelete`, which places it
+    at every place holding the key (§3.4). Lenders keep it as a
+    tombstone for the retention window (RET-1), so even a wrong delete
+    is recoverable for that long, but a whole bucket's would be the
+    user's whole backup; hence the guards.
+  - *Guards against mass deletion.* Researched 2026-11-09: Syncthing
+    takes a file missing from a folder as deleted only if its index had
+    it, and only while the folder's marker `.stfolder` exists, which
+    keeps an unmounted disk from deleting everything at every device
+    ("folder marker missing" stops the folder until the user recreates
+    it); Unison's `confirmbigdeletes` (default on) asks before
+    propagating the deletion of a whole replica; rsync's `--max-delete`
+    caps the deletes of one run. lendisk does all three:
+    - the store marker: the first pass writes
+      `<store>/.lendisk/store-marker` (0600, its directory 0700) and
+      records it in the node table (`store_marker`); from then on a
+      pass that finds the file missing reconciles nothing at all, writes
+      included (another directory in the store's place would otherwise
+      be enqueued whole), records the path (`store_marker_missing`,
+      `state.NodeMarkerMissing`) and raises `store_marker_missing`
+      (§3.8). The fix, after checking the mount, is `touch` on the path;
+      the next pass clears the alert
+      (`TestMissingStoreMarkerStopsReconciling`);
+    - a bucket whose directory is gone (`NoSuchBucket`) is skipped,
+      logged as a warning;
+    - the delete limit (`store.reconcile_delete_limit`, a percentage,
+      default 10, 1 to 100), cumulative (decided 2026-11-09, #8 review):
+      the deletes a pass would enqueue count together with the
+      reconciler's own deletes of the bucket in its window, those
+      enqueued after the last used allowance (`reconcile.window_seq`,
+      `state.StartDeleteWindow`) and within `DeleteWindow` (7 days),
+      whichever is later (`state.RecentDeletes`), against that share of
+      the objects held then (held now plus those deletes). rsync's
+      `--max-delete` caps one run because a person starts each run; the
+      reconciler runs unattended, so a store losing under the limit
+      per pass would otherwise be emptied over a few passes or restarts
+      (`TestDeleteLimitIsCumulativeAcrossPasses`: 1 of 40 lost per pass
+      is deleted four times and held the fifth). A pass over the limit
+      enqueues none of them. It records the hold (table `reconcile`, migration 33: `held`, of
+      `held_of`, since `held_at`; `state.FinishReconcile`), logs an error
+      and raises `reconcile_held` for the bucket. `lendisk bucket
+      reconcile <bucket> --allow-deletes N` (`state.AllowDeletes`)
+      refuses an N below the held count, and otherwise records it in
+      `reconcile.allowed`, tied to the hold it was given for
+      (`allowed_for` = its `held_at`, `allowed_held` = its count;
+      `ReconcileState.AllowanceValid`). The next pass, within the poll,
+      uses it only while that hold stands: a pass that held another
+      count since voids it, and so does any pass that does not finish
+      (the bucket's directory gone, a listing or database error, a
+      stop), which drops it, so it never covers another set of deletes
+      (`TestAllowanceIsTiedToItsHold`). Used, it lets the pass delete
+      what it finds if no more than N are missing (else it holds again
+      with the new count), starts a new delete window, and is cleared
+      unless the user set another meanwhile. A pass that finds fewer
+      missing (objects put back) ends the hold. 100 never holds
+      (`TestMassDeleteHeldUntilAllowed`,
+      `TestEmptiedBucketHeldUntilTheUserAllowsDeletes`);
+    - the capped second walk: the first walk may take hours (it hashes
+      every dropped file), so what goes missing between the walks was
+      never counted. The second walk enqueues at most as many deletes as
+      the first counted (which the limit or the allowance admitted, so
+      never more than N); every further held key it finds missing is
+      held back as above, with `reconcile_held`
+      (`TestDeletesBetweenTheWalksAreHeld`: 1 of 20 missing at the first
+      walk, all at the second, gives 1 delete and 19 held;
+      `TestAllowanceNeverDeletesMoreThanAllowed`).
+  - *Captures in flight.* A key with a pending row is the capture's (in
+    flight while versitygw writes it, or stranded for `ResolveStranded`)
+    and is left alone, for writes and deletes
+    (`TestKeysWithACaptureInFlightAreLeftAlone`); the key's lock also
+    orders the pass after a running capture or read-through of the key.
+  - *Counted.* `status` shows under each bucket "reconciled outside the
+    endpoint: N writes, M deletes" (done rows with `reconciled` = 1,
+    ever), and a held hold with the command; `status --json` adds
+    `buckets[].reconciled` (`writes`, `deletes`, `held_deletes`, and
+    while held `held_of`, `held_since`, `allow`; `last_pass`) and
+    `store_marker_missing`. ACs: `TestStoreChangesWhileStoppedAreReconciledAtStart`
+    (`internal/cli`), `TestDroppedFilesEnqueuedAsWritesInTheirClass`,
+    `TestMissingObjectEnqueuedAsDeleteOnlyIfHeldLocally` and
+    `TestPassPagesThroughListingAndIndex` (`internal/gateway`, pages of
+    3 keys).
+  - *Rule for later code:* anything that removes an own bucket's object
+    from the store without a captured delete (VER-5's re-fetch of a
+    rotten object, post-v1 evict) must hold the key's lock and clear
+    `queue.local` first, or the next pass enqueues the loss as a delete.
 - **EP-15** On `posix` the store is plain files: `restic -r
   <data>/store/<bucket>` opens it with nothing running, and a borrower's
   replica on the lender, `restic -r <data>/store/lent-<id16>-<sealed>`,
@@ -4394,7 +4533,10 @@ the handler's own reads and is never cancelled; nothing below
   stored bytes through
   the decorator and compares with the index, on both sides; neither
   backend has a scrub of its own. On a mismatch the borrower deletes
-  and re-fetches the object (EP-10).
+  and re-fetches the object (EP-10), holding the key's lock and
+  clearing its held-locally mark (`queue.local`) before it deletes, so
+  the store reconciler does not take the removal for the user's delete
+  (§3.3 EP-14).
 
 ### 3.7 Network
 
@@ -4848,7 +4990,19 @@ the handler's own reads and is never cancelled; nothing below
     format-1 blob, says writes are accepted and replicated as before,
     and gives `kopia repository set-parameters --upgrade`. Raised once
     per bucket, cleared when the bucket captures the upgrade's poison
-    blob or is deleted (`TestKopiaFormat1BucketIsAlertedUntilUpgraded`).
+    blob or is deleted (`TestKopiaFormat1BucketIsAlertedUntilUpgraded`);
+  - `reconcile_held`, subject the bucket: the store reconciler found
+    more than `store.reconcile_delete_limit` percent of the objects this
+    node held missing from the bucket's directory and enqueued none of
+    them as deletes (§3.3 EP-14, #8); the message gives the count, of
+    how many, since when, and `lendisk bucket reconcile <bucket>
+    --allow-deletes <count>` (`alert.ReconcileHeldMessage`). Cleared by
+    the first pass that holds nothing back;
+  - `store_marker_missing`, no subject: the store marker is gone, so the
+    store may be unmounted or replaced and nothing is reconciled (§3.3
+    EP-14); the message names the path and says to check the mount and
+    `touch` it. Cleared by the first pass that finds it
+    (`TestReconcileHoldAndMissingMarkerAreAlerted`).
   The three quota alerts have hysteresis (#24 review): one stays raised
   until its condition has been false for `alert.Service.QuotaHold`
   (`DefaultQuotaHold`, 10 minutes), so a friend flipping it with every

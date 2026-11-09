@@ -9,8 +9,9 @@
 // friendship's quota nearly or wholly used either way (PEER-6, #24),
 // a bucket holding a Kopia format-1 repository (COMPAT-1, #79),
 // objects below copies past replication.replace_after (REPL-13, #26),
-// and a friend's replica that failed verification or has not passed it
-// for days (VER-1, SEC-7, #27).
+// a friend's replica that failed verification or has not passed it
+// for days (VER-1, SEC-7, #27), and the store reconciler's held deletes
+// and missing store marker (EP-14, #8).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -152,6 +153,19 @@ const (
 	// it says the replica's state is unknown. Subject: <peer>/<bucket>.
 	// It clears at the next pass.
 	KindReplicaUnchecked = "replica_unchecked"
+	// KindReconcileHeld: the store reconciler found more than its delete
+	// limit's share of a bucket's objects missing from the store and
+	// enqueued none of them as deletes (EP-14, #8): an emptied or
+	// unmounted bucket directory would otherwise delete the backup at
+	// every friend. Subject: the bucket. It clears at the first pass that
+	// holds nothing back: the user allowed the deletes (`lendisk bucket
+	// reconcile`) or restored the objects.
+	KindReconcileHeld = "reconcile_held"
+	// KindStoreMarkerMissing: the store marker the reconciler made is
+	// gone, so the store may be unmounted or replaced, and nothing is
+	// reconciled (EP-14, #8). No subject. It clears when a pass finds it
+	// again.
+	KindStoreMarkerMissing = "store_marker_missing"
 )
 
 // DefaultUncheckedAfter is Service.UncheckedAfter when zero.
@@ -166,6 +180,13 @@ const KopiaUpgrade = "kopia repository set-parameters --upgrade"
 func KopiaFormat1Message(b state.Bucket) string {
 	return fmt.Sprintf("bucket %s holds a Kopia repository in format version 1 (Kopia 0.8 or earlier; it wrote %s at %s), which lendisk does not support: its compaction and cleanup blobs reach only `copies` friends, not every friend. Writes are accepted and replicated as before. Run `%s` with Kopia 0.9 or later (every client of the repository must then be 0.9 or later)",
 		b.Name, b.Format1Key, b.Format1At.UTC().Format(time.RFC3339), KopiaUpgrade)
+}
+
+// ReconcileHeldMessage says what deletes the store reconciler held back
+// for a bucket (EP-14), for the alert and status alike.
+func ReconcileHeldMessage(bucket string, r state.ReconcileState) string {
+	return fmt.Sprintf("bucket %s: %d of the %d objects this node held are missing from the store (since %s); they are not deleted at any friend, since an emptied or unmounted directory looks the same. If you removed them, allow their deletes: lendisk bucket reconcile %s --allow-deletes %d; otherwise put them back, or read them through from friends",
+		bucket, r.Held, r.HeldOf, r.HeldAt.UTC().Format(time.RFC3339), bucket, r.Held)
 }
 
 // QuotaHighPercent is the use of a quota above which KindQuotaHigh is
@@ -193,7 +214,7 @@ const PurgeWarning = 7 * 24 * time.Hour
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindFriendRefuses, KindPurgeSoon,
 	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
-	KindReplicaUnchecked}
+	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -539,6 +560,22 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		msg := fmt.Sprintf("bucket %s keeps %d copies of each object, but the pool has only %s: objects are held at fewer places until another friend joins (lendisk invite)",
 			b.Name, b.Copies, countPlaces(pool))
 		out = append(out, alertOf(KindPoolTooSmall, b.Name, msg))
+	}
+	recs, err := s.DB.ReconcileStates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, b := range bs {
+		if r := recs[b.Name]; r.Held > 0 {
+			out = append(out, alertOf(KindReconcileHeld, b.Name, ReconcileHeldMessage(b.Name, r)))
+		}
+	}
+	if m, _, err := s.DB.GetNode(ctx, state.NodeMarkerMissing); err != nil {
+		return nil, err
+	} else if m != "" {
+		msg := fmt.Sprintf("the store marker %s is missing, so the store may be unmounted or replaced; nothing written or removed outside the S3 endpoint is replicated until it is back (EP-14). Check that the store is mounted; if it is the right one, recreate the marker: touch %s",
+			m, m)
+		out = append(out, alertOf(KindStoreMarkerMissing, "", msg))
 	}
 	dropped, err := s.DB.DroppedBelowCopies(ctx)
 	if err != nil {

@@ -9,7 +9,9 @@
 // as tombstones for the retention window (RET-1, RET-2); its inner layer
 // captures every write and delete of an own bucket into the replication
 // queue (EP-2, EP-3, EP-7, REPL-3, REPL-10) and serves a read of a key the
-// store lacks from a friend that holds it (EP-10, ID-6). A friend's node ID is an
+// store lacks from a friend that holds it (EP-10, ID-6). The store
+// reconciler enqueues what reached or left the store outside the
+// endpoint (EP-14, reconcile.go). A friend's node ID is an
 // account whose secret is derived per pair (NET-7a).
 //
 // Rules a caller must keep:
@@ -103,6 +105,11 @@ type Gateway struct {
 	// ReconcileEvery is how often borrowers' usage counters are checked
 	// for their daily reconcile (default an hour).
 	ReconcileEvery time.Duration
+	// Reconcile, if set, runs the store reconciler (EP-14, reconcile.go)
+	// once serving: at start, every Reconcile.Every, and for the deletes
+	// the user allowed. Nil runs none: tests that change the store behind
+	// the decorator.
+	Reconcile *ReconcileSettings
 	// PurgeEvery is how often tombs past their retention window are
 	// purged (RET-1; default an hour). The window is read on Clock.
 	PurgeEvery time.Duration
@@ -229,6 +236,17 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		return err
 	}
 	g.Log.Info("gateway serving", "socket", g.Socket, "store", g.StoreDir, "versitygw", Version())
+	if dec.DB != nil && g.Reconcile != nil {
+		now := g.Clock
+		if now == nil {
+			now = time.Now
+		}
+		r := &reconciler{d: dec, storeDir: g.StoreDir, ReconcileSettings: *g.Reconcile, log: g.Log, now: now}
+		rctx, cancel := context.WithCancel(ctx)
+		reconciled := make(chan struct{})
+		go func() { defer close(reconciled); r.loop(rctx) }()
+		defer func() { cancel(); <-reconciled }()
+	}
 	if ready != nil {
 		close(ready)
 	}

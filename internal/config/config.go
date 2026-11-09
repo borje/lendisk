@@ -83,6 +83,10 @@ type Store struct {
 	Backend        string `toml:"backend" default:"posix" help:"store backend; posix is the only one in v1"`
 	Path           string `toml:"path" help:"store directory (default <data_dir>/store)"`
 	FreeSpaceFloor string `toml:"free_space_floor" default:"5%" help:"refuse writes below this much free space: a percentage or a size such as 20G (LEND-2, EP-12)"`
+	ReconcileEvery string `toml:"reconcile_every" default:"24h" help:"how often the store is compared with the index, besides at start, so objects written or removed outside the S3 endpoint are replicated (EP-14), such as 24h or 6h"`
+	// ReconcileDeleteLimit is a percentage: a guard against an unmounted
+	// or emptied store deleting a backup at every friend.
+	ReconcileDeleteLimit Number `toml:"reconcile_delete_limit" default:"10" help:"objects found missing from the store that, with the reconciler's own deletes of the last 7 days (or since the last confirmation), are more than this percentage of a bucket's objects are not deleted until you confirm with lendisk bucket reconcile (EP-14); 1 to 100, where 100 never asks"`
 }
 
 // Endpoint is the [endpoint] section (EP-1, EP-5, EP-17).
@@ -346,6 +350,12 @@ func (c *Config) MaxTotal() (n int64, ok bool) {
 	return int64(v), true
 }
 
+// ReconcileEvery is store.reconcile_every, which Validate checked.
+func (c *Config) ReconcileEvery() time.Duration {
+	d, _ := time.ParseDuration(c.Store.ReconcileEvery)
+	return d
+}
+
 // UnreachableAfter is alerts.unreachable_after, which Validate checked.
 func (c *Config) UnreachableAfter() time.Duration {
 	d, _ := time.ParseDuration(c.Alerts.UnreachableAfter)
@@ -379,6 +389,12 @@ func (c *Config) Validate() error {
 	}
 	if _, err := ParseFloor(c.Store.FreeSpaceFloor); err != nil {
 		errs = append(errs, fmt.Errorf("store.free_space_floor: %w", err))
+	}
+	if d, err := time.ParseDuration(c.Store.ReconcileEvery); err != nil || d < time.Minute {
+		errs = append(errs, fmt.Errorf("store.reconcile_every = %q: want a duration of a minute or more, such as 24h", c.Store.ReconcileEvery))
+	}
+	if n, err := strconv.Atoi(string(c.Store.ReconcileDeleteLimit)); err != nil || n < 1 || n > 100 {
+		errs = append(errs, fmt.Errorf("store.reconcile_delete_limit = %q: want a whole percentage from 1 to 100", c.Store.ReconcileDeleteLimit))
 	}
 	if err := checkLoopback(c.Endpoint.Loopback); err != nil {
 		errs = append(errs, fmt.Errorf("endpoint.loopback = %q: %w", c.Endpoint.Loopback, err))

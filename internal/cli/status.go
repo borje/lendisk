@@ -53,6 +53,10 @@ type Status struct {
 	// FormerFriends are friendships that ended and whose replicas are
 	// kept until the retention window ends (PEER-5, #25).
 	FormerFriends []StatusFormer `json:"former_friends"`
+	// StoreMarkerMissing is the store marker's path while the store
+	// reconciler finds it missing (EP-14, #8): the store may be
+	// unmounted or replaced, and nothing is reconciled. Absent otherwise.
+	StoreMarkerMissing string `json:"store_marker_missing,omitempty"`
 	// Lending is the effective cap on the sum of the node's numbers
 	// (LEND-1, #24); absent when it cannot be read.
 	Lending *StatusLending `json:"lending,omitempty"`
@@ -390,6 +394,27 @@ type StatusBucket struct {
 	// Replicas are the friends that hold the bucket's objects, each with
 	// its verification (VER-1, VER-4, #27).
 	Replicas []StatusReplica `json:"replicas"`
+	// Reconciled is what the store reconciler found reached or left the
+	// store outside the endpoint (EP-14, #8).
+	Reconciled StatusReconciled `json:"reconciled"`
+}
+
+// StatusReconciled counts a bucket's reconciled changes (EP-14): writes
+// and deletes enqueued, ever, and the deletes held back for the user's
+// confirmation.
+type StatusReconciled struct {
+	Writes  int64 `json:"writes"`
+	Deletes int64 `json:"deletes"`
+	// HeldDeletes are objects this node held that the last pass found
+	// missing, more than store.reconcile_delete_limit allows at once:
+	// not deleted anywhere until allowed (Allow, the command) or put
+	// back. HeldOf is how many objects it held; HeldSince when the hold
+	// began. Zero, and the others absent, when none.
+	HeldDeletes int64  `json:"held_deletes"`
+	HeldOf      int64  `json:"held_of,omitempty"`
+	HeldSince   string `json:"held_since,omitempty"` // RFC 3339, UTC
+	Allow       string `json:"allow,omitempty"`
+	LastPass    string `json:"last_pass,omitempty"` // RFC 3339, UTC; absent before the first
 }
 
 // StatusReplica is one friend's replica of a bucket and when it was last
@@ -578,6 +603,36 @@ func kopiaFormat1(b state.Bucket) *StatusKopiaFormat1 {
 	return &StatusKopiaFormat1{Since: b.Format1At.UTC().Format(time.RFC3339), Key: b.Format1Key, Fix: alert.KopiaUpgrade}
 }
 
+// reconciledStatus is what status says of a bucket's reconciler record
+// (EP-14).
+func reconciledStatus(bucket string, r state.ReconcileState) StatusReconciled {
+	s := StatusReconciled{Writes: r.Writes, Deletes: r.Deletes, HeldDeletes: r.Held}
+	if r.Held > 0 {
+		s.HeldOf, s.HeldSince = r.HeldOf, r.HeldAt.UTC().Format(time.RFC3339)
+		s.Allow = fmt.Sprintf("lendisk bucket reconcile %s --allow-deletes %d", bucket, r.Held)
+	}
+	if !r.PassedAt.IsZero() {
+		s.LastPass = r.PassedAt.UTC().Format(time.RFC3339)
+	}
+	return s
+}
+
+// reconciledLines are the lines status prints under a bucket for its
+// reconciled changes and held deletes (EP-14).
+func reconciledLines(r StatusReconciled) []string {
+	var out []string
+	if r.Writes+r.Deletes > 0 {
+		out = append(out, fmt.Sprintf("reconciled outside the endpoint: %s, %s",
+			plural(r.Writes, "write", "writes"), plural(r.Deletes, "delete", "deletes")))
+	}
+	if r.HeldDeletes > 0 {
+		out = append(out, fmt.Sprintf("! %d of %d objects held here are missing from the store (since %s); not deleted at friends:",
+			r.HeldDeletes, r.HeldOf, r.HeldSince),
+			"  if you removed them: `"+r.Allow+"`; otherwise put them back")
+	}
+	return out
+}
+
 // StatusSchema is the current `status --json` schema number.
 const StatusSchema = 1
 
@@ -690,6 +745,13 @@ friend, or with no room in the pool), which status shows.`,
 			if err != nil {
 				return err
 			}
+			recs, err := db.ReconcileStates(cmd.Context())
+			if err != nil {
+				return err
+			}
+			if st.StoreMarkerMissing, _, err = db.GetNode(cmd.Context(), state.NodeMarkerMissing); err != nil {
+				return err
+			}
 			for _, b := range bs {
 				q, bc := queues[b.Name], below[b.Name]
 				off, err := offsiteStatus(cmd.Context(), db, b, profiles.Get(b.Profile))
@@ -711,7 +773,8 @@ friend, or with no room in the pool), which status shows.`,
 					Queue: StatusQueue{Objects: q.Entries, Bytes: q.Bytes, Pending: q.Pending}, Refused: refused[b.Name],
 					BelowCopies: StatusBelow{Objects: bc.Objects, Bytes: bc.Bytes}, SingleCopy: b.Copies == 1,
 					OutsideTrust: !profiles.Get(b.Profile).Encrypted, Offsite: off,
-					Changed: changed[b.Name], KopiaFormat1: kopiaFormat1(b), Replicas: replicas[b.Name]})
+					Changed: changed[b.Name], KopiaFormat1: kopiaFormat1(b), Replicas: replicas[b.Name],
+					Reconciled: reconciledStatus(b.Name, recs[b.Name])})
 			}
 			if st.Pool.Friends, err = db.PoolSize(cmd.Context()); err != nil {
 				return err
@@ -839,12 +902,19 @@ friend, or with no room in the pool), which status shows.`,
 				if l := replacingLine(b); l != "" {
 					fmt.Fprintf(a.out, "    %s\n", l)
 				}
+				for _, l := range reconciledLines(b.Reconciled) {
+					fmt.Fprintf(a.out, "    %s\n", l)
+				}
 				for _, r := range b.Replicas {
 					fmt.Fprintf(a.out, "    %s\n", replicaLine(r))
 				}
 			}
 			if st.Pool.SingleFriend {
 				fmt.Fprintln(a.out, singleFriendLine)
+			}
+			if m := st.StoreMarkerMissing; m != "" {
+				fmt.Fprintf(a.out, "! Store marker %s is missing: the store may be unmounted or replaced, so nothing is reconciled;\n", m)
+				fmt.Fprintf(a.out, "  check the mount, and if the store is the right one: touch %s\n", m)
 			}
 			if st.Lending != nil {
 				fmt.Fprintf(a.out, "Lending: at most %s (%s); numbers and open invites take %s\n",

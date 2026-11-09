@@ -35,7 +35,8 @@ func (n *node) serve(t *testing.T) *daemon {
 	addrc := make(chan string, 1)
 	var out, errOut bytes.Buffer
 	a := &app{in: bufio.NewReader(strings.NewReader("")), out: &out, errOut: &errOut, ctx: ctx,
-		serving: func(addr string) { addrc <- addr }, regions: n.regions, tuneAlerts: n.tuneAlerts}
+		serving: func(addr string) { addrc <- addr }, regions: n.regions, tuneAlerts: n.tuneAlerts,
+		tuneReconcile: n.tuneReconcile}
 	done := make(chan int, 1)
 	go func() {
 		done <- a.run([]string{"serve", "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0"})

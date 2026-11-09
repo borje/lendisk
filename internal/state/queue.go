@@ -34,6 +34,9 @@ type Capture struct {
 	Token string
 	// ETag and UploadID identify a CompleteMultipartUpload.
 	ETag, UploadID string
+	// Reconciled: the store reconciler found the write or delete outside
+	// the endpoint (EP-14); status counts these rows.
+	Reconciled bool
 }
 
 // Entry is a queue row.
@@ -74,6 +77,13 @@ func (db *DB) BeginCaptures(ctx context.Context, cs []Capture) ([]int64, error) 
 		seq, err := r.LastInsertId()
 		if err != nil {
 			return nil, err
+		}
+		if c.Reconciled {
+			// Only the reconciler sets it (migration 33); a capture's
+			// insert is as before.
+			if _, err := tx.ExecContext(ctx, `UPDATE queue SET reconciled = 1 WHERE seq = ?`, seq); err != nil {
+				return nil, err
+			}
 		}
 		seqs = append(seqs, seq)
 	}
@@ -132,14 +142,19 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
+	// The object is in the store now: the key is held locally (EP-14).
 	if err == nil && op == OpPut && prev.String == sha256 && !refused {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM queue WHERE seq = ?`, seq); err != nil {
 			return false, err
 		}
+		if _, err := tx.ExecContext(ctx, `UPDATE queue SET local = ? WHERE seq = (SELECT seq FROM queue
+			WHERE bucket = ? AND key = ? AND state = 'done' ORDER BY seq DESC LIMIT 1)`, db.now().Unix(), bucket, key); err != nil {
+			return false, err
+		}
 		return true, tx.Commit()
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE queue SET state = 'done', size = ?, sha256 = ?, token = NULL WHERE seq = ?`,
-		size, sha256, seq); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE queue SET state = 'done', size = ?, sha256 = ?, token = NULL, local = ? WHERE seq = ?`,
+		size, sha256, db.now().Unix(), seq); err != nil {
 		return false, err
 	}
 	var changed *ChangedKey

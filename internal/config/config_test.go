@@ -174,6 +174,32 @@ func TestExamplesParse(t *testing.T) {
 	}
 }
 
+// EP-14 (#8): the store reconciler's interval and delete limit are
+// settings, a day and 10% by default.
+func TestReconcileSettings(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.ReconcileEvery() != 24*time.Hour || l.Store.ReconcileDeleteLimit.Int() != 10 {
+		t.Fatalf("defaults %v %v", l.ReconcileEvery(), l.Store.ReconcileDeleteLimit)
+	}
+	l, err = load(t, []string{"--config", writeFile(t, "[store]\nreconcile_every = \"6h\"\nreconcile_delete_limit = 25\n")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.ReconcileEvery() != 6*time.Hour || l.Store.ReconcileDeleteLimit.Int() != 25 {
+		t.Fatalf("from the file %v %v", l.ReconcileEvery(), l.Store.ReconcileDeleteLimit)
+	}
+	for _, bad := range [][]string{{"--store-reconcile-every", "0s"}, {"--store-reconcile-every", "daily"},
+		{"--store-reconcile-delete-limit", "0"}, {"--store-reconcile-delete-limit", "101"}, {"--store-reconcile-delete-limit", "5%"}} {
+		if _, err := load(t, append([]string{"--config", none}, bad...), nil); err == nil {
+			t.Errorf("accepted %v", bad)
+		}
+	}
+}
+
 func TestStoreAndEndpointSettings(t *testing.T) {
 	l, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "none.toml"), "--data-dir", "/srv/l"}, nil)
 	if err != nil {

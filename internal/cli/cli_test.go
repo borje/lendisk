@@ -53,6 +53,8 @@ type node struct {
 	tuneBridge func(*bridge.Bridge)
 	// tuneAlerts, when set, is given to serveLogged's daemon.
 	tuneAlerts func(*alert.Service)
+	// tuneReconcile, when set, is given to serve's daemon.
+	tuneReconcile func(*gateway.ReconcileSettings)
 	// sleep, when set, is every command's pause between polls.
 	sleep func(context.Context, time.Duration) error
 	// tuneEnding, when set, is given to serveLogged's daemon.

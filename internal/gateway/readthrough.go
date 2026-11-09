@@ -190,6 +190,12 @@ func (d *Decorator) readThrough(ctx context.Context, bucketp, keyp *string) erro
 		err := d.fetchFrom(ctx, p, bucket, key, src)
 		if err == nil {
 			d.reached(p, true)
+			// The store holds the version now: its loss from here on is
+			// a delete (EP-14). A failed mark is left to the next pass.
+			if err := d.DB.MarkLocal(ctx, bucket, key, src.SHA256); err != nil {
+				d.Log.Warn("read-through: marking a fetched object held failed; the next reconcile pass marks it",
+					"bucket", bucket, "key", key, "err", err)
+			}
 			d.Log.Info("read-through: fetched an object from a friend", "bucket", bucket, "key", key, "place", p,
 				"bytes", src.Size, "took", time.Since(start).Round(time.Millisecond))
 			return nil
