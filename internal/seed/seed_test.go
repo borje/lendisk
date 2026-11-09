@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -374,5 +377,92 @@ func TestSeedEnds(t *testing.T) {
 	}
 	if s, _ := db.GetSeed(ctx, bKey, "other"); s.Outcome != state.SeedRemoved {
 		t.Fatalf("other of a former friend: %+v", s)
+	}
+}
+
+// seedDisk writes a manifest from a for b, of objs, into dir.
+func seedDisk(t *testing.T, dir string, a, b *identity.Identity, objs ...Object) {
+	t.Helper()
+	secret, err := a.S3Secret(b.NodeID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := Manifest{Format: Format, Borrower: a.NodeID().String(), Lender: b.NodeID().String(),
+		Bucket: a.SealedName("laptop"), Layout: LayoutPlain, Objects: objs}
+	if err := writeManifest(dir, m, secret); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// #36 review: import reads only the regular files the export wrote. A
+// symbolic link, to a file or through a directory, a FIFO and a missing
+// file are refused without being opened or followed, and a manifest
+// naming a key outside the disk is refused whole, as is a manifest that
+// is a link.
+func TestImportFollowsNoLinkAndOpensNoDevice(t *testing.T) {
+	a, b := newID(t), newID(t)
+	dir := t.TempDir()
+	outside := t.TempDir()
+	body := []byte("the lender's own file")
+	secretFile := filepath.Join(outside, "secret")
+	os.WriteFile(secretFile, body, 0o600)
+	if err := os.Symlink(secretFile, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, "dirlink")); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(dir, "fifo"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	obj := func(key string) Object { return Object{Key: key, Size: int64(len(body)), SHA256: hexSum(body)} }
+	seedDisk(t, dir, a, b, obj("link"), obj("dirlink/secret"), obj("fifo"), obj("missing"))
+	m, err := ReadManifest(dir, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialled := false
+	im := &Importer{Self: b, Dial: func(context.Context) (net.Conn, error) {
+		dialled = true
+		return nil, errors.New("no gateway in this test")
+	}}
+	done := make(chan struct{})
+	var r ImportResult
+	go func() {
+		defer close(done)
+		r, err = im.Import(context.Background(), dir, m)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("import blocked (on the FIFO?)")
+	}
+	if err != nil || r.Objects != 0 || len(r.Refused) != 4 || dialled {
+		t.Fatalf("import: %+v %v, dialled %v; want all four refused, nothing sent", r, err, dialled)
+	}
+	for _, f := range r.Refused {
+		want := "not a regular file"
+		if f.Key == "missing" {
+			want = "missing"
+		}
+		if !strings.Contains(f.Reason, want) {
+			t.Errorf("%s refused as %q; want %q", f.Key, f.Reason, want)
+		}
+	}
+
+	for _, key := range []string{"../x", "/etc/passwd", "a/../../x"} {
+		d := t.TempDir()
+		seedDisk(t, d, a, b, Object{Key: key, Size: 1, SHA256: hexSum([]byte("x"))})
+		if _, err := ReadManifest(d, b); err == nil || !strings.Contains(err.Error(), "no file of the export") {
+			t.Errorf("manifest naming %q: %v", key, err)
+		}
+	}
+	d := t.TempDir()
+	seedDisk(t, d, a, b)
+	real := filepath.Join(d, ".lendisk", "real.json")
+	os.Rename(filepath.Join(d, filepath.FromSlash(ManifestPath)), real)
+	os.Symlink(real, filepath.Join(d, filepath.FromSlash(ManifestPath)))
+	if _, err := ReadManifest(d, b); err == nil || !strings.Contains(err.Error(), "not a regular file") {
+		t.Errorf("a linked manifest: %v", err)
 	}
 }

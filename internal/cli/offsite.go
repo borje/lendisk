@@ -334,7 +334,11 @@ func (a *app) waitOffsite(ctx context.Context, cfg *config.Loaded, db *state.DB,
 			}
 		}
 		if timeout > 0 && a.now().Sub(start) >= timeout {
-			return codeError{fmt.Errorf("timed out after %v: %s", timeout, what), 3}
+			note, err := seedNote(ctx, db, bucket)
+			if err != nil {
+				return err
+			}
+			return codeError{fmt.Errorf("timed out after %v: %s%s", timeout, what, note), 3}
 		}
 		if err := a.pause(ctx, waitInterval(took)); err != nil {
 			return err
@@ -366,4 +370,26 @@ func daemonRunning(dataDir string) bool {
 	}
 	c.Close()
 	return true
+}
+
+// seedNote says, for a wait that timed out, which pending seeds of
+// bucket hold objects back from a friend (REPL-8, #36), or nothing.
+func seedNote(ctx context.Context, db *state.DB, bucket string) (string, error) {
+	seeds, err := db.Seeds(ctx)
+	if err != nil {
+		return "", err
+	}
+	var note string
+	for _, s := range seeds {
+		if s.Bucket != bucket || !s.DoneAt.IsZero() {
+			continue
+		}
+		n, err := db.SeedLeft(ctx, s.Place, s.Bucket, s.Through)
+		if err != nil {
+			return "", err
+		}
+		note += fmt.Sprintf("; a seed from a disk holds %s for friend %s until it imports them (exported %s; `lendisk status` shows it)",
+			plural(n, "object", "objects"), s.Place, textTime(utc(s.ExportedAt)))
+	}
+	return note, nil
 }

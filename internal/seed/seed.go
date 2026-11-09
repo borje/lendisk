@@ -32,10 +32,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/borje/lendisk/internal/export"
@@ -116,6 +118,45 @@ func writeManifest(dir string, m Manifest, secret string) error {
 	return export.WriteNew(p, strings.NewReader(string(b)+"\n"))
 }
 
+// MaxManifest bounds the seed manifest import reads: about 200 bytes an
+// object, so some 2.5 million objects, a restic repository of 40 TB in
+// its default 16 MiB packs.
+const MaxManifest = 512 << 20
+
+// errNotRegular is a path on the disk that is no regular file, or
+// passes through a symbolic link.
+var errNotRegular = errors.New("not a regular file on the disk (a symbolic link, directory or device); nothing is followed")
+
+// openPlain opens the regular file rel under root for reading. It
+// follows no symbolic link, at any component, and opens no FIFO or
+// device: a disk is someone else's filesystem, and an import reads only
+// the files the export wrote (#36 review).
+func openPlain(root *os.Root, rel string) (*os.File, error) {
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	for i := range parts {
+		fi, err := root.Lstat(filepath.Join(parts[:i+1]...))
+		if err != nil {
+			return nil, err
+		}
+		last := i == len(parts)-1
+		if !last && !fi.IsDir() || last && !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s: %w", rel, errNotRegular)
+		}
+	}
+	f, err := root.OpenFile(rel, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	if fi, err := f.Stat(); err != nil {
+		f.Close()
+		return nil, err
+	} else if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, fmt.Errorf("%s: %w", rel, errNotRegular)
+	}
+	return f, nil
+}
+
 // ErrNoManifest is returned for a directory without a seed manifest.
 var ErrNoManifest = errors.New("no seed manifest")
 
@@ -124,11 +165,26 @@ var ErrNoManifest = errors.New("no seed manifest")
 // object names a file inside dir.
 func ReadManifest(dir string, self *identity.Identity) (Manifest, error) {
 	var m Manifest
-	b, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(ManifestPath)))
+	root, err := os.OpenRoot(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return m, fmt.Errorf("%s has %w (%s): give the directory `lendisk export <bucket> --for <friend>` wrote", dir, ErrNoManifest, ManifestPath)
 	} else if err != nil {
 		return m, err
+	}
+	defer root.Close()
+	f, err := openPlain(root, filepath.FromSlash(ManifestPath))
+	if errors.Is(err, fs.ErrNotExist) {
+		return m, fmt.Errorf("%s has %w (%s): give the directory `lendisk export <bucket> --for <friend>` wrote", dir, ErrNoManifest, ManifestPath)
+	} else if err != nil {
+		return m, fmt.Errorf("the seed manifest %s: %w", ManifestPath, err)
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, MaxManifest+1))
+	if err != nil {
+		return m, err
+	}
+	if len(b) > MaxManifest {
+		return m, fmt.Errorf("the seed manifest %s is larger than %d bytes, the most an import reads", ManifestPath, MaxManifest)
 	}
 	var env envelope
 	if err := json.Unmarshal(b, &env); err != nil {

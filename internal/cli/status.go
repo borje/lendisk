@@ -73,6 +73,26 @@ type Status struct {
 	Seeds []StatusSeed `json:"seeds"`
 }
 
+// seedExpiry is when a pending seed ends at the latest, if the friend's
+// list confirms nothing more (seed.Confirmer's rules).
+func seedExpiry(s state.Seed) time.Time {
+	if s.Confirmed > 0 && !s.ProgressAt.IsZero() {
+		return s.ProgressAt.Add(state.SeedQuietAfter)
+	}
+	return s.ExportedAt.Add(state.SeedExpiry)
+}
+
+// ageText is a duration as a rough age: minutes, hours or days.
+func ageText(d time.Duration) string {
+	switch {
+	case d < time.Hour:
+		return plural(int64(d/time.Minute), "minute", "minutes")
+	case d < 48*time.Hour:
+		return plural(int64(d/time.Hour), "hour", "hours")
+	}
+	return plural(int64(d/(24*time.Hour)), "day", "days")
+}
+
 // StatusSeed is one seed: while Outcome is empty the friend's rows of
 // the bucket are held from the network until its list confirms them.
 type StatusSeed struct {
@@ -86,6 +106,10 @@ type StatusSeed struct {
 	Error      string `json:"error,omitempty"` // the last listing's failure
 	Outcome    string `json:"outcome,omitempty"`
 	DoneAt     string `json:"done_at,omitempty"`
+	// ExpiresAt, while pending, is when the hold ends at the latest if
+	// the friend's list confirms nothing more: SeedExpiry after the
+	// export, or SeedQuietAfter after the last confirmation.
+	ExpiresAt string `json:"expires_at,omitempty"`
 }
 
 // StatusBitrot is the bit-rot sampler's sweep of the store and the
@@ -958,6 +982,8 @@ friend, or with no room in the pool), which status shows.`,
 				}
 				if !sd.DoneAt.IsZero() {
 					ss.DoneAt = sd.DoneAt.UTC().Format(time.RFC3339)
+				} else {
+					ss.ExpiresAt = seedExpiry(sd).UTC().Format(time.RFC3339)
 				}
 				st.Seeds = append(st.Seeds, ss)
 			}
@@ -1132,6 +1158,9 @@ friend, or with no room in the pool), which status shows.`,
 				}
 				fmt.Fprintf(a.out, "Seeding %s from a disk: bucket %s, %d of %d objects confirmed; held from the network until the friend imports it\n",
 					sd.Place, sd.Bucket, sd.Confirmed, sd.Objects)
+				exported, _ := time.Parse(time.RFC3339, sd.ExportedAt)
+				fmt.Fprintf(a.out, "  exported %s ago; if the friend's list confirms nothing more, the rest go by the network from %s\n",
+					ageText(a.now().Sub(exported)), textTime(sd.ExpiresAt))
 				if sd.Error != "" {
 					fmt.Fprintf(a.out, "  (last list: %s)\n", sd.Error)
 				}

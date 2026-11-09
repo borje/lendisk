@@ -67,7 +67,7 @@ func TestScenarioSeedAFriendFromADisk(t *testing.T) {
 		objs["data/"+string([]byte{c, c})+"/"+hexName(c)] = randomBytes(1 << 20)
 	}
 	repo := writeRepo(t, objs)
-	if code, out, e := an.run("", "", "bucket", "import", "laptop", repo, "--profile", "restic"); code != 0 {
+	if code, out, e := an.run("", "", "bucket", "import", "laptop", repo, "--profile", "restic", "--copies", "1"); code != 0 {
 		t.Fatalf("bucket import: %s%s", out, e)
 	}
 
@@ -94,6 +94,20 @@ func TestScenarioSeedAFriendFromADisk(t *testing.T) {
 	if st := an.status(); len(st.Seeds) != 1 || st.Seeds[0].Place != bKey || st.Seeds[0].Objects != 10 || st.Seeds[0].Outcome != "" {
 		t.Fatalf("status seeds after the export: %+v", st.Seeds)
 	}
+	if _, text, _ := an.run("", "", "status"); !strings.Contains(text, "Seeding "+bKey+" from a disk: bucket laptop, 0 of 10 objects confirmed") ||
+		!strings.Contains(text, "exported 0 minutes ago; if the friend's list confirms nothing more, the rest go by the network from ") {
+		t.Fatalf("status text after the export:\n%s", text)
+	}
+	// While the disk travels, a wait for offsite says what holds it.
+	maddr := freeAddr(t, "127.0.0.1")
+	an.setMetrics(t, maddr)
+	a := newProcNode(t, an, envReplFast+"=1")
+	a.start()
+	if code, _, e := an.run("", "", "status", "--wait", "laptop", "--timeout", "1s"); code != 3 ||
+		!strings.Contains(e, "a seed from a disk holds 10 objects for friend "+bKey) {
+		t.Fatalf("status --wait while seeding: exit %d\n%s", code, e)
+	}
+	a.p.kill()
 
 	// The disk is damaged in one object; B already holds another key
 	// with other bytes, sent by A over the tunnel.
@@ -156,9 +170,6 @@ func TestScenarioSeedAFriendFromADisk(t *testing.T) {
 	// Boxes 3 and 4: A's daemon acknowledges the 8 objects B's list shows
 	// with their hash and never sends them; the other two stay queued
 	// while the seed holds, then go by the network.
-	maddr := freeAddr(t, "127.0.0.1")
-	an.setMetrics(t, maddr)
-	a := newProcNode(t, an, envReplFast+"=1")
 	a.start()
 	deadline := time.Now().Add(30 * time.Second)
 	for {

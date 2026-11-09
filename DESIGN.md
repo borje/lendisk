@@ -3950,12 +3950,21 @@ upstream bucket is Q-V.
     the bucket, so the disk's objects are not also sent over the
     network, and writes since queue behind them in order ("queued
     operations continue from where the export ended"). Other buckets and
-    other friends are not held. A failed export drops its row. A second
+    other friends are not held: rows a pending seed holds count in
+    neither of `Held`'s checks (the metadata barrier's data puts, the
+    delete mirror's metadata), as an unreachable place's do not (#21),
+    so metadata, snapshots and prunes reach every other friend and the
+    watermark advances as they and the seed's confirmations acknowledge
+    (decided in #36's review). The seeded friend's replica of the bucket
+    lags, as an offline friend's does; its own FIFO keeps the order,
+    since it is sent nothing of the bucket until the seed ends. A failed
+    export drops its row. A second
     export of the same bucket for the same friend replaces the seed.
     Reroute (#19) still applies to a friend unreachable past
     `reroute_after`.
   - *Import* (`lendisk import <dir>`, on the lender, daemon running):
-    reads and authenticates the manifest, checks the borrower is a
+    reads and authenticates the manifest (at most `seed.MaxManifest`,
+    512 MiB, some 2.5 million objects), checks the borrower is a
     friend, then puts each object through the lender's own gateway
     socket (`gw.sock`) with `replica.NewSeeder`: the borrower's access
     key and the pair secret the lender derives too, `x-amz-meta-lendisk-
@@ -3968,13 +3977,20 @@ upstream bucket is Q-V.
     socket; the client's connection discards writes after EPIPE so it
     reads that answer (`seed.answered`). An object refused alone
     (`BadDigest`: damaged on the disk; 412: held with other bytes; a
-    file missing or of another size) is reported and the import goes
+    file missing or of another size; anything but a regular file) is
+    reported and the import goes
     on; quota, floor, a removed friend or a gateway failure stop it.
     Run again, objects already stored answer as `putAgain` and are not
     stored twice. Exit 1 if anything was refused or it stopped.
     Objects go in one PUT each (the worker's multipart path is not
     used), so an object over 5 GiB is not seeded; restic and Kopia
-    packs are far smaller.
+    packs are far smaller. The disk is someone else's filesystem: files
+    and the manifest are opened under an `os.Root` of the directory,
+    every path component `Lstat`ed and refused if it is a symbolic
+    link, then opened `O_NOFOLLOW|O_NONBLOCK` and refused unless a
+    regular file (`seed.openPlain`), so no link is followed and no FIFO
+    or device blocks or is read; a manifest key that is absolute or has
+    `..` refuses the whole manifest.
   - *Confirm* (`seed.Confirmer`, in the borrower's daemon, `full`
     role): every minute each pending seed's friend is listed (§3.7
     `list`; a 404 `NoSuchBucket` is "nothing yet"; failures back off
@@ -3990,10 +4006,14 @@ upstream bucket is Q-V.
     confirmed within `state.SeedExpiry` (30 days: `expired`, a disk
     lost or never imported); or when the friend is no longer one
     (`removed`). Then the FIFO sends what is left, in seq order.
-  - `status` shows pending seeds (text) and every seed (`seeds` in
-    `--json`).
-  - *Tests:* `TestSeedHoldsRowsUntilTheFriendsListConfirmsThem`
-    (`internal/state`); `TestExportWritesExactlyTheKeysPlacedAtTheFriend`,
+  - `status` shows each pending seed with its age and when its hold
+    ends at the latest if nothing more is confirmed (text, and
+    `expires_at` in `--json`'s `seeds`, which lists every seed);
+    `status --wait` that times out names each pending seed of the
+    bucket and the objects it holds.
+  - *Tests:* `TestSeedHoldsRowsUntilTheFriendsListConfirmsThem`,
+    `TestASeedHoldsOnlyTheSeededFriend` (`internal/state`);
+    `TestImportFollowsNoLinkAndOpensNoDevice`, `TestExportWritesExactlyTheKeysPlacedAtTheFriend`,
     `TestExportOfAKopiaBucketIsInKopiasLayout`,
     `TestOnlyRowsTheListShowsWithTheirHashAreAcknowledged`,
     `TestSeedEnds` (`internal/seed`);

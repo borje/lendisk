@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"net"
 	"os"
-	"path/filepath"
 	"syscall"
 
 	"github.com/borje/lendisk/internal/identity"
@@ -45,9 +44,10 @@ var ErrStopped = errors.New("import stopped")
 
 // Import reads m's objects from dir and puts each, in manifest order. A
 // refusal of one object (bytes that do not match the hash, a key held
-// with other bytes, a file missing or of another size) is recorded and
-// the import goes on; a refusal no later object can pass stops it, with
-// ErrStopped and the result so far.
+// with other bytes, a file missing, of another size, or no regular
+// file: a symbolic link or a device is never followed, openPlain) is
+// recorded and the import goes on; a refusal no later object can pass
+// stops it, with ErrStopped and the result so far.
 func (im *Importer) Import(ctx context.Context, dir string, m Manifest) (ImportResult, error) {
 	r := ImportResult{Bucket: m.Bucket}
 	borrower, err := identity.ParseNodeID(m.Borrower)
@@ -69,8 +69,13 @@ func (im *Importer) Import(ctx context.Context, dir string, m Manifest) (ImportR
 	if err != nil {
 		return r, err
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return r, err
+	}
+	defer root.Close()
 	for i, o := range m.Objects {
-		reason, err := im.put(ctx, c, filepath.Join(dir, m.Path(o.Key)), m.Bucket, o)
+		reason, err := im.put(ctx, c, root, m.Path(o.Key), m.Bucket, o)
 		switch {
 		case err != nil:
 			return r, err
@@ -90,10 +95,12 @@ func (im *Importer) Import(ctx context.Context, dir string, m Manifest) (ImportR
 // put puts one object: a reason when the lender (or the disk) refuses
 // that object alone, an error wrapping ErrStopped when the import
 // cannot go on.
-func (im *Importer) put(ctx context.Context, c *replica.Friend, path, sealed string, o Object) (string, error) {
-	f, err := os.Open(path)
+func (im *Importer) put(ctx context.Context, c *replica.Friend, root *os.Root, path, sealed string, o Object) (string, error) {
+	f, err := openPlain(root, path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return "missing from the disk", nil
+	} else if errors.Is(err, errNotRegular) {
+		return err.Error(), nil
 	} else if err != nil {
 		return "", fmt.Errorf("%w: reading %s: %w", ErrStopped, path, err)
 	}
@@ -102,7 +109,7 @@ func (im *Importer) put(ctx context.Context, c *replica.Friend, path, sealed str
 	if err != nil {
 		return "", fmt.Errorf("%w: reading %s: %w", ErrStopped, path, err)
 	}
-	if !fi.Mode().IsRegular() || fi.Size() != o.Size {
+	if fi.Size() != o.Size {
 		return fmt.Sprintf("the disk holds %d bytes, the export wrote %d: damaged on the disk", fi.Size(), o.Size), nil
 	}
 	err = c.Put(ctx, replica.Object{Bucket: sealed, Key: o.Key, Size: o.Size, SHA256: o.SHA256, Body: f})
