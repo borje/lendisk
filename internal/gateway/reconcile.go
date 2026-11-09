@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -36,7 +37,12 @@ import (
 //     own store. A recovered node's store is empty by design (ID-5,
 //     ID-6) and fills through the read-through, so a key it never read
 //     is not held and its absence deletes nothing;
-//   - an indexed key whose object is listed is marked held.
+//   - an indexed key whose object is listed is marked held (not
+//     verified: queue.stamp stays empty); one whose file is no longer the
+//     one this node verified (queue.stamp: inode, size, modification
+//     time) is hashed again, paced, and enqueued as a put if its bytes
+//     changed: an edit in place outside the endpoint, which EP-11 judges
+//     as any write (#88). The same bytes record the file's identity.
 //
 // Guards against mass deletion (a delete goes to every place, where
 // lenders keep it only as a tombstone for the retention window):
@@ -94,6 +100,9 @@ type ReconcileSettings struct {
 	Alerted func()
 	// Page is the keys per listing page; zero means MaxListPage.
 	Page int
+	// Pace paces the reads of objects hashed again (pace.Pacer.Scrub);
+	// nil reads unpaced.
+	Pace func(ctx context.Context, r io.Reader) io.Reader
 }
 
 type reconciler struct {
@@ -107,6 +116,9 @@ type reconciler struct {
 	// listed, if set, is called with each listing's page size. Tests
 	// only.
 	listed func(n int32)
+	// beforeLock, if set, runs when a re-hash has read an object and has
+	// not yet taken its key's lock. Tests only.
+	beforeLock func()
 }
 
 func (r *reconciler) page() int {
@@ -391,6 +403,18 @@ func (r *reconciler) bucket(ctx context.Context, bucket string) error {
 					mark = mark[:0]
 					return err
 				}
+				return nil
+			}
+			// A verified key whose file is another one now was edited
+			// (#88); an unverified one is the sampler's to verify.
+			// A file of the same inode and modification time but another
+			// size lost bytes without a write: rot, the sampler's.
+			if cur := r.d.stampOf(bucket, k.Key); k.Stamp != "" && cur != k.Stamp && !sameFile(cur, k.Stamp) {
+				ok, err := r.rehash(ctx, bucket, k)
+				if ok {
+					writes++
+				}
+				return err
 			}
 			return nil
 		},
@@ -527,7 +551,7 @@ func (r *reconciler) write(ctx context.Context, bucket, key string) (bool, error
 	if err != nil {
 		return false, err
 	}
-	n, sum, err := r.d.hashStored(ctx, bucket, key)
+	n, sum, stamp, err := r.d.hashStamped(ctx, bucket, key, r.Pace)
 	if err != nil {
 		if derr := r.d.DB.DropCaptures(context.Background(), seqs...); derr != nil {
 			r.d.strand(seqs...)
@@ -542,8 +566,74 @@ func (r *reconciler) write(ctx context.Context, bucket, key string) (bool, error
 		r.d.strand(seqs...)
 		return false, err
 	}
+	if stamp != "" {
+		r.d.markHeld(ctx, bucket, key, sum, stamp)
+	}
 	r.d.noteFormat(bucket, key, k.format)
 	return !dup, nil
+}
+
+// rehash hashes again a held key's object whose file is no longer the
+// one this node verified (its identity, queue.stamp: another size,
+// modification time or inode), #88. The read is paced (Pace) and holds
+// no lock; under the key's lock the row and the file are checked to be
+// the ones hashed, then other bytes are enqueued as a put, an edit
+// outside the endpoint, and the same bytes (a copy back, a touch) record
+// the file's identity. It reports whether a row was queued.
+func (r *reconciler) rehash(ctx context.Context, bucket string, k state.IndexedKey) (bool, error) {
+	if class, err := r.d.classify(&bucket, &k.Key); err != nil || !captured(class) {
+		return false, err
+	}
+	n, sum, stamp, err := r.d.hashStamped(ctx, bucket, k.Key, r.Pace)
+	if notFound(err) || err == nil && stamp == "" {
+		return false, nil // gone, or changing while read: the next pass
+	}
+	if err != nil {
+		return false, err
+	}
+	if r.beforeLock != nil {
+		r.beforeLock()
+	}
+	unlock, err := r.d.keys.lock(ctx, bucket, k.Key)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	v, err := r.d.DB.OwnVersion(ctx, bucket, k.Key)
+	if err != nil || v.Seq != k.Seq || !v.Held() || v.Pending || v.Stamp != k.Stamp || r.d.stampOf(bucket, k.Key) != stamp {
+		return false, err
+	}
+	if n == v.Size && sum == v.SHA256 {
+		return false, r.d.DB.MarkLocal(ctx, bucket, k.Key, sum, stamp)
+	}
+	r.log.Info("reconcile: an object was changed in place outside the endpoint; enqueued as a write", "bucket", bucket,
+		"key", k.Key, "sha256", sum)
+	return true, r.d.captureChanged(ctx, bucket, k.Key, n, sum, stamp)
+}
+
+// captureChanged enqueues an indexed key's object, changed in place
+// outside the endpoint, as a put of the bytes the caller hashed (n,
+// sum) from the file of identity stamp, in its class; FinishPut applies
+// EP-11 as to any capture. The caller holds the key's lock. A crash
+// between the row and its finish leaves a pending row with no token,
+// which startup settles as landed.
+func (d *Decorator) captureChanged(ctx context.Context, bucket, key string, n int64, sum, stamp string) error {
+	k, err := d.kind(&bucket, &key)
+	if err != nil || !captured(k.class) {
+		return err
+	}
+	seqs, err := d.DB.BeginCaptures(ctx, []state.Capture{{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(k.class),
+		Rewritable: k.rewritable, Reconciled: true}})
+	if err != nil {
+		return err
+	}
+	if _, err := d.DB.FinishPut(ctx, seqs[0], n, sum); err != nil {
+		d.strand(seqs...)
+		return err
+	}
+	d.markHeld(ctx, bucket, key, sum, stamp)
+	d.noteFormat(bucket, key, k.format)
+	return nil
 }
 
 // delete enqueues the delete of a held key whose object is gone from

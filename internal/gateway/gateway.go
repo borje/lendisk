@@ -11,7 +11,10 @@
 // queue (EP-2, EP-3, EP-7, REPL-3, REPL-10) and serves a read of a key the
 // store lacks from a friend that holds it (EP-10, ID-6). The store
 // reconciler enqueues what reached or left the store outside the
-// endpoint (EP-14, reconcile.go). A friend's node ID is an
+// endpoint (EP-14, reconcile.go), and the bit-rot sampler hashes a
+// share of the store each week against the index, own objects and
+// friends' alike, fetching a rotten own object again (VER-5,
+// bitrot.go). A friend's node ID is an
 // account whose secret is derived per pair (NET-7a).
 //
 // Rules a caller must keep:
@@ -113,6 +116,9 @@ type Gateway struct {
 	// PurgeEvery is how often tombs past their retention window are
 	// purged (RET-1; default an hour). The window is read on Clock.
 	PurgeEvery time.Duration
+	// Sample, if set, runs the bit-rot sampler (VER-5, bitrot.go) once
+	// serving, on Clock. Nil runs none.
+	Sample *SampleSettings
 
 	lending *Lending // once Run has built it; tests only
 	// running is lending for other goroutines (PurgeFormer), once built.
@@ -246,6 +252,17 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		reconciled := make(chan struct{})
 		go func() { defer close(reconciled); r.loop(rctx) }()
 		defer func() { cancel(); <-reconciled }()
+	}
+	if dec.DB != nil && g.Sample != nil {
+		now := g.Clock
+		if now == nil {
+			now = time.Now
+		}
+		s := &sampler{d: dec, l: lend, storeDir: g.StoreDir, SampleSettings: *g.Sample, log: g.Log, now: now}
+		sctx, cancel := context.WithCancel(ctx)
+		sampled := make(chan struct{})
+		go func() { defer close(sampled); s.loop(sctx) }()
+		defer func() { cancel(); <-sampled }()
 	}
 	if ready != nil {
 		close(ready)

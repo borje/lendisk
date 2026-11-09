@@ -79,6 +79,9 @@ const (
 	// envReloadEvery is how often the daemon looks at its config file (a
 	// Go duration, #23).
 	envReloadEvery = "LENDISK_TEST_RELOAD_EVERY"
+	// envBitrotEvery is the bit-rot sampler's time between steps (a Go
+	// duration, #31).
+	envBitrotEvery = "LENDISK_TEST_BITROT_EVERY"
 )
 
 // offsetClock is real time plus the duration in the file at path, read
@@ -135,6 +138,9 @@ func TestMain(m *testing.M) {
 		}
 		if d, err := time.ParseDuration(os.Getenv(envReloadEvery)); err == nil {
 			a.reloadEvery = d
+		}
+		if d, err := time.ParseDuration(os.Getenv(envBitrotEvery)); err == nil {
+			a.tuneSample = func(s *gateway.SampleSettings) { s.Every = d }
 		}
 		if d, err := time.ParseDuration(os.Getenv(envFarewellInterval)); err == nil {
 			a.tuneEnding = func(f *farewell) { f.Interval = d }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"slices"
 	"strings"
 	"time"
@@ -76,9 +77,12 @@ func (d *Decorator) resolve(ctx context.Context, e state.Entry, landed func()) (
 	if e.Op == state.OpDelete {
 		return true, d.DB.FinishDelete(ctx, e.Seq)
 	}
-	size, sum, err := d.hashStored(ctx, e.Bucket, e.Key)
+	size, sum, stamp, err := d.hashStamped(ctx, e.Bucket, e.Key, nil)
 	if err == nil {
 		_, err = d.DB.FinishPut(ctx, e.Seq, size, sum)
+	}
+	if err == nil && stamp != "" {
+		d.markHeld(ctx, e.Bucket, e.Key, sum, stamp)
 	}
 	return true, err
 }
@@ -247,17 +251,69 @@ func (d *Decorator) landed(ctx context.Context, e state.Entry) (bool, error) {
 
 // hashStored reads a stored object once and returns its size and SHA-256.
 func (d *Decorator) hashStored(ctx context.Context, bucket, key string) (int64, string, error) {
+	return d.hashPaced(ctx, bucket, key, nil)
+}
+
+// hashPaced reads a stored object once, each read through pace if set
+// (the disk's read limit, VER-5), and returns its size and SHA-256.
+func (d *Decorator) hashPaced(ctx context.Context, bucket, key string, pace func(context.Context, io.Reader) io.Reader) (int64, string, error) {
 	out, err := d.Backend.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
 	if err != nil {
 		return 0, "", err
 	}
 	defer out.Body.Close()
+	var r io.Reader = out.Body
+	if pace != nil {
+		r = pace(ctx, r)
+	}
 	h := sha256.New()
-	n, err := io.Copy(h, ctxReader{ctx, out.Body})
+	n, err := io.Copy(h, ctxReader{ctx, r})
 	if err != nil {
 		return 0, "", err
 	}
 	return n, hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// hashStamped hashes a stored object as hashPaced does and returns its
+// file's identity (fileStamp) if the file did not change while it was
+// read, "" otherwise: the identity those bytes belong to (VER-5).
+func (d *Decorator) hashStamped(ctx context.Context, bucket, key string, pace func(context.Context, io.Reader) io.Reader) (n int64, sum, stamp string, err error) {
+	before := d.stampOf(bucket, key)
+	if n, sum, err = d.hashPaced(ctx, bucket, key, pace); err != nil {
+		return 0, "", "", err
+	}
+	if after := d.stampOf(bucket, key); after == before {
+		stamp = after
+	}
+	return n, sum, stamp, nil
+}
+
+// filePaths names the file of a stored object: *Store.
+type filePaths interface {
+	Path(bucket, key string) string
+}
+
+// stampOf is the identity of the file holding key's object in bucket
+// (fileStamp), "" if there is none or it cannot be read.
+func (d *Decorator) stampOf(bucket, key string) string {
+	fp, ok := d.Uploads.(filePaths)
+	if !ok {
+		return ""
+	}
+	fi, err := os.Lstat(fp.Path(bucket, key))
+	if err != nil || !fi.Mode().IsRegular() {
+		return ""
+	}
+	return fileStamp(fi)
+}
+
+// markHeld marks key's version of hash sum held locally, with stamp the
+// identity of the file this node wrote or hashed it from ("" for none).
+// A failure is logged: the key stays unverified, which is safe.
+func (d *Decorator) markHeld(ctx context.Context, bucket, key, sum, stamp string) {
+	if err := d.DB.MarkLocal(ctx, bucket, key, sum, stamp); err != nil {
+		d.Log.Warn("capture: recording an object's file failed; it stays unverified", "bucket", bucket, "key", key, "err", err)
+	}
 }
 
 func notFound(err error) bool {

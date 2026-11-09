@@ -265,3 +265,34 @@ func TestRatesBelowTheFloorAreRefused(t *testing.T) {
 		t.Fatal("0 or MinRate refused")
 	}
 }
+
+// VER-5 (#31): the bit-rot sampler's disk reads hold to their own limit
+// (store.bitrot_read_limit), apart from every network limit, and a
+// changed limit applies from the next read.
+func TestBitrotReadsHoldToTheirLimit(t *testing.T) {
+	c := newClock()
+	p := paced(c, Settings{Down: 64 << 10, Scrub: 512 << 10})
+	start := c.now()
+	if n := drain(t, p.Scrub(t.Context(), zeros(2<<20))); n != 2<<20 {
+		t.Fatal(n)
+	}
+	if el := c.now().Sub(start); el < 3750*time.Millisecond || el > 4*time.Second {
+		t.Fatalf("2 MiB at 512 KiB/s took %v", el)
+	}
+	p.Set(Settings{Scrub: 1 << 20})
+	start = c.now()
+	drain(t, p.Scrub(t.Context(), zeros(2<<20)))
+	if el := c.now().Sub(start); el < 1900*time.Millisecond || el > 2*time.Second {
+		t.Fatalf("2 MiB at 1 MiB/s took %v", el)
+	}
+	p.Set(Settings{})
+	start = c.now()
+	drain(t, p.Scrub(t.Context(), zeros(4<<20)))
+	if el := c.now().Sub(start); el != 0 {
+		t.Fatalf("no limit waited %v", el)
+	}
+	var none *Pacer
+	if n := drain(t, none.Scrub(t.Context(), zeros(10))); n != 10 {
+		t.Fatal(n)
+	}
+}

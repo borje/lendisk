@@ -4,7 +4,9 @@
 // replication schedule (time-of-day windows); the upload slots that keep
 // every request body above a lender's floor rate (#76); and, as a
 // lender, a limit per borrower on what it receives from and sends to
-// that borrower.
+// that borrower; and the disk reads of the bit-rot sampler (VER-5,
+// #31), which move no bytes over the network but compete with backups
+// for a Pi's disk.
 //
 // Rules a caller must keep:
 //   - Pace by concurrency, never by trickling one body: take a Slot for
@@ -74,6 +76,9 @@ type Settings struct {
 	// PartSize is the size of each part of an object sent in parts, and
 	// the largest object sent in one PUT (REPL-6); 0 is DefaultPartSize.
 	PartSize int64
+	// Scrub limits the bit-rot sampler's reads of the local store
+	// (VER-5, store.bitrot_read_limit); zero is no limit.
+	Scrub int64
 }
 
 // DefaultPartSize is replication.part_size's default (REPL-6).
@@ -98,6 +103,7 @@ type Pacer struct {
 	mu       sync.Mutex
 	s        Settings
 	up, down *rate.Limiter
+	scrub    *rate.Limiter
 	peers    map[string]*pair
 	lend     map[string]*pair
 	slots    int           // bodies holding an upload slot
@@ -108,7 +114,7 @@ type pair struct{ up, down *rate.Limiter }
 
 // New returns a pacer with no limits, open always.
 func New(now func() time.Time) *Pacer {
-	return &Pacer{Now: now, up: unlimited(), down: unlimited(), peers: map[string]*pair{}, lend: map[string]*pair{},
+	return &Pacer{Now: now, up: unlimited(), down: unlimited(), scrub: unlimited(), peers: map[string]*pair{}, lend: map[string]*pair{},
 		freed: make(chan struct{})}
 }
 
@@ -158,6 +164,7 @@ func (p *Pacer) Set(s Settings) {
 	p.s = s
 	p.up.SetLimitAt(now, limitOf(s.Up))
 	p.down.SetLimitAt(now, limitOf(s.Down))
+	p.scrub.SetLimitAt(now, limitOf(s.Scrub))
 	set := func(m map[string]*pair, rs map[string]Rates) {
 		for peer, l := range m {
 			r := rs[peer]
@@ -254,6 +261,15 @@ func (p *Pacer) Fetch(ctx context.Context, peer string, r io.Reader) io.Reader {
 		return r
 	}
 	return &reader{ctx: ctx, r: r, p: p, lims: []*rate.Limiter{p.of(p.peers, p.Settings().Peers, peer).down, p.down}}
+}
+
+// Scrub paces r, the bit-rot sampler's read of an object in the local
+// store (VER-5), by the scrub limit alone.
+func (p *Pacer) Scrub(ctx context.Context, r io.Reader) io.Reader {
+	if p == nil {
+		return r
+	}
+	return &reader{ctx: ctx, r: r, p: p, lims: []*rate.Limiter{p.scrub}}
 }
 
 // LendIn paces r, a request body borrower peer sends this node, by its

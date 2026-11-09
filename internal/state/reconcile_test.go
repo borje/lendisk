@@ -70,10 +70,10 @@ func TestHeldLocallyOnlyWhenTheStoreHadIt(t *testing.T) {
 	}
 
 	// The read-through fetched data/b; a stale hash marks nothing.
-	if err := db.MarkLocal(ctx, "laptop", "data/c", "h-other"); err != nil {
+	if err := db.MarkLocal(ctx, "laptop", "data/c", "h-other", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.MarkLocal(ctx, "laptop", "data/b", "h-b"); err != nil {
+	if err := db.MarkLocal(ctx, "laptop", "data/b", "h-b", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := indexed(t, db, "laptop"); !got["data/b"] || got["data/c"] {

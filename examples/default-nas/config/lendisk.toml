@@ -30,6 +30,8 @@ path             = "/var/lib/lendisk/store"
 free_space_floor = "5%"      # LEND-2: refuse borrowers' writes below this
 reconcile_every  = "24h"     # EP-14: compare the store with what was captured
 reconcile_delete_limit = 10  # EP-14: more missing than this % deletes nothing until confirmed
+bitrot_sample    = "0.1"     # VER-5: % of the stored bytes hashed a week to find bit-rot
+bitrot_read_limit = "8M"     # VER-5: the sample's disk reads, bytes a second
 
 [tunnel]
 # The tunnel port is always 9000 inside WireGuard (lender-facing S3 + control API).

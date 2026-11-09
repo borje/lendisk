@@ -206,6 +206,9 @@ func (d *Decorator) PutObject(ctx context.Context, in s3response.PutObjectInput)
 		d.strand(seq)
 		return s3response.PutObjectOutput{}, errInternal
 	}
+	// The bytes just hashed are this file's (VER-5): still holding the
+	// key's lock, its identity is recorded with them.
+	d.markHeld(context.Background(), *in.Bucket, *in.Key, h.hex(), d.stampOf(*in.Bucket, *in.Key))
 	return out, nil
 }
 
@@ -482,6 +485,7 @@ func (d *Decorator) finishUpload(ctx context.Context, seq int64, bucket, key, et
 	if d.beforeHash != nil {
 		d.beforeHash()
 	}
+	before := d.stampOf(bucket, key)
 	out, err := d.Backend.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
 	if notFound(err) {
 		d.drop(seq)
@@ -500,10 +504,14 @@ func (d *Decorator) finishUpload(ctx context.Context, seq int64, bucket, key, et
 	if err != nil {
 		return err
 	}
-	_, err = d.DB.FinishPut(ctx, seq, n, hex.EncodeToString(h.Sum(nil)))
+	sum := hex.EncodeToString(h.Sum(nil))
+	_, err = d.DB.FinishPut(ctx, seq, n, sum)
 	if errors.Is(err, state.ErrNotFound) {
 		d.Log.Debug("capture: a completed upload's row was settled elsewhere", "bucket", bucket, "key", key, "seq", seq)
 		return nil
+	}
+	if err == nil && before != "" && d.stampOf(bucket, key) == before {
+		d.markHeld(ctx, bucket, key, sum, before) // the file did not change while it was hashed
 	}
 	return err
 }

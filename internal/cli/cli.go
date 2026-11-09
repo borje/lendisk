@@ -71,6 +71,9 @@ type app struct {
 	// tuneReconcile, if set, adjusts the store reconciler's settings
 	// before the gateway starts (its poll); tests only.
 	tuneReconcile func(*gateway.ReconcileSettings)
+	// tuneSample, if set, adjusts the bit-rot sampler's settings
+	// (VER-5). Tests only.
+	tuneSample func(*gateway.SampleSettings)
 	// tuneManifest, if set, adjusts the manifest pusher before it
 	// starts (its poll); tests only.
 	tuneManifest func(*manifest.Pusher)
