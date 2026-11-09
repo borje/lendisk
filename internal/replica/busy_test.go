@@ -39,7 +39,12 @@ func TestABusyFriendIsRetriedWithoutFailing(t *testing.T) {
 	fx.write("laptop", "data/1", "x")
 	fx.run()
 	waitFor(t, "busy", func() bool { return fx.condition("B").Condition == state.ConditionBusy })
-	waitFor(t, "retries", func() bool { return tries.Load() >= 3 })
+	// The retry is counted just after the attempt fails: wait on the
+	// counter, not on the attempts.
+	busyRetries := func() float64 {
+		return metrics.Values(c.Families())[`lendisk_replication_retries_total{place="B",reason="busy"}`]
+	}
+	waitFor(t, "retries", func() bool { return tries.Load() >= 3 && busyRetries() >= 3 })
 	cond := fx.condition("B")
 	if cond.LastOK.Before(start.Truncate(time.Second)) || !cond.FailingSince.IsZero() || cond.Detail == "" {
 		t.Fatalf("busy: %+v", cond)
@@ -48,7 +53,7 @@ func TestABusyFriendIsRetriedWithoutFailing(t *testing.T) {
 		t.Fatalf("%d alerts for a busy friend", n)
 	}
 	v := metrics.Values(c.Families())
-	if v[`lendisk_replication_retries_total{place="B",reason="busy"}`] < 3 ||
+	if busyRetries() < 3 ||
 		v[`lendisk_replication_retries_total{place="B",reason="network"}`] != 0 {
 		t.Fatalf("retries: %v", v)
 	}
