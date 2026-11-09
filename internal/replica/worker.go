@@ -612,8 +612,14 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			probeFailed = true
 		}
 	}
+	_, target := state.OverflowName(place)
+	var tombsAt time.Time // the last look for held deletes due (real time)
 	for ctx.Err() == nil {
 		w.done(place) // the previous row's outcome is recorded
+		if target && time.Since(tombsAt) >= poll && w.Pace.Open() {
+			tombsAt = time.Now()
+			w.issueTombs(ctx, place, r, log)
+		}
 		p, ok, err := w.next(ctx, place)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -842,6 +848,43 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	}
 }
 
+// issueTombs sends the deletes held for overflow target place whose
+// retention window has ended (S3-4, state.DueOverflowTombs), on the
+// target's own sender, so never beside a put of the same key. A tomb
+// whose key the target holds again is dropped unsent. A delete that
+// fails gives back its claim and the rest's, to be tried at the next
+// look.
+func (w *Worker) issueTombs(ctx context.Context, place string, r Replica, log *slog.Logger) {
+	ts, err := w.DB.DueOverflowTombs(ctx, place, w.now(), 64)
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Error("replication: reading the held deletes due failed", "err", err)
+		}
+		return
+	}
+	for i, t := range ts {
+		if err := r.Delete(ctx, t.Bucket, t.Key); err != nil {
+			seqs := make([]int64, 0, len(ts)-i)
+			for _, u := range ts[i:] {
+				seqs = append(seqs, u.Seq)
+			}
+			if uerr := w.DB.UnclaimOverflowTombs(context.Background(), place, seqs); uerr != nil {
+				log.Error("replication: giving back held deletes failed; they are tried again within the hour", "err", uerr)
+			}
+			if ctx.Err() == nil {
+				log.Warn("replication: sending a held delete after its retention window failed; trying again",
+					"bucket", t.Bucket, "key", t.Key, "err", err)
+			}
+			return
+		}
+		if err := w.DB.DropOverflowTomb(context.Background(), place, t.Seq); err != nil {
+			log.Error("replication: recording a held delete as sent failed", "bucket", t.Bucket, "key", t.Key, "err", err)
+		}
+		log.Debug("replication: a held delete was sent after the target's retention window (S3-4)",
+			"bucket", t.Bucket, "key", t.Key, "deleted_at", t.DeletedAt)
+	}
+}
+
 // waitingOnStore reports whether place's recorded condition is
 // ConditionStore; false if it cannot be read.
 func (w *Worker) waitingOnStore(place string) bool {
@@ -903,6 +946,12 @@ func (w *Worker) rewriting(ctx context.Context, p state.Placement) bool {
 // cancelled first), so a rewrite never replaces a newer version.
 func (w *Worker) send(ctx context.Context, place string, r Replica, p state.Placement) error {
 	if p.Op == state.OpDelete {
+		// An overflow target without versioning keeps nothing a delete
+		// removes: the delete is held as a client-side tombstone and sent
+		// after the target's retention window (S3-4, issueTombs).
+		if held, err := w.DB.HoldOverflowDelete(ctx, place, p.Seq, w.now()); err != nil || held {
+			return err
+		}
 		return r.Delete(ctx, p.Bucket, p.Key)
 	}
 	if sup, err := w.DB.Superseded(ctx, p.Seq); err != nil {

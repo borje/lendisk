@@ -1,6 +1,8 @@
-// Package verify is the borrower's side of verification (VER-1, VER-3,
-// VER-4; DESIGN §3.6): the daily challenge of each friend's replica of
-// each bucket, and the checks `lendisk verify` asks the daemon for.
+// Package verify is the borrower's side of verification (VER-1, VER-2,
+// VER-3, VER-4, S3-6; DESIGN §3.6, §3.11): the daily challenge of each
+// friend's replica of each bucket, the checks of overflow targets by
+// their stored checksums and a weekly downloaded sample (overflow.go),
+// and the checks `lendisk verify` asks the daemon for.
 //
 // A challenge names one of the node's objects that the friend
 // acknowledged (state.DB.ChallengeableAt), by the bucket's sealed name
@@ -52,6 +54,7 @@ import (
 
 	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/pace"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -118,7 +121,19 @@ type Verifier struct {
 	// Alerted, if set, is called after a replica is marked unverified,
 	// so the alert service reads it at once. It must not block.
 	Alerted func()
-	Log     *slog.Logger
+	// Overflow builds an overflow target's client (VER-2, S3-6, #39):
+	// the daemon's reads the credential from the environment, as the
+	// worker's does. Nil leaves overflow targets unchecked.
+	Overflow func(o state.Overflow) (Target, error)
+	// Pace paces the sample's downloads by the download limits
+	// (REPL-7); nil paces nothing.
+	Pace *pace.Pacer
+	// SamplePercent is the share of each overflow target's bytes
+	// downloaded a week (DefaultSamplePercent when zero); SampleEvery
+	// how often the sample steps (DefaultSampleEvery when zero).
+	SamplePercent float64
+	SampleEvery   time.Duration
+	Log           *slog.Logger
 
 	once sync.Once
 	kick chan struct{}
@@ -204,6 +219,7 @@ func (v *Verifier) pass(ctx context.Context) {
 			return
 		}
 	}
+	v.sampleTargets(ctx)
 }
 
 // Check challenges place's replica of bucket now, ranged (VER-1) or full
@@ -247,6 +263,9 @@ var errNoAnswer = errors.New("no answer")
 // outcome.
 func (v *Verifier) check(ctx context.Context, place, bucket string, full bool) (state.VerifyOutcome, error) {
 	var o state.VerifyOutcome
+	if _, ok := state.OverflowName(place); ok {
+		return v.checkTarget(ctx, place, bucket, full)
+	}
 	f, err := v.DB.GetFriendship(ctx, place)
 	if err != nil {
 		return o, fmt.Errorf("the friendship: %w", err)

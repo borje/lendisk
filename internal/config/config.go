@@ -203,6 +203,8 @@ type Replication struct {
 	Copies       Number `toml:"copies" default:"2" help:"how many friends hold each object of a bucket created without --copies (EP-6); 1 means one lost friend loses data, and bucket add and status say so"`
 	RerouteAfter string `toml:"reroute_after" default:"1h" help:"move the unsent copies at a friend that has failed this long to another friend with room (D6, REPL-1), such as 1h or 90m"`
 	ReplaceAfter string `toml:"replace_after" default:"168h" help:"a friend failing this long since its last answer is no longer room for copies (REPL-12, REPL-13), such as 168h"`
+	// OverflowSample is a decimal percentage (VER-2, #39).
+	OverflowSample string `toml:"overflow_sample" default:"0.1" help:"the share of the bytes at each overflow target downloaded each week, hashed and compared with the index (VER-2), within the download limits: a percentage above 0 and at most 100, such as 1"`
 	// The rest is pacing (REPL-6, REPL-7); it applies without a restart
 	// (the daemon re-reads the file, §3.4 REPL-7).
 	PartSize      string      `toml:"part_size" default:"16M" help:"objects larger than this are sent in parts of this size and resume at the next part after an interruption (REPL-6); 5M to 5G"`
@@ -379,6 +381,13 @@ func (c *Config) BitrotSample() float64 {
 	return v
 }
 
+// OverflowSample is replication.overflow_sample, a percentage, which
+// Validate checked.
+func (c *Config) OverflowSample() float64 {
+	v, _ := strconv.ParseFloat(strings.TrimSpace(c.Replication.OverflowSample), 64)
+	return v
+}
+
 // UnreachableAfter is alerts.unreachable_after, which Validate checked.
 func (c *Config) UnreachableAfter() time.Duration {
 	d, _ := time.ParseDuration(c.Alerts.UnreachableAfter)
@@ -421,6 +430,9 @@ func (c *Config) Validate() error {
 	}
 	if v, err := strconv.ParseFloat(strings.TrimSpace(c.Store.BitrotSample), 64); err != nil || !(v >= MinBitrotSample && v <= 100) {
 		errs = append(errs, fmt.Errorf("store.bitrot_sample = %q: want a percentage from 0.1 (VER-5's least) to 100, such as 1", c.Store.BitrotSample))
+	}
+	if v, err := strconv.ParseFloat(strings.TrimSpace(c.Replication.OverflowSample), 64); err != nil || !(v > 0 && v <= 100) {
+		errs = append(errs, fmt.Errorf("replication.overflow_sample = %q: want a percentage above 0 and at most 100, such as 0.1", c.Replication.OverflowSample))
 	}
 	if err := checkLoopback(c.Endpoint.Loopback); err != nil {
 		errs = append(errs, fmt.Errorf("endpoint.loopback = %q: %w", c.Endpoint.Loopback, err))

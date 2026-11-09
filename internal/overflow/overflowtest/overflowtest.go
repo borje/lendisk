@@ -9,6 +9,7 @@
 package overflowtest
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -41,7 +42,7 @@ type Server struct {
 func Start(t *testing.T, bucket string, versioning bool) *Server {
 	t.Helper()
 	root, vers := t.TempDir(), t.TempDir()
-	opts := posix.PosixOpts{AbsolutePaths: true}
+	opts := posix.PosixOpts{AbsolutePaths: true, CopyObjectThreshold: 5 << 30} // undelete copies a version (S3-4)
 	if versioning {
 		opts.VersioningDir = vers
 	}
@@ -157,6 +158,14 @@ func (s *Server) Get(ctx context.Context, key string) ([]byte, string, error) {
 	defer o.Body.Close()
 	b, err := io.ReadAll(o.Body)
 	return b, o.Metadata["lendisk-sha256"], err
+}
+
+// Put stores body at key with metadata meta, as a provider's own fault
+// or another writer would (#39: rot a copy for verification to find).
+func (s *Server) Put(ctx context.Context, key string, body []byte, meta map[string]string) error {
+	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(s.Bucket), Key: aws.String(key),
+		Body: bytes.NewReader(body), Metadata: meta})
+	return err
 }
 
 // Versions counts the versions and delete markers of key.

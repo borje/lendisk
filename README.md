@@ -152,6 +152,7 @@ if none exists.
 | `replication.copies` | `2` | how many friends hold each object of a bucket created without `--copies`; with 1, losing one friend loses data, and `bucket add` and `status` say so |
 | `replication.reroute_after` | `1h` | move unsent copies from a friend failing this long to another with room |
 | `replication.replace_after` | `168h` | a friend failing this long no longer counts as room for copies |
+| `replication.overflow_sample` | `0.1` | percent of the bytes at each overflow target downloaded each week and hashed against what was recorded (VER-2), within the download limits; a target is also checked daily by the provider's stored checksums |
 | `alerts.command` | none | absolute path of a program run for each alert, the alert as JSON on stdin |
 | `alerts.webhook` | none | http(s) URL each alert's JSON is POSTed to |
 | `alerts.unreachable_after` | `24h` | alert when a friend has not answered for this long |

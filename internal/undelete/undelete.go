@@ -8,7 +8,10 @@
 // that time back to the live set, a page at a time, and records what
 // each restored in the index (state.DB.RecordRestored): a done put of
 // the version, acknowledged at that friend, not held locally, so the
-// read-through serves it and the offsite watermark counts it.
+// read-through serves it and the offsite watermark counts it. Overflow
+// targets are asked the same command by their own retention
+// (overflow.go, S3-4): a versioned one copies the version before each
+// delete marker back, an unversioned one's held deletes are cancelled.
 //
 // Rules a caller must keep:
 //
@@ -146,7 +149,11 @@ type Runner struct {
 	Timeout time.Duration
 	// Wait waits out a friend's 503 for d; nil waits on a timer.
 	Wait func(ctx context.Context, d time.Duration) error
-	Log  *slog.Logger
+	// Overflow builds an overflow target's client (S3-4, #39): the
+	// daemon's reads the credential from the environment, as the
+	// worker's does. Nil leaves overflow targets out.
+	Overflow func(o state.Overflow) (Target, error)
+	Log      *slog.Logger
 }
 
 func (r *Runner) now() time.Time {
@@ -314,6 +321,13 @@ func (r *Runner) Preview(ctx context.Context, q state.UndeleteRequest) (Preview,
 		p.Rewritten = max(p.Rewritten, fp.Rewritten)
 		p.Friends = append(p.Friends, fp)
 	}
+	tgs, err := r.targets(ctx)
+	if err != nil {
+		return p, err
+	}
+	for _, tg := range tgs {
+		p.Friends = append(p.Friends, r.previewTarget(ctx, tg, q, prof, time.Unix(p.Since, 0), all, snaps))
+	}
 	for k, n := range all {
 		p.Keys++
 		p.Bytes += n
@@ -381,6 +395,32 @@ func (r *Runner) Undelete(ctx context.Context, q state.UndeleteRequest) (Result,
 		if n > 0 {
 			r.log().Info("undelete: adopted objects a friend restored whose answer was lost", "peer", f.Peer, "bucket", q.Bucket, "adopted", n)
 		}
+	}
+	tgs, err := r.targets(ctx)
+	if err != nil {
+		return res, err
+	}
+	for _, tg := range tgs {
+		fr := FriendResult{Peer: tg.o.Place()}
+		err := r.undeleteTarget(ctx, tg, q, prof, time.Unix(since, 0), &fr)
+		if err == nil {
+			var n int
+			n, err = r.adoptTarget(ctx, tg, q, prof)
+			fr.Adopted += n
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return res, ctx.Err()
+			}
+			fr.Error = err.Error()
+			r.log().Warn("undelete: an overflow target's undelete did not finish; run `lendisk undelete` again to finish it",
+				"place", fr.Peer, "bucket", q.Bucket, "err", err)
+		}
+		if fr.Restored > 0 {
+			r.log().Info("undelete: an overflow target restored deleted objects", "place", fr.Peer, "bucket", q.Bucket,
+				"restored", fr.Restored, "bytes", fr.Bytes)
+		}
+		res.Friends = append(res.Friends, fr)
 	}
 	return res, nil
 }
@@ -496,25 +536,7 @@ func (r *Runner) undeleteAt(ctx context.Context, f state.Friendship, q state.Und
 		if err != nil {
 			return fmt.Errorf("recording what the friend restored: %w", err)
 		}
-		fr.Recorded += rr.Recorded
-		fr.Acked += rr.Acked
-		fr.Busy += len(rr.Busy)
-		fr.Unknown += len(rr.Unknown)
-		for _, k := range rr.Busy {
-			if len(fr.BusyKeys) < MaxNamed {
-				fr.BusyKeys = append(fr.BusyKeys, k)
-			}
-		}
-		for _, k := range rr.Unknown {
-			r.log().Warn("undelete: a friend restored a key this node never had and the preview did not list; not recorded",
-				"peer", f.Peer, "bucket", q.Bucket, "key", k)
-		}
-		fr.KeptCount += len(rr.Kept)
-		for _, k := range rr.Kept {
-			if len(fr.Kept) < MaxNamed {
-				fr.Kept = append(fr.Kept, k)
-			}
-		}
+		r.tally(fr, f.Peer, q.Bucket, rr)
 		for _, s := range page.Skipped {
 			if s.Reason == gateway.SkipLive {
 				fr.Live++
@@ -536,6 +558,29 @@ func (r *Runner) undeleteAt(ctx context.Context, f state.Friendship, q state.Und
 			return nil
 		}
 		after = page.Next
+	}
+}
+
+// tally adds what the index made of a page place restored to fr.
+func (r *Runner) tally(fr *FriendResult, place, bucket string, rr state.RestoreResult) {
+	fr.Recorded += rr.Recorded
+	fr.Acked += rr.Acked
+	fr.Busy += len(rr.Busy)
+	fr.Unknown += len(rr.Unknown)
+	for _, k := range rr.Busy {
+		if len(fr.BusyKeys) < MaxNamed {
+			fr.BusyKeys = append(fr.BusyKeys, k)
+		}
+	}
+	for _, k := range rr.Unknown {
+		r.log().Warn("undelete: a place restored a key this node never had and the preview did not list; not recorded",
+			"peer", place, "bucket", bucket, "key", k)
+	}
+	fr.KeptCount += len(rr.Kept)
+	for _, k := range rr.Kept {
+		if len(fr.Kept) < MaxNamed {
+			fr.Kept = append(fr.Kept, k)
+		}
 	}
 }
 

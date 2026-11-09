@@ -158,7 +158,7 @@ func TestCheckOverflowWarnsWhenVersioningIsOff(t *testing.T) {
 		t.Fatal(err)
 	}
 	if notes := strings.Join(ch.Notes, "\n"); ch.Versioning != state.VersioningOff || !strings.Contains(notes, "warning: versioning is off") ||
-		!strings.Contains(notes, "a delete there is final") {
+		!strings.Contains(notes, "retention: client-side") || strings.Contains(notes, "final") {
 		t.Fatalf("check %+v", ch)
 	}
 }

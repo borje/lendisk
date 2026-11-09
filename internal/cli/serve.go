@@ -314,7 +314,16 @@ func (a *app) serveCmd() *cobra.Command {
 				// asks for through lendisk.db. A failure marks the replica
 				// unverified, which the worker's next pass re-places.
 				ver := &verify.Verifier{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Now: a.clock, Random: a.random,
-					Alerted: alerts.Check, Log: log}
+					Alerted: alerts.Check, Log: log, Pace: pacer, SamplePercent: cfg.OverflowSample()}
+				// Overflow targets (VER-2, S3-6, #39): the provider's
+				// stored checksums daily, and a downloaded sample weekly.
+				ver.Overflow = func(o state.Overflow) (verify.Target, error) {
+					cred, err := overflow.Lookup(getenv, o.EnvPrefix)
+					if err != nil {
+						return nil, err
+					}
+					return replica.NewOverflow(o, cred, id.SealedName, w.Client)
+				}
 				if a.tuneVerify != nil {
 					a.tuneVerify(ver)
 				}
@@ -325,6 +334,14 @@ func (a *app) serveCmd() *cobra.Command {
 				// `lendisk undelete` asks for through lendisk.db, run here
 				// so only the daemon dials with this node's keys.
 				und := &undelete.Runner{DB: db, Self: id, Dial: tun.Dial, Profiles: profiles, Now: a.clock, Log: log}
+				// Overflow targets the same way (S3-4, #39).
+				und.Overflow = func(o state.Overflow) (undelete.Target, error) {
+					cred, err := overflow.Lookup(getenv, o.EnvPrefix)
+					if err != nil {
+						return nil, err
+					}
+					return replica.NewOverflow(o, cred, id.SealedName, w.Client)
+				}
 				if a.tuneUndelete != nil {
 					a.tuneUndelete(und)
 				}
