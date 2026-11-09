@@ -18,9 +18,18 @@ import (
 )
 
 // flipByte changes one byte of the file at path in place, keeping its
-// size: what a failing disk does.
+// inode, size and modification time: what a failing disk does.
 func flipByte(t *testing.T, path string) {
 	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := os.Chtimes(path, fi.ModTime(), fi.ModTime()); err != nil {
+			t.Fatal(err)
+		}
+	}()
 	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -39,17 +48,16 @@ func flipByte(t *testing.T, path string) {
 // VER-5 AC (#31), real daemons: A borrows from B, both sampling 100% of
 // their stores a week. A byte flips in an object in A's store and in
 // another in B's copy of A's bucket. A week on both clocks later, A
-// alerts bitrot for the bucket and fetches its object again from B
-// through the read-through, so its store holds the right bytes, without
-// enqueueing any write or delete; B alerts lent_bitrot for A and leaves
+// alerts bitrot for the bucket and replaces its object with a verified
+// copy from B, fetched as the read-through fetches, so its store holds
+// the right bytes, without enqueueing any write or delete; B alerts lent_bitrot for A and leaves
 // A's object as it is. status shows both, in text and JSON.
 func TestBitrotIsFoundOnBothSidesAndRepairedAtTheBorrower(t *testing.T) {
 	parallel(t, 2)
 	an, bn := friendNode(t), friendNode(t)
 	bn.regions = an.regions
-	// Both clocks run an hour ahead from the start, so the objects are
-	// known to their nodes after the flips below happen: the flips are
-	// rot, not edits (a test cannot set a file's change time).
+	// The clocks move a week on once the flips are made, so the samples
+	// owe the whole store.
 	clock := filepath.Join(t.TempDir(), "clock")
 	jump := func(d time.Duration) {
 		t.Helper()
@@ -57,7 +65,6 @@ func TestBitrotIsFoundOnBothSidesAndRepairedAtTheBorrower(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	jump(time.Hour)
 	env := []string{envReplFast + "=1", envClock + "=" + clock, envAlertInterval + "=100ms", envBitrotEvery + "=100ms",
 		"LENDISK_STORE_BITROT_SAMPLE=100"}
 	a, b := newProcNode(t, an, env...), newProcNode(t, bn, env...)

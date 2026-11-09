@@ -185,17 +185,26 @@ func (d *Decorator) readThrough(ctx context.Context, bucketp, keyp *string) erro
 			"bucket", bucket, "key", key, "sha256", src.SHA256)
 		return errNotFetched
 	}
+	return d.fetchAny(ctx, bucket, key, src)
+}
+
+// fetchAny stores src's version of key from the first place holding it
+// that serves it, verified as it passes, most recently reachable first,
+// over whatever the store holds there: posix replaces an object only
+// once the new one is complete, so a rotten copy stays until a verified
+// one takes its place (VER-5). The caller holds the key's lock. It
+// returns errNotFetched when no place could serve it, or errInternal.
+func (d *Decorator) fetchAny(ctx context.Context, bucket, key string, src state.Source) error {
 	for _, p := range d.fetchOrder(src.Places) {
 		start := time.Now()
 		err := d.fetchFrom(ctx, p, bucket, key, src)
 		if err == nil {
 			d.reached(p, true)
-			// The store holds the version now: its loss from here on is
-			// a delete (EP-14). A failed mark is left to the next pass.
-			if err := d.DB.MarkLocal(ctx, bucket, key, src.SHA256); err != nil {
-				d.Log.Warn("read-through: marking a fetched object held failed; the next reconcile pass marks it",
-					"bucket", bucket, "key", key, "err", err)
-			}
+			// The store holds the version now, in a file this node wrote
+			// verified: its loss from here on is a delete (EP-14), and
+			// other bytes in that file are rot (VER-5). A failed mark is
+			// left to the next pass.
+			d.markHeld(ctx, bucket, key, src.SHA256, d.stampOf(bucket, key))
 			d.Log.Info("read-through: fetched an object from a friend", "bucket", bucket, "key", key, "place", p,
 				"bytes", src.Size, "took", time.Since(start).Round(time.Millisecond))
 			return nil

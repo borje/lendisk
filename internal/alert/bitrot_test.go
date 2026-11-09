@@ -21,7 +21,7 @@ func TestBitrotIsAlertedOnBothSides(t *testing.T) {
 	kept := state.Rot{Bucket: "laptop", Key: "data/aa", Seq: 1, SHA256: "h1", Found: "x1", Size: 9, FoundAt: now,
 		Detail: "no friend holds the version captured"}
 	fixed := state.Rot{Bucket: "photos", Key: "data/bb", Seq: 2, SHA256: "h2", Found: "x2", Size: 9, FoundAt: now,
-		RemovedAt: now, RepairedAt: now, Detail: "fetched again from a friend"}
+		RepairedAt: now, Detail: "replaced by a verified copy from a friend"}
 	lent := state.Rot{Bucket: "lent-0123456789abcdef-s1", Key: "data/cc", Borrower: "FRIEND", Sealed: "s1", SHA256: "h3",
 		Found: "x3", Size: 9, FoundAt: now}
 	for _, r := range []state.Rot{kept, fixed, lent} {

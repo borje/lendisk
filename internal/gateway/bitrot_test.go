@@ -64,14 +64,18 @@ func (h *harness) step(s *sampler) {
 }
 
 // rot flips a byte of key's object in bucket's directory, keeping its
-// size: what a failing disk does.
+// inode, size and modification time: what a failing disk does.
 func (h *harness) rot(bucket, key string) {
 	h.t.Helper()
-	f, err := os.OpenFile(filepath.Join(h.store, bucket, filepath.FromSlash(key)), os.O_RDWR, 0)
+	p := filepath.Join(h.store, bucket, filepath.FromSlash(key))
+	fi, err := os.Stat(p)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	defer f.Close()
+	f, err := os.OpenFile(p, os.O_RDWR, 0)
+	if err != nil {
+		h.t.Fatal(err)
+	}
 	b := make([]byte, 1)
 	if _, err := f.ReadAt(b, 3); err != nil {
 		h.t.Fatal(err)
@@ -79,6 +83,31 @@ func (h *harness) rot(bucket, key string) {
 	b[0] ^= 0x40
 	if _, err := f.WriteAt(b, 3); err != nil {
 		h.t.Fatal(err)
+	}
+	f.Close()
+	if err := os.Chtimes(p, fi.ModTime(), fi.ModTime()); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
+// edit writes other bytes of the same size into key's file in place,
+// as a user's tool would: a later modification time.
+func (h *harness) edit(bucket, key string, body []byte) {
+	h.t.Helper()
+	p := filepath.Join(h.store, bucket, filepath.FromSlash(key))
+	fi, err := os.Stat(p)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	if err := os.WriteFile(p, body, 0o600); err != nil {
+		h.t.Fatal(err)
+	}
+	// A filesystem's timestamps are coarse (a few ms on ext4): move the
+	// modification time on as a later edit would see it.
+	if after, _ := os.Stat(p); after != nil && after.ModTime().Equal(fi.ModTime()) {
+		if err := os.Chtimes(p, fi.ModTime(), fi.ModTime().Add(time.Millisecond)); err != nil {
+			h.t.Fatal(err)
+		}
 	}
 }
 
@@ -100,22 +129,6 @@ func (h *harness) rots() []state.Rot {
 	}
 	return rs
 }
-
-// knownAhead makes the index record each capture an hour (and later
-// what the returned offset adds) ahead of the store's clock: the store's
-// change times are then all before the time this node last knew its
-// objects, as for objects captured long ago, so a changed byte is rot,
-// not an edit (a test cannot set a file's change time).
-func (h *harness) knownAhead() *atomic.Int64 {
-	var ahead atomic.Int64
-	ahead.Store(int64(time.Hour))
-	h.db.Clock = func() time.Time { return time.Now().Add(time.Duration(ahead.Load())) }
-	return &ahead
-}
-
-// knownBehind makes the index record each capture an hour behind: any
-// later change of a file is after the time this node last knew it.
-func (h *harness) knownBehind() { h.db.Clock = func() time.Time { return time.Now().Add(-time.Hour) } }
 
 // VER-5 (#31): the sample is a share of the stored bytes a week: at 1%
 // a week it hashes a hundredth of what the store holds after a week,
@@ -204,12 +217,13 @@ func TestSampleCoversTheStoreInTurnAtTheConfiguredRate(t *testing.T) {
 		t.Fatalf("sweep %+v %v %v", sw, ok, err)
 	}
 
-	// A restarted sampler goes on from where the sweep was.
+	// A restarted sampler goes on from where the sweep was, and owes at
+	// its first step what passed since the last one (#31 review): a
+	// daemon restarted more often than it steps still samples.
 	last := checked[len(checked)-1]
 	checked = nil
-	s = h.sampler(SampleSettings{Percent: 1}, clock, &checked)
-	h.step(s)
 	clock.add(week)
+	s = h.sampler(SampleSettings{Percent: 1}, clock, &checked)
 	h.step(s)
 	if next := fmt.Sprintf("%s/data/%02d", lent, first); len(checked) == 0 || checked[0] != next {
 		t.Fatalf("after %s a restarted sampler checked %v; want %s first", last, checked, next)
@@ -244,7 +258,8 @@ func TestSampleReadsArePaced(t *testing.T) {
 }
 
 // VER-5, EP-10 (#31): a local object whose bytes no longer hash to the
-// version the index holds is alerted, removed and re-fetched through the
+// version the index holds, in the very file this node verified, is
+// alerted and replaced by a verified copy fetched through the
 // read-through from a friend that acknowledged that version; nothing is
 // enqueued, no friend is asked to change anything, and the store holds
 // the right bytes again.
@@ -255,7 +270,6 @@ func TestRottenLocalObjectIsAlertedRemovedAndRefetched(t *testing.T) {
 	h.fetch = ff
 	var logs syncBuffer
 	h.log = slogTo(&logs)
-	h.knownAhead()
 	h.serve(false)
 	c := h.client("laptop")
 	for _, k := range []string{"data/00", "data/01"} {
@@ -278,7 +292,7 @@ func TestRottenLocalObjectIsAlertedRemovedAndRefetched(t *testing.T) {
 
 	rs := h.rots()
 	if len(rs) != 1 || rs[0].Bucket != "laptop" || rs[0].Key != "data/01" || rs[0].SHA256 != sum(good) ||
-		rs[0].Found == sum(good) || rs[0].RemovedAt.IsZero() || rs[0].RepairedAt.IsZero() || rs[0].Lent() {
+		rs[0].Found == sum(good) || rs[0].Refetch || rs[0].RepairedAt.IsZero() || rs[0].Lent() {
 		t.Fatalf("rots %+v", rs)
 	}
 	if b, ok := h.stored("data/01"); !ok || !bytes.Equal(b, good) {
@@ -293,22 +307,22 @@ func TestRottenLocalObjectIsAlertedRemovedAndRefetched(t *testing.T) {
 	if n, _ := h.queueRows(); n != rows {
 		t.Fatalf("queue rows %d; want %d: the repair enqueued something", n, rows)
 	}
-	if v, err := h.db.OwnVersion(t.Context(), "laptop", "data/01"); err != nil || !v.Held() {
-		t.Fatalf("the re-fetched object is not held: %+v %v", v, err)
+	if v, err := h.db.OwnVersion(t.Context(), "laptop", "data/01"); err != nil || !v.Held() || v.Stamp == "" {
+		t.Fatalf("the re-fetched object is not held and verified: %+v %v", v, err)
 	}
 }
 
-// VER-5, EP-14 (#31): the re-fetch's removal is no user delete. With
-// every friend holding the version offline, the rotten object is
-// removed and its re-fetch fails: a reconcile pass then enqueues no
-// delete, a read is served through the read-through once a friend is
-// back, and the next sample step finishes the repair.
-func TestTheRefetchsRemovalIsNoDeleteToTheReconciler(t *testing.T) {
+// VER-5, EP-14 (#31): a repair never leaves the key missing, so the
+// store reconciler never takes it for a delete. With the only friend
+// holding the version offline, then serving forged bytes, the rotten
+// copy stays where it is (a failed fetch replaces nothing) and a
+// reconcile pass enqueues nothing; once the friend serves the version,
+// the next sample step replaces it.
+func TestARepairNeverLeavesTheKeyMissing(t *testing.T) {
 	h := newHarness(t, map[string]string{"laptop": "restic"})
 	good := bytes.Repeat([]byte("pack "), 300)
 	ff := &fakeFetch{held: map[string][]byte{}}
 	h.fetch = ff
-	h.knownAhead()
 	h.serve(false)
 	h.putAll("laptop", dataKeys(3)...)
 	if _, err := h.client("laptop").PutObject(t.Context(), &s3.PutObjectInput{Bucket: aws.String("laptop"),
@@ -324,16 +338,30 @@ func TestTheRefetchsRemovalIsNoDeleteToTheReconciler(t *testing.T) {
 	clock.add(week)
 	h.step(s)
 	rs := h.rots()
-	if len(rs) != 1 || rs[0].RemovedAt.IsZero() || !rs[0].RepairedAt.IsZero() || rs[0].Detail == "" {
+	if len(rs) != 1 || !rs[0].Refetch || !rs[0].RepairedAt.IsZero() || rs[0].Detail == "" {
 		t.Fatalf("rots %+v", rs)
 	}
-	if _, ok := h.stored("data/09"); ok {
-		t.Fatal("the rotten object is still in the store")
+	rotten, ok := h.stored("data/09")
+	if !ok || bytes.Equal(rotten, good) {
+		t.Fatal("the rotten copy is not where it was")
 	}
 	// DeleteLimit 100 would enqueue any delete the pass took it for.
 	h.pass(h.reconciler(ReconcileSettings{DeleteLimit: 100}))
 	if n := h.deletes("laptop"); n != 0 {
 		t.Fatalf("the reconciler enqueued %d deletes", n)
+	}
+	if got := h.reconciled("laptop"); len(got) != 0 {
+		t.Fatalf("the reconciler enqueued %v", got)
+	}
+	// Forged bytes of the right size fail verification midway: the
+	// rotten copy stays.
+	forged := bytes.Repeat([]byte("PACK "), 300)
+	ff.mu.Lock()
+	ff.held["B data/09"] = forged
+	ff.mu.Unlock()
+	h.step(s)
+	if b, _ := h.stored("data/09"); !bytes.Equal(b, rotten) {
+		t.Fatalf("a failed fetch changed the store: %q", b)
 	}
 
 	ff.mu.Lock()
@@ -359,7 +387,6 @@ func TestRotNoFriendHoldsIsKeptAndAlerted(t *testing.T) {
 	h.fetch = &fakeFetch{held: map[string][]byte{}}
 	var logs syncBuffer
 	h.log = slogTo(&logs)
-	ahead := h.knownAhead()
 	h.serve(false)
 	h.putAll("laptop", "data/00")
 	h.rot("laptop", "data/00")
@@ -370,7 +397,7 @@ func TestRotNoFriendHoldsIsKeptAndAlerted(t *testing.T) {
 	clock.add(week)
 	h.step(s)
 	rs := h.rots()
-	if len(rs) != 1 || !rs[0].RemovedAt.IsZero() || !rs[0].RepairedAt.IsZero() || !strings.Contains(rs[0].Detail, "no friend") {
+	if len(rs) != 1 || rs[0].Refetch || !rs[0].RepairedAt.IsZero() || !strings.Contains(rs[0].Detail, "no friend") {
 		t.Fatalf("rots %+v", rs)
 	}
 	if b, ok := h.stored("data/00"); !ok || !bytes.Equal(b, rotten) {
@@ -379,9 +406,8 @@ func TestRotNoFriendHoldsIsKeptAndAlerted(t *testing.T) {
 	if !strings.Contains(logs.String(), "no friend holds") {
 		t.Fatalf("not alerted loudly:\n%s", logs.String())
 	}
-	// Written again by the backup tool, the same bytes a while later: the
-	// rot is over.
-	ahead.Add(int64(2 * time.Second))
+	// Written again by the backup tool, the same bytes: another file, so
+	// the rot is over.
 	h.putAll("laptop", "data/00")
 	h.step(s)
 	if rs := h.rots(); len(rs) != 1 || rs[0].RepairedAt.IsZero() {
@@ -396,7 +422,6 @@ func TestRotNoFriendHoldsIsKeptAndAlerted(t *testing.T) {
 func TestHeldBackAndBusyKeysAreSkipped(t *testing.T) {
 	h := newHarness(t, map[string]string{"laptop": "restic"})
 	h.fetch = &fakeFetch{held: map[string][]byte{}}
-	h.knownAhead()
 	h.serve(false)
 	h.putAll("laptop", "data/00", "data/01")
 	h.ack("B", "data/00")
@@ -433,20 +458,20 @@ func TestHeldBackAndBusyKeysAreSkipped(t *testing.T) {
 }
 
 // VER-5, #88 (#31): an object changed in place outside the endpoint
-// (a later change time than this node last knew it) is no rot: it is
-// the user's write, enqueued as one, and EP-11 holds it back as it
-// would a capture, since B acknowledged the old bytes.
+// (its file is no longer the one this node verified: a later
+// modification time) is no rot: it is the user's write, enqueued as
+// one, and EP-11 holds it back as it would a capture, since B
+// acknowledged the old bytes.
 func TestAnObjectChangedInPlaceIsAWriteNotRot(t *testing.T) {
 	h := newHarness(t, map[string]string{"laptop": "restic"})
 	h.fetch = &fakeFetch{held: map[string][]byte{}}
-	h.knownBehind()
 	h.serve(false)
 	h.putAll("laptop", "data/00")
 	if _, err := h.db.Exec(`INSERT INTO friendship (peer_key, created_at) VALUES ('B', 0)`); err != nil {
 		t.Fatal(err)
 	}
 	h.ack("B", "data/00")
-	h.rot("laptop", "data/00")
+	h.edit("laptop", "data/00", []byte("EDITED of data/00"))
 	edited, _ := h.stored("data/00")
 	clock := &fakeNow{t: time.Unix(1_800_000_000, 0)}
 	s := h.sampler(SampleSettings{Percent: 100}, clock, nil)
@@ -468,27 +493,27 @@ func TestAnObjectChangedInPlaceIsAWriteNotRot(t *testing.T) {
 	}
 }
 
-// #88 (#31): the store reconciler re-hashes an indexed object changed in
-// place since this node last knew it, and enqueues it as a write when
-// its bytes changed (EP-11 then applies); one whose metadata alone
-// changed (chmod) is re-hashed once, found the same and enqueues
-// nothing.
+// #88 (#31): the store reconciler re-hashes, paced, an indexed object
+// whose file is no longer the one this node verified, and enqueues it
+// as a write when its bytes changed (EP-11 then applies); a copy of the
+// same bytes back over it is hashed once and recorded; a chmod is no
+// edit and hashes nothing.
 func TestReconcilerRehashesObjectsChangedInPlace(t *testing.T) {
 	h := newHarness(t, map[string]string{"laptop": "restic"})
-	var behind atomic.Int64
-	behind.Store(int64(time.Hour))
-	h.db.Clock = func() time.Time { return time.Now().Add(-time.Duration(behind.Load())) }
 	h.serve(false)
 	h.putAll("laptop", "data/00", "data/01", "data/02")
-	if err := os.WriteFile(filepath.Join(h.store, "laptop", "data", "00"), []byte("edited in place"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	h.edit("laptop", "data/00", []byte("edited in place"))
 	if err := os.Chmod(filepath.Join(h.store, "laptop", "data", "01"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	behind.Store(0)
-	r := h.reconciler(ReconcileSettings{})
+	same, _ := h.stored("data/02")
+	h.edit("laptop", "data/02", same)
+	var paced atomic.Int32
+	r := h.reconciler(ReconcileSettings{Pace: func(_ context.Context, rd io.Reader) io.Reader { paced.Add(1); return rd }})
 	h.pass(r)
+	if n := paced.Load(); n != 2 {
+		t.Fatalf("hashed %d objects through the pacing; want data/00 and data/02", n)
+	}
 	got := h.reconciled("laptop")
 	if len(got) != 1 || got["data/00"] != state.OpPut {
 		t.Fatalf("reconciled %v; want data/00's edit as a put", got)
@@ -497,8 +522,8 @@ func TestReconcilerRehashesObjectsChangedInPlace(t *testing.T) {
 		t.Fatalf("version %+v", v)
 	}
 	h.pass(r)
-	if got := h.reconciled("laptop"); len(got) != 1 {
-		t.Fatalf("a second pass reconciled %v", got)
+	if got := h.reconciled("laptop"); len(got) != 1 || paced.Load() != 2 {
+		t.Fatalf("a second pass reconciled %v, hashed %d", got, paced.Load()-2)
 	}
 }
 

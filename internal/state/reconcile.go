@@ -26,9 +26,9 @@ type IndexedKey struct {
 	Key   string
 	Seq   int64 // the latest done row
 	Local bool  // held locally: its object was in this node's store
-	// LocalAt is when this node last knew it there (queue.local); zero
-	// when not held.
-	LocalAt time.Time
+	// Stamp is the identity of the file whose bytes this node verified
+	// (queue.stamp); "" while unverified.
+	Stamp string
 }
 
 // IndexedKeys returns up to limit keys of bucket whose latest done write
@@ -36,7 +36,7 @@ type IndexedKey struct {
 // in key order (bytes, as S3 orders them). A key with only pending rows
 // is not indexed.
 func (db *DB) IndexedKeys(ctx context.Context, bucket, after, upto string, limit int) ([]IndexedKey, error) {
-	q := `SELECT q.key, q.seq, q.local FROM queue q
+	q := `SELECT q.key, q.seq, q.local IS NOT NULL, coalesce(q.stamp, '') FROM queue q
 		WHERE q.bucket = ?1 AND q.key > ?2 AND (?3 = '' OR q.key <= ?3) AND q.state = 'done' AND q.op = 'put'
 			AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
 		ORDER BY q.key LIMIT ?4`
@@ -48,12 +48,8 @@ func (db *DB) IndexedKeys(ctx context.Context, bucket, after, upto string, limit
 	var out []IndexedKey
 	for rows.Next() {
 		var k IndexedKey
-		var local sql.NullInt64
-		if err := rows.Scan(&k.Key, &k.Seq, &local); err != nil {
+		if err := rows.Scan(&k.Key, &k.Seq, &k.Local, &k.Stamp); err != nil {
 			return nil, err
-		}
-		if k.Local = local.Valid; k.Local {
-			k.LocalAt = time.Unix(local.Int64, 0)
 		}
 		out = append(out, k)
 	}
@@ -87,11 +83,14 @@ func (db *DB) KeyNow(ctx context.Context, bucket, key string) (KeyNow, error) {
 }
 
 // MarkLocal marks key held locally if its latest done row is a put of
-// sha256: the read-through has just stored that version.
-func (db *DB) MarkLocal(ctx context.Context, bucket, key, sha256 string) error {
-	_, err := db.ExecContext(ctx, `UPDATE queue SET local = ? WHERE seq = (SELECT seq FROM queue
+// sha256, and records stamp, the identity of the file whose bytes this
+// node wrote or hashed to that version ("" for none: unverified). The
+// capture, the read-through and the bit-rot sampler call it once the
+// store holds the version (VER-5).
+func (db *DB) MarkLocal(ctx context.Context, bucket, key, sha256, stamp string) error {
+	_, err := db.ExecContext(ctx, `UPDATE queue SET local = ?, stamp = ? WHERE seq = (SELECT seq FROM queue
 		WHERE bucket = ? AND key = ? AND state = 'done' ORDER BY seq DESC LIMIT 1) AND op = 'put' AND sha256 = ?`,
-		db.now().Unix(), bucket, key, sha256)
+		db.now().Unix(), nullStr(stamp), bucket, key, sha256)
 	return err
 }
 

@@ -81,7 +81,7 @@ type StatusBitrot struct {
 }
 
 // StatusRot is one rotten object. State is "repaired", "refetching"
-// (removed, waiting for a friend holding it), "kept" (no friend holds
+// (waiting for a friend holding its version; the rotten copy stays), "kept" (no friend holds
 // its version) or, for a friend's object, "lent".
 type StatusRot struct {
 	Bucket   string `json:"bucket,omitempty"` // an own bucket
@@ -124,7 +124,7 @@ func bitrotStatus(ctx context.Context, db *state.DB, now time.Time) (*StatusBitr
 			s.Friend, s.Sealed, s.State = r.Borrower, r.Sealed, "lent"
 		case !r.RepairedAt.IsZero():
 			s.Bucket, s.State = r.Bucket, "repaired"
-		case !r.RemovedAt.IsZero():
+		case r.Refetch:
 			s.Bucket, s.State = r.Bucket, "refetching"
 		default:
 			s.Bucket, s.State = r.Bucket, "kept"

@@ -152,7 +152,7 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 			// The store reconciler (EP-14): at start, every
 			// store.reconcile_every, and for deletes the user allowed.
-			rec := &gateway.ReconcileSettings{Every: cfg.ReconcileEvery(), DeleteLimit: cfg.Store.ReconcileDeleteLimit.Int(),
+			rec := &gateway.ReconcileSettings{Every: cfg.ReconcileEvery(), DeleteLimit: cfg.Store.ReconcileDeleteLimit.Int(), Pace: pacer.Scrub,
 				Alerted: alerts.Check}
 			if a.tuneReconcile != nil {
 				a.tuneReconcile(rec)

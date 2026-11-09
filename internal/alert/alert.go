@@ -170,7 +170,7 @@ const (
 	// KindBitrot: the bit-rot sampler found own objects of a bucket whose
 	// bytes no longer hash to the version captured (VER-5, #31). Subject:
 	// the bucket. It holds while one is not repaired (kept, as no friend
-	// holds its version, or removed and not yet fetched again) and for
+	// holds its version, or waiting for a friend that does to answer) and for
 	// state.RotShown after the last repair, so a disk that is failing is
 	// told even when every object came back.
 	KindBitrot = "bitrot"
@@ -210,7 +210,7 @@ func BitrotMessage(bucket string, rs []state.Rot) string {
 		switch {
 		case !r.RepairedAt.IsZero():
 			fixed++
-		case !r.RemovedAt.IsZero():
+		case r.Refetch:
 			waiting++
 		default:
 			kept++
@@ -219,10 +219,10 @@ func BitrotMessage(bucket string, rs []state.Rot) string {
 	first := rs[0]
 	var parts []string
 	if fixed > 0 {
-		parts = append(parts, fmt.Sprintf("%d fetched again from friends", fixed))
+		parts = append(parts, fmt.Sprintf("%d fetched again from friends (repaired)", fixed))
 	}
 	if waiting > 0 {
-		parts = append(parts, fmt.Sprintf("%d removed and waiting for a friend holding them to answer (a read fetches them)", waiting))
+		parts = append(parts, fmt.Sprintf("%d waiting for a friend holding their version to answer (the rotten copy stays until one does)", waiting))
 	}
 	if kept > 0 {
 		parts = append(parts, fmt.Sprintf("%d kept rotten, as no friend holds their version", kept))

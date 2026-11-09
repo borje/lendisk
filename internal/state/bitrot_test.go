@@ -19,17 +19,28 @@ func TestOwnVersionForTheSampler(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !v.Held() || v.Seq != seq || v.SHA256 != "h-a" || v.Size != 3 || !v.Local.Equal(at) || v.Pending || v.Changed {
-		t.Fatalf("version %+v", v)
+	if !v.Held() || v.Seq != seq || v.SHA256 != "h-a" || v.Size != 3 || !v.Local.Equal(at) || v.Pending || v.Changed ||
+		v.Stamp != "" {
+		t.Fatalf("version %+v; want held, unverified", v)
 	}
-	if err := db.ClearLocal(ctx, seq); err != nil {
+	// The file's identity is recorded with the hash it was verified at;
+	// another hash records nothing.
+	if err := db.MarkLocal(ctx, "laptop", "data/a", "h-other", "1:3:5"); err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := db.OwnVersion(ctx, "laptop", "data/a"); v.Held() || !v.Local.IsZero() {
-		t.Fatalf("after ClearLocal: %+v", v)
+	if v, _ := db.OwnVersion(ctx, "laptop", "data/a"); v.Stamp != "" {
+		t.Fatalf("stamped for another hash: %+v", v)
 	}
-	if indexed(t, db, "laptop")["data/a"] {
-		t.Fatal("the reconciler still sees the key held")
+	if err := db.MarkLocal(ctx, "laptop", "data/a", "h-a", "1:3:5"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := db.OwnVersion(ctx, "laptop", "data/a"); v.Stamp != "1:3:5" {
+		t.Fatalf("not stamped: %+v", v)
+	}
+	// An identical re-upload is another file: unverified until stamped.
+	putDone(t, db, Capture{Bucket: "laptop", Key: "data/a", Class: "data"}, 3, "h-a")
+	if v, _ := db.OwnVersion(ctx, "laptop", "data/a"); v.Stamp != "" || v.Seq != seq {
+		t.Fatalf("after a re-upload: %+v", v)
 	}
 	if v, _ := db.OwnVersion(ctx, "laptop", "data/none"); v.Seq != 0 || v.Held() {
 		t.Fatalf("unknown key: %+v", v)
@@ -68,7 +79,7 @@ func TestSweepAndRotRecords(t *testing.T) {
 		t.Fatalf("a new node has a sweep: %v %v", ok, err)
 	}
 	sw := Sweep{Bucket: "laptop", Key: "data/b", CycleAt: time.Unix(100, 0), Cycles: 2, Objects: 5, Bytes: 500,
-		CheckedAt: time.Unix(200, 0)}
+		CheckedAt: time.Unix(200, 0), SteppedAt: time.Unix(210, 0), Owed: -42.5}
 	if err := db.SaveSweep(ctx, sw); err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +91,7 @@ func TestSweepAndRotRecords(t *testing.T) {
 		t.Fatalf("sweep %+v %v %v; want %+v", got, ok, err, sw)
 	}
 
-	own := Rot{Bucket: "laptop", Key: "data/a", Seq: 7, LocalAt: time.Unix(250, 0), SHA256: "h-a", Found: "h-x", Size: 3, FoundAt: time.Unix(300, 0)}
+	own := Rot{Bucket: "laptop", Key: "data/a", Seq: 7, Stamp: "1:3:5", SHA256: "h-a", Found: "h-x", Size: 3, FoundAt: time.Unix(300, 0)}
 	lent := Rot{Bucket: "lent-0123456789abcdef-s1", Key: "data/z", Borrower: "A", Sealed: "s1", SHA256: "h-z", Found: "h-y",
 		Size: 9, FoundAt: time.Unix(310, 0)}
 	for _, r := range []Rot{own, lent} {
@@ -88,7 +99,7 @@ func TestSweepAndRotRecords(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	own.RemovedAt, own.RepairedAt, own.Detail = time.Unix(301, 0), time.Unix(302, 0), "re-fetched from B"
+	own.Refetch, own.RepairedAt, own.Detail = true, time.Unix(302, 0), "re-fetched from B"
 	if err := db.RecordRot(ctx, own); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +130,7 @@ func TestStoredBytesCountsHeldAndLent(t *testing.T) {
 	if err := db.FinishDelete(ctx, seqs...); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.ClearLocal(ctx, s); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE queue SET local = NULL WHERE seq = ?`, s); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.AddLentUsage(ctx, "A", 1000); err != nil {

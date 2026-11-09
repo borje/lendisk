@@ -2298,9 +2298,10 @@ upstream bucket is Q-V.
     the size and capture (or listing) time and no ETag. On a node that
     lost nothing the index adds no key the store lacks. `ListObjects`
     (v1) is not merged: restic, Kopia, rclone and the AWS CLI use v2.
-  - A miss happens after `recover` (ID-6) and after VER-5 has removed a
-    rotten object; nothing else removes an object from the local store
-    (EP-9). Only what a tool reads is fetched; no download runs in the
+  - A miss happens after `recover` (ID-6); nothing else removes an
+    object from the local store (EP-9). VER-5 replaces a rotten object
+    in place with the read-through's verified fetch (`fetchAny`), so its
+    key is never missing (§3.6). Only what a tool reads is fetched; no download runs in the
     background.
   - *Tests:* `TestMissFetchesFromAFriendAndRejectsWrongBytes`,
     `TestNoFriendServingTheVersionStoresNothing`,
@@ -2462,20 +2463,26 @@ upstream bucket is Q-V.
     `TestPassPagesThroughListingAndIndex` (`internal/gateway`, pages of
     3 keys).
   - *Edits in place (#88's second item, #31).* A pass that lists a held
-    key's object stats it; if its status change time is in a later
-    second than `queue.local`, the file changed after this node last
-    knew it, so it is hashed again under the key's lock: other bytes are
-    enqueued as a put (`reconciled` = 1, `Decorator.captureChanged`,
-    EP-11 applying as to a capture), the same bytes (a `chmod`, a copy
-    back) refresh `queue.local` so the next pass does not hash it again
-    (`TestReconcilerRehashesObjectsChangedInPlace`). A `chown -R` or a
-    restore of the store with `cp -a` costs one pass that hashes
-    everything. The sampler (§3.6 VER-5) tells edits from rot the same
-    way. #88's first item (files still being copied) stays open.
+    key whose file's identity (`queue.stamp`: inode, size, modification
+    time; §3.6 VER-5) is recorded stats it; another identity means the
+    file was edited or replaced since this node verified it, so it is
+    hashed again, paced by `store.bitrot_read_limit` (`Pacer.Scrub`) and
+    holding no lock, then, under the key's lock with the row and the
+    file still the ones read, other bytes are enqueued as a put
+    (`reconciled` = 1, `Decorator.captureChanged`, EP-11 applying as to
+    a capture) and the same bytes (a copy back) record the new identity
+    (`TestReconcilerRehashesObjectsChangedInPlace`). A chmod or chown
+    changes no identity and hashes nothing; a restore of the store with
+    `cp -a` (new inodes) costs one pass that hashes everything. A key
+    with no identity recorded is the sampler's to verify. No clock is
+    read, so a file whose times are ahead of the node's clock is hashed
+    once (`TestAFileAheadOfTheClockIsHashedOnce`). #88's first item
+    (files still being copied) stays open.
   - *Rule for later code:* anything that removes an own bucket's object
-    from the store without a captured delete (VER-5's re-fetch of a
-    rotten object, post-v1 evict) must hold the key's lock and clear
-    `queue.local` first, or the next pass enqueues the loss as a delete.
+    from the store without a captured delete (post-v1 evict) must hold
+    the key's lock and clear `queue.local` first, or the next pass
+    enqueues the loss as a delete. VER-5's repair removes nothing: it
+    replaces a rotten object in place (§3.6).
 - **EP-15** On `posix` the store is plain files: `restic -r
   <data>/store/<bucket>` opens it with nothing running, and a borrower's
   replica on the lender, `restic -r <data>/store/lent-<id16>-<sealed>`,
@@ -4711,9 +4718,14 @@ the handler's own reads and is never cancelled; nothing below
     Every 10 minutes (`gateway.DefaultSampleEvery`) a step owes that
     share of `state.DB.StoredBytes` (the own objects held locally plus
     every friend's `lent_usage`, overhead and tombs included, so the
-    share errs high) for the time passed on the gateway's clock, never
-    more than the store holds, and hashes objects until it has paid; the
-    last object may run over, and an empty one counts a byte.
+    share errs high) for the time passed on the gateway's clock since
+    the last step, never more than the store holds, and hashes objects
+    until it has paid; the last object may run over, and an empty one
+    counts a byte. The last step and what it owed are kept with the
+    sweep, so a restart neither forgives the time it was down nor
+    repeats what it paid: a daemon restarted more often than it steps
+    still samples, and one down for a week owes that week at its first
+    step (#31 review). A clock set back restarts the count.
   - *Paced.* Every read goes through `pace.Pacer.Scrub`, a token bucket
     of its own (`store.bitrot_read_limit`, default 8M a second, at least
     16K, empty for none; reloaded without a restart like the other
@@ -4725,7 +4737,8 @@ the handler's own reads and is never cancelled; nothing below
     order, over the own buckets and every friend's `lent-*` bucket,
     wrapping after the last; its place (table `bitrot_sweep`, schema
     36: the last object checked, the cycle's start, objects and bytes
-    checked in it, cycles done; `state.DB.Sweep`) survives a restart.
+    checked in it, cycles done, the last step and what it owed;
+    `state.DB.Sweep`) survives a restart.
     So the next object is always the one checked longest ago (or never),
     every object is checked once a cycle, and a step stops when it comes
     back past where it began rather than check anything twice
@@ -4742,55 +4755,95 @@ the handler's own reads and is never cancelled; nothing below
     Listing order is posix's: where it differs from byte order (a key
     beside a directory of a longer name) an object may be visited a
     cycle late, never lost to the sweep.
+  - *Rot or an edit: the file's identity, never a clock (#31 review).*
+    `queue.stamp` (schema 36) is the identity of the file whose bytes
+    this node wrote or hashed to the row's hash: inode, size and
+    modification time in nanoseconds (`fileStamp`). It is recorded by
+    `state.DB.MarkLocal` when the capture stores a put (still holding
+    the key's lock), when a completed upload, a settled row or a
+    reconciled write is hashed and the file did not change while it was
+    read (`Decorator.hashStamped`), when the read-through stores a
+    verified fetch, and when the sampler or the reconciler hash a file
+    to the row's hash. An identical re-upload clears it (another file)
+    until its capture records it; a key marked held from a listing
+    (`MarkLocalSeqs`), a recovered or undeleted row and a row of an
+    earlier release have none: *unverified*. Then:
+    - *the same identity, other bytes:* rot (writing a file moves its
+      modification time, replacing it changes its inode, rot changes
+      neither);
+    - *another size, modification time or inode:* an edit outside the
+      endpoint, the user's write (#88);
+    - *no identity recorded:* other bytes are taken for the user's
+      write, never for rot; the right bytes record the identity;
+    - *a change of mode, owner or xattrs alone* (a chmod, a tagging or
+      retention call) moves the ctime only and is no edit: rot under it
+      is still rot (`TestRotUnderAMetadataChangeIsStillRot`; for a
+      rewritable key the rotten bytes would otherwise replicate over the
+      friends' good copy).
+    No clock is read, so an edit right after its capture is an edit
+    (`TestAnEditRightAfterItsCaptureIsAnEdit`) and a file whose times
+    are ahead of the node's clock (fake-hwclock, a network filesystem's
+    server) is hashed once, not at every pass
+    (`TestAFileAheadOfTheClockIsHashedOnce`). *Accepted:* a tool that
+    writes other bytes of the same size into the same file and sets its
+    modification time back (`rsync --inplace -t`, `touch -d`) makes an
+    edit look like rot, and its object is replaced by the version the
+    index holds; so does an edit of the same size within the
+    filesystem's timestamp granularity of the capture (a few
+    milliseconds on ext4). Bytes never verified are never judged rot,
+    so on an upgraded node (and after recovery) rot found before a first
+    verifying read is taken for an edit, which EP-11 holds back for any
+    key a friend acknowledged other bytes of
+    (`TestBytesNeverVerifiedAreNeverRot`).
   - *An own object* is checked if its key's latest done write is a put
     held locally (`state.OwnVersion`) with no write in flight and not
     held back by EP-11 (its bytes are the user's, replicated nowhere),
     and not local-only; its bytes must hash to the queue row's size and
-    SHA-256 (`TestHeldBackAndBusyKeysAreSkipped`). A mismatch is checked
-    again holding the key's lock, the row read again and the object
-    hashed again (a misread or a write that landed in between decides
-    nothing):
-    - *An edit, not rot (#88).* A file whose status change time (ctime,
-      `changeTime`; set by every write, rename, link and xattr change,
-      and not by `touch -d` or `rsync -t`) is in a later second than
-      the row's `queue.local` changed after this node last knew it, so
-      its bytes are the user's: they are enqueued as a put (`reconciled`
-      = 1, `Decorator.captureChanged`), which EP-11 judges as any write
-      (`TestAnObjectChangedInPlaceIsAWriteNotRot`). Rot never moves the
-      ctime. *Accepted:* a clock stepped back by more than the time
-      since capture would make an edit look like rot (and its object be
-      fetched again as the version the index holds), and an edit within
-      the second of its capture likewise.
-    - *Rot.* Logged at error with `alert=true`, recorded (table
-      `bitrot`, schema 36: bucket, key, the row, its `queue.local` then,
-      both hashes, when found; `state.DB.RecordRot`) and alerted
-      (`bitrot`, §3.8). If a friend acknowledged that very version
-      (`state.Source`), the sampler, still holding the key's lock,
-      clears `queue.local` (`state.ClearLocal`, EP-14's rule for later
-      code), deletes the object through the backend (no capture, no
-      row), records the removal, releases the lock and fetches it again
-      through the read-through (`readThrough`, which verifies it and
-      marks it held, §3.3 EP-10). Nothing is enqueued and no friend is
+    SHA-256 (`TestHeldBackAndBusyKeysAreSkipped`). The right bytes record
+    the file's identity if it was not recorded. Other bytes are read a
+    second time, holding no lock, and must read the same from the same
+    file (a misread, or a file being written, decides nothing); then,
+    holding the key's lock, the row and the file's identity must still
+    be the ones read (`TestTheSampleHoldsNoLockWhileItHashes`: a write of
+    the key goes through during the second read):
+    - *An edit* (or bytes never verified) is enqueued as a put
+      (`reconciled` = 1, `Decorator.captureChanged`), which EP-11 judges
+      as any write (`TestAnObjectChangedInPlaceIsAWriteNotRot`).
+    - *Rot* is logged at error with `alert=true`, recorded (table
+      `bitrot`, schema 36: bucket, key, the row, its identity, both
+      hashes, when found; `state.DB.RecordRot`) and alerted (`bitrot`,
+      §3.8). If a friend acknowledged that very version (`state.Source`),
+      the sampler, still holding the key's lock, fetches it as the
+      read-through does (`Decorator.fetchAny`: most recently reachable
+      friend first, verified as it streams) *over* the rotten copy:
+      posix links the new object only once it is complete and verified,
+      so the rotten copy stays until a verified one takes its place. The
+      key is never missing, so the store reconciler sees nothing and
+      `queue.local` is never cleared. Nothing is enqueued and no friend is
       asked to change anything
-      (`TestRottenLocalObjectIsAlertedRemovedAndRefetched`). If no
-      friend holding it answers, the object stays absent: a read
-      fetches it (EP-10), each later step tries again, and the reconciler
-      sees a key not held locally, so no delete
-      (`TestTheRefetchsRemovalIsNoDeleteToTheReconciler` runs a pass with
-      a delete limit of 100 between the removal and the fetch). With no
-      friend holding the version (not replicated yet, or held back) the
-      rotten object is kept, as it is all there is, and logged as such
-      (`TestRotNoFriendHoldsIsKeptAndAlerted`).
-    - *Follow-up.* Each step first goes over the records: a removed
-      object is fetched again; a kept one is looked at again once a
-      friend holds its version (recovery, undelete) or the version was
-      stored again (an identical re-upload moves `queue.local`); a key
-      written or deleted since is over; a repaired record is dropped
+      (`TestRottenLocalObjectIsAlertedRemovedAndRefetched`). If no friend
+      holding it answers, or one serves other bytes, the rotten copy
+      stays, the record says so (`refetch`), each later step tries again,
+      and reconcile passes enqueue nothing
+      (`TestARepairNeverLeavesTheKeyMissing`). With no friend holding the
+      version (not replicated yet, or held back) the rotten object is
+      kept, as it is all there is, and logged as such
+      (`TestRotNoFriendHoldsIsKeptAndAlerted`). *Decision (#31 review):
+      replace, not delete then fetch:* a restic pack with one rotten
+      blob still holds every other blob, and a store that loses a key
+      even for a moment needs EP-14's rule.
+    - *Follow-up.* Each step first goes over the records: one a friend
+      holds is fetched again (one kept is taken up once a friend holds
+      its version, after recovery or an undelete); a key written,
+      deleted or stored again since, or whose file was replaced, is over
+      and the sweep judges what is there; a repaired record is dropped
       `state.RotShown` (7 days) after its repair.
   - *A friend's object* is hashed against the hash it was stored with
     (`x-amz-meta-lendisk-sha256` in its xattrs, LEND-4); a mismatch is
-    checked again holding `Lending`'s key lock (a put, rewrite or delete
-    of the key holds it until the store answers), then logged with
+    read a second time, holding no lock, and then, holding `Lending`'s
+    key lock (a put, rewrite or delete of the key holds it until the
+    store answers), the hash it was stored with and the file's identity
+    must still be the ones read; then it is logged with
     `alert=true`, recorded with the friend and its sealed bucket, and
     alerted (`lent_bitrot`, §3.8). The object is left as it is
     (`TestRottenLentObjectIsAlertedOnly`); the record ends when the
@@ -4819,9 +4872,10 @@ the handler's own reads and is never cancelled; nothing below
     `detail`), and `status` prints the cycle and a line per rotten
     object. *AC:* `TestBitrotIsFoundOnBothSidesAndRepairedAtTheBorrower`
     (`internal/cli`, real daemons): a byte flipped at A and another in
-    B's copy of A's bucket; a week on both clocks, A alerts and fetches
-    its object again from B, enqueueing nothing, and B alerts and keeps
-    A's object as it is.
+    B's copy of A's bucket, each keeping its file's identity; a week on
+    both clocks, A alerts and replaces its object with a verified copy
+    from B, enqueueing nothing, and B alerts and keeps A's object as it
+    is.
 
 ### 3.7 Network
 

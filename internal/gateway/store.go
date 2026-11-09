@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path/filepath"
 	"syscall"
 
 	"github.com/versity/versitygw/backend"
@@ -39,6 +40,11 @@ func OpenBackend(dir string) (*Store, error) {
 		return nil, fmt.Errorf("opening store %s: %w", dir, err)
 	}
 	return &Store{Backend: p, posix: p, meta: m}, nil
+}
+
+// Path is the file holding key's object in bucket.
+func (s *Store) Path(bucket, key string) string {
+	return filepath.Join(s.posix.BucketPath(bucket), filepath.FromSlash(key))
 }
 
 // UploadIDs reads which multipart upload assembled a stored object.

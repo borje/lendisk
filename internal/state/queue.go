@@ -147,7 +147,9 @@ func (db *DB) FinishPut(ctx context.Context, seq, size int64, sha256 string) (du
 		if _, err := tx.ExecContext(ctx, `DELETE FROM queue WHERE seq = ?`, seq); err != nil {
 			return false, err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE queue SET local = ? WHERE seq = (SELECT seq FROM queue
+		// The re-upload is another file: unverified until its caller
+		// records its identity (MarkLocal, VER-5).
+		if _, err := tx.ExecContext(ctx, `UPDATE queue SET local = ?, stamp = NULL WHERE seq = (SELECT seq FROM queue
 			WHERE bucket = ? AND key = ? AND state = 'done' ORDER BY seq DESC LIMIT 1)`, db.now().Unix(), bucket, key); err != nil {
 			return false, err
 		}

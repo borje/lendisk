@@ -13,6 +13,12 @@ import (
 // the hash the borrower stored it with (its xattr, in the gateway).
 // Sweep is its place, kept across restarts so a sweep covers every
 // object; Rot is an object found rotten, which the alert service reads.
+//
+// queue.stamp tells rot from an edit without a clock: it is the
+// identity (inode, size, modification time) of the file whose bytes this
+// node wrote or hashed to the row's hash. Other bytes in a file of that
+// identity are rot; a file of another identity was edited. A row without
+// one is unverified, and its bytes are never judged rot.
 
 // RotShown is how long a repaired own object's record is kept, shown
 // in status and alerted, after its repair.
@@ -27,6 +33,9 @@ type OwnVersion struct {
 	// Local is when this node last knew the version to be in its store
 	// (queue.local); zero when it is not held locally.
 	Local time.Time
+	// Stamp is the identity of the file whose bytes this node verified
+	// (queue.stamp); "" while unverified.
+	Stamp string
 	// Changed: EP-11 held the version back (another was acknowledged).
 	Changed bool
 	// Pending: a write of the key is in flight.
@@ -40,31 +49,23 @@ func (v OwnVersion) Held() bool { return v.Seq != 0 && v.Op == OpPut && !v.Local
 // OwnVersion reads what the index holds of bucket's key now.
 func (db *DB) OwnVersion(ctx context.Context, bucket, key string) (OwnVersion, error) {
 	var v OwnVersion
-	var sha sql.NullString
+	var sha, stamp sql.NullString
 	var size, local sql.NullInt64
-	err := db.QueryRowContext(ctx, `SELECT q.seq, q.op, q.sha256, q.size, q.local,
+	err := db.QueryRowContext(ctx, `SELECT q.seq, q.op, q.sha256, q.size, q.local, q.stamp,
 			q.immutable IS NOT NULL OR EXISTS (SELECT 1 FROM placement p WHERE p.seq = q.seq AND p.state = 'refused'
 				AND p.cause = '`+CauseImmutable+`')
 		FROM queue q WHERE q.bucket = ? AND q.key = ? AND q.state = 'done' ORDER BY q.seq DESC LIMIT 1`, bucket, key).
-		Scan(&v.Seq, &v.Op, &sha, &size, &local, &v.Changed)
+		Scan(&v.Seq, &v.Op, &sha, &size, &local, &stamp, &v.Changed)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return v, err
 	}
-	v.SHA256, v.Size = sha.String, size.Int64
+	v.SHA256, v.Size, v.Stamp = sha.String, size.Int64, stamp.String
 	if local.Valid {
 		v.Local = time.Unix(local.Int64, 0)
 	}
 	err = db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM queue WHERE bucket = ? AND key = ? AND state = 'pending')`,
 		bucket, key).Scan(&v.Pending)
 	return v, err
-}
-
-// ClearLocal marks row seq not held locally: its object is about to
-// leave the store without a captured delete (VER-5's re-fetch), so the
-// store reconciler must not take its absence for one (EP-14).
-func (db *DB) ClearLocal(ctx context.Context, seq int64) error {
-	_, err := db.ExecContext(ctx, `UPDATE queue SET local = NULL WHERE seq = ?`, seq)
-	return err
 }
 
 // StoredBytes is what the store holds, as the index counts it: the own
@@ -111,15 +112,21 @@ type Sweep struct {
 	// Objects and Bytes checked in the current cycle.
 	Objects, Bytes int64
 	CheckedAt      time.Time // the last check; zero before one
+	// SteppedAt is the last step and Owed the bytes the sample owed
+	// after it, so a restart neither forgives nor repeats them.
+	SteppedAt time.Time
+	Owed      float64
 }
 
-// Sweep reads the sampler's place; ok is false before its first check.
+// Sweep reads the sampler's place; ok is false before its first step.
 func (db *DB) Sweep(ctx context.Context) (Sweep, bool, error) {
 	var s Sweep
 	var cycleAt int64
-	var checked sql.NullInt64
-	err := db.QueryRowContext(ctx, `SELECT bucket, key, cycle_at, cycles, objects, bytes, checked_at FROM bitrot_sweep
-		WHERE id = 1`).Scan(&s.Bucket, &s.Key, &cycleAt, &s.Cycles, &s.Objects, &s.Bytes, &checked)
+	var checked, stepped sql.NullInt64
+	var owed sql.NullFloat64
+	err := db.QueryRowContext(ctx, `SELECT bucket, key, cycle_at, cycles, objects, bytes, checked_at, stepped_at, owed
+		FROM bitrot_sweep WHERE id = 1`).Scan(&s.Bucket, &s.Key, &cycleAt, &s.Cycles, &s.Objects, &s.Bytes, &checked,
+		&stepped, &owed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return s, false, nil
 	}
@@ -130,14 +137,18 @@ func (db *DB) Sweep(ctx context.Context) (Sweep, bool, error) {
 	if checked.Valid {
 		s.CheckedAt = time.Unix(checked.Int64, 0)
 	}
+	if stepped.Valid {
+		s.SteppedAt = time.Unix(stepped.Int64, 0)
+	}
+	s.Owed = owed.Float64
 	return s, true, nil
 }
 
 // SaveSweep records the sampler's place.
 func (db *DB) SaveSweep(ctx context.Context, s Sweep) error {
 	_, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO bitrot_sweep (id, bucket, key, cycle_at, cycles, objects, bytes,
-		checked_at) VALUES (1, ?, ?, ?, ?, ?, ?, ?)`, s.Bucket, s.Key, s.CycleAt.Unix(), s.Cycles, s.Objects, s.Bytes,
-		unixOrNull(s.CheckedAt))
+		checked_at, stepped_at, owed) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, s.Bucket, s.Key, s.CycleAt.Unix(), s.Cycles,
+		s.Objects, s.Bytes, unixOrNull(s.CheckedAt), unixOrNull(s.SteppedAt), s.Owed)
 	return err
 }
 
@@ -148,17 +159,20 @@ type Rot struct {
 	// for an own one.
 	Borrower, Sealed string
 	Seq              int64 // an own object's queue row
-	// LocalAt is the row's queue.local when found: a later one means the
+	// Stamp is the row's queue.stamp when found: another one means the
 	// version was stored again since (an identical re-upload).
-	LocalAt time.Time
+	Stamp   string
 	SHA256  string // what the index holds
 	Found   string // what the bytes hash to
 	Size    int64
 	FoundAt time.Time
-	// An own object's repair: removed for its re-fetch, and stored again
-	// verified (or written since); Detail says why it is not, yet.
-	RemovedAt, RepairedAt time.Time
-	Detail                string
+	// An own object's repair: Refetch while a friend holds the version
+	// and none has served it yet; RepairedAt once a verified copy
+	// replaced it (or the key was written since); Detail says why it is
+	// not, yet.
+	Refetch    bool
+	RepairedAt time.Time
+	Detail     string
 }
 
 // Lent reports whether the rotten object is a friend's.
@@ -166,11 +180,10 @@ func (r Rot) Lent() bool { return r.Borrower != "" }
 
 // RecordRot writes r, replacing any row of its bucket and key.
 func (db *DB) RecordRot(ctx context.Context, r Rot) error {
-	_, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO bitrot (bucket, key, borrower, sealed, seq, local_at, sha256, found,
-		size, found_at, removed_at, repaired_at, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.Bucket, r.Key, nullStr(r.Borrower), nullStr(r.Sealed), r.Seq, unixOrNull(r.LocalAt), r.SHA256, r.Found, r.Size,
-		r.FoundAt.Unix(),
-		unixOrNull(r.RemovedAt), unixOrNull(r.RepairedAt), nullStr(r.Detail))
+	_, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO bitrot (bucket, key, borrower, sealed, seq, stamp, sha256, found,
+		size, found_at, refetch, repaired_at, detail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.Bucket, r.Key, nullStr(r.Borrower), nullStr(r.Sealed), r.Seq, nullStr(r.Stamp), r.SHA256, r.Found, r.Size,
+		r.FoundAt.Unix(), r.Refetch, unixOrNull(r.RepairedAt), nullStr(r.Detail))
 	return err
 }
 
@@ -183,7 +196,8 @@ func (db *DB) DropRot(ctx context.Context, bucket, key string) error {
 // Rots lists the rotten objects, by bucket and key.
 func (db *DB) Rots(ctx context.Context) ([]Rot, error) {
 	rows, err := db.QueryContext(ctx, `SELECT bucket, key, coalesce(borrower, ''), coalesce(sealed, ''), coalesce(seq, 0),
-		local_at, sha256, found, size, found_at, removed_at, repaired_at, coalesce(detail, '') FROM bitrot ORDER BY bucket, key`)
+		coalesce(stamp, ''), sha256, found, size, found_at, coalesce(refetch, 0), repaired_at, coalesce(detail, '')
+		FROM bitrot ORDER BY bucket, key`)
 	if err != nil {
 		return nil, err
 	}
@@ -192,18 +206,12 @@ func (db *DB) Rots(ctx context.Context) ([]Rot, error) {
 	for rows.Next() {
 		var r Rot
 		var found int64
-		var local, removed, repaired sql.NullInt64
-		if err := rows.Scan(&r.Bucket, &r.Key, &r.Borrower, &r.Sealed, &r.Seq, &local, &r.SHA256, &r.Found, &r.Size, &found,
-			&removed, &repaired, &r.Detail); err != nil {
+		var repaired sql.NullInt64
+		if err := rows.Scan(&r.Bucket, &r.Key, &r.Borrower, &r.Sealed, &r.Seq, &r.Stamp, &r.SHA256, &r.Found, &r.Size, &found,
+			&r.Refetch, &repaired, &r.Detail); err != nil {
 			return nil, err
 		}
 		r.FoundAt = time.Unix(found, 0)
-		if local.Valid {
-			r.LocalAt = time.Unix(local.Int64, 0)
-		}
-		if removed.Valid {
-			r.RemovedAt = time.Unix(removed.Int64, 0)
-		}
 		if repaired.Valid {
 			r.RepairedAt = time.Unix(repaired.Int64, 0)
 		}

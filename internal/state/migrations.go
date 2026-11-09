@@ -749,11 +749,18 @@ var migrations = []Migration{
 	{
 		Version: 36, Compat: 1, Release: "0.1",
 		SQL: `
-		-- Bit-rot sampling (VER-5, #31). bitrot_sweep is the sampler's place
-		-- in its sweep of the store, one row: the last object it checked
-		-- (store bucket, key), when the current cycle began, how many cycles
-		-- it finished, and the objects and bytes checked in this cycle.
-		-- Unix seconds.
+		-- Bit-rot sampling (VER-5, #31). queue.stamp: the identity of the
+		-- file whose bytes this node hashed to the done put's hash, recorded
+		-- when it wrote or verified them ('<inode>:<size>:<mtime ns>'); NULL
+		-- while unverified (rows of earlier releases, recovered rows, keys
+		-- marked held from a listing). A file with another identity was
+		-- edited; one with the same identity and other bytes is rot.
+		ALTER TABLE queue ADD COLUMN stamp TEXT;
+		-- bitrot_sweep is the sampler's place in its sweep of the store, one
+		-- row: the last object it checked (store bucket, key), when the
+		-- current cycle began, how many cycles it finished, the objects and
+		-- bytes checked in this cycle, its last step and the bytes it owed
+		-- then. Unix seconds.
 		CREATE TABLE bitrot_sweep (
 			id         INTEGER PRIMARY KEY CHECK (id = 1),
 			bucket     TEXT NOT NULL,
@@ -762,29 +769,31 @@ var migrations = []Migration{
 			cycles     INTEGER NOT NULL,
 			objects    INTEGER NOT NULL,
 			bytes      INTEGER NOT NULL,
-			checked_at INTEGER
+			checked_at INTEGER,
+			stepped_at INTEGER,
+			owed       REAL
 		);
 		-- Objects whose bytes no longer hash to what the index holds, one row
 		-- per store bucket and key. An own bucket's (borrower NULL): seq is
-		-- the queue row whose hash they failed, local_at its queue.local then
-		-- (a later one: the version was stored again); removed_at when the rotten
-		-- object was removed for its re-fetch, repaired_at when a verified
-		-- copy was stored again (or the key was written since), detail why
-		-- it is not. A lent bucket's: borrower is the friend's node ID and
-		-- sealed its bucket; the row lasts while the object does. Unix
-		-- seconds.
+		-- the queue row whose hash they failed, stamp its queue.stamp then
+		-- (another one: the version was stored again); refetch 1 while a
+		-- friend holds the version and none has served it yet, repaired_at
+		-- when a verified copy replaced it (or the key was written since),
+		-- detail why it is not. A lent bucket's: borrower is the friend's
+		-- node ID and sealed its bucket; the row lasts while the object
+		-- does. Unix seconds.
 		CREATE TABLE bitrot (
 			bucket      TEXT NOT NULL,
 			key         TEXT NOT NULL,
 			borrower    TEXT,
 			sealed      TEXT,
 			seq         INTEGER,
-			local_at    INTEGER,
+			stamp       TEXT,
 			sha256      TEXT NOT NULL,
 			found       TEXT NOT NULL,
 			size        INTEGER NOT NULL,
 			found_at    INTEGER NOT NULL,
-			removed_at  INTEGER,
+			refetch     INTEGER,
 			repaired_at INTEGER,
 			detail      TEXT,
 			PRIMARY KEY (bucket, key)
