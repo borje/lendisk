@@ -25,7 +25,7 @@ const (
 )
 
 func (a *app) initCmd() *cobra.Command {
-	var restore bool
+	var restore, lenderOnly bool
 	var plan initPlan
 	cmd := &cobra.Command{
 		Use:   "init",
@@ -42,16 +42,25 @@ Then init asks how large the repository you back up will be and at how
 many copies, and says how much to lend your friends in total, written
 as lending.max_total into the config it creates (LEND-7).
 --repository-size and --copies answer without asking; with nothing more
-on standard input, init asks nothing.`,
+on standard input, init asks nothing.
+
+With --lender-only the node lends and backs up nothing (PEER-9): init
+writes role = "lender" and asks nothing about a repository. Setting
+role = "full" later and restarting lets it add buckets; its friendships
+stay as they are.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := plan.parse(); err != nil {
 				return usageError{err}
 			}
-			return a.runInit(cmd.Context(), restore, plan)
+			if lenderOnly && (plan.sizeFlag != "" || plan.copies != 0) {
+				return usageError{errors.New("--lender-only: a lender-only node backs up nothing, so --repository-size and --copies do not apply")}
+			}
+			return a.runInit(cmd.Context(), restore, lenderOnly, plan)
 		},
 	}
 	cmd.Flags().BoolVar(&restore, "restore", false, "recreate the identity from an existing recovery phrase read from stdin")
+	cmd.Flags().BoolVar(&lenderOnly, "lender-only", false, "make a node that only lends, with no buckets and nothing on loopback (PEER-9): writes role = \"lender\"")
 	cmd.Flags().StringVar(&plan.sizeFlag, "repository-size", "", "the expected size of the repository you back up, such as 100G (LEND-7); asked if not given")
 	cmd.Flags().IntVar(&plan.copies, "copies", 0, "how many friends hold each object (EP-6); asked if not given")
 	return cmd
@@ -123,10 +132,18 @@ func (a *app) askPlan(p *initPlan, defaultCopies int) error {
 	return nil
 }
 
-func (a *app) runInit(ctx context.Context, restore bool, plan initPlan) error {
+func (a *app) runInit(ctx context.Context, restore, lenderOnly bool, plan initPlan) error {
 	cfg, log, err := a.load(a.errOut)
 	if err != nil {
 		return err
+	}
+	if lenderOnly {
+		// PEER-9: the role is the config file's, which init writes only
+		// when there is none; one that says otherwise is the user's.
+		if cfg.FileExists && cfg.Role != "lender" {
+			return usageError{fmt.Errorf("--lender-only: %s sets role = %q; set role = \"lender\" there, or move the file aside", cfg.Path, cfg.Role)}
+		}
+		cfg.Role = "lender"
 	}
 	confDir := cfg.ConfigDir()
 	if _, err := identity.Load(confDir); err == nil || !errors.Is(err, identity.ErrNoIdentity) {

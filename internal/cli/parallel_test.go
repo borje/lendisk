@@ -20,7 +20,7 @@ import (
 // -parallel places, so TestMain raises -parallel's default
 // (parallelDefault) and these two bound the work instead. A test that
 // needs a quiet process stays serial, saying why: go test runs the
-// serial tests before the parallel ones. Two read the process's own
+// serial tests before the parallel ones. Three read the process's own
 // sockets.
 
 var (

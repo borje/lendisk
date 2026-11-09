@@ -50,7 +50,8 @@ type app struct {
 	// storeCheck runs EP-12's filesystem checks; zero means the real ones.
 	storeCheck store.Checker
 	// serving, if set, is called once `serve` accepts S3 requests, with
-	// the loopback endpoint's address.
+	// the loopback endpoint's address; in the lender-only profile, which
+	// has none, with "" once it lends (PEER-9).
 	serving func(addr string)
 	// regions offers the tunnel's relay regions; nil means the public map.
 	regions transport.RegionSource

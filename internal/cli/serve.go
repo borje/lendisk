@@ -32,6 +32,10 @@ import (
 	"github.com/borje/lendisk/internal/version"
 )
 
+// lendingOnlyLog is what a lender-only daemon logs once it lends
+// (PEER-9).
+const lendingOnlyLog = "lending only: nothing listens on loopback (PEER-9)"
+
 func (a *app) serveCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
@@ -75,6 +79,17 @@ func (a *app) serveCmd() *cobra.Command {
 			} else if !ok {
 				if err := db.SetNode(ctx, "id", nodeID); err != nil {
 					return err
+				}
+			}
+			if cfg.Role == "lender" {
+				// A lender-only daemon replicates nothing (PEER-9): a
+				// bucket left from the full role would silently stop
+				// going offsite.
+				if bs, err := db.Buckets(ctx); err != nil {
+					return err
+				} else if len(bs) > 0 {
+					return fmt.Errorf("role = \"lender\", but this node has %d bucket(s), such as %s, which a lender-only node does not replicate; set role = \"full\" in %s",
+						len(bs), bs[0].Name, cfg.Path)
 				}
 			}
 			floor, _ := config.ParseFloor(cfg.Store.FreeSpaceFloor)
@@ -156,13 +171,20 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 			// The store reconciler (EP-14): at start, every
 			// store.reconcile_every, and for deletes the user allowed.
-			rec := &gateway.ReconcileSettings{Every: cfg.ReconcileEvery(), DeleteLimit: cfg.Store.ReconcileDeleteLimit.Int(), Pace: pacer.Scrub,
-				Alerted: alerts.Check}
-			if a.tuneReconcile != nil {
-				a.tuneReconcile(rec)
+			// The lender-only profile has no buckets of its own to
+			// reconcile (PEER-9); the borrowers' usage counters are the
+			// gateway's own loop and run in both.
+			var rec *gateway.ReconcileSettings
+			if cfg.Role == "full" {
+				rec = &gateway.ReconcileSettings{Every: cfg.ReconcileEvery(), DeleteLimit: cfg.Store.ReconcileDeleteLimit.Int(), Pace: pacer.Scrub,
+					Alerted: alerts.Check}
+				if a.tuneReconcile != nil {
+					a.tuneReconcile(rec)
+				}
 			}
 			// The bit-rot sample (VER-5): a share of the store each week,
-			// own objects and friends' alike, its reads paced.
+			// own objects and friends' alike, its reads paced; on a
+			// lender-only node, friends' only (#31).
 			sample := &gateway.SampleSettings{Percent: cfg.BitrotSample(), Pace: pacer.Scrub, Random: a.random,
 				Alerted: alerts.Check}
 			if a.tuneSample != nil {
@@ -206,8 +228,13 @@ func (a *app) serveCmd() *cobra.Command {
 					return err
 				}
 			}
-			// The lender-only profile has nothing on loopback (PEER-9)
-			// and no buckets to replicate.
+			// The lender-only profile (PEER-9) has nothing on loopback
+			// and no buckets: no endpoint, replication, verification or
+			// undelete. What it lends runs as on any node: the tunnel's
+			// S3 and control calls, the purge and usage loops inside the
+			// gateway, the friends' half of the bit-rot sample, and below
+			// the farewell, alerts, quota exchange, manifest push and
+			// recovery lister.
 			if cfg.Role == "full" {
 				ln, err := net.Listen("tcp", cfg.Endpoint.Loopback)
 				if err != nil {
@@ -257,6 +284,11 @@ func (a *app) serveCmd() *cobra.Command {
 				}
 				running++
 				go func() { und.Run(ctx); errc <- nil }()
+			} else {
+				log.Info(lendingOnlyLog)
+				if a.serving != nil {
+					a.serving("")
+				}
 			}
 			fw.Clear, fw.Cut, fw.Disconnect = tun.Admission.Clear, tun.Conns.Cut, tun.Disconnect
 			fw.Tell = func(ctx context.Context, f state.FormerFriend) error {

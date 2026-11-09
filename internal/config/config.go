@@ -716,5 +716,25 @@ func (f *Flags) load(getenv func(string) (string, bool)) (*Loaded, error) {
 	if err := l.Validate(); err != nil {
 		return nil, fmt.Errorf("configuration: %w", err)
 	}
+	if err := lenderUnknown(l); err != nil {
+		return nil, fmt.Errorf("configuration: %w", err)
+	}
 	return l, nil
+}
+
+// lenderUnknown refuses a metrics setting in the lender-only profile
+// (PEER-9, OPS-4), which starts no metrics listener. No setting exists
+// yet, so the key is one this version does not know and a full node only
+// reports it. #43, adding the metrics settings: refuse them in Validate
+// for role = "lender", as endpoint.listen is, and drop this.
+func lenderUnknown(l *Loaded) error {
+	if l.Role != "lender" {
+		return nil
+	}
+	for _, k := range l.Unknown {
+		if k == "metrics" || strings.HasPrefix(k, "metrics.") || strings.HasPrefix(k, "endpoint.metrics") {
+			return fmt.Errorf("%s: a lender-only node has no metrics listener (PEER-9); remove it or set role = \"full\"", k)
+		}
+	}
+	return nil
 }

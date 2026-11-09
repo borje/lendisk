@@ -508,6 +508,10 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 	} else {
 		fmt.Fprintf(a.out, "This node's lending cap is unknown: %v\n", err)
 	}
+	if cfg.Role == "lender" {
+		// PEER-9: the friendships are symmetric; this half waits.
+		fmt.Fprintln(a.out, "This node lends only: what its friends lend it back stays unused until it has a bucket (role = \"full\").")
+	}
 	tw := tabwriter.NewWriter(a.out, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "FRIEND\tQUOTA\tNUMBERS\tYOU USE THERE\tTHEY USE HERE\tREMAINING\tREACH\tLAST SEEN\tVERIFIED\tPROTOCOL\tTHEIR REPO\tYOU KEEP\tTHEY KEEP\tSINCE")
 	for _, p := range out {
@@ -528,6 +532,8 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 		}
 		verified := "never"
 		switch {
+		case cfg.Role == "lender" && p.LastVerified == nil && !p.Unverified:
+			verified = "n/a" // nothing of this node's to verify there (PEER-9)
 		case p.Unverified:
 			verified = "UNVERIFIED"
 		case p.LastVerified != nil:
