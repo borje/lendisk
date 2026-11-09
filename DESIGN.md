@@ -2375,8 +2375,11 @@ upstream bucket is Q-V.
     (`TestRecoveredNodeDeletesNothingItNeverHeld`). A first walk counts
     such keys; if the pass may delete them (below), a second walk
     enqueues each, under the key's lock, only if no row of the key is
-    pending, its latest done row is still the one the walk saw, and the
-    store's `HEAD` says `NoSuchKey` (not `NoSuchBucket`): a delete row
+    pending, its latest done row is still the one the walk saw, the
+    store's `HEAD` says `NoSuchKey` (not `NoSuchBucket`), and nothing is
+    at the key's path (`Lstat`: a directory where the object was, or an
+    object whose attributes were lost, answers `NoSuchKey` too, and is
+    logged and left; `TestSomethingAtThePathIsNoDelete`): a delete row
     with `reconciled` = 1, finished by `FinishDelete`, which places it
     at every place holding the key (§3.4). Lenders keep it as a
     tombstone for the retention window (RET-1), so even a wrong delete
@@ -2403,20 +2406,46 @@ upstream bucket is Q-V.
     - a bucket whose directory is gone (`NoSuchBucket`) is skipped,
       logged as a warning;
     - the delete limit (`store.reconcile_delete_limit`, a percentage,
-      default 10, 1 to 100): a pass that finds more than that share of a
-      bucket's locally held objects missing enqueues none of them. It
-      records the hold (table `reconcile`, migration 33: `held`, of
+      default 10, 1 to 100), cumulative (decided 2026-11-09, #8 review):
+      the deletes a pass would enqueue count together with the
+      reconciler's own deletes of the bucket in its window, those
+      enqueued after the last used allowance (`reconcile.window_seq`,
+      `state.StartDeleteWindow`) and within `DeleteWindow` (7 days),
+      whichever is later (`state.RecentDeletes`), against that share of
+      the objects held then (held now plus those deletes). rsync's
+      `--max-delete` caps one run because a person starts each run; the
+      reconciler runs unattended, so a store losing under the limit
+      per pass would otherwise be emptied over a few passes or restarts
+      (`TestDeleteLimitIsCumulativeAcrossPasses`: 1 of 40 lost per pass
+      is deleted four times and held the fifth). A pass over the limit
+      enqueues none of them. It records the hold (table `reconcile`, migration 33: `held`, of
       `held_of`, since `held_at`; `state.FinishReconcile`), logs an error
       and raises `reconcile_held` for the bucket. `lendisk bucket
       reconcile <bucket> --allow-deletes N` (`state.AllowDeletes`)
       refuses an N below the held count, and otherwise records it in
-      `reconcile.allowed`; the next pass, within the poll, enqueues the
-      deletes if no more than N are missing (else it holds again with
-      the new count), and clears the allowance it read unless the user
-      set another meanwhile. A pass that finds fewer missing (objects
-      put back) ends the hold. 100 never holds
+      `reconcile.allowed`, tied to the hold it was given for
+      (`allowed_for` = its `held_at`, `allowed_held` = its count;
+      `ReconcileState.AllowanceValid`). The next pass, within the poll,
+      uses it only while that hold stands: a pass that held another
+      count since voids it, and so does any pass that does not finish
+      (the bucket's directory gone, a listing or database error, a
+      stop), which drops it, so it never covers another set of deletes
+      (`TestAllowanceIsTiedToItsHold`). Used, it lets the pass delete
+      what it finds if no more than N are missing (else it holds again
+      with the new count), starts a new delete window, and is cleared
+      unless the user set another meanwhile. A pass that finds fewer
+      missing (objects put back) ends the hold. 100 never holds
       (`TestMassDeleteHeldUntilAllowed`,
-      `TestEmptiedBucketHeldUntilTheUserAllowsDeletes`).
+      `TestEmptiedBucketHeldUntilTheUserAllowsDeletes`);
+    - the capped second walk: the first walk may take hours (it hashes
+      every dropped file), so what goes missing between the walks was
+      never counted. The second walk enqueues at most as many deletes as
+      the first counted (which the limit or the allowance admitted, so
+      never more than N); every further held key it finds missing is
+      held back as above, with `reconcile_held`
+      (`TestDeletesBetweenTheWalksAreHeld`: 1 of 20 missing at the first
+      walk, all at the second, gives 1 delete and 19 held;
+      `TestAllowanceNeverDeletesMoreThanAllowed`).
   - *Captures in flight.* A key with a pending row is the capture's (in
     flight while versitygw writes it, or stranded for `ResolveStranded`)
     and is left alone, for writes and deletes

@@ -117,6 +117,17 @@ type ReconcileState struct {
 	// Allowed is how many deletes the user allowed the next pass.
 	Allowed  int64
 	PassedAt time.Time // the last finished pass; zero before one
+	// AllowedFor and AllowedHeld are the hold the allowance was given
+	// for: its start and count.
+	AllowedFor  time.Time
+	AllowedHeld int64
+}
+
+// AllowanceValid reports whether the allowance is for the hold that
+// stands: given for a hold that began at HeldAt with Held deletes. A
+// pass that held another set since makes it void.
+func (r ReconcileState) AllowanceValid() bool {
+	return r.Allowed > 0 && r.Held > 0 && r.AllowedHeld == r.Held && r.AllowedFor.Equal(r.HeldAt)
 }
 
 // Errors of AllowDeletes.
@@ -147,20 +158,23 @@ func (db *DB) ReconcileStates(ctx context.Context) (map[string]ReconcileState, e
 	}
 	rows.Close()
 	rs, err := db.QueryContext(ctx, `SELECT bucket, passed_at, coalesce(held, 0), coalesce(held_of, 0), held_at,
-		coalesce(allowed, 0) FROM reconcile`)
+		coalesce(allowed, 0), allowed_for, coalesce(allowed_held, 0) FROM reconcile`)
 	if err != nil {
 		return nil, err
 	}
 	defer rs.Close()
 	for rs.Next() {
 		var b string
-		var passed, heldAt sql.NullInt64
+		var passed, heldAt, allowedFor sql.NullInt64
 		r0 := ReconcileState{}
-		if err := rs.Scan(&b, &passed, &r0.Held, &r0.HeldOf, &heldAt, &r0.Allowed); err != nil {
+		if err := rs.Scan(&b, &passed, &r0.Held, &r0.HeldOf, &heldAt, &r0.Allowed, &allowedFor, &r0.AllowedHeld); err != nil {
 			return nil, err
 		}
 		r := out[b]
-		r.Held, r.HeldOf, r.Allowed = r0.Held, r0.HeldOf, r0.Allowed
+		r.Held, r.HeldOf, r.Allowed, r.AllowedHeld = r0.Held, r0.HeldOf, r0.Allowed, r0.AllowedHeld
+		if allowedFor.Valid {
+			r.AllowedFor = time.Unix(allowedFor.Int64, 0)
+		}
 		if passed.Valid {
 			r.PassedAt = time.Unix(passed.Int64, 0)
 		}
@@ -202,7 +216,8 @@ func (db *DB) FinishReconcile(ctx context.Context, bucket string, at time.Time, 
 		return err
 	}
 	if consumed > 0 {
-		if _, err := tx.ExecContext(ctx, `UPDATE reconcile SET allowed = NULL WHERE bucket = ? AND allowed = ?`,
+		if _, err := tx.ExecContext(ctx, `UPDATE reconcile SET allowed = NULL, allowed_for = NULL, allowed_held = NULL
+			WHERE bucket = ? AND allowed = ?`,
 			bucket, consumed); err != nil {
 			return err
 		}
@@ -226,8 +241,47 @@ func (db *DB) AllowDeletes(ctx context.Context, bucket string, n int64) (held in
 	case n < held:
 		return held, ErrAllowTooFew
 	}
-	_, err = db.ExecContext(ctx, `UPDATE reconcile SET allowed = ? WHERE bucket = ?`, n, bucket)
+	_, err = db.ExecContext(ctx, `UPDATE reconcile SET allowed = ?, allowed_for = held_at, allowed_held = held
+		WHERE bucket = ?`, n, bucket)
 	return held, err
+}
+
+// DropAllowance clears bucket's allowance: a pass that did not finish,
+// or one that found it void, so it never covers another set of deletes.
+func (db *DB) DropAllowance(ctx context.Context, bucket string) error {
+	_, err := db.ExecContext(ctx, `UPDATE reconcile SET allowed = NULL, allowed_for = NULL, allowed_held = NULL
+		WHERE bucket = ?`, bucket)
+	return err
+}
+
+// StartDeleteWindow starts bucket's delete window after its last queue
+// row: an allowance was used, so the reconciler's deletes before it no
+// longer count against the limit.
+func (db *DB) StartDeleteWindow(ctx context.Context, bucket string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO reconcile (bucket) VALUES (?) ON CONFLICT (bucket) DO NOTHING`, bucket); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE reconcile SET window_seq = (SELECT coalesce(max(seq), 0) FROM queue)
+		WHERE bucket = ?`, bucket); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RecentDeletes counts the deletes the reconciler enqueued for bucket in
+// its delete window: after the window's start (StartDeleteWindow) and
+// at or after since.
+func (db *DB) RecentDeletes(ctx context.Context, bucket string, since time.Time) (int64, error) {
+	var n int64
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM queue
+		WHERE bucket = ?1 AND reconciled = 1 AND op = 'delete' AND state = 'done' AND created_at >= ?2
+			AND seq > coalesce((SELECT window_seq FROM reconcile WHERE bucket = ?1), 0)`, bucket, since.Unix()).Scan(&n)
+	return n, err
 }
 
 // AllowedBuckets lists the buckets whose next pass has an allowance.

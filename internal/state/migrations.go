@@ -692,14 +692,21 @@ var migrations = []Migration{
 		-- Per own bucket: the last pass, the deletes it held back for the
 		-- user's confirmation (held of held_of objects held locally, since
 		-- held_at), and the deletes the user allowed for the next pass
-		-- (lendisk bucket reconcile --allow-deletes). Unix seconds.
+		-- (lendisk bucket reconcile --allow-deletes), tied to the hold it
+		-- was given for (allowed_for = that hold's held_at, allowed_held =
+		-- its count). window_seq: the queue's last seq when an allowance
+		-- was last used; the delete limit counts the reconciler's deletes
+		-- after it (and within 7 days). Unix seconds.
 		CREATE TABLE reconcile (
-			bucket    TEXT PRIMARY KEY,
-			passed_at INTEGER,
-			held      INTEGER,
-			held_of   INTEGER,
-			held_at   INTEGER,
-			allowed   INTEGER
+			bucket       TEXT PRIMARY KEY,
+			passed_at    INTEGER,
+			held         INTEGER,
+			held_of      INTEGER,
+			held_at      INTEGER,
+			allowed      INTEGER,
+			allowed_for  INTEGER,
+			allowed_held INTEGER,
+			window_seq   INTEGER
 		);`,
 	},
 }

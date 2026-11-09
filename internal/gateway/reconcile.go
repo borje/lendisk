@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -338,14 +339,45 @@ func (r *reconciler) walk(ctx context.Context, bucket string, v visit) error {
 	}
 }
 
+// DeleteWindow is how far back the reconciler's own deletes count
+// against the delete limit, unless an allowance was used since.
+const DeleteWindow = 7 * 24 * time.Hour
+
 // bucket reconciles one own bucket: writes and marks in a first walk,
-// counting the held keys whose objects are missing; then, within the
-// delete limit or the user's allowance, a second walk enqueues those as
-// deletes. Otherwise they are held back with an alert.
+// counting the held keys whose objects are missing. If those deletes,
+// with the reconciler's own deletes of the bucket in its window (since
+// the last used allowance, within DeleteWindow), stay within the delete
+// limit, or a valid allowance covers them, a second walk enqueues them,
+// at most as many as the first walk counted: whatever else it finds
+// missing is held. Otherwise all are held back with an alert. An
+// allowance is used only for the hold it was given for, and is dropped
+// by a pass that does not finish.
 func (r *reconciler) bucket(ctx context.Context, bucket string) error {
 	st, err := r.d.DB.ReconcileState(ctx, bucket)
 	if err != nil {
 		return err
+	}
+	finished := false
+	defer func() {
+		if !finished && st.Allowed > 0 {
+			if err := r.d.DB.DropAllowance(context.Background(), bucket); err != nil {
+				r.log.Error("reconcile: dropping an allowance after an unfinished pass failed", "bucket", bucket, "err", err)
+				return
+			}
+			r.log.Warn("reconcile: the pass did not finish, so the deletes allowed are dropped; allow them again once the hold is shown",
+				"bucket", bucket)
+		}
+	}()
+	var allowance int64
+	switch {
+	case st.AllowanceValid():
+		allowance = st.Allowed
+	case st.Allowed > 0:
+		if err := r.d.DB.DropAllowance(ctx, bucket); err != nil {
+			return err
+		}
+		r.log.Warn("reconcile: the deletes allowed were for another hold; dropped", "bucket", bucket, "allowed", st.Allowed)
+		st.Allowed = 0
 	}
 	var held, gone, writes int64
 	var mark []int64
@@ -390,26 +422,27 @@ func (r *reconciler) bucket(ctx context.Context, bucket string) error {
 	if writes > 0 {
 		r.log.Info("reconcile: objects found in the store outside the endpoint enqueued as writes", "bucket", bucket, "writes", writes)
 	}
-	over := gone*100 > r.limit()*held
-	if gone > 0 && over && (st.Allowed == 0 || gone > st.Allowed) {
-		r.log.Error("reconcile: many objects this node held are missing from the store; their deletes are held back until you allow them",
-			"alert", true, "bucket", bucket, "missing", gone, "held", held, "limit_percent", r.limit(),
-			"allow", fmt.Sprintf("lendisk bucket reconcile %s --allow-deletes %d", bucket, gone))
-		if err := r.d.DB.FinishReconcile(ctx, bucket, r.now(), gone, held, st.Allowed); err != nil {
-			return err
-		}
-		if r.Alerted != nil {
-			r.Alerted()
-		}
-		return nil
+	recent, err := r.d.DB.RecentDeletes(ctx, bucket, r.now().Add(-DeleteWindow))
+	if err != nil {
+		return err
 	}
-	var deletes int64
+	within := (recent+gone)*100 <= r.limit()*(held+recent)
+	allowed := allowance > 0 && gone <= allowance
+	if gone > 0 && !within && !allowed {
+		finished = true
+		return r.hold(ctx, bucket, gone, held, recent, st.Allowed)
+	}
+	var deletes, over int64
 	if gone > 0 {
 		err := r.walk(ctx, bucket, visit{
 			present:   func(state.IndexedKey) error { return nil },
 			unindexed: func(string) error { return nil },
 			missing: func(k state.IndexedKey) error {
 				if !k.Local {
+					return nil
+				}
+				if deletes >= gone { // more missing than the first walk counted
+					over++
 					return nil
 				}
 				ok, err := r.delete(ctx, bucket, k)
@@ -419,16 +452,44 @@ func (r *reconciler) bucket(ctx context.Context, bucket string) error {
 				return err
 			},
 		})
-		if err != nil && !errors.Is(err, errNoBucketDir) {
+		if errors.Is(err, errNoBucketDir) {
+			r.log.Warn("reconcile: the bucket's directory went away during the pass", "bucket", bucket, "deletes", deletes)
+			return nil
+		}
+		if err != nil {
 			return err
 		}
 		r.log.Info("reconcile: objects removed from the store outside the endpoint enqueued as deletes", "bucket", bucket, "deletes", deletes)
+		if allowed && !within {
+			if err := r.d.DB.StartDeleteWindow(ctx, bucket); err != nil {
+				return err
+			}
+		}
+	}
+	finished = true
+	if over > 0 {
+		return r.hold(ctx, bucket, over, held, recent, st.Allowed)
 	}
 	if err := r.d.DB.FinishReconcile(ctx, bucket, r.now(), 0, 0, st.Allowed); err != nil {
 		return err
 	}
 	if st.Held > 0 && r.Alerted != nil {
 		r.Alerted() // the hold ended
+	}
+	return nil
+}
+
+// hold records n deletes of bucket held back (of held objects held
+// locally) and alerts; consumed is the allowance the pass read.
+func (r *reconciler) hold(ctx context.Context, bucket string, n, held, recent, consumed int64) error {
+	r.log.Error("reconcile: many objects this node held are missing from the store; their deletes are held back until you allow them",
+		"alert", true, "bucket", bucket, "missing", n, "held", held, "recent_deletes", recent, "limit_percent", r.limit(),
+		"allow", fmt.Sprintf("lendisk bucket reconcile %s --allow-deletes %d", bucket, n))
+	if err := r.d.DB.FinishReconcile(ctx, bucket, r.now(), n, held, consumed); err != nil {
+		return err
+	}
+	if r.Alerted != nil {
+		r.Alerted()
 	}
 	return nil
 }
@@ -506,6 +567,16 @@ func (r *reconciler) delete(ctx context.Context, bucket string, k state.IndexedK
 	if _, err := r.d.Backend.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &bucket, Key: &k.Key}); err == nil {
 		return false, nil
 	} else if !missing(err) {
+		return false, err
+	}
+	// Something at the path the store does not answer for (a directory
+	// where the object was, an object whose attributes were lost) is no
+	// delete: it is left, and logged.
+	if _, err := os.Lstat(filepath.Join(r.storeDir, bucket, filepath.FromSlash(k.Key))); err == nil {
+		r.log.Warn("reconcile: the store does not answer for a key, but something is at its path; not a delete",
+			"bucket", bucket, "key", k.Key)
+		return false, nil
+	} else if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
 		return false, err
 	}
 	seqs, err := r.d.DB.BeginCaptures(ctx, []state.Capture{{Bucket: bucket, Key: k.Key, Op: state.OpDelete, Class: string(class),

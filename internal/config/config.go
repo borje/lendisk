@@ -86,7 +86,7 @@ type Store struct {
 	ReconcileEvery string `toml:"reconcile_every" default:"24h" help:"how often the store is compared with the index, besides at start, so objects written or removed outside the S3 endpoint are replicated (EP-14), such as 24h or 6h"`
 	// ReconcileDeleteLimit is a percentage: a guard against an unmounted
 	// or emptied store deleting a backup at every friend.
-	ReconcileDeleteLimit Number `toml:"reconcile_delete_limit" default:"10" help:"a reconcile pass that finds more than this percentage of a bucket's objects missing from the store deletes none of them until you confirm with lendisk bucket reconcile (EP-14); 1 to 100, where 100 never asks"`
+	ReconcileDeleteLimit Number `toml:"reconcile_delete_limit" default:"10" help:"objects found missing from the store that, with the reconciler's own deletes of the last 7 days (or since the last confirmation), are more than this percentage of a bucket's objects are not deleted until you confirm with lendisk bucket reconcile (EP-14); 1 to 100, where 100 never asks"`
 }
 
 // Endpoint is the [endpoint] section (EP-1, EP-5, EP-17).
