@@ -66,11 +66,13 @@ func timeOf(n sql.NullInt64) time.Time {
 // RecordVerified records a passed check of place's replica of bucket at
 // now: it is due again a day later. A full check also clears the
 // unverified mark (VER-3: the user checked every object); a ranged one
-// leaves it.
+// leaves it, and leaves the time it last passed as it was, so an
+// unverified replica never looks freshly verified (#39 review).
 func (db *DB) RecordVerified(ctx context.Context, place, bucket string, full bool, now time.Time) error {
 	_, err := db.ExecContext(ctx, `INSERT INTO replica_check (place, bucket, checked_at, verified_at, full_at)
 		VALUES (?1, ?2, ?3, ?3, CASE WHEN ?4 THEN ?3 END)
-		ON CONFLICT (place, bucket) DO UPDATE SET checked_at = ?3, verified_at = ?3,
+		ON CONFLICT (place, bucket) DO UPDATE SET checked_at = ?3,
+			verified_at = CASE WHEN ?4 OR unverified_at IS NULL THEN ?3 ELSE verified_at END,
 			full_at = CASE WHEN ?4 THEN ?3 ELSE full_at END,
 			unverified_at = CASE WHEN ?4 THEN NULL ELSE unverified_at END,
 			detail = CASE WHEN ?4 THEN NULL ELSE detail END,

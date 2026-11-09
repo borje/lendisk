@@ -56,11 +56,17 @@ func undeleteAt(t *testing.T, s *overflowtest.Server, prefix string) {
 	if err := c.Put(ctx, object("laptop", "index/zz", []byte("an index"))); err != nil {
 		t.Fatal(err)
 	}
+	// A key deleted twice: the version before its newest marker is the
+	// older marker, so it was deleted already and nothing comes back.
+	if err := c.Put(ctx, object("laptop", "index/aa", []byte("twice"))); err != nil {
+		t.Fatal(err)
+	}
 	before := time.Now().Add(-time.Minute)
-	for _, k := range []string{"data/ab/abcdef", "index/zz"} {
+	for _, k := range []string{"data/ab/abcdef", "index/zz", "index/aa", "index/aa"} {
 		if err := c.Delete(ctx, "laptop", k); err != nil {
 			t.Fatal(err)
 		}
+		time.Sleep(10 * time.Millisecond) // distinct marker times
 	}
 	if ds, err := c.ListDeleted(ctx, "laptop", time.Now().Add(time.Hour)); err != nil || len(ds) != 0 {
 		t.Fatalf("deleted since a later time: %+v, %v", ds, err)

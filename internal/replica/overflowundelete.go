@@ -55,26 +55,33 @@ func (f *Client) ListDeleted(ctx context.Context, bucket string, since time.Time
 	}
 	var out []Deleted
 	for _, key := range slices.Sorted(maps.Keys(vers)) {
-		var latest *minio.ObjectInfo
-		for i, v := range vers[key] {
-			if v.IsLatest {
-				latest = &vers[key][i]
+		// Newest first; at equal times the current version (IsLatest),
+		// then the order the provider listed them in, which S3 defines
+		// as newest first.
+		vs := vers[key]
+		slices.SortStableFunc(vs, func(a, b minio.ObjectInfo) int {
+			if c := b.LastModified.Compare(a.LastModified); c != 0 {
+				return c
 			}
-		}
-		if latest == nil || !latest.IsDeleteMarker || latest.LastModified.Before(since) {
+			switch {
+			case a.IsLatest && !b.IsLatest:
+				return -1
+			case b.IsLatest && !a.IsLatest:
+				return 1
+			}
+			return 0
+		})
+		latest := vs[0]
+		if !latest.IsLatest || !latest.IsDeleteMarker || latest.LastModified.Before(since) {
 			continue
 		}
-		// The newest version made before the marker; one the lifecycle
-		// rule purged leaves nothing to bring back.
-		var prev *minio.ObjectInfo
-		for i, v := range vers[key] {
-			if !v.IsDeleteMarker && !v.LastModified.After(latest.LastModified) && (prev == nil || v.LastModified.After(prev.LastModified)) {
-				prev = &vers[key][i]
-			}
-		}
-		if prev == nil {
+		// The version just before the marker. Another marker there means
+		// the key was already deleted then; none means the lifecycle rule
+		// purged it: either way nothing comes back (#39 review).
+		if len(vs) < 2 || vs[1].IsDeleteMarker {
 			continue
 		}
+		prev := &vs[1]
 		info, err := f.core.StatObject(ctx, b, prev.Key, minio.StatObjectOptions{VersionID: prev.VersionID})
 		if err != nil {
 			return nil, f.classify(fmt.Errorf("reading version %s of %s: %w", prev.VersionID, key, err))
@@ -150,6 +157,9 @@ type ObjectStat struct {
 	// bytes.
 	ETag      string
 	Multipart bool
+	// Composite: the provider's checksum is of the parts, not of the
+	// whole object, so it is no SHA-256 of the bytes.
+	Composite bool
 }
 
 // MD5ETag reports whether the ETag is a hex MD5 of the bytes: 32 hex
@@ -182,7 +192,8 @@ func (f *Client) Stat(ctx context.Context, bucket, key string) (ObjectStat, bool
 	s := ObjectStat{Size: info.Size, SHA256: strings.ToLower(info.Metadata.Get("X-Amz-Meta-" + MetaSHA256)),
 		ETag: strings.Trim(info.ETag, `"`)}
 	s.Multipart = strings.Contains(s.ETag, "-")
-	if c := info.ChecksumSHA256; c != "" && !strings.Contains(c, "-") && !strings.EqualFold(info.ChecksumMode, "COMPOSITE") {
+	s.Composite = strings.Contains(info.ChecksumSHA256, "-") || strings.EqualFold(info.ChecksumMode, "COMPOSITE")
+	if c := info.ChecksumSHA256; c != "" && !s.Composite {
 		if raw, err := base64.StdEncoding.DecodeString(c); err == nil && len(raw) == 32 {
 			s.ChecksumSHA256 = hex.EncodeToString(raw)
 		}

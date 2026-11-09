@@ -190,3 +190,55 @@ func TestAnUndeleteClaimsTombsInsideTheWindowOnly(t *testing.T) {
 		t.Fatalf("due %+v", ts)
 	}
 }
+
+// #39 review: a claim holds the key. A key with a drained copy's tomb,
+// due, and a later delete's, inside the window: an undelete claims both,
+// and the worker sends neither while the claim lives; given back, the
+// due one is sent. A key whose newest tomb is stale (superseded) is
+// judged by the newest live one.
+func TestAnUndeleteClaimsEveryTombOfTheKey(t *testing.T) {
+	ctx := context.Background()
+	p, target, d := tombPool(t, t.TempDir())
+	t0 := p.now
+	if _, err := p.db.Exec(`UPDATE placement SET state = 'dropping' WHERE place = ? AND seq = ?`, target, d); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := p.db.HoldOverflowDelete(ctx, target, d, p.now); err != nil || !held {
+		t.Fatalf("drain held %v, %v", held, err)
+	}
+	p.ack(target, d)
+	p.now = t0.Add(23 * time.Hour)
+	del := p.del("r", "data/1", "data")
+	if p.rowState(target, del) == "" {
+		if _, err := p.db.Exec(`INSERT INTO placement (seq, place, bucket, key, op, state, size) VALUES (?, ?, 'r', 'data/1', 'delete', 'queued', 0)`,
+			del, target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if held, err := p.db.HoldOverflowDelete(ctx, target, del, p.now); err != nil || !held {
+		t.Fatalf("delete held %v, %v", held, err)
+	}
+	p.now = t0.Add(24 * time.Hour)
+	ts, err := p.db.ClaimOverflowTombs(ctx, target, "r", time.Time{}, p.now)
+	if err != nil || len(ts) != 2 || ts[0].Seq != d || !ts[0].Drained || ts[1].Seq != del {
+		t.Fatalf("claimed %+v, %v", ts, err)
+	}
+	if due := p.due(target); len(due) != 0 {
+		t.Fatalf("the worker took a tomb of a claimed key: %+v", due)
+	}
+	// Renewed, the claims outlive the hour.
+	p.now = p.now.Add(50 * time.Minute)
+	if err := p.db.RenewOverflowClaims(ctx, target, []int64{d, del}, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.now = p.now.Add(50 * time.Minute)
+	if due := p.due(target); len(due) != 0 {
+		t.Fatalf("a renewed claim lapsed: %+v", due)
+	}
+	if err := p.db.UnclaimOverflowTombs(ctx, target, []int64{d, del}); err != nil {
+		t.Fatal(err)
+	}
+	if due := p.due(target); len(due) != 1 || due[0].Seq != d {
+		t.Fatalf("due after the claim was given back: %+v", due)
+	}
+}

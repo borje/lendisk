@@ -21,10 +21,14 @@ type SampleObject struct {
 	Challengeable
 }
 
-// sampleable selects place ?1's objects a sample may download.
+// sampleable selects place ?1's objects a sample may download: not of a
+// replica already marked unverified, which re-placement is draining
+// (#39 review).
 const sampleable = `FROM placement p JOIN queue q ON q.seq = p.seq
 	WHERE p.place = ?1 AND p.state = 'acked' AND p.op = 'put'
-	AND q.state = 'done' AND q.immutable IS NULL AND ` + liveQ
+	AND q.state = 'done' AND q.immutable IS NULL AND ` + liveQ + `
+	AND NOT EXISTS (SELECT 1 FROM replica_check c WHERE c.place = p.place AND c.bucket = q.bucket
+		AND c.unverified_at IS NOT NULL)`
 
 // Sampleable returns how many objects a sample may download at place,
 // and their bytes.

@@ -60,7 +60,7 @@ add tests it and says what it found.`,
 	add.Flags().StringVar(&f.region, "region", "", "the bucket's region, if the provider needs one named (empty: ask the provider)")
 	add.Flags().StringVar(&f.maxBytes, "max-bytes", "", "the most this node stores there, such as 450G: the room it adds to the pool (required)")
 	add.Flags().StringVar(&f.envPrefix, "env-prefix", "", "the prefix of the credential's environment variables (default LENDISK_OVERFLOW_<NAME>_)")
-	add.Flags().StringVar(&f.retention, "retention", "30d", "how long deleted copies are kept by the provider's lifecycle rule")
+	add.Flags().StringVar(&f.retention, "retention", "30d", "how long deleted copies are kept: at a target with versioning, by the lifecycle rule (see --lifecycle); at one without, lendisk holds each delete this long before it sends it (S3-4)")
 	add.Flags().BoolVar(&f.lifecycle, "lifecycle", false, "create the lifecycle rule expiring non-current versions after --retention, if the bucket has none")
 	add.Flags().StringVar(&f.price, "price-per-gb", "", "the provider's price per GB and month, for status's cost estimate, such as 0.006")
 	cmd.AddCommand(add)

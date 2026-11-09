@@ -18,6 +18,8 @@ type fakeTarget struct {
 	bodies   map[string]string // every key's body
 	deleted  []replica.Deleted
 	restored []string
+	// restoring, if set, runs at each Restore, before it copies.
+	restoring func(key string)
 }
 
 func (f *fakeTarget) ListDeleted(ctx context.Context, bucket string, since time.Time) ([]replica.Deleted, error) {
@@ -31,6 +33,9 @@ func (f *fakeTarget) ListDeleted(ctx context.Context, bucket string, since time.
 }
 
 func (f *fakeTarget) Restore(ctx context.Context, bucket string, d replica.Deleted) error {
+	if f.restoring != nil {
+		f.restoring(d.Key)
+	}
 	f.restored = append(f.restored, d.Key)
 	f.live[d.Key] = f.bodies[d.Key]
 	return nil
@@ -261,5 +266,142 @@ func TestUndeleteLeavesACopyDrainedFromAVersionedTarget(t *testing.T) {
 	p, res := runUndelete(t, db, r, time.Time{})
 	if p.Keys != 1 || len(ft.restored) != 1 || ft.restored[0] != packA || res.Friends[0].Restored != 1 {
 		t.Fatalf("preview %+v, restored %v, result %+v", p, ft.restored, res.Friends[0])
+	}
+}
+
+// #39 review: a key deleted, written again (acknowledged at the target),
+// and deleted again, before the worker dropped the first, superseded
+// held delete: undelete judges the key by its newest held delete, so it
+// brings back the version the target holds, and neither delete is ever
+// sent.
+func TestUndeleteJudgesAKeyByItsNewestHeldDelete(t *testing.T) {
+	db, r, ft, now := targetNode(t, state.VersioningOff, "config")
+	ctx := context.Background()
+	place := "overflow:g"
+	v2 := "version two"
+	*now = now.Add(time.Minute)
+	seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "config", Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FinishPut(ctx, seqs[0], int64(len(v2)), hash(v2)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AckPlacement(ctx, place, seqs[0], hash(v2), *now); err != nil {
+		t.Fatal(err)
+	}
+	ft.live["config"] = v2
+	ft.bodies["config"] = v2
+	*now = now.Add(time.Minute)
+	seqs, err = db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "config", Op: state.OpDelete, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishDelete(ctx, seqs...); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := db.HoldOverflowDelete(ctx, place, seqs[0], *now); err != nil || !held {
+		t.Fatal(held, err)
+	}
+	if err := db.AckPlacement(ctx, place, seqs[0], "", *now); err != nil {
+		t.Fatal(err)
+	}
+	_, res := runUndelete(t, db, r, time.Time{})
+	if fr := res.Friends[0]; fr.Restored != 1 || fr.Failed != 0 {
+		t.Fatalf("v2 not restored: %+v", fr)
+	}
+	if live, _ := db.KeyLive(ctx, "laptop", "config"); !live {
+		t.Fatal("not live in the index")
+	}
+	*now = now.Add(48 * time.Hour)
+	if due, _ := db.DueOverflowTombs(ctx, place, *now, 10); len(due) != 0 {
+		t.Fatalf("a held delete of the restored key is due: %+v", due)
+	}
+}
+
+// #39 review: at a versioned target, a key whose put is queued or in
+// flight there by the time of the copy is not copied over it: reported
+// kept, the target's newer version stands.
+func TestUndeleteAtAVersionedTargetKeepsAPutInFlight(t *testing.T) {
+	db, r, ft, _ := targetNode(t, state.VersioningEnabled, packA, packB)
+	ctx := context.Background()
+	// While packA is copied back, packB is written again here.
+	ft.restoring = func(key string) {
+		if key != packA {
+			return
+		}
+		seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: packB, Op: state.OpPut, Class: "data"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FinishPut(ctx, seqs[0], 3, hash("new")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, res := runUndelete(t, db, r, time.Time{})
+	if fr := res.Friends[0]; len(ft.restored) != 1 || fr.KeptCount != 1 || fr.Kept[0].Key != packB || fr.Kept[0].Ours != hash("new") || fr.Restored != 1 {
+		t.Fatalf("restored %v, result %+v", ft.restored, fr)
+	}
+}
+
+// #39 review: a key with a drained copy's held delete, already due, and
+// a later delete's, inside the window: undelete claims both, brings the
+// key back, and neither is ever sent.
+func TestUndeleteClaimsADrainedCopysHeldDeleteToo(t *testing.T) {
+	db, r, ft, now := targetNode(t, state.VersioningOff)
+	ctx := context.Background()
+	place := "overflow:g"
+	body := bodyOf(packA)
+	ft.live[packA], ft.bodies[packA] = body, body
+	seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: packA, Op: state.OpPut, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.FinishPut(ctx, seqs[0], int64(len(body)), hash(body)); err != nil {
+		t.Fatal(err)
+	}
+	put := seqs[0]
+	if err := db.AckPlacement(ctx, place, put, hash(body), *now); err != nil {
+		t.Fatal(err)
+	}
+	// Re-placement drains it: held, and due a day later.
+	if _, err := db.ExecContext(ctx, `UPDATE placement SET state = 'dropping' WHERE seq = ? AND place = ?`, put, place); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := db.HoldOverflowDelete(ctx, place, put, *now); err != nil || !held {
+		t.Fatal(held, err)
+	}
+	if err := db.AckPlacement(ctx, place, put, "", *now); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(23 * time.Hour)
+	seqs, err = db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: packA, Op: state.OpDelete, Class: "data"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.FinishDelete(ctx, seqs...); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO placement (seq, place, bucket, key, op, state, size)
+		SELECT ?1, ?2, 'laptop', ?3, 'delete', 'queued', 0
+		WHERE NOT EXISTS (SELECT 1 FROM placement WHERE seq = ?1 AND place = ?2)`, seqs[0], place, packA); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := db.HoldOverflowDelete(ctx, place, seqs[0], *now); err != nil || !held {
+		t.Fatal(held, err)
+	}
+	if err := db.AckPlacement(ctx, place, seqs[0], "", *now); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(2 * time.Hour) // the drain's held delete is due
+	_, res := runUndelete(t, db, r, time.Time{})
+	if fr := res.Friends[0]; fr.Restored != 1 || fr.Failed != 0 {
+		t.Fatalf("result %+v", fr)
+	}
+	if holds, _ := db.OverflowTombHolds(ctx); holds["g"].Tombs != 0 {
+		t.Fatalf("held deletes left: %+v", holds)
+	}
+	if due, _ := db.DueOverflowTombs(ctx, place, now.Add(48*time.Hour), 10); len(due) != 0 {
+		t.Fatalf("due: %+v", due)
 	}
 }

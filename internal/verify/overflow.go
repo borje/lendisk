@@ -27,7 +27,8 @@ import (
 //     the index's; where it keeps none and the ETag is the MD5 of a
 //     single-part object, the ETag must be the MD5 of the local copy
 //     (skipped, as for a challenge, when the local copy is gone or no
-//     longer matches its capture hash). This trusts the provider's word
+//     longer matches its capture hash). A multipart object's ETag and
+//     composite checksum are never compared. This trusts the provider's word
 //     for its checksums, which S3-6 accepts.
 //   - Each week, by downloads (VER-2): SamplePercent of the bytes each
 //     target holds is downloaded whole, at random, through Pace.Fetch
@@ -175,6 +176,11 @@ func (v *Verifier) stat(ctx context.Context, t Target, place, bucket string, c s
 		return v.confirm(ctx, place, bucket, c, fmt.Sprintf("overflow target %s holds %s with %d bytes, not %d", place, c.Key, st.Size, c.Size))
 	case st.SHA256 != "" && st.SHA256 != c.SHA256:
 		return v.confirm(ctx, place, bucket, c, fmt.Sprintf("overflow target %s holds another version of %s (%s)", place, c.Key, st.SHA256))
+	case st.Multipart || st.Composite:
+		// A multipart object's ETag and composite checksum are of its
+		// parts: comparing them would be a false mismatch, and one
+		// drains the whole replica (#39 review).
+		return "", false, nil
 	case st.ChecksumSHA256 != "":
 		if st.ChecksumSHA256 != c.SHA256 {
 			return v.confirm(ctx, place, bucket, c, fmt.Sprintf("the provider's stored SHA-256 of %s at %s is %s, not %s",

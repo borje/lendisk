@@ -28,6 +28,7 @@ type provider struct {
 	objs     map[string][]byte
 	etag     map[string]string // overrides the MD5 ETag
 	checksum map[string]string // a stored SHA-256, when set
+	multi    map[string]bool   // stored in parts
 	got      int64             // bytes served by Get
 	stats    int
 }
@@ -57,6 +58,11 @@ func (p *provider) Stat(_ context.Context, _, key string) (replica.ObjectStat, b
 	if e, ok := p.etag[key]; ok {
 		st.ETag = e
 	}
+	if p.multi[key] {
+		// Neither the ETag nor a composite checksum is of the bytes.
+		st.Multipart, st.Composite, st.ETag = true, true, "0123456789abcdef0123456789abcdef-3"
+		st.ChecksumSHA256 = ""
+	}
 	return st, true, nil
 }
 
@@ -73,7 +79,7 @@ func targetNode(t *testing.T, objects, size int) (*node, *provider) {
 		EnvPrefix: "X_", Retention: time.Hour, Versioning: state.VersioningEnabled, AddedAt: n.now}); err != nil {
 		t.Fatal(err)
 	}
-	pr := &provider{objs: map[string][]byte{}, etag: map[string]string{}, checksum: map[string]string{}}
+	pr := &provider{objs: map[string][]byte{}, etag: map[string]string{}, checksum: map[string]string{}, multi: map[string]bool{}}
 	for i := range objects {
 		body := make([]byte, size)
 		rand.Read(body)
@@ -227,5 +233,50 @@ func TestAFullCheckOfATargetDownloadsEveryObject(t *testing.T) {
 	pr.objs["data/c"] = bytes.Repeat([]byte("y"), 1000)
 	if o := n.v.Check(t.Context(), targetPlace, "laptop", true); o.Outcome != state.VerifyFailed {
 		t.Fatalf("full over rotted bytes: %+v", o)
+	}
+}
+
+// #39 review: a multipart object's ETag and composite checksum are of
+// its parts; a check that compared them would fail every such object
+// and drain the replica. They are not compared.
+func TestAMultipartObjectsChecksumsAreNotCompared(t *testing.T) {
+	n, pr := targetNode(t, 2, 2000)
+	pr.multi["data/a"], pr.multi["data/b"] = true, true
+	if o := n.v.Check(t.Context(), targetPlace, "laptop", false); o.Outcome != state.VerifyPassed || o.Checked != 2 {
+		t.Fatalf("outcome %+v", o)
+	}
+}
+
+// #39 review: once a target's replica is unverified, the sample takes
+// nothing more of it, and a ranged pass does not make it look freshly
+// verified; a full pass clears the mark.
+func TestAnUnverifiedTargetIsNotSampledNorRefreshed(t *testing.T) {
+	n, pr := targetNode(t, 3, 1000)
+	ctx := t.Context()
+	n.v.SamplePercent = 100
+	if o := n.v.Check(ctx, targetPlace, "laptop", false); o.Outcome != state.VerifyPassed {
+		t.Fatalf("outcome %+v", o)
+	}
+	passed := n.targetRecord().VerifiedAt
+	if err := n.db.RecordUnverified(ctx, targetPlace, "laptop", "lost one", n.now); err != nil {
+		t.Fatal(err)
+	}
+	n.v.sampleTargets(ctx)
+	n.advance(week)
+	n.v.sampleTargets(ctx)
+	if pr.served() != 0 {
+		t.Fatalf("sampled an unverified replica: %d bytes", pr.served())
+	}
+	if o := n.v.Check(ctx, targetPlace, "laptop", false); o.Outcome != state.VerifyPassed {
+		t.Fatalf("outcome %+v", o)
+	}
+	if c := n.targetRecord(); !c.Unverified() || c.VerifiedAt != passed {
+		t.Fatalf("a ranged pass refreshed an unverified replica: %+v", c)
+	}
+	if o := n.v.Check(ctx, targetPlace, "laptop", true); o.Outcome != state.VerifyPassed {
+		t.Fatalf("full %+v", o)
+	}
+	if c := n.targetRecord(); c.Unverified() || c.VerifiedAt != n.now {
+		t.Fatalf("after a full pass %+v", c)
 	}
 }

@@ -6792,11 +6792,17 @@ of the `copies`, and the estimated cost (S3-7).
     `<prefix>/<sealed name>/` (`Client.ListDeleted`), gathered by key,
     since a provider need not list a key's versions together (RustFS
     1.0.3 lists every delete marker of a page before its versions);
-    a key whose current version (`IsLatest`) is a delete marker made
-    at or after `since` comes back as the newest version made before
-    the marker, read once with a HEAD for its
-    `x-amz-meta-lendisk-sha256`; a key whose earlier versions the
-    lifecycle rule purged has nothing to bring back. `Client.Restore`
+    each key's versions are ordered newest first (at equal times the
+    current one, `IsLatest`, then the provider's list order, which S3
+    defines as newest first). A key whose newest is a delete marker
+    made at or after `since` comes back as the version just before it,
+    read once with a HEAD for its `x-amz-meta-lendisk-sha256`; when
+    that is another marker the key was deleted already, and when there
+    is none the lifecycle rule purged it: nothing comes back (#39
+    review). Right before the copy, a key with a put queued or in
+    flight at the target (`state.PutInFlight`) is skipped and reported
+    kept, so an old version is never copied over a newer one.
+    `Client.Restore`
     copies that version onto the key (`CopyObject` with the source
     version id, keeping its metadata; `ComposeObject` with the hash
     as metadata above 5 GiB), which makes it current and leaves the
@@ -6824,16 +6830,22 @@ of the `copies`, and the estimated cost (S3-7).
     `lendisk.db`: a restart neither forgets nor hastens one
     (`TestAClientSideTombstoneIsDueOnlyAfterTheWindowAndSurvivesARestart`,
     `TestAnUnversionedTargetGetsItsDeleteOnlyAfterTheWindow`).
-    `undelete` claims the tombs of deletes (not drains) made at or
-    after `since` and still inside their window
-    (`ClaimOverflowTombs`), checks with a HEAD that the target still
-    holds each key with the bytes deleted, records it
-    (`RecordRestored`), drops the tombs that record supersedes, and
-    gives back the rest, which are sent when due. A claim marks a tomb
-    for one process: the worker never sends a tomb an undelete
-    claimed, and an undelete never claims one past its window, so the
-    two never meet on the same tomb; a claim older than an hour died
-    with its process and is free again.
+    `undelete` first drops superseded tombs, then takes each key whose
+    newest tomb is a delete (not a drain) made at or after `since` and
+    still inside its window, and claims every tomb of that key, drained
+    and due ones included (`ClaimOverflowTombs`). The newest tomb says
+    which version the target holds: a HEAD checks the target still
+    holds it, and it is recorded (`RecordRestored`); the tombs that
+    record supersedes are dropped and the rest given back, to be sent
+    when due. A claim holds the key, not one tomb: the worker sends no
+    held delete of a key with a live claim on any of its tombs, and an
+    undelete claims no key the worker holds, in one statement each, so
+    the two never meet on a key. An undelete renews its claims at each
+    page (`RenewOverflowClaims`); a claim older than an hour died with
+    its process and is free again (#39 review:
+    `TestUndeleteJudgesAKeyByItsNewestHeldDelete`,
+    `TestAnUndeleteClaimsEveryTombOfTheKey`,
+    `TestUndeleteClaimsADrainedCopysHeldDeleteToo`).
   - *Drained copies.* A copy re-placement drained or moved away is no
     delete of the user's: undelete leaves it at both kinds of target
     (`state.PlaceDeleted`: the target's last row of the key that holds
@@ -6887,7 +6899,10 @@ of the `copies`, and the estimated cost (S3-7).
   failing that, an ETag of 32 hex digits without a part count
   (`ObjectStat.MD5ETag`) must be the MD5 of the local copy, read and
   checked against its capture hash first (gone or changed: skipped, as
-  for a challenge). Any other ETag is not compared. The weekly sample
+  for a challenge). Any other ETag is not compared, and neither
+  checksum is for a multipart object or a composite checksum: a false
+  mismatch would drain the whole replica
+  (`TestAMultipartObjectsChecksumsAreNotCompared`). The weekly sample
   (VER-2, `sampleStep`) owes `replication.overflow_sample` percent
   (default 0.1, above 0 up to 100) of the bytes each target holds a
   week, stepped every 10 minutes like the bit-rot sweep, its step time
@@ -6895,7 +6910,11 @@ of the `copies`, and the estimated cost (S3-7).
   downloads random acknowledged objects whole through `Pace.Fetch`
   (REPL-7's global `download_limit`; `peer_limit` names friends only,
   so a target has no limit of its own) until it has paid, hashing each
-  against the index. `lendisk verify <bucket> --peer overflow:<name>
+  against the index. A replica already marked unverified is not
+  sampled, and a ranged pass of one leaves its last-verified time as it
+  was (`RecordVerified`; friends' too), so it never looks freshly
+  verified until a full check clears the mark
+  (`TestAnUnverifiedTargetIsNotSampledNorRefreshed`). `lendisk verify <bucket> --peer overflow:<name>
   [--full]` runs the daily check, or with `--full` downloads every
   object of the replica (VER-3). Outcomes are a friend's: a missing
   object, other bytes or a mismatched checksum, read again with

@@ -1,9 +1,12 @@
 package state
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -23,8 +26,10 @@ import (
 //   - A tomb whose key the target holds again (an acknowledged put of
 //     it at or after the tomb's row: a re-put, or an undelete's record)
 //     is never issued; it is dropped (DropSupersededTombs).
-//   - An undelete restores only tombs it claimed, still inside the
-//     window, so it never meets the worker issuing the same tomb.
+//   - A claim holds a key: the worker sends no held delete of a key an
+//     undelete claimed, and an undelete claims no key the worker holds,
+//     and restores only keys whose newest tomb is still inside the
+//     window.
 
 // tombClaim is how long a claim on a tomb holds: one older died with
 // its process, and the tomb is free again.
@@ -114,6 +119,9 @@ func (db *DB) HoldOverflowDelete(ctx context.Context, place string, seq int64, n
 
 const oTombCols = `place, seq, bucket, key, coalesce(sha256, ''), size, coalesce(drained, 0), deleted_at, due_at`
 
+// tombColsT is oTombCols of table alias t.
+const tombColsT = `t.place, t.seq, t.bucket, t.key, coalesce(t.sha256, ''), t.size, coalesce(t.drained, 0), t.deleted_at, t.due_at`
+
 func scanOTombs(rows *sql.Rows, err error) ([]OverflowTomb, error) {
 	if err != nil {
 		return nil, err
@@ -146,18 +154,26 @@ func (db *DB) DropSupersededTombs(ctx context.Context, place string) (int64, err
 	return r.RowsAffected()
 }
 
+// keyClaimed is true for tomb t when any tomb of its key at its place
+// has a live claim (newer than ?stale): a claim holds the key, not one
+// tomb, since an undelete restoring a key and the worker sending any of
+// its held deletes must never meet (#39 review).
+const keyClaimed = `EXISTS (SELECT 1 FROM overflow_tomb c WHERE c.place = t.place AND c.bucket = t.bucket
+	AND c.key = t.key AND c.claimed_at > :stale)`
+
 // DueOverflowTombs drops place's superseded tombs, then claims and
 // returns up to limit of those due at now (their window ended), oldest
-// first, that no one else holds a live claim on. The caller sends each
+// first, whose key no one holds a live claim on. The caller sends each
 // delete and then drops the tomb.
 func (db *DB) DueOverflowTombs(ctx context.Context, place string, now time.Time, limit int) ([]OverflowTomb, error) {
 	if _, err := db.DropSupersededTombs(ctx, place); err != nil {
 		return nil, err
 	}
-	return scanOTombs(db.QueryContext(ctx, `UPDATE overflow_tomb SET claimed_at = ?2
-		WHERE place = ?1 AND seq IN (SELECT seq FROM overflow_tomb WHERE place = ?1 AND due_at <= ?2
-			AND (claimed_at IS NULL OR claimed_at <= ?3) ORDER BY due_at, seq LIMIT ?4)
-		RETURNING `+oTombCols, place, now.Unix(), now.Add(-tombClaim).Unix(), limit))
+	return scanOTombs(db.QueryContext(ctx, `UPDATE overflow_tomb SET claimed_at = :now
+		WHERE place = :place AND seq IN (SELECT t.seq FROM overflow_tomb t WHERE t.place = :place AND t.due_at <= :now
+			AND NOT `+keyClaimed+` ORDER BY t.due_at, t.seq LIMIT :limit)
+		RETURNING `+oTombCols, sql.Named("place", place), sql.Named("now", now.Unix()),
+		sql.Named("stale", now.Add(-tombClaim).Unix()), sql.Named("limit", limit)))
 }
 
 // DropOverflowTomb drops a tomb whose delete the target acknowledged.
@@ -166,29 +182,61 @@ func (db *DB) DropOverflowTomb(ctx context.Context, place string, seq int64) err
 	return err
 }
 
-// undeletable selects place ?1's tombs of bucket ?2 an undelete may
-// restore: deletes of the key (not copies re-placement drained, which
-// the index holds elsewhere), deleted at or after ?3, inside the window
-// at ?4 (not due).
-const undeletable = `FROM overflow_tomb WHERE place = ?1 AND bucket = ?2 AND drained IS NULL
-	AND deleted_at >= ?3 AND due_at > ?4`
+// undeletable selects place's tombs t of bucket an undelete may restore:
+// the newest tomb of its key, a delete of the key (not a copy
+// re-placement drained, which the index holds elsewhere), made at or
+// after :since and inside its window at :now (not due).
+const undeletable = `FROM overflow_tomb t WHERE t.place = :place AND t.bucket = :bucket AND t.drained IS NULL
+	AND t.deleted_at >= :since AND t.due_at > :now
+	AND t.seq = (SELECT max(n.seq) FROM overflow_tomb n WHERE n.place = t.place AND n.bucket = t.bucket AND n.key = t.key)`
 
-// UndeletableTombs lists place's tombs of bucket an undelete since
-// since would restore at now (RET-3), by key.
-func (db *DB) UndeletableTombs(ctx context.Context, place, bucket string, since, now time.Time) ([]OverflowTomb, error) {
-	return scanOTombs(db.QueryContext(ctx, `SELECT `+oTombCols+` `+undeletable+` ORDER BY key, seq`,
-		place, bucket, unixOrZero(since), now.Unix()))
+func undeletableArgs(place, bucket string, since, now time.Time) []any {
+	return []any{sql.Named("place", place), sql.Named("bucket", bucket), sql.Named("since", unixOrZero(since)),
+		sql.Named("now", now.Unix()), sql.Named("stale", now.Add(-tombClaim).Unix())}
 }
 
-// ClaimOverflowTombs claims and returns place's tombs of bucket an
-// undelete since since restores at now, that no one else holds a live
-// claim on. The caller records what it restores, drops the tombs that
-// record supersedes (DropSupersededTombs), and gives back the rest
-// (UnclaimOverflowTombs).
+// UndeletableTombs drops place's superseded tombs, then lists those of
+// bucket an undelete since since would restore at now (RET-3): the
+// newest of each key, by key.
+func (db *DB) UndeletableTombs(ctx context.Context, place, bucket string, since, now time.Time) ([]OverflowTomb, error) {
+	if _, err := db.DropSupersededTombs(ctx, place); err != nil {
+		return nil, err
+	}
+	return scanOTombs(db.QueryContext(ctx, `SELECT `+tombColsT+` `+undeletable+` ORDER BY t.key`,
+		undeletableArgs(place, bucket, since, now)...))
+}
+
+// ClaimOverflowTombs drops place's superseded tombs, then claims every
+// tomb, drained and due ones included, of each key of bucket an
+// undelete since since restores at now (UndeletableTombs) that no one
+// holds a live claim on, and returns them, by key and then sequence: the
+// worker sends none of them while the claim lives. The caller renews
+// the claims at least hourly (RenewOverflowClaims), records what it
+// restores, drops the tombs that record supersedes
+// (DropSupersededTombs), and gives back the rest (UnclaimOverflowTombs).
 func (db *DB) ClaimOverflowTombs(ctx context.Context, place, bucket string, since, now time.Time) ([]OverflowTomb, error) {
-	return scanOTombs(db.QueryContext(ctx, `UPDATE overflow_tomb SET claimed_at = ?4
-		WHERE place = ?1 AND seq IN (SELECT seq `+undeletable+` AND (claimed_at IS NULL OR claimed_at <= ?5))
-		RETURNING `+oTombCols, place, bucket, unixOrZero(since), now.Unix(), now.Add(-tombClaim).Unix()))
+	if _, err := db.DropSupersededTombs(ctx, place); err != nil {
+		return nil, err
+	}
+	ts, err := scanOTombs(db.QueryContext(ctx, `UPDATE overflow_tomb SET claimed_at = :now
+		WHERE place = :place AND bucket = :bucket AND key IN (SELECT t.key `+undeletable+` AND NOT `+keyClaimed+`)
+		RETURNING `+oTombCols, undeletableArgs(place, bucket, since, now)...))
+	slices.SortFunc(ts, func(a, b OverflowTomb) int {
+		return cmp.Or(strings.Compare(a.Key, b.Key), cmp.Compare(a.Seq, b.Seq))
+	})
+	return ts, err
+}
+
+// RenewOverflowClaims renews the live claims on place's tombs seqs at
+// now, so a long undelete keeps them.
+func (db *DB) RenewOverflowClaims(ctx context.Context, place string, seqs []int64, now time.Time) error {
+	for _, s := range seqs {
+		if _, err := db.ExecContext(ctx, `UPDATE overflow_tomb SET claimed_at = ? WHERE place = ? AND seq = ? AND claimed_at IS NOT NULL`,
+			now.Unix(), place, s); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // UnclaimOverflowTombs gives back claims on place's tombs seqs: they

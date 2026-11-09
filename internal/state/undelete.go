@@ -408,6 +408,20 @@ func (db *DB) PlaceDeleted(ctx context.Context, place, bucket, key string) (bool
 	return op == OpDelete, err
 }
 
+// PutInFlight reports whether place has a put of key queued or in
+// flight, and its hash: a version an overflow target's undelete must not
+// copy an older one over (#39 review).
+func (db *DB) PutInFlight(ctx context.Context, place, bucket, key string) (sha string, busy bool, err error) {
+	var h sql.NullString
+	err = db.QueryRowContext(ctx, `SELECT q.sha256 FROM placement p JOIN queue q ON q.seq = p.seq
+		WHERE p.place = ? AND p.bucket = ? AND p.key = ? AND p.op = 'put' AND p.state = 'queued'
+		ORDER BY p.seq DESC LIMIT 1`, place, bucket, key).Scan(&h)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	return h.String, err == nil, err
+}
+
 // KeyLive reports whether key's latest done write in bucket is a put:
 // the index holds it live.
 func (db *DB) KeyLive(ctx context.Context, bucket, key string) (bool, error) {

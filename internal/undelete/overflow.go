@@ -120,10 +120,13 @@ func (r *Runner) targetCandidates(ctx context.Context, tg target, q state.Undele
 	if err != nil {
 		return nil, err
 	}
+	// By key, the newest tomb last: it says which version the target
+	// holds (#39 review); the older ones are claimed with it.
 	byKey := map[string]int{}
 	for _, t := range ts {
 		if i, ok := byKey[t.Key]; ok {
 			out[i].tomb = append(out[i].tomb, t)
+			out[i].obj = control.ListObject{Key: t.Key, Size: max(t.Size-state.ObjectOverhead, 0), SHA256: t.SHA256}
 			continue
 		}
 		byKey[t.Key] = len(out)
@@ -220,9 +223,29 @@ func (r *Runner) undeleteTarget(ctx context.Context, tg target, q state.Undelete
 	const page = 100
 	for start := 0; start < len(cs); start += page {
 		var objs []state.Restored
+		// The claims outlive a long run (state.RenewOverflowClaims).
+		if err := r.DB.RenewOverflowClaims(ctx, place, claimed, r.now()); err != nil {
+			return err
+		}
 		for _, c := range cs[start:min(start+page, len(cs))] {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if !tg.o.ClientSide() {
+				// A put of the key queued or in flight there is a newer
+				// version: copying the old one over it could undo it
+				// (#39 review). It is kept, as a friend's newer version is.
+				ours, busy, err := r.DB.PutInFlight(ctx, place, q.Bucket, c.obj.Key)
+				if err != nil {
+					return err
+				}
+				if busy {
+					fr.KeptCount++
+					if len(fr.Kept) < MaxNamed {
+						fr.Kept = append(fr.Kept, state.KeptVersion{Key: c.obj.Key, SHA256: c.obj.SHA256, Ours: ours})
+					}
+					continue
+				}
 			}
 			why := ""
 			if tg.o.ClientSide() {
