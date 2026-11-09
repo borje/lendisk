@@ -97,11 +97,12 @@ func TestNoTwoFriendsEverHoldASnapshotWithoutItsPacks(t *testing.T) {
 	}
 	// D is offline at first: whatever is placed there waits.
 	var offline sync.Mutex
-	dOff := true
+	dOff, dTried := true, 0
 	fx.places["D"].fail = func(op, key string) error {
 		offline.Lock()
 		defer offline.Unlock()
 		if dOff {
+			dTried++
 			return errors.New("dial: no route to host")
 		}
 		return nil
@@ -122,7 +123,24 @@ func TestNoTwoFriendsEverHoldASnapshotWithoutItsPacks(t *testing.T) {
 		fx.put("repo", snap, "snapshot", "snapshot "+snap)
 	}
 	fx.run()
-	time.Sleep(200 * time.Millisecond)
+	// D stays offline until it has refused a put and B and C have each
+	// sent all they may before it: their heads are held at the barrier,
+	// waiting on packs only D has yet to take. A fixed sleep let a slow
+	// machine bring D back before any sender had tried it.
+	heldAtBarrier := func(place string) bool {
+		p, ok, err := fx.db.NextPlacement(t.Context(), place)
+		if err != nil || !ok || p.Class == "data" {
+			return false
+		}
+		held, err := fx.db.Held(t.Context(), p.Seq)
+		return err == nil && held
+	}
+	fx.settle("B and C held at the barrier while D is offline", func() bool {
+		offline.Lock()
+		tried := dTried
+		offline.Unlock()
+		return tried > 0 && heldAtBarrier("B") && heldAtBarrier("C")
+	})
 	offline.Lock()
 	dOff = false
 	offline.Unlock()
