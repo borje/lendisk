@@ -23,8 +23,9 @@ SEC-12, SEC-14); v0.11.3 lets a profile name the few keys its tool
 rewrites in place, which replicate as rewrites while lenders keep the
 replaced version (EP-7, EP-11, LEND-4, RET-1); v0.11.4 supports Kopia repositories
 in format version 2 or later only (COMPAT-1); v0.11.5 places each data
-object at one friend fewer and an overflow target while friends
-cannot hold `copies` of the repository (REPL-12). The design
+object of a bucket with `copies` ≥ 2 at one friend fewer and an
+overflow target while friends cannot hold `copies` of the repository
+(REPL-12). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -626,9 +627,10 @@ double the surface for no change in the core problem.
   unreachable past the REPL-13 threshold; from then on it is no longer
   room and gets no new copies. Overflow targets (§4.11) shall be
   chosen only for copies that no friend, reachable or not, has room
-  for, with one exception: while the node's capacity plan (LEND-7)
-  says its friends cannot hold `copies` copies of its repository and
-  an overflow target has room, each data object shall be placed at
+  for, with one exception: for a bucket with `copies` ≥ 2, while the
+  node's capacity plan (LEND-7) says its friends cannot hold `copies`
+  copies of its repository and an overflow target has room, each data
+  object shall be placed at
   `copies − 1` friends and one overflow target, so that the friends'
   room goes to one copy of every object rather than to `copies`
   copies of the first ones; re-placement follows the same rule. Every friend is treated as an independent place; failure
@@ -1267,7 +1269,7 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
-- **v0.11.5 (2026-11-09)** REPL-12: while friends cannot hold `copies` of the repository, each data object goes to `copies − 1` friends and one overflow target, so scenario 12's equal friends do not fill with second copies (#38, DESIGN Q-AD). Decided by the user.
+- **v0.11.5 (2026-11-09)** REPL-12: for a bucket with `copies` ≥ 2, while friends cannot hold `copies` of the repository, each data object goes to `copies − 1` friends and one overflow target, so scenario 12's equal friends do not fill with second copies (#38, DESIGN Q-AD). Decided by the user.
 - **v0.11.4 (2026-11-08)** Kopia format version 1 (repositories made by
   Kopia 0.8 or earlier and never upgraded) is not supported (#79). Its
   compaction and cleanup blobs `m*` and `l*` are not listed in EP-7, so

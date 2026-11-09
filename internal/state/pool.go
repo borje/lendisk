@@ -484,13 +484,15 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 			return err
 		}
 		// Split (REPL-12 as of v0.11.5): copies − 1 friends and one
-		// overflow target, while friends cannot hold copies of it all.
+		// overflow target, while friends cannot hold copies of it all,
+		// for a bucket of two copies or more; a copies-1 bucket's one
+		// copy goes to a friend while one has room.
 		maxFriends := -1
-		split, err := db.overflowSplit(ctx, tx)
-		if err != nil {
+		var split bool
+		if split, err = db.overflowSplit(ctx, tx); err != nil {
 			return err
 		}
-		if split {
+		if split && copies >= 2 {
 			held := 0
 			for _, t := range targets {
 				if _, ok := OverflowName(t); !ok {

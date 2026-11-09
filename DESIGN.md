@@ -416,7 +416,9 @@ answer) and a last-reachable time.
      fill the rest from overflow targets by free bytes. An overflow
      target that gets its first data object of a bucket gets every
      metadata object of the bucket first (§3.4). *Split* (REQUIREMENTS
-     v0.11.5, Q-AD): while the capacity plan says the friends cannot
+     v0.11.5, Q-AD), for a bucket with `copies` ≥ 2 (a copies-1
+     bucket's one copy goes to a friend while one has room): while
+     the capacity plan says the friends cannot
      hold `copies` copies of the repository (`state.FriendsHold`, §4's
      rule without overflow) and an overflow target exists, step 2
      takes at most `copies − 1` friends and step 3 the rest, so the
@@ -6685,9 +6687,12 @@ of the `copies`, and the estimated cost (S3-7).
   returns the targets after the friends, with `max_bytes` as quota.
   `choose` (capture) and the re-placement pass's choose take friends
   first by D6's rule, at most `copies − 1` of them while placement is
-  split (D6 step 3, `overflowSplit`, cached 30 s in the daemon since it
-  reads the whole repository; `status` shows it as
-  `capacity.overflow_split`), and for the copies still missing a target
+  split (D6 step 3, `overflowSplit`, for buckets with `copies` ≥ 2;
+  cached at most 30 s since it reads the whole repository, and
+  recomputed at once when the friendships, their numbers, the targets
+  or a bucket's copies change, read as one cheap `splitKey` query, so a
+  change made by another process counts at the next capture; `status`
+  shows it as `capacity.overflow_split`), and for the copies still missing a target
   that answers (one failing is no candidate: its queued copies would
   hold the metadata barrier everywhere), by most free bytes: `max_bytes` less use, less the bucket's metadata
   it lacks, so a target never passes `max_bytes` (S3-7). A target
@@ -6701,10 +6706,17 @@ of the `copies`, and the estimated cost (S3-7).
   re-placement batch reads the target's `place_use` again in its
   transaction before it places a copy there, so a capture between the
   pass's scan and its batch cannot take it past `max_bytes`.
-  *Split re-placement:* an object whose copies are all at friends gets
-  a copy at a target in place of the fullest friend's (that copy is
-  counted out as drained, and the new copy records which it
-  replaces), which is deleted there once the target acknowledges; the
+  *Split re-placement:* a split bucket's pass runs two rounds over its
+  data (`dataRound`): the first places missing copies only, the second
+  also moves copies, so a move never takes a target's room from an
+  object with fewer copies (#38 review). In the second, an object
+  whose copies are all at friends gets a copy at a target in place of
+  the fullest friend's (that copy is counted out as drained, and the
+  new copy records which it replaces), which is deleted there once the
+  target acknowledges and only while the object keeps `copies`
+  acknowledged copies at intact places (`keepReplaced`: not removed,
+  gone or unverified; otherwise the next pass drops it when
+  `decide`'s guard allows); the
   friend's room comes back when it purges the tomb after its retention
   window (RET-1), and the objects that had no friend copy get one then
   (`TestSplitPlacementGivesEveryObjectOneFriendAndTheTarget`,
@@ -6718,6 +6730,14 @@ of the `copies`, and the estimated cost (S3-7).
   is never a target of re-routing; as a source it is a friend's like.
   Deletes go straight to the provider: client-side tombstones for an
   unversioned bucket (S3-4) are #39.
+- **Hysteresis** (#38 review, for #40). The split decision flips as
+  the repository or the pool changes, and a move in flight is cancelled
+  as surplus when it flips back; that is acceptable here, since a move
+  only adds a copy before it deletes one. #40's drain-back, which
+  moves copies from targets to friends, must not run on the same
+  threshold: it needs a margin (drain back only once the friends hold
+  `copies` copies with room to spare), or the two will move the same
+  copies back and forth.
 - **Alerts and status** (#38, S3-7). `overflow_receiving` while a
   target holds or has queued a live data copy (it costs money);
   `overflow_high` at 90% of `max_bytes` and `overflow_full` at 100%,

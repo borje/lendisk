@@ -191,7 +191,7 @@ func (f *Client) Put(ctx context.Context, o Object) error {
 	ended()
 	if err != nil {
 		if body.stalled() {
-			return fmt.Errorf("sending %s: no progress for %v: %w", o.Key, f.stall, err)
+			return f.redact(fmt.Errorf("sending %s: no progress for %v: %w", o.Key, f.stall, err))
 		}
 		return f.classify(fmt.Errorf("sending %s: %w", o.Key, err))
 	}

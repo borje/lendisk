@@ -95,7 +95,7 @@ func (f *Client) PutPart(ctx context.Context, bucket, key, uploadID string, n in
 	ended()
 	if err != nil {
 		if wd.stalled() {
-			return Part{}, fmt.Errorf("sending part %d of %s: no progress for %v: %w", n, key, f.stall, err)
+			return Part{}, f.redact(fmt.Errorf("sending part %d of %s: no progress for %v: %w", n, key, f.stall, err))
 		}
 		return Part{}, f.uploadErr(fmt.Errorf("sending part %d of %s: %w", n, key, err))
 	}
@@ -143,7 +143,7 @@ func (f *Client) Abort(ctx context.Context, bucket, key, uploadID string) error 
 func (f *Client) uploadErr(err error) error {
 	var er minio.ErrorResponse
 	if errors.As(err, &er) && (er.Code == "NoSuchUpload" || strings.EqualFold(er.Code, "NoSuchUpload")) {
-		return fmt.Errorf("%w: %w", ErrNoSuchUpload, err)
+		return f.redact(fmt.Errorf("%w: %w", ErrNoSuchUpload, err))
 	}
 	return f.classify(err)
 }

@@ -198,7 +198,7 @@ const splitCacheTTL = 30 * time.Second
 // FriendsHold reports whether friends with quotas hold copies copies of
 // a repository of data bytes plus metadata bytes (DESIGN §4): with D the
 // data and m the metadata, held at every friend, Σ min(D, quota − m)
-// ≥ copies × D, each term floored at 0. capacity.Plan.FriendsHold is
+// ≥ copies × D, each term floored at 0. capacity.Plan.Split applies
 // the same rule, for status.
 func FriendsHold(data, metadata int64, copies int, quotas []int64) bool {
 	if data <= 0 {
@@ -215,12 +215,19 @@ func FriendsHold(data, metadata int64, copies int, quotas []int64) bool {
 // v0.11.5, #38): there is an overflow target, and the node's friends
 // cannot hold `copies` copies of its repository (FriendsHold, the
 // capacity plan's rule). Then each data object goes to copies − 1
-// friends and one overflow target. The answer is kept splitTTL.
+// friends and one overflow target. The answer is kept splitTTL, and
+// only while the pool is as it was (splitKey: friends, their numbers,
+// overflow targets, buckets' copies, #38 review), whichever process
+// changed it; the repository's growth is what the TTL bounds.
 func (db *DB) overflowSplit(ctx context.Context, q querier) (bool, error) {
 	ttl := cmp.Or(db.splitTTL, splitCacheTTL)
+	var key string
+	if err := q.QueryRowContext(ctx, splitKey).Scan(&key); err != nil {
+		return false, err
+	}
 	db.splitMu.Lock()
 	defer db.splitMu.Unlock()
-	if ttl > 0 && !db.splitAt.IsZero() && time.Since(db.splitAt) < ttl {
+	if ttl > 0 && !db.splitAt.IsZero() && time.Since(db.splitAt) < ttl && key == db.splitKey {
 		return db.splitVal, nil
 	}
 	var targets int
@@ -245,9 +252,17 @@ func (db *DB) overflowSplit(ctx context.Context, q querier) (bool, error) {
 		}
 		split = !FriendsHold(u.Data, u.Metadata, cmp.Or(u.Copies, DefaultCopies), quotas)
 	}
-	db.splitAt, db.splitVal = time.Now(), split
+	db.splitAt, db.splitVal, db.splitKey = time.Now(), split, key
 	return split, nil
 }
+
+// splitKey is what overflowSplit's answer depends on besides the
+// repository: one cheap read of the friendships, the overflow targets
+// and the buckets' copies.
+const splitKey = `SELECT coalesce((SELECT group_concat(peer_key || ':' || coalesce(address, '') || ':' ||
+		coalesce(own_number, 0) || ':' || coalesce(peer_number, 0), ',') FROM friendship), '') || '|' ||
+	coalesce((SELECT group_concat(name || ':' || max_bytes, ',') FROM overflow), '') || '|' ||
+	coalesce((SELECT group_concat(name || ':' || copies, ',') FROM buckets), '')`
 
 // overflowHolding lists the overflow targets that hold or have queued a
 // data copy of bucket, in place order.

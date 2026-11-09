@@ -280,6 +280,9 @@ type replacer struct {
 	// split: placement is split between copies − 1 friends and one
 	// overflow target (overflowSplit, REPL-12 as of v0.11.5).
 	split bool
+	// moves: this round may move a copy held only at friends to a
+	// target (the second round of a split bucket, dataRound).
+	moves bool
 }
 
 // Replace runs one re-placement pass over every bucket (REPL-13, file
@@ -574,7 +577,45 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 			delete(m.unsent, k)
 		}
 	}
-	// Data: read in pages, decided again in each batch's transaction.
+	// Data: read in pages, decided again in each batch's transaction. A
+	// split bucket takes two rounds (#38 review): the first places
+	// missing copies only, the second moves copies to a target with the
+	// room the first left, so moves never take a target's room from an
+	// object with fewer copies.
+	rounds := []bool{false}
+	if m.split && copies >= 2 {
+		rounds = append(rounds, true)
+	}
+	var below, belowBytes int64
+	for _, moves := range rounds {
+		m.moves = moves
+		s, b, bb, err := m.dataRound(ctx, bucket, copies)
+		st.add(s)
+		below, belowBytes = b, bb
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	m.moves = false
+	st.Below, st.BelowBytes = below, belowBytes
+	if ctx.Err() == nil {
+		if err := m.recordBelow(ctx, bucket, below, belowBytes); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return st, errors.Join(errs...)
+}
+
+// dataRound scans bucket's live data objects and applies what decide
+// asks for them, in batches; it returns what it did and the objects
+// still below copies after it. A failed batch's error is returned with
+// the rest done.
+func (m *replacer) dataRound(ctx context.Context, bucket string, copies int) (ReplaceStats, int64, int64, error) {
+	var st ReplaceStats
+	var errs []error
 	type job struct {
 		seq, size int64
 		short     bool // below copies even with what the scan would place
@@ -585,7 +626,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 	for ctx.Err() == nil {
 		objs, err := m.page(ctx, bucket, after)
 		if err != nil {
-			return st, errors.Join(append(errs, err)...)
+			return st, below, belowBytes, errors.Join(append(errs, err)...)
 		}
 		if len(objs) == 0 {
 			break
@@ -594,7 +635,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 			after = o.seq
 			ops, short, left, err := m.decide(ctx, bucket, o, copies, false)
 			if err != nil {
-				return st, errors.Join(append(errs, err)...)
+				return st, below, belowBytes, errors.Join(append(errs, err)...)
 			}
 			switch {
 			case len(ops) > 0:
@@ -632,13 +673,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 		}
 		work = work[n:]
 	}
-	st.Below, st.BelowBytes = below, belowBytes
-	if ctx.Err() == nil {
-		if err := m.recordBelow(ctx, bucket, below, belowBytes); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return st, errors.Join(errs...)
+	return st, below, belowBytes, errors.Join(errs...)
 }
 
 // page reads up to replacePage live data objects of bucket after
@@ -734,7 +769,7 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 		}
 	}
 	maxFriends := -1
-	if m.split {
+	if m.split && copies >= 2 {
 		// REPL-12 as of v0.11.5: copies − 1 friends and one overflow
 		// target. A friend copy an overflow copy replaces is moving
 		// there; with no overflow copy yet, the fullest friend's of an
@@ -755,7 +790,7 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 			keep = append(keep, r)
 		}
 		good = keep
-		if overflowHeld == 0 && friendsHeld >= copies && copies > 1 {
+		if m.moves && overflowHeld == 0 && friendsHeld >= copies {
 			var acked []prow
 			for _, r := range good {
 				if r.state == PlacementAcked {
@@ -943,7 +978,7 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 func (m *replacer) overflowFor(ctx context.Context, bucket string, o robj, at map[string]prow) (bool, error) {
 	need := o.size + ObjectOverhead
 	for _, f := range m.order {
-		if !f.overflow || !f.candidate || !f.reachable {
+		if !f.overflow || !f.candidate || !f.reachable || f.drain[o.seq] || m.unverified[f.peer] {
 			continue
 		}
 		if r, ok := at[f.peer]; ok && (r.holds() || r.state == PlacementRefused || r.state == PlacementDropping) {

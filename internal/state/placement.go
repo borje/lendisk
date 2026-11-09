@@ -178,11 +178,61 @@ func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 
 		return err
 	}
 	if replaces.Valid && replaces.String != place {
-		if _, err := tx.ExecContext(ctx, markDropping, replaces.String, seq); err != nil {
+		keep, err := db.keepReplaced(ctx, tx, bucket, seq, replaces.String)
+		if err != nil {
 			return err
+		}
+		if !keep {
+			if _, err := tx.ExecContext(ctx, markDropping, replaces.String, seq); err != nil {
+				return err
+			}
 		}
 	}
 	return tx.Commit()
+}
+
+// keepReplaced reports whether the copy of row seq at replaced must stay
+// although its replacement was acknowledged (#38 review): replaced is
+// an intact place (in the pool, not removed, not gone past
+// replace_after, its replica of the bucket not unverified), as it is
+// when re-placement moved a copy rather than drained one, and without
+// it the object would have fewer than `copies` acknowledged copies at
+// such places. Re-placement then drops it when that is safe (decide).
+func (db *DB) keepReplaced(ctx context.Context, tx *sql.Tx, bucket string, seq int64, replaced string) (bool, error) {
+	ps, err := poolPlaces(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	unverified, err := unverifiedAt(ctx, tx, bucket)
+	if err != nil {
+		return false, err
+	}
+	now := db.now()
+	intact := map[string]bool{}
+	for _, p := range ps {
+		if p.cond != ConditionRemoved && !p.gone(db, now) && !unverified[p.peer] {
+			intact[p.peer] = true
+		}
+	}
+	if !intact[replaced] {
+		return false, nil // drained: it never counted
+	}
+	acked, err := column(ctx, tx, `SELECT place FROM placement WHERE seq = ? AND state = 'acked' AND place != ?`, seq, replaced)
+	if err != nil {
+		return false, err
+	}
+	n := 0
+	for _, a := range acked {
+		if intact[a] {
+			n++
+		}
+	}
+	var copies int
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce((SELECT copies FROM buckets WHERE name = ?), ?)`,
+		bucket, DefaultCopies).Scan(&copies); err != nil {
+		return false, err
+	}
+	return n < copies, nil
 }
 
 // freeLatePut handles a put of size bytes (row seq) acknowledged after a

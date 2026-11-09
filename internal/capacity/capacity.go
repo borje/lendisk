@@ -131,7 +131,7 @@ func (p Plan) FairProtectable() int64 { return p.largest(func(f Friend) int64 { 
 // placement applies), so each data object goes to Copies − 1 friends and
 // one overflow target.
 func (p Plan) Split() bool {
-	if len(p.Overflow) == 0 {
+	if len(p.Overflow) == 0 || p.Copies < 2 {
 		return false
 	}
 	var quotas []int64

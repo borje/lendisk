@@ -65,6 +65,7 @@ type DB struct {
 	splitMu  sync.Mutex
 	splitAt  time.Time
 	splitVal bool
+	splitKey string
 	splitTTL time.Duration
 
 	// beforeApply, if set, runs before each re-placement batch takes the

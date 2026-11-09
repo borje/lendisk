@@ -89,6 +89,15 @@ func (f *Client) classify(err error) error {
 	return classify(err)
 }
 
+// redact takes an overflow target's credential out of err's message; a
+// friend's error is returned as it is.
+func (f *Client) redact(err error) error {
+	if f.overflow {
+		return redacted{err, f.cred}
+	}
+	return err
+}
+
 // redacted is an overflow target's error with the credential's keys
 // taken out of its message (SEC-3): a provider's 403 may name the access
 // key (Garage does), and the message reaches place.detail, the log,
