@@ -4431,16 +4431,33 @@ the handler's own reads and is never cancelled; nothing below
     and undelete with `--rewrites`. *The revival* is the re-put's
     (`revive`): the row pending, the tomb hard-linked back (never over
     an object), the tomb unlinked, the row dropped, so `settleTombs`
-    settles a crash midway as for a re-put. *Quota:* a tomb counts
+    settles a crash midway as for a re-put
+    (`TestAnUndeleteCrashIsSettledAtStart`); the key's lock, held from
+    the choice of tomb to the end, keeps a purge due meanwhile from
+    taking the tomb in between (`TestUndeleteHoldsTheKeyAgainstThePurge`,
+    `TestUndeleteRacingAPutOfTheKey`). *Quota:* a tomb counts
     until purged (LEND-1), so a revival moves its count from tomb to
     live unchanged (`TestUndeleteRestoresTheTombsDeletedSince`).
+    *Never a revival unreported (#32 review).* A key that cannot be
+    revived now (its directory blocked by an object written since, the
+    disk) is skipped as `failed` with the reason, its tomb kept, and the
+    page goes on (`TestUndeleteReportsAKeyItCannotReviveAndGoesOn`).
+    Each key's steps run on a context detached from the request, so a
+    cancel (the borrower's call timing out, its daemon stopping) cannot
+    cut a revival midway; it ends the page after the key in hand, with
+    `next` at the last key handled
+    (`TestUndeleteCancelledMidPageReportsWhatItDid`). The control call
+    answers what a page did even if it ends in an error
+    (`TestAnUndeletePageThatFailsLateAnswersWhatItDid`). An answer
+    still lost on the way is healed by the borrower's adoption, below.
   - *The borrower (`state.DB.RecordRestored`).* What a friend restored
     is checked as recovery checks a list (key, size, hash, a
     hash-named key's name; rejected entries are logged and counted),
     classified by the bucket's profile (local-only keys are not
     recorded), and joins the index in one transaction per page: a key
     whose latest done write is a delete, or that has none (a recovered
-    node's key every friend listed tombstoned), gains a done put of
+    node's key every friend listed tombstoned) and that the preview the
+    user confirmed listed (table `undelete_key`, schema 35), gains a done put of
     the version, created now, with an acknowledged placement row at
     that friend (size plus `ObjectOverhead`); a second friend
     restoring the same version adds its acknowledgement (a `queued`,
@@ -4459,9 +4476,29 @@ the handler's own reads and is never cancelled; nothing below
     held back) keeps it: the local store is the user's, and its version
     is the newer; the friend's restored copy is reported (`kept`) and
     not counted. A key with a write in flight (a pending row) is left
-    to that write. The borrower's count of the friend is high by the
+    to that write. *Decision (#32 review): kept and busy keys are
+    reported, not counted.* The friend holds the restored version live,
+    which is not this node's version (kept) or not yet known to be
+    (busy); counting it as held would place a version the index does
+    not hold. The command names each, with both hashes for a kept key;
+    the node's own write reaches that friend as any write over a version
+    it holds (EP-11, LEND-4). The borrower's count of the friend is high by the
     restored bytes until its next quota answer (§3.4 *What each side
-    counts*).
+    counts*). *A friend cannot add keys:* a key this node has no
+    history of that the confirmed preview did not list is recorded
+    nowhere and reported `unknown` (`TestAFriendCannotAddKeysByUndelete`).
+    *What a friend restored is never lost to the index:* a page that
+    fails to record is recorded again (five tries, a second apart)
+    before the next page is asked for; and after every run the runner
+    reads each friend's list again and adopts its live keys whose
+    latest done write here is a delete that friend acknowledged, or
+    that have no history here and were in the confirmed preview
+    (`state.DB.AdoptRestored`): the keys of an answer lost on the way,
+    or of an earlier run that failed, join the index as restored there
+    (`TestOrphansOfALostAnswerAreAdopted`,
+    `TestTheRunnerTrustsOnlyThePreviewAndHealsLostAnswers`). A delete
+    not yet acknowledged there is the friend's lag, not a revival, and
+    is left alone.
   - *Scenario 4* (`TestScenarioRansomwareIsUndone`, real daemons,
     restic): A at two copies over B and C; the attacker's `restic
     forget --prune` of both snapshots replicates as tombs at both; A
@@ -4842,7 +4879,7 @@ the handler's own reads and is never cancelled; nothing below
   "tombstoned_at"}], "skipped": [{"key", "sha256", "live",
   "reason"}], "next"}`: at most a page (`gateway.MaxListPage`) of the
   keys with tombs since then after `after`, each restored or skipped
-  (`conflict`, `live`). Open to the `peer` role only and keyed by the
+  (`conflict`, `live`, or `failed` with a `detail`). Open to the `peer` role only and keyed by the
   resolved caller, like `list`; another's or an unknown sealed name is
   `404` with `NoSuchBucket`; a negative since, a page over 1000 or no
   bucket `400`; a gateway still starting `503` with `Retry-After: 5`.

@@ -146,10 +146,12 @@ func TestTheRunnerPreviewsThenRestores(t *testing.T) {
 		got[f.Peer] = f
 	}
 	b, c := got[ids["B"]], got[ids["C"]]
-	if b.Restored != 2 || b.Recorded != 2 || b.Rejected != 1 || b.ConflictCount != 1 || b.Conflicts[0].Key != "config" || b.Error != "" {
+	// Friends are asked in node ID order: whichever restores the pack
+	// first records it, the other acknowledges it.
+	if b.Restored != 2 || b.Recorded+b.Acked != 2 || b.Rejected != 1 || b.ConflictCount != 1 || b.Conflicts[0].Key != "config" || b.Error != "" {
 		t.Fatalf("B %+v", b)
 	}
-	if c.Restored != 1 || c.Acked != 1 || c.Recorded != 0 {
+	if c.Restored != 1 || c.Acked+c.Recorded != 1 || b.Recorded+c.Recorded != 2 {
 		t.Fatalf("C %+v", c)
 	}
 	if got[ids["D"]].Error != "" || got[ids["D"]].Restored != 0 || !strings.Contains(got[ids["E"]].Error, "no route") {

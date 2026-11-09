@@ -274,6 +274,11 @@ func (l *Lending) revive(ctx context.Context, bucket string, t state.Tombstone) 
 		l.log().Error("lending: reviving a tombstoned object failed; it stays tombstoned", "bucket", bucket, "key", t.Key, "err", err)
 		return "", errInternal
 	}
+	if l.afterReviveLink != nil {
+		if err := l.afterReviveLink(); err != nil {
+			return "", errInternal // as a crash: the row stays pending
+		}
+	}
 	if err := l.removeTomb(bucket, t.Tomb); err != nil {
 		l.log().Warn("lending: removing a revived object's tomb failed; the next start settles it", "bucket", bucket, "key", t.Key, "err", err)
 		return t.ETag, nil

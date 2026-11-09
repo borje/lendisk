@@ -77,12 +77,14 @@ type UndeleteResponse struct {
 
 // UndeleteSkip is a key the lender left as it was: its version that would
 // have come back, what the key holds, and why (gateway.SkipConflict:
-// other bytes; gateway.SkipLive: the same).
+// other bytes; gateway.SkipLive: the same; gateway.SkipFailed: it could
+// not revive it now, Detail saying why).
 type UndeleteSkip struct {
 	Key    string `json:"key"`
 	SHA256 string `json:"sha256"`
 	Live   string `json:"live"`
 	Reason string `json:"reason"`
+	Detail string `json:"detail,omitempty"` // why it failed (gateway.SkipFailed)
 }
 
 // Undeleter brings a borrower's tombs back (gateway.Gateway.Undelete).
@@ -171,6 +173,12 @@ func (s *Server) undelete(w http.ResponseWriter, r *http.Request, c Caller) {
 	limit := cmp.Or(req.Limit, gateway.MaxListPage)
 	u, err := s.Undeleter.Undelete(r.Context(), c.Peer, req.Bucket, time.Unix(req.Since, 0), req.Rewrites, req.After, limit)
 	looked = len(u.Restored) + len(u.Skipped)
+	if err != nil && looked > 0 {
+		// Never drop what was done: the caller records what this page
+		// restored and goes on from the last key handled (#32 review).
+		s.Log.Error("undelete: a page ended early", "peer", peer, "err", err)
+		u.Next, err = undeletedLast(u, req.After), nil
+	}
 	switch {
 	case errors.Is(err, gateway.ErrNoLentBucket):
 		writeJSON(w, http.StatusNotFound, errorBody{Error: err.Error(), Code: CodeNoSuchBucket})
@@ -190,7 +198,7 @@ func (s *Server) undelete(w http.ResponseWriter, r *http.Request, c Caller) {
 		resp.Restored = append(resp.Restored, ListObject{Key: o.Key, Size: o.Size, SHA256: o.SHA256, TombstonedAt: &at})
 	}
 	for _, k := range u.Skipped {
-		resp.Skipped = append(resp.Skipped, UndeleteSkip{Key: k.Key, SHA256: k.SHA256, Live: k.Live, Reason: k.Reason})
+		resp.Skipped = append(resp.Skipped, UndeleteSkip{Key: k.Key, SHA256: k.SHA256, Live: k.Live, Reason: k.Reason, Detail: k.Detail})
 	}
 	if len(u.Restored) > 0 {
 		s.Log.Info("undelete: restored a friend's deleted objects", "peer", peer, "restored", len(u.Restored),
@@ -274,4 +282,16 @@ func (s *Server) undeleteDone(peer string, looked int, now time.Time) {
 	s.refillUndelete(&p.b, now)
 	p.b.tokens -= float64(max(looked, UndeleteCallCost))
 	p.running = false
+}
+
+// undeletedLast is the greatest key u restored or skipped, or after.
+func undeletedLast(u gateway.Undeleted, after string) string {
+	last := after
+	for _, o := range u.Restored {
+		last = max(last, o.Key)
+	}
+	for _, k := range u.Skipped {
+		last = max(last, k.Key)
+	}
+	return last
 }

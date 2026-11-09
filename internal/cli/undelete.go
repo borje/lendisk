@@ -250,6 +250,7 @@ func (a *app) printPreview(p undelete.Preview, at time.Time) {
 // reached, or that failed, makes it an error: run it again.
 func (a *app) printUndeleted(bucket string, res undelete.Result) error {
 	var failed []string
+	failedKeys := false
 	for _, f := range res.Friends {
 		if f.Error != "" {
 			fmt.Fprintf(a.out, "  %s: not finished (%s)\n", f.Peer, f.Error)
@@ -271,13 +272,34 @@ func (a *app) printUndeleted(bucket string, res undelete.Result) error {
 		if n := f.KeptCount - len(f.Kept); n > 0 {
 			fmt.Fprintf(a.out, "    ! … and %d more keys this node wrote again since\n", n)
 		}
-		if f.Busy > 0 {
-			fmt.Fprintf(a.out, "    ! %s being written now, left to that write\n", plural(int64(f.Busy), "key", "keys"))
+		for _, k := range f.BusyKeys {
+			fmt.Fprintf(a.out, "    ! %s was being written here: the friend holds its deleted version live again, not counted; this node's write goes to it as any write over a version it holds (EP-11)\n", k)
+		}
+		if n := f.Busy - len(f.BusyKeys); n > 0 {
+			fmt.Fprintf(a.out, "    ! … and %d more keys being written here\n", n)
+		}
+		for _, k := range f.FailedKeys {
+			fmt.Fprintf(a.out, "    ! %s could not be brought back now (%s); its tombstone stays: undelete again later\n", k.Key, k.Detail)
+			failedKeys = true
+		}
+		if n := f.Failed - len(f.FailedKeys); n > 0 {
+			fmt.Fprintf(a.out, "    ! … and %d more keys not brought back now\n", n)
+			failedKeys = true
+		}
+		if f.Unknown > 0 {
+			fmt.Fprintf(a.out, "    ! %s the friend restored this node never had and the preview did not list: not counted (see the daemon's log)\n",
+				plural(int64(f.Unknown), "key", "keys"))
+		}
+		if f.Adopted > 0 {
+			fmt.Fprintf(a.out, "    %s an earlier undelete brought back there, now counted\n", plural(int64(f.Adopted), "object", "objects"))
 		}
 		if f.Rejected > 0 {
 			fmt.Fprintf(a.out, "    ! %s the friend sent cannot be this node's and %s not counted (see the daemon's log)\n",
 				plural(int64(f.Rejected), "entry", "entries"), map[bool]string{true: "was", false: "were"}[f.Rejected == 1])
 		}
+	}
+	if failedKeys && len(failed) == 0 {
+		return fmt.Errorf("some objects could not be brought back now; run `lendisk undelete %s` again later", bucket)
 	}
 	if len(failed) > 0 {
 		return fmt.Errorf("%s not finished; run `lendisk undelete %s` again when %s reachable",

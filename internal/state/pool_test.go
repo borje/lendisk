@@ -17,10 +17,11 @@ const unit = int64(1 << 20)
 // pool is a node's lendisk.db with friends of given quotas, a clock, and
 // helpers to capture objects of a class and size.
 type pool struct {
-	t   *testing.T
-	db  *DB
-	now time.Time
-	n   int
+	t       *testing.T
+	db      *DB
+	now     time.Time
+	n       int
+	request int64 // the undelete request RecordRestored records under (#32)
 }
 
 func newPool(t *testing.T) *pool {

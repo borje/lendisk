@@ -18,7 +18,13 @@
 //   - Nothing a friend answers is trusted beyond what recovery trusts of
 //     a list (ID-5): keys a borrower may not name, impossible sizes,
 //     malformed hashes and hash-named keys whose hash is not their name
-//     are rejected and counted, never recorded.
+//     are rejected and counted, never recorded; a key this node has no
+//     history of is taken only if the preview the user confirmed listed
+//     it (state.DB.RecordRestored).
+//   - What a friend revived must reach the index: a page that fails to
+//     record is recorded again before the next is asked for, and after
+//     each run the friends' lists are read again to adopt revivals whose
+//     answer was lost (state.DB.AdoptRestored).
 //   - The local store is never written: restored objects are fetched on
 //     demand (ID-6, EP-10).
 package undelete
@@ -67,6 +73,8 @@ type Preview struct {
 	Snapshots int             `json:"snapshots"`
 	Named     []string        `json:"named,omitempty"` // snapshot keys that come back, at most MaxNamed
 	Rewritten int             `json:"rewritten,omitempty"`
+
+	keys []string // every key that would come back: what the user confirms
 }
 
 // FriendPreview is one friend's part of a preview: the tombstoned keys it
@@ -87,10 +95,12 @@ type Result struct {
 }
 
 // FriendResult is one friend's undelete: the keys it restored and their
-// bytes; how the index took them (Recorded, Acked, Kept, Busy:
+// bytes; how the index took them (Recorded, Acked, Kept, Busy, Unknown:
 // state.RestoreResult); the keys it left as they were (Conflicts: live
-// with other bytes; Live: with the same); entries rejected; and why it
-// could not finish.
+// with other bytes; Live: with the same; Failed: it could not revive
+// them now); keys it revived whose answer was lost, found live in its
+// list after the run (Adopted); entries rejected; and why it could not
+// finish.
 type FriendResult struct {
 	Peer          string                 `json:"peer"`
 	Restored      int                    `json:"restored"`
@@ -100,6 +110,11 @@ type FriendResult struct {
 	Kept          []state.KeptVersion    `json:"kept,omitempty"` // at most MaxNamed
 	KeptCount     int                    `json:"kept_count,omitempty"`
 	Busy          int                    `json:"busy,omitempty"`
+	BusyKeys      []string               `json:"busy_keys,omitempty"` // at most MaxNamed
+	Unknown       int                    `json:"unknown,omitempty"`
+	Failed        int                    `json:"failed,omitempty"`
+	FailedKeys    []control.UndeleteSkip `json:"failed_keys,omitempty"` // at most MaxNamed
+	Adopted       int                    `json:"adopted,omitempty"`
 	Conflicts     []control.UndeleteSkip `json:"conflicts,omitempty"` // at most MaxNamed
 	ConflictCount int                    `json:"conflict_count,omitempty"`
 	Live          int                    `json:"live,omitempty"`
@@ -121,6 +136,9 @@ type Runner struct {
 	// API over Dial. Tests set them.
 	List func(ctx context.Context, f state.Friendship, sealed, after string) (control.ListPage, error)
 	Call func(ctx context.Context, f state.Friendship, req control.UndeleteRequest) (control.UndeleteResponse, error)
+	// Record records a page a friend restored; nil means
+	// state.DB.RecordRestored. Tests set it.
+	Record func(ctx context.Context, place, bucket string, request int64, objs []state.Restored) (state.RestoreResult, error)
 	// Now is the clock; nil means time.Now. Poll is how often Run looks
 	// for requests (DefaultPoll); Timeout bounds one call (1 min).
 	Now     func() time.Time
@@ -180,7 +198,7 @@ func (r *Runner) Once(ctx context.Context) error {
 				continue
 			}
 			b, _ := json.Marshal(p)
-			if err := r.DB.PreviewUndelete(ctx, q.ID, string(b), r.now()); err != nil && !errors.Is(err, state.ErrNotFound) {
+			if err := r.DB.PreviewUndelete(ctx, q.ID, string(b), p.keys, r.now()); err != nil && !errors.Is(err, state.ErrNotFound) {
 				return err
 			}
 		case state.UndeleteConfirmed:
@@ -296,9 +314,10 @@ func (r *Runner) Preview(ctx context.Context, q state.UndeleteRequest) (Preview,
 		p.Rewritten = max(p.Rewritten, fp.Rewritten)
 		p.Friends = append(p.Friends, fp)
 	}
-	for _, n := range all {
+	for k, n := range all {
 		p.Keys++
 		p.Bytes += n
+		p.keys = append(p.keys, k)
 	}
 	p.Snapshots = len(snaps)
 	for _, k := range slices.Sorted(maps.Keys(snaps)) {
@@ -344,7 +363,89 @@ func (r *Runner) Undelete(ctx context.Context, q state.UndeleteRequest) (Result,
 		}
 		res.Friends = append(res.Friends, fr)
 	}
+	// Keys a friend revived whose answer never arrived (a call that timed
+	// out after the lender's work, a restart): live in its list now,
+	// deleted here. Adopted, so an earlier failed run heals too.
+	for i, f := range fs {
+		if res.Friends[i].Error != "" {
+			continue
+		}
+		n, err := r.adopt(ctx, f, q, prof, sealed)
+		res.Friends[i].Adopted += n
+		if err != nil {
+			if ctx.Err() != nil {
+				return res, ctx.Err()
+			}
+			res.Friends[i].Error = "listing what it holds after the undelete: " + err.Error()
+		}
+		if n > 0 {
+			r.log().Info("undelete: adopted objects a friend restored whose answer was lost", "peer", f.Peer, "bucket", q.Bucket, "adopted", n)
+		}
+	}
 	return res, nil
+}
+
+// adopt reads f's list of the bucket and records the live keys an
+// undelete revived there that the index still holds deleted
+// (state.DB.AdoptRestored).
+func (r *Runner) adopt(ctx context.Context, f state.Friendship, q state.UndeleteRequest, prof *profile.Profile, sealed string) (int, error) {
+	list, done := r.lister(f)
+	defer done()
+	after, n := "", 0
+	for pages := 0; ; pages++ {
+		if pages > 2*gateway.MaxListPage {
+			return n, errors.New("the friend's list does not end")
+		}
+		cctx, cancel := context.WithTimeout(ctx, cmp.Or(r.Timeout, time.Minute))
+		page, err := list(cctx, f, sealed, after)
+		cancel()
+		var ce *control.CallError
+		if errors.As(err, &ce) && ce.Code == control.CodeNoSuchBucket {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+		var objs []state.Restored
+		for _, o := range page.Objects {
+			if o.TombstonedAt != nil || reject(prof, o) != "" || prof.Classify(o.Key) == profile.LocalOnly {
+				continue
+			}
+			objs = append(objs, state.Restored{Key: o.Key, Size: o.Size, SHA256: o.SHA256,
+				Class: string(prof.Classify(o.Key)), Rewritable: prof.Rewritable(o.Key)})
+		}
+		a, err := r.DB.AdoptRestored(ctx, f.Peer, q.Bucket, q.ID, objs)
+		n += a
+		if err != nil {
+			return n, err
+		}
+		if page.Next == "" {
+			return n, nil
+		}
+		after = page.Next
+	}
+}
+
+// record records a page f restored, trying again on failure before the
+// next page is asked for: the friend has revived those keys, and only
+// this answer says so (#32 review).
+func (r *Runner) record(ctx context.Context, place, bucket string, request int64, objs []state.Restored) (state.RestoreResult, error) {
+	rec := r.Record
+	if rec == nil {
+		rec = r.DB.RecordRestored
+	}
+	var err error
+	for try := 0; try < 5; try++ {
+		var rr state.RestoreResult
+		if rr, err = rec(ctx, place, bucket, request, objs); err == nil {
+			return rr, nil
+		}
+		r.log().Warn("undelete: recording what a friend restored failed; trying again", "peer", place, "bucket", bucket, "err", err)
+		if werr := r.wait(ctx, time.Second); werr != nil {
+			return rr, werr
+		}
+	}
+	return state.RestoreResult{}, err
 }
 
 func (r *Runner) undeleteAt(ctx context.Context, f state.Friendship, q state.UndeleteRequest, prof *profile.Profile,
@@ -391,13 +492,23 @@ func (r *Runner) undeleteAt(ctx context.Context, f state.Friendship, q state.Und
 			objs = append(objs, state.Restored{Key: o.Key, Size: o.Size, SHA256: o.SHA256,
 				Class: string(prof.Classify(o.Key)), Rewritable: prof.Rewritable(o.Key)})
 		}
-		rr, err := r.DB.RecordRestored(ctx, f.Peer, q.Bucket, objs)
+		rr, err := r.record(ctx, f.Peer, q.Bucket, q.ID, objs)
 		if err != nil {
 			return fmt.Errorf("recording what the friend restored: %w", err)
 		}
 		fr.Recorded += rr.Recorded
 		fr.Acked += rr.Acked
 		fr.Busy += len(rr.Busy)
+		fr.Unknown += len(rr.Unknown)
+		for _, k := range rr.Busy {
+			if len(fr.BusyKeys) < MaxNamed {
+				fr.BusyKeys = append(fr.BusyKeys, k)
+			}
+		}
+		for _, k := range rr.Unknown {
+			r.log().Warn("undelete: a friend restored a key this node never had and the preview did not list; not recorded",
+				"peer", f.Peer, "bucket", q.Bucket, "key", k)
+		}
 		fr.KeptCount += len(rr.Kept)
 		for _, k := range rr.Kept {
 			if len(fr.Kept) < MaxNamed {
@@ -407,6 +518,13 @@ func (r *Runner) undeleteAt(ctx context.Context, f state.Friendship, q state.Und
 		for _, s := range page.Skipped {
 			if s.Reason == gateway.SkipLive {
 				fr.Live++
+				continue
+			}
+			if s.Reason == gateway.SkipFailed {
+				fr.Failed++
+				if len(fr.FailedKeys) < MaxNamed {
+					fr.FailedKeys = append(fr.FailedKeys, s)
+				}
 				continue
 			}
 			fr.ConflictCount++

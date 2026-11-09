@@ -92,6 +92,12 @@ type Lending struct {
 	// into its tomb and the new one is not yet published; an error fails
 	// the rewrite there, as the store failing would.
 	afterRewriteMove func() error
+	// afterUndeleteKey runs when undelete has handled a key; afterReviveLink
+	// when a revival has linked a tomb back and not yet unlinked it, an
+	// error stopping it there as a crash would.
+	afterUndeleteKey    func(key string)
+	afterUndeleteChoose func() // undelete has chosen a key's tomb, holding its locks
+	afterReviveLink     func() error
 
 	tombDirs sync.Mutex // creating and removing directories for tombs and revivals
 

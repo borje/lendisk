@@ -233,3 +233,25 @@ func TestUndeleteIsPacedPerFriend(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// partial is an Undeleter that revives one key and then fails.
+type partial struct{}
+
+func (partial) Undelete(_ context.Context, _ identity.NodeID, _ string, since time.Time, _ bool, _ string, _ int) (gateway.Undeleted, error) {
+	return gateway.Undeleted{Restored: []gateway.LentObject{{Key: "data/aa/1", Size: 1, SHA256: strings.Repeat("a", 64), TombstonedAt: since}}},
+		errors.New("the disk went away")
+}
+
+// RET-3 (#32 review): a page that ends in an error after it revived keys
+// still answers them, with next at the last key handled: the borrower
+// records them and goes on, rather than losing them to a 500.
+func TestAnUndeletePageThatFailsLateAnswersWhatItDid(t *testing.T) {
+	l := newLender(t)
+	bob := newID(t)
+	l.srv.Undeleter = partial{}
+	asBob := l.client(t, control.Caller{Peer: bob.NodeID(), Role: state.RolePeer})
+	page, err := asBob.Undelete(t.Context(), control.UndeleteRequest{Bucket: bob.SealedName("laptop")})
+	if err != nil || len(page.Restored) != 1 || page.Next != "data/aa/1" {
+		t.Fatalf("%+v %v", page, err)
+	}
+}

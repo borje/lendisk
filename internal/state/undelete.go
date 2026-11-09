@@ -47,6 +47,9 @@ func (db *DB) RequestUndelete(ctx context.Context, bucket string, since time.Tim
 	if _, err := db.ExecContext(ctx, `DELETE FROM undelete_request WHERE requested_at < ?`, now.Add(-UndeleteKept).Unix()); err != nil {
 		return 0, err
 	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM undelete_key WHERE request NOT IN (SELECT id FROM undelete_request)`); err != nil {
+		return 0, err
+	}
 	var s int64
 	if !since.IsZero() {
 		s = max(since.Unix(), 0)
@@ -125,9 +128,29 @@ func (db *DB) advanceUndelete(ctx context.Context, id int64, from, to, col, val 
 	return nil
 }
 
-// PreviewUndelete records the daemon's preview of request id.
-func (db *DB) PreviewUndelete(ctx context.Context, id int64, preview string, now time.Time) error {
-	return db.advanceUndelete(ctx, id, UndeleteAsked, UndeletePreviewed, "preview", preview, now)
+// PreviewUndelete records the daemon's preview of request id, with the
+// keys it listed as coming back (undelete_key): what the user confirms.
+func (db *DB) PreviewUndelete(ctx context.Context, id int64, preview string, keys []string, now time.Time) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE undelete_request SET stage = ?, updated_at = ?, preview = ? WHERE id = ? AND stage = ?`,
+		UndeletePreviewed, now.Unix(), preview, id, UndeleteAsked)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	p := prepared(tx)
+	for _, k := range keys {
+		if _, err := p.ExecContext(ctx, `INSERT OR IGNORE INTO undelete_key (request, key) VALUES (?, ?)`, id, k); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // ConfirmUndelete records the user's yes to a previewed request.
@@ -156,7 +179,13 @@ func (db *DB) FinishUndelete(ctx context.Context, id int64, failed bool, result 
 // CancelUndelete drops a request not yet confirmed: the user said no, or
 // stopped waiting. A confirmed one runs to its end.
 func (db *DB) CancelUndelete(ctx context.Context, id int64) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM undelete_request WHERE id = ? AND stage IN (?, ?)`, id, UndeleteAsked, UndeletePreviewed)
+	res, err := db.ExecContext(ctx, `DELETE FROM undelete_request WHERE id = ? AND stage IN (?, ?)`, id, UndeleteAsked, UndeletePreviewed)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		_, err = db.ExecContext(ctx, `DELETE FROM undelete_key WHERE request = ?`, id)
+	}
 	return err
 }
 
@@ -182,19 +211,24 @@ type KeptVersion struct {
 // put of the restored version, acknowledged at the place; Acked keys'
 // latest write was that version already, now acknowledged at the place;
 // Kept keys keep this node's other version (EP-11); Busy keys were being
-// written, and are left to that write.
+// written, and are left to that write; Unknown keys this node has no
+// history of and the confirmed preview did not list: a friend's claim
+// alone, recorded nowhere.
 type RestoreResult struct {
 	Recorded, Acked int
 	Kept            []KeptVersion
 	Busy            []string
+	Unknown         []string
 }
 
 // RecordRestored records objects place restored of bucket (RET-3, #32),
 // in one transaction, as recovery records a listed version (ID-5):
 //
 //   - a key whose latest done write is a delete, or that has none (a
-//     recovered node's key every place held tombstoned), gains a done
-//     put of the version, created now, with an acknowledged placement
+//     recovered node's key every place held tombstoned) and that the
+//     preview of request listed (undelete_key: what the user confirmed;
+//     else Unknown, so a friend cannot add keys), gains a done put of
+//     the version, created now, with an acknowledged placement
 //     row at place, counted in its use with the object overhead. The row
 //     is not held locally (queue.local NULL): the local store is not
 //     refilled, the read-through fetches the object when it is read, and
@@ -210,7 +244,7 @@ type RestoreResult struct {
 //
 // The offsite watermark then counts the restored rows as any put
 // acknowledged at its places (REPL-11).
-func (db *DB) RecordRestored(ctx context.Context, place, bucket string, objs []Restored) (RestoreResult, error) {
+func (db *DB) RecordRestored(ctx context.Context, place, bucket string, request int64, objs []Restored) (RestoreResult, error) {
 	var r RestoreResult
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -256,21 +290,104 @@ func (db *DB) RecordRestored(ctx context.Context, place, bucket string, objs []R
 			}
 			r.Acked++
 			continue
+		case errors.Is(err, sql.ErrNoRows):
+			ok, err := previewed(ctx, p, request, o.Key)
+			if err != nil {
+				return r, err
+			}
+			if !ok {
+				r.Unknown = append(r.Unknown, o.Key)
+				continue
+			}
 		}
-		res, err := p.ExecContext(ctx, `INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at, rewritable)
-			VALUES (?, ?, 'put', ?, 'done', ?, ?, ?, ?)`, bucket, o.Key, o.Class, o.Size, o.SHA256, now, nullTrue(o.Rewritable))
-		if err != nil {
-			return r, err
-		}
-		id, err := res.LastInsertId()
-		if err != nil {
-			return r, err
-		}
-		if _, err := p.ExecContext(ctx, `INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
-			VALUES (?, ?, ?, ?, 'put', 'acked', ?, ?, ?)`, id, place, bucket, o.Key, o.SHA256, now, o.Size+ObjectOverhead); err != nil {
+		if err := recordPut(ctx, p, place, bucket, o, now); err != nil {
 			return r, err
 		}
 		r.Recorded++
 	}
 	return r, tx.Commit()
+}
+
+// previewed reports whether request's preview listed key.
+func previewed(ctx context.Context, p *preparedTx, request int64, key string) (bool, error) {
+	var n int
+	err := p.QueryRowContext(ctx, `SELECT count(*) FROM undelete_key WHERE request = ? AND key = ?`, request, key).Scan(&n)
+	return n > 0, err
+}
+
+// recordPut adds a done put of o, created now, acknowledged at place.
+func recordPut(ctx context.Context, p *preparedTx, place, bucket string, o Restored, now int64) error {
+	res, err := p.ExecContext(ctx, `INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at, rewritable)
+		VALUES (?, ?, 'put', ?, 'done', ?, ?, ?, ?)`, bucket, o.Key, o.Class, o.Size, o.SHA256, now, nullTrue(o.Rewritable))
+	if err != nil {
+		return err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+	_, err = p.ExecContext(ctx, `INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
+		VALUES (?, ?, ?, ?, 'put', 'acked', ?, ?, ?)`, id, place, bucket, o.Key, o.SHA256, now, o.Size+ObjectOverhead)
+	return err
+}
+
+// AdoptRestored records, of the live keys place lists of bucket, those an
+// undelete revived whose answer never arrived (#32 review): a key whose
+// latest done write here is a delete place acknowledged (so place held
+// it deleted, and holds it live again), or, with no history here, one the
+// preview of request listed. Each gains a done put acknowledged at place,
+// as RecordRestored records it; it returns how many. A delete not yet
+// acknowledged at place, a key with a write in flight, and a key this
+// node holds as a put are left alone.
+func (db *DB) AdoptRestored(ctx context.Context, place, bucket string, request int64, objs []Restored) (int, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	p := prepared(tx)
+	now := db.now().Unix()
+	n := 0
+	for _, o := range objs {
+		var pending int
+		if err := p.QueryRowContext(ctx, `SELECT count(*) FROM queue WHERE bucket = ? AND key = ? AND state = 'pending'`,
+			bucket, o.Key).Scan(&pending); err != nil {
+			return n, err
+		}
+		if pending > 0 {
+			continue
+		}
+		var seq int64
+		var op string
+		err := p.QueryRowContext(ctx, `SELECT seq, op FROM queue
+			WHERE bucket = ? AND key = ? AND state = 'done' ORDER BY seq DESC LIMIT 1`, bucket, o.Key).Scan(&seq, &op)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			ok, err := previewed(ctx, p, request, o.Key)
+			if err != nil || !ok {
+				if err != nil {
+					return n, err
+				}
+				continue
+			}
+		case err != nil:
+			return n, err
+		case op != OpDelete:
+			continue
+		default:
+			var acked int
+			if err := p.QueryRowContext(ctx, `SELECT count(*) FROM placement WHERE seq = ? AND place = ? AND state = 'acked'`,
+				seq, place).Scan(&acked); err != nil {
+				return n, err
+			}
+			if acked == 0 {
+				continue
+			}
+		}
+		if err := recordPut(ctx, p, place, bucket, o, now); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, tx.Commit()
 }

@@ -732,4 +732,18 @@ var migrations = []Migration{
 			updated_at   INTEGER
 		);`,
 	},
+	{
+		Version: 35, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The keys an undelete's preview listed (#32 review): what the user
+		-- confirmed. A key a friend says it restored that this node has no
+		-- history of is taken only if its request's preview listed it, so a
+		-- friend cannot add keys the bucket never had. Dropped with the
+		-- request.
+		CREATE TABLE undelete_key (
+			request INTEGER NOT NULL,
+			key     TEXT NOT NULL,
+			PRIMARY KEY (request, key)
+		) WITHOUT ROWID;`,
+	},
 }

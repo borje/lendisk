@@ -30,6 +30,10 @@ import (
 //     lock. The count moves from tomb to live unchanged (LEND-1).
 //   - A page covers at most limit keys with such tombs, in key order,
 //     after the key after; Next is where the next page starts.
+//   - Every revival is reported: a key that cannot be revived is skipped
+//     as SkipFailed and the page goes on; each key's steps run detached
+//     from the request, and a cancelled request ends the page after the
+//     key in hand, Next naming the last key handled (#32 review).
 
 // Reasons a key is skipped by undelete.
 const (
@@ -38,6 +42,9 @@ const (
 	SkipConflict = "conflict"
 	// SkipLive: the key is live with the version's own bytes already.
 	SkipLive = "live"
+	// SkipFailed: the lender could not revive the key now (Detail says
+	// why); its tomb stays, and a later undelete tries again.
+	SkipFailed = "failed"
 )
 
 // UndeleteSkip is a key undelete left as it was.
@@ -45,7 +52,8 @@ type UndeleteSkip struct {
 	Key    string
 	SHA256 string // the version undelete would have brought back
 	Live   string // the hash of what the key holds
-	Reason string // SkipConflict or SkipLive
+	Reason string // SkipConflict, SkipLive or SkipFailed
+	Detail string // SkipFailed's reason
 }
 
 // Undeleted is a page of undelete: the keys moved back to the live set,
@@ -94,15 +102,58 @@ func (l *Lending) undelete(ctx context.Context, borrower identity.NodeID, sealed
 		u.Next = keys[len(keys)-1]
 	}
 	bucket := LentName(borrower, sealed)
+	// Each key's steps run to their end once begun, whatever becomes of
+	// the request: a revival the answer never reports would leave the
+	// object live at the lender and deleted in the borrower's index
+	// (#32 review). A cancelled request ends the page after the key in
+	// hand, Next naming it.
+	work := detach(ctx)
 	for _, key := range keys {
-		if err := l.undeleteKey(ctx, peer, sealed, bucket, key, since, rewrites, &u); err != nil {
-			return u, err
+		if ctx.Err() != nil {
+			u.Next = key
+			break
 		}
+		if err := l.undeleteKey(work, peer, sealed, bucket, key, since, rewrites, &u); err != nil {
+			// Never the page: the key keeps its tomb and is reported, and
+			// the keys after it are still undeleted.
+			l.log().Error("lending: undeleting a borrower's object failed; its tomb stays", "peer", peer, "key", key, "err", err)
+			u.Skipped = append(u.Skipped, UndeleteSkip{Key: key, Reason: SkipFailed, Detail: failure(err)})
+		}
+		if l.afterUndeleteKey != nil {
+			l.afterUndeleteKey(key)
+		}
+	}
+	if ctx.Err() != nil && u.Next != "" {
+		// Next is the key not reached: the next page starts after the
+		// last key handled.
+		u.Next = lastHandled(u, after)
 	}
 	return u, nil
 }
 
-// undeleteKey brings key's chosen tomb back, or records why not.
+// lastHandled is the greatest key u restored or skipped, or after.
+func lastHandled(u Undeleted, after string) string {
+	last := after
+	for _, o := range u.Restored {
+		last = max(last, o.Key)
+	}
+	for _, s := range u.Skipped {
+		last = max(last, s.Key)
+	}
+	return last
+}
+
+// failure says why a key could not be revived, for the borrower.
+func failure(err error) string {
+	if isCode(err, "InternalError") {
+		return "the lender could not move it back now (see its log); its tombstone stays, and a later undelete tries again"
+	}
+	return err.Error()
+}
+
+// undeleteKey brings key's chosen tomb back, or records why not. An
+// error leaves the key as it was, its tombstone kept or settled at the
+// next start.
 func (l *Lending) undeleteKey(ctx context.Context, peer, sealed, bucket, key string, since time.Time, rewrites bool, u *Undeleted) error {
 	unlock, err := l.keys.lock(ctx, bucket, key)
 	if err != nil {
@@ -121,6 +172,9 @@ func (l *Lending) undeleteKey(ctx context.Context, peer, sealed, bucket, key str
 	t, ok := chooseTomb(ts, since, rewrites)
 	if !ok {
 		return nil
+	}
+	if l.afterUndeleteChoose != nil {
+		l.afterUndeleteChoose()
 	}
 	cur, has, err := l.existing(ctx, bucket, key)
 	if err != nil {
