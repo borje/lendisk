@@ -415,6 +415,9 @@ func places(ctx context.Context, db *state.DB, now time.Time) ([]StatusPlace, er
 // in the lender-only profile, which has no endpoint (PEER-9).
 type StatusEndpoint struct {
 	S3 string `json:"s3"`
+	// Metrics is where the daemon serves Prometheus metrics (OPS-4),
+	// absent when metrics.listen is empty.
+	Metrics string `json:"metrics,omitempty"`
 	// Listen is every non-loopback listener (EP-17), one per address.
 	Listen []StatusListener `json:"listen"`
 }
@@ -795,6 +798,9 @@ friend, or with no room in the pool), which status shows.`,
 			}
 			if cfg.Role == "full" {
 				st.Endpoint.S3 = "http://" + cfg.Endpoint.Loopback
+				if cfg.Metrics.Listen != "" {
+					st.Endpoint.Metrics = "http://" + cfg.Metrics.Listen + "/metrics"
+				}
 			}
 			st.Endpoint.Listen = lanListeners(cfg)
 			db, err := state.Open(cmd.Context(), cfg.DataDir, log)
@@ -971,6 +977,9 @@ friend, or with no room in the pool), which status shows.`,
 			}
 			for _, l := range st.Endpoint.Listen {
 				fmt.Fprintf(a.out, "LAN:     %s\n", listenerLine(l))
+			}
+			if st.Endpoint.Metrics != "" {
+				fmt.Fprintf(a.out, "Metrics: %s\n", st.Endpoint.Metrics)
 			}
 			fmt.Fprintf(a.out, "Buckets: %d\n", len(st.Buckets))
 			for _, b := range st.Buckets {

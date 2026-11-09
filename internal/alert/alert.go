@@ -282,6 +282,10 @@ var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotR
 	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot, KindRecoverySheetStale,
 	KindProtectable}
 
+// Kinds are the alert kinds the evaluator owns, for the metrics that
+// count pending alerts by kind (OPS-4).
+func Kinds() []string { return slices.Clone(kinds) }
+
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
 // Schema changes only on a breaking change.

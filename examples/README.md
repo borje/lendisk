@@ -62,7 +62,8 @@ versitygw on the internal unix socket; versitygw opens no TCP port.
 - `127.0.0.1:9000` TCP: the S3 endpoint for your backup tools (EP-1).
   Because of `network_mode: host` this is the host's loopback, which is
   where restic or Kopia on the same machine look.
-- `127.0.0.1:9100` TCP: Prometheus metrics (OPS-4). Absent in the
+- `127.0.0.1:9101` TCP: Prometheus metrics at `/metrics` (OPS-4), where
+  `[metrics] listen` sets it; off by default. Refused in the
   lender-only profile, where nothing listens on loopback (PEER-9).
 - The tailcat tunnel: one UDP port for WireGuard, chosen by tailcat,
   carrying the lender-facing S3 and control API on port 9000 inside it.

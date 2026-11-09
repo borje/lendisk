@@ -372,21 +372,59 @@ func TestEndpointListenRefused(t *testing.T) {
 	}
 }
 
-// PEER-9, OPS-4 (#41): the lender-only profile has no metrics listener,
-// so a metrics setting is refused at load, though no version knows one
-// yet (#43): a full node only reports it as unknown.
+// PEER-9, OPS-4 (#41, #43): the lender-only profile has no metrics
+// listener, so metrics.listen is refused at load in the lender role,
+// from the file, a flag or the environment (Config.Validate); a full
+// node takes it. A key no version knows is only reported, in both roles.
 func TestLenderOnlyRefusesMetricsSettings(t *testing.T) {
-	for _, body := range []string{
-		"[metrics]\nlisten = \"127.0.0.1:9100\"\n",
-		"[endpoint]\nmetrics = \"127.0.0.1:9100\"\n",
+	none := filepath.Join(t.TempDir(), "none.toml")
+	for _, c := range []struct {
+		args []string
+		env  map[string]string
+	}{
+		{[]string{"--config", writeFile(t, "role = \"lender\"\n[metrics]\nlisten = \"127.0.0.1:9101\"\n")}, nil},
+		{[]string{"--config", none, "--role", "lender", "--metrics-listen", "127.0.0.1:9101"}, nil},
+		{[]string{"--config", none}, map[string]string{"LENDISK_ROLE": "lender", "LENDISK_METRICS_LISTEN": "127.0.0.1:9101"}},
 	} {
-		_, err := load(t, []string{"--config", writeFile(t, "role = \"lender\"\n"+body)}, nil)
-		if err == nil || !strings.Contains(err.Error(), "metrics") || !strings.Contains(err.Error(), "PEER-9") {
-			t.Errorf("lender-only profile accepted %q: %v", body, err)
+		_, err := load(t, c.args, c.env)
+		if err == nil || !strings.Contains(err.Error(), "metrics.listen") || !strings.Contains(err.Error(), "PEER-9") {
+			t.Errorf("lender-only profile accepted metrics.listen (%v %v): %v", c.args, c.env, err)
 		}
-		l, err := load(t, []string{"--config", writeFile(t, "role = \"full\"\n"+body)}, nil)
+	}
+	l, err := load(t, []string{"--config", writeFile(t, "role = \"full\"\n[metrics]\nlisten = \"127.0.0.1:9101\"\n")}, nil)
+	if err != nil || l.Metrics.Listen != "127.0.0.1:9101" || len(l.Unknown) != 0 {
+		t.Errorf("full node: %v %v", l, err)
+	}
+	// Empty is no listener, in either role.
+	if _, err := load(t, []string{"--config", writeFile(t, "role = \"lender\"\n[metrics]\nlisten = \"\"\n")}, nil); err != nil {
+		t.Errorf("lender with metrics off: %v", err)
+	}
+	for _, role := range []string{"full", "lender"} {
+		l, err := load(t, []string{"--config", writeFile(t, "role = \""+role+"\"\n[endpoint]\nmetrics = \"127.0.0.1:9101\"\n")}, nil)
 		if err != nil || len(l.Unknown) != 1 {
-			t.Errorf("full node with %q: %v %v", body, l, err)
+			t.Errorf("%s node with an unknown metrics key: %v %v", role, l, err)
+		}
+	}
+}
+
+// OPS-4, SEC-8 (#43): metrics are served on loopback only; off by
+// default.
+func TestMetricsListenLoopbackOnly(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil || l.Metrics.Listen != "" {
+		t.Fatalf("default metrics.listen %q: %v", l.Metrics.Listen, err)
+	}
+	for _, bad := range []string{"192.168.1.10:9101", "0.0.0.0:9101", "[::]:9101", ":9101", "localhost:9101",
+		"example.com:9101", "127.0.0.1", "127.0.0.1:99999", "[fd00::1]:9101"} {
+		_, err := load(t, []string{"--config", none, "--metrics-listen", bad}, nil)
+		if err == nil || !strings.Contains(err.Error(), "metrics.listen") || !strings.Contains(err.Error(), "loopback") {
+			t.Errorf("accepted %q: %v", bad, err)
+		}
+	}
+	for _, good := range []string{"127.0.0.1:9101", "127.0.0.2:9101", "[::1]:9101", "127.0.0.1:0"} {
+		if _, err := load(t, []string{"--config", none, "--metrics-listen", good}, nil); err != nil {
+			t.Errorf("refused %q: %v", good, err)
 		}
 	}
 }

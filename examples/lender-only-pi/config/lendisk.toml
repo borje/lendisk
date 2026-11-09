@@ -12,7 +12,8 @@ role = "lender"
 
 [endpoint]
 # Nothing on loopback in this profile (PEER-9 AC): no S3 endpoint and no
-# metrics listener. A `listen` or `metrics` entry is refused at config load.
+# metrics listener: an [[endpoint.listen]] entry or [metrics] listen is
+# refused at config load.
 
 [store]
 backend          = "posix"
