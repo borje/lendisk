@@ -90,6 +90,22 @@ func (o *offsiteNode) ack(seq int64, refuse ...string) {
 	}
 }
 
+// answered records that a re-placement pass has answered the pool as
+// it is now and placed nothing more, as the daemon's worker would; the
+// fixture runs no worker. Until a pass has, an object short of places
+// waits rather than being stuck (passDue, #37).
+func (o *offsiteNode) answered() {
+	o.t.Helper()
+	fp, err := o.db.PoolFingerprint(context.Background())
+	if err != nil {
+		o.t.Fatal(err)
+	}
+	if _, err := o.db.Exec(`INSERT OR REPLACE INTO replace_pass (id, pool, done_at) VALUES (1, ?, ?)`,
+		fp, o.now.Unix()); err != nil {
+		o.t.Fatal(err)
+	}
+}
+
 // daemonUp stands in for a running daemon: something answers on the
 // gateway's socket, which is how `status --wait` tells one is running.
 func (o *offsiteNode) daemonUp() {
@@ -348,6 +364,7 @@ func TestStatusWaitStopsWhenAFriendRefusesEverything(t *testing.T) {
 	for _, s := range seqs {
 		o.ack(s, "D")
 	}
+	o.answered()
 	b := bucketOf(t, o.status(), "laptop")
 	if b.Offsite.Snapshot != nil || b.Offsite.LatestSnapshot.Offsite || b.Offsite.Stuck.Objects != int64(refused) ||
 		b.Offsite.Stuck.Refused != int64(refused) || b.BelowCopies.Objects != int64(refused) {
