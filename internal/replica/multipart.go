@@ -34,7 +34,7 @@ func (f *Friend) Create(ctx context.Context, o Object) (string, error) {
 	if sum, err := hex.DecodeString(o.SHA256); err != nil || len(sum) != 32 {
 		return "", fmt.Errorf("object %s has no SHA-256 to send (%q)", o.Key, o.SHA256)
 	}
-	sealed := f.self.SealedName(o.Bucket)
+	sealed := f.seal(o.Bucket)
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
 	if err := f.ensureBucket(ctx, sealed); err != nil {
@@ -55,7 +55,7 @@ func (f *Friend) Create(ctx context.Context, o Object) (string, error) {
 func (f *Friend) Parts(ctx context.Context, bucket, key, uploadID string) (map[int]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
-	sealed := f.self.SealedName(bucket)
+	sealed := f.seal(bucket)
 	out := map[int]string{}
 	marker := 0
 	for {
@@ -87,7 +87,7 @@ func (f *Friend) PutPart(ctx context.Context, bucket, key, uploadID string, n in
 	ctx, abandon, ended := abandoning(ctx, cancel)
 	wd := newWatchdog(h, f.stall, abandon)
 	defer wd.stop()
-	p, err := f.core.PutObjectPart(ctx, f.self.SealedName(bucket), key, uploadID, n, wd, size, minio.PutObjectPartOptions{
+	p, err := f.core.PutObjectPart(ctx, f.seal(bucket), key, uploadID, n, wd, size, minio.PutObjectPartOptions{
 		DisableContentSha256: true,
 		Trailer:              trailer,
 	})
@@ -120,7 +120,7 @@ func (f *Friend) Complete(ctx context.Context, bucket, key, uploadID string, par
 	}
 	ctx, cancel := context.WithTimeout(ctx, f.stall+timePerMiB(size))
 	defer cancel()
-	if _, err := f.core.CompleteMultipartUpload(ctx, f.self.SealedName(bucket), key, uploadID, cps, minio.PutObjectOptions{}); err != nil {
+	if _, err := f.core.CompleteMultipartUpload(ctx, f.seal(bucket), key, uploadID, cps, minio.PutObjectOptions{}); err != nil {
 		return uploadErr(fmt.Errorf("completing the upload of %s: %w", key, err))
 	}
 	return nil
@@ -130,7 +130,7 @@ func (f *Friend) Complete(ctx context.Context, bucket, key, uploadID string, par
 func (f *Friend) Abort(ctx context.Context, bucket, key, uploadID string) error {
 	ctx, cancel := context.WithTimeout(ctx, f.stall)
 	defer cancel()
-	if err := f.core.AbortMultipartUpload(ctx, f.self.SealedName(bucket), key, uploadID); err != nil {
+	if err := f.core.AbortMultipartUpload(ctx, f.seal(bucket), key, uploadID); err != nil {
 		return uploadErr(fmt.Errorf("aborting the upload of %s: %w", key, err))
 	}
 	return nil

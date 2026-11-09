@@ -28,6 +28,7 @@ import (
 	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/seed"
 	"github.com/borje/lendisk/internal/store"
 	"github.com/borje/lendisk/internal/transport"
 	"github.com/borje/lendisk/internal/undelete"
@@ -120,6 +121,9 @@ type app struct {
 	// tuneUndelete, if set, adjusts the daemon's undelete runner (RET-3,
 	// #32) before it starts (its poll); tests only.
 	tuneUndelete func(*undelete.Runner)
+	// tuneSeed, if set, adjusts the daemon's seed confirmer (REPL-8,
+	// #36) before it starts. Tests only.
+	tuneSeed func(*seed.Confirmer)
 	// reloadEvery is how often serve looks at its config file for changed
 	// pacing settings; zero means defaultReloadEvery. Tests set it.
 	reloadEvery time.Duration
@@ -185,7 +189,7 @@ func (a *app) rootCmd() *cobra.Command {
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.recoverCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
 	root.AddCommand(a.endpointCmd())
-	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd(), a.undeleteCmd(), a.recoverySheetCmd(), a.exportCmd())
+	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd(), a.undeleteCmd(), a.recoverySheetCmd(), a.exportCmd(), a.importCmd())
 	usageArgs(root)
 	return root
 }

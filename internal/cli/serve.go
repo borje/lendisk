@@ -26,6 +26,7 @@ import (
 	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/seed"
 	"github.com/borje/lendisk/internal/sheet"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/undelete"
@@ -381,6 +382,16 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 			running++
 			go func() { lister.Run(ctx); errc <- nil }()
+			// Seeding from a disk (REPL-8): each pending seed's friend is
+			// listed and the rows it shows with their hash acknowledged.
+			if cfg.Role == "full" {
+				conf := &seed.Confirmer{DB: db, Self: id, Dial: tun.Dial, Now: a.clock, Log: log}
+				if a.tuneSeed != nil {
+					a.tuneSeed(conf)
+				}
+				running++
+				go func() { conf.Run(ctx); errc <- nil }()
+			}
 			// Pacing changes apply without a restart: the file is looked
 			// at every 10 s, and at once on SIGHUP (§3.4 REPL-7).
 			rl := &reloader{Load: a.flags.Load, Path: cfg.Path, Pace: pacer, Log: log, Every: a.reloadEvery, started: cfg.Config}

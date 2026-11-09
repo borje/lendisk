@@ -47,18 +47,18 @@ type Result struct {
 	Kopia bool
 }
 
-// kopiaShards is the .shards file Kopia 0.23.1 writes in a new
+// KopiaShards is the .shards file Kopia 0.23.1 writes in a new
 // filesystem repository (repo/blob/sharded, sharded_parameters.go): blob
 // IDs longer than 20 characters go into directories of their first 1,
 // then the next 3, characters. An export writes it, so Kopia reads the
 // layout from it rather than guessing.
-const kopiaShards = `{"default":[1,3],"maxNonShardedLength":20}`
+const KopiaShards = `{"default":[1,3],"maxNonShardedLength":20}`
 
 // kopiaBlobSuffix is what Kopia's sharded storage appends to a finished
 // blob's file name (CompleteBlobSuffix); repoimport strips it.
 const kopiaBlobSuffix = ".f"
 
-// KopiaPath is where Kopia's filesystem storage, sharded as kopiaShards
+// KopiaPath is where Kopia's filesystem storage, sharded as KopiaShards
 // says, keeps blob id: the reverse of `bucket import`'s mapping (#9).
 func KopiaPath(id string) string {
 	if len(id) <= 20 {
@@ -80,7 +80,7 @@ func Lent(storeDir, name, dst string, kopia bool) (Result, error) {
 	} else if err != nil {
 		return Result{}, err
 	}
-	if err := emptyDir(dst); err != nil {
+	if err := EmptyDir(dst); err != nil {
 		return Result{}, err
 	}
 	var r Result
@@ -128,7 +128,7 @@ func Lent(storeDir, name, dst string, kopia bool) (Result, error) {
 		return r, err
 	}
 	if kopia {
-		if err := writeNew(filepath.Join(dst, ".shards"), strings.NewReader(kopiaShards)); err != nil {
+		if err := WriteNew(filepath.Join(dst, ".shards"), strings.NewReader(KopiaShards)); err != nil {
 			return r, err
 		}
 	}
@@ -166,9 +166,9 @@ func lentBuckets(storeDir string) string {
 	return strings.Join(names, ", ")
 }
 
-// emptyDir makes dst an empty directory at 0700, refusing one that holds
+// EmptyDir makes dst an empty directory at 0700, refusing one that holds
 // anything.
-func emptyDir(dst string) error {
+func EmptyDir(dst string) error {
 	ents, err := os.ReadDir(dst)
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -196,12 +196,13 @@ func copyFile(src, dst string) (int64, error) {
 		return 0, err
 	}
 	cr := &countReader{r: f}
-	err = writeNew(dst, cr)
+	err = WriteNew(dst, cr)
 	return cr.n, err
 }
 
-// writeNew writes r to a file that must not exist yet, at 0600.
-func writeNew(path string, r io.Reader) error {
+// WriteNew writes r to a file that must not exist yet, at 0600, from
+// the first byte.
+func WriteNew(path string, r io.Reader) error {
 	w, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err

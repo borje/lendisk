@@ -19,6 +19,7 @@ import (
 	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/seed"
 	"github.com/borje/lendisk/internal/verify"
 )
 
@@ -176,6 +177,11 @@ func TestMain(m *testing.M) {
 		a.tuneVerify = func(v *verify.Verifier) {
 			if os.Getenv(envReplFast) == "1" {
 				v.Poll = 200 * time.Millisecond
+			}
+		}
+		a.tuneSeed = func(c *seed.Confirmer) {
+			if os.Getenv(envReplFast) == "1" {
+				c.Poll, c.Timeout, c.Quiet = 200*time.Millisecond, 10*time.Second, 2*time.Second
 			}
 		}
 		a.tuneRecovery = func(l *recovery.Lister) {
