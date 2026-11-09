@@ -298,7 +298,7 @@ func (db *DB) overflowDrain(ctx context.Context) (bool, error) {
 	}
 	var peak RepositoryUse
 	if err := db.QueryRowContext(ctx, `SELECT coalesce(max(data), 0), coalesce(max(metadata), 0), coalesce(max(copies), 0)
-		FROM repository_peak WHERE day > ?`, peakDay(now.Add(-DrainWindow))).Scan(&peak.Data, &peak.Metadata, &peak.Copies); err != nil {
+		FROM repository_peak WHERE day > ? AND day <= ?`, peakDay(now.Add(-DrainWindow)), peakDay(now)).Scan(&peak.Data, &peak.Metadata, &peak.Copies); err != nil {
 		return false, err
 	}
 	ps, err := poolPlaces(ctx, db)
@@ -317,16 +317,34 @@ func (db *DB) overflowDrain(ctx context.Context) (bool, error) {
 // peakDay is t's day in repository_peak: days since the Unix epoch.
 func peakDay(t time.Time) int64 { return t.Unix() / 86400 }
 
+// peakKept is how many of the newest days recordPeak keeps whatever
+// the clock says: a clock run forward deletes no history by them.
+const peakKept = 31
+
 // recordPeak keeps u as a sample of the repository at now in
-// repository_peak (its day's largest of each), and deletes the days
-// past DrainWindow.
+// repository_peak (its day's largest of each). A day after now's, left
+// by a clock that ran ahead, is folded into now's day, so it ages out
+// with the window rather than holding drain-back back until the clock
+// reaches it. Days past DrainWindow are deleted, except the newest
+// peakKept, so a clock that jumps ahead and back keeps the history.
 func recordPeak(ctx context.Context, x execer, u RepositoryUse, now time.Time) error {
-	if _, err := x.ExecContext(ctx, `INSERT INTO repository_peak (day, data, metadata, copies) VALUES (?, ?, ?, ?)
+	today := peakDay(now)
+	if _, err := x.ExecContext(ctx, `INSERT INTO repository_peak (day, data, metadata, copies)
+		SELECT ?1, max(data), max(metadata), max(copies) FROM repository_peak WHERE day > ?1 HAVING count(*) > 0
 		ON CONFLICT (day) DO UPDATE SET data = max(data, excluded.data), metadata = max(metadata, excluded.metadata),
-			copies = max(copies, excluded.copies)`, peakDay(now), u.Data, u.Metadata, u.Copies); err != nil {
+			copies = max(copies, excluded.copies)`, today); err != nil {
 		return err
 	}
-	_, err := x.ExecContext(ctx, `DELETE FROM repository_peak WHERE day <= ?`, peakDay(now.Add(-DrainWindow)))
+	if _, err := x.ExecContext(ctx, `DELETE FROM repository_peak WHERE day > ?`, today); err != nil {
+		return err
+	}
+	if _, err := x.ExecContext(ctx, `INSERT INTO repository_peak (day, data, metadata, copies) VALUES (?, ?, ?, ?)
+		ON CONFLICT (day) DO UPDATE SET data = max(data, excluded.data), metadata = max(metadata, excluded.metadata),
+			copies = max(copies, excluded.copies)`, today, u.Data, u.Metadata, u.Copies); err != nil {
+		return err
+	}
+	_, err := x.ExecContext(ctx, `DELETE FROM repository_peak WHERE day <= ?
+		AND day NOT IN (SELECT day FROM repository_peak ORDER BY day DESC LIMIT ?)`, peakDay(now.Add(-DrainWindow)), peakKept)
 	return err
 }
 
@@ -338,13 +356,26 @@ const splitKey = `SELECT coalesce((SELECT group_concat(peer_key || ':' || coales
 	coalesce((SELECT group_concat(name || ':' || max_bytes, ',') FROM overflow), '') || '|' ||
 	coalesce((SELECT group_concat(name || ':' || copies, ',') FROM buckets), '')`
 
-// overflowHolding lists the overflow targets that hold or have queued a
-// data copy of bucket, in place order.
+// overflowHolding lists the overflow targets that hold, have queued or
+// are deleting a copy of a live data object of bucket, in place order
+// (holdsLiveData).
 func overflowHolding(ctx context.Context, q querier, bucket string) ([]string, error) {
 	return column(ctx, q, `SELECT p FROM (SELECT '`+OverflowPrefix+`' || name AS p FROM overflow)
-		WHERE EXISTS (SELECT 1 FROM placement h JOIN queue hq ON hq.seq = h.seq
-			WHERE h.place = p AND h.bucket = ?1 AND h.state IN ('queued', 'acked') AND h.op = 'put' AND hq.class = 'data')
-		ORDER BY p`, bucket)
+		WHERE `+holdsLiveData("p", "?1")+` ORDER BY p`, bucket)
+}
+
+// holdsLiveData is the SQL condition that the overflow target place
+// holds, has queued or is deleting a copy of a live data object (the
+// key's latest done write) of bucket: then the bucket's metadata goes
+// there (overflowHolding, REPL-12), and otherwise it is dropped there
+// (dropIdleMetadata, #40). One condition for both, so the two never
+// place and drop the same metadata in turn (#40 review). place and
+// bucket are SQL expressions.
+func holdsLiveData(place, bucket string) string {
+	return `EXISTS (SELECT 1 FROM placement h JOIN queue hq ON hq.seq = h.seq
+		WHERE h.place = ` + place + ` AND h.bucket = ` + bucket + ` AND h.op = 'put' AND hq.class = 'data'
+		AND h.state IN ('queued', 'acked', 'dropping')
+		AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = hq.bucket AND l.key = hq.key AND l.seq > hq.seq AND l.state = 'done'))`
 }
 
 // placeMetadata puts every live metadata object of bucket that place

@@ -6745,8 +6745,16 @@ of the `copies`, and the estimated cost (S3-7).
   placement is split. The repository is sampled at every look the
   split takes (at most every 30 s, at capture and at each pass) into
   table `repository_peak` (migration 42: per UTC day, the day's
-  largest data bytes, metadata bytes and copies; days past the window
-  are deleted). So the split turns on at once when the repository
+  largest data bytes, metadata bytes and copies, each the day's
+  maximum on its own, so `copies` is the largest any bucket had in the
+  window; only days after the window's start and up to today are read).
+  A clock run ahead and back cannot block drain-back or wipe the
+  history (#40 review): a day after today is folded into today's, so
+  it ages out with the window, and days past the window are deleted
+  except the newest 31, whatever the clock says
+  (`TestTheRepositoryPeakSurvivesAClockThatJumps`). After the upgrade
+  to migration 42 the table starts empty, so drain-back may run at once
+  on the repository as it is, with no window behind it. So the split turns on at once when the repository
   outgrows the friends (REPL-12), and turns off as soon as they hold it
   again, but the copies the split moved stay at the target until the
   friends hold everything the repository was in the last 30 days.
@@ -6775,7 +6783,9 @@ of the `copies`, and the estimated cost (S3-7).
   (`TestTheSplitAndDrainBackNeverMoveACopyBackAndForth`: grown past the
   threshold, pruned below it and grown again four times, no copy
   leaves the target, and after the window the copies move back and
-  stay).
+  stay). A drain-back copy already sent when the split returns lands
+  all the same, and the split then moves that object's copy to the
+  target once more: one move back, not a cycle.
 - **Drain-back** (#40, REPL-13, scenario 12). The re-placement pass
   (§3.4) of a bucket not split, while drain-back runs, takes a last
   round (`dataRound`, after the round that places missing copies, so a
@@ -6816,7 +6826,17 @@ of the `copies`, and the estimated cost (S3-7).
   retention-preserving way (*Retention and undelete* below). A
   metadata row still dropping when the target is chosen again for a
   data copy is not queued again with it; the pass after its delete
-  lands puts it back, ahead of later data in the FIFO.
+  lands puts it back, ahead of later data in the FIFO. Whether a
+  target holds data of a bucket is one condition (`holdsLiveData`: a
+  queued, acknowledged or dropping copy of a live data object) for
+  sending it the bucket's metadata (`overflowHolding`) and for dropping
+  it there, so an old put row of a key deleted since never makes a pass
+  place what the next drops (#40 review,
+  `TestAnIdleTargetsMetadataIsNotPlacedAndDroppedOnEveryPass`). A copy
+  placed again at a place clears the `replaces` of the object's other
+  rows naming that place, so a friend copy that once drained the
+  target never counts out the target's copy the split placed there
+  later (#40 review, `TestAStaleDrainBackPointerDoesNotCountATargetCopyOut`).
 - **Alerts and status** (#38, S3-7). `overflow_receiving` while a
   target holds or has queued a live data copy (it costs money);
   `overflow_high` at 90% of `max_bytes` and `overflow_full` at 100%,

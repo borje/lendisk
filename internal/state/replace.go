@@ -1237,6 +1237,14 @@ func (m *replacer) write(ctx context.Context, tx *preparedTx, seq int64, op rop,
 	var err error
 	switch op.kind {
 	case opPlace:
+		// A copy placed here again is no longer one another row of the
+		// object replaces: a stale pointer would count it out as moving
+		// (decide, drain-back) though nothing replaces it now (#40
+		// review). Only the rows' bookkeeping changes.
+		if _, err := tx.ExecContext(ctx, `UPDATE placement SET replaces = NULL WHERE seq = ? AND replaces = ? AND place != ?`,
+			seq, op.place, op.place); err != nil {
+			return 0, err
+		}
 		exists := false
 		for _, row := range rows {
 			exists = exists || row.place == op.place
@@ -1316,9 +1324,7 @@ func (m *replacer) dropIdleMetadata(ctx context.Context, bucket string) (Replace
 	defer tx.Rollback()
 	for _, t := range targets {
 		var idle bool
-		if err := tx.QueryRowContext(ctx, `SELECT NOT EXISTS (SELECT 1 FROM placement p JOIN queue q ON q.seq = p.seq
-			WHERE p.place = ?1 AND p.bucket = ?2 AND p.op = 'put' AND q.class = 'data'
-			AND p.state IN ('queued', 'acked', 'dropping') AND `+liveQ+`)`, t, bucket).Scan(&idle); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT NOT `+holdsLiveData("?1", "?2"), t, bucket).Scan(&idle); err != nil {
 			return st, err
 		}
 		if !idle {
