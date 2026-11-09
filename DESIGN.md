@@ -510,7 +510,7 @@ bundled program, not reimplemented. The daemon is glue around these:
 | State and queues | **SQLite** via `modernc.org/sqlite` | MIT / BSD | Pure Go, no cgo, so static builds stay simple. |
 | Recovery phrase | `github.com/tyler-smith/go-bip39` | MIT | |
 | CLI, config | `cobra`, `BurntSushi/toml` | Apache / MIT | |
-| Metrics | `prometheus/client_golang` | Apache | Transfer counters come from the replication worker. |
+| Metrics | none: the text exposition format written by hand (`internal/metrics`) | — | Decided for #43 (§3.8 OPS-4): `client_golang` v1.25.0 added 3.1 MB (5.2%) to the amd64 binary and 3.0 MB (5.2%) to armv7, and seven modules (protobuf, procfs among them), for counters and gauges a scrape reads from `lendisk.db`. |
 
 What is written from scratch, because nothing exists: the backend
 decorator (capture, read-through, bucket mapping, quota, immutability,
@@ -1624,12 +1624,12 @@ upstream bucket is Q-V.
     #31), the farewell and purge (PEER-5), the quota exchange (LEND-8),
     alerts (the borrower-side conditions have nothing to raise), the
     recovery lister and the manifest pusher.
-  - *Config.* An `endpoint.listen` entry is refused at load in this
-    profile (`Config.Validate`). No metrics setting exists yet, so a
-    `metrics` or `endpoint.metrics` key is one this version does not
-    know, which a full node only reports; for a lender it is refused at
-    load (`config.lenderUnknown`). #43 adds the settings and refuses
-    them in `Validate` instead.
+  - *Config.* An `endpoint.listen` entry and a non-empty
+    `metrics.listen` (§3.8 OPS-4, #43) are refused at load in this
+    profile (`Config.Validate`), from the file, a flag or the
+    environment. #41's interim refusal of unknown `metrics` keys
+    (`config.lenderUnknown`) went with #43: such a key is now only
+    reported as unknown, in either role.
   - *Decision: the manifest is pushed* in both profiles: a lender-only
     node has no buckets, but its manifest holds its friendships and
     their quotas, which `lendisk recover` needs to rebuild it from its
@@ -5681,10 +5681,71 @@ the handler's own reads and is never cancelled; nothing below
   redirect errors, and a config refusal never echoes it. `status` and `status --json`
   (`alerts`: kind, subject, message, raised_at) show the pending
   alerts, also while the daemon is stopped.
-- **OPS-4** `prometheus/client_golang` on a loopback port, not started
-  in the lender-only profile (PEER-9). Transfer
-  counters (bytes, objects, retries, lag, per place) come from the
-  replication worker.
+- **OPS-4, metrics (#43).** Package `metrics`; the daemon serves
+  `GET /metrics` (`HEAD` too; any other path 404, other methods 405) in
+  the Prometheus text exposition format 0.0.4 on `metrics.listen`, a
+  loopback IP literal and port such as `127.0.0.1:9101`. *Decision:
+  off by default* (empty): a default port would be a second loopback
+  listener on every node and would collide on a host running two nodes
+  or an exporter there, and the lender role could not tell a default
+  from a setting. `Config.Validate` refuses a non-loopback address, a
+  host name (`localhost` too: a name can resolve elsewhere) and any
+  value in the lender role (PEER-9); `serve` checks the bound address
+  is loopback again (`listenLoopback`, SEC-8). `status` and `status
+  --json` (`endpoint.metrics`, additive) show the URL.
+  *Decision: no dependency.* `prometheus/client_golang` (v1.25.0,
+  pure Go) was measured on this binary: +3.1 MB amd64 (61.1 to 64.2 MB)
+  and +3.0 MB armv7 (57.1 to 60.0 MB), about 5% each, and seven modules
+  more (`client_model`, `common`, `procfs`, `protobuf`, …), for a
+  format that is line-based text and stable since 2014. lendisk writes
+  counters and gauges only, so `metrics.Write` (~150 lines) writes them
+  and refuses what Prometheus could not read (bad names, a counter not
+  ending in `_total` or negative, a series twice); `metrics.Parse`
+  reads the format back strictly and the tests check every scrape with
+  it. The format's only maintenance is OpenMetrics, which Prometheus
+  negotiates and does not require.
+  - *Counters* (`metrics.Counters`, in memory, from zero at each start;
+    `rate()` handles the reset) are moved by the replication worker
+    (`replica.Worker.Metrics`): `lendisk_replication_sent_bytes_total`
+    `{place}`, the object bytes the replica client read from the store
+    for the place, every attempt and part (counted after pacing, so a
+    retried part counts again); `lendisk_replication_objects_total`
+    `{place,op}`, rows acknowledged, `op` put or delete; and
+    `lendisk_replication_retries_total{place,reason}`, failed sends that
+    wait to be retried, `reason` network, store, quota or removed.
+  - *Gauges* are read from `lendisk.db` at each scrape by the functions
+    `status` uses (`cli.metricsFamilies`), so the two never disagree:
+    per place (status's Places) `lendisk_place_queue_objects`,
+    `_queue_bytes`, `_lag_seconds`, `_refused_objects`,
+    `_dropping_copies`, `_last_ok_timestamp_seconds`, and
+    `lendisk_place_state{place,state}`, 1 for the current condition of
+    ok, retrying, quota, removed, store, none; per friend (§3.5 LEND-7,
+    `capacity`) `lendisk_friend_quota_bytes`, `_used_there_bytes`,
+    `_used_here_bytes`, with `lendisk_repository_bytes` and
+    `lendisk_protectable_bytes`; `lendisk_alerts{kind}`, pending alerts
+    for every kind in `alert.Kinds()`, 0 when none, so a rule can match
+    a kind before it first fires; per bucket `lendisk_bucket_copies`,
+    `_captured_objects`, `_captured_bytes`, `_refused_objects`,
+    `_below_copies_objects`, `_below_copies_bytes`,
+    `_offsite_complete`, `_offsite_behind_seconds` (the age of the
+    first write not offsite, the offsite watermark's lag, 0 when
+    complete) and `_offsite_through_timestamp_seconds`; the bit-rot
+    sample (§3.6 VER-5) `lendisk_bitrot_findings{state}` (kept,
+    refetching, repaired, lent, as status shows them),
+    `lendisk_bitrot_cycles_total` and
+    `lendisk_bitrot_last_checked_timestamp_seconds`; and
+    `lendisk_info{version}`.
+  - *Cardinality:* labels are places and friends (PEER-7: 20), buckets,
+    alert kinds and fixed states, never object keys. A scrape costs
+    what `status` costs; nothing is cached.
+  - Not started in the lender-only profile (PEER-9), which refuses the
+    setting. *Tests:* `TestWriteParsesBackAsPrometheusText`,
+    `TestWriteRefusesWhatPrometheusCannotRead`,
+    `TestParseRefusesInvalidText`, `TestServerServesMetricsOnly`,
+    `TestCountersMoveWhenReplicationSends` (replica),
+    `TestMetricsListenLoopbackOnly`, `TestLenderOnlyRefusesMetricsSettings`
+    (config), `TestMetricsEndpointBindsLoopbackOnly` (serial: it reads
+    the process's sockets) and `TestMetricsCountReplication` (cli).
 - **OPS-6** The configuration file is TOML and holds what the user
   sets; everything the daemon creates or learns is state in
   `lendisk.db`: friendships with both numbers, buckets, overflow
@@ -5697,8 +5758,8 @@ the handler's own reads and is never cancelled; nothing below
   the cap is `[lending]` (`max_total`); network addresses for the
   endpoint are `[[endpoint.listen]]` entries (EP-17), none by default;
   relays are `[relays]`, the address's bootstrap region `[tunnel]`
-  (`region`, SEC-14) and alerts `[alerts]` (`command`, `webhook`,
-  `unreachable_after`). There are no
+  (`region`, SEC-14), alerts `[alerts]` (`command`, `webhook`,
+  `unreachable_after`) and metrics `[metrics]` (`listen`, OPS-4). There are no
   `[[peer]]` or `[[overflow]]` entries: `peer add`, `peer quota` and
   `overflow add` write `lendisk.db`.
 - **OPS-7** Idle RSS is lendisk alone (versitygw, tailcat and the
@@ -5835,7 +5896,8 @@ the handler's own reads and is never cancelled; nothing below
   every `PATCH`, which S3 does not use and every admin route does. lendisk's
   listeners are the bridge (§3.7) on loopback S3, on each configured
   `endpoint.listen` address (EP-17) and on the one tunnel port inside
-  tailcat; loopback metrics, except in the lender-only profile; the
+  tailcat; loopback metrics when `metrics.listen` is set (OPS-4), never in
+  the lender-only profile; the
   internal `gw.sock`; and the loopback listener `peer forward` opens
   while that command runs (NET-7b). tailcat's one UDP socket on all
   interfaces is the peer connection NET-1 names. There is no child

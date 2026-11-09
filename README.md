@@ -155,6 +155,7 @@ if none exists.
 | `alerts.command` | none | absolute path of a program run for each alert, the alert as JSON on stdin |
 | `alerts.webhook` | none | http(s) URL each alert's JSON is POSTed to |
 | `alerts.unreachable_after` | `24h` | alert when a friend has not answered for this long |
+| `metrics.listen` | none | loopback IP and port where the daemon serves Prometheus metrics at `/metrics`, such as `127.0.0.1:9101`; never a network address, and refused with `role = "lender"` |
 | `log.level` | `info` | `debug`, `info`, `warn`, `error` |
 | `log.format` | `text` | `text` (logfmt) or `json` |
 

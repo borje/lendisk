@@ -18,7 +18,9 @@ role = "full"
 [endpoint]
 # S3 for backup tools on this host is always 127.0.0.1:9000 (EP-1, EP-5).
 # LAN addresses, if any, would be [[endpoint.listen]] entries (EP-17).
-metrics = "127.0.0.1:9100"
+
+[metrics]
+listen = "127.0.0.1:9101"   # Prometheus at /metrics (OPS-4); loopback only
 
 [store]
 # Any S3-compatible service the user names (EP-16). Each lendisk bucket

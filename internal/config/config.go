@@ -60,7 +60,14 @@ type Config struct {
 	Replication Replication `toml:"replication"`
 	// Lending is [lending]: what this node lends its friends (LEND-1).
 	Lending Lending `toml:"lending"`
+	// Metrics is [metrics]: the Prometheus endpoint (OPS-4).
+	Metrics Metrics `toml:"metrics"`
 	Log     Log     `toml:"log"`
+}
+
+// Metrics is the [metrics] section (OPS-4, #43).
+type Metrics struct {
+	Listen string `toml:"listen" help:"loopback address (IP and port) where the daemon serves Prometheus metrics at /metrics (OPS-4), such as 127.0.0.1:9101; empty for none. Never a network address; refused on a lender-only node (PEER-9)"`
 }
 
 // Lending is the [lending] section (LEND-1, LEND-8).
@@ -421,6 +428,13 @@ func (c *Config) Validate() error {
 	if c.Role == "lender" && len(c.Endpoint.Listen) > 0 {
 		errs = append(errs, errors.New("endpoint.listen: a lender-only node has no S3 endpoint (PEER-9); remove the entries or set role = \"full\""))
 	}
+	if m := c.Metrics.Listen; m != "" {
+		if c.Role == "lender" {
+			errs = append(errs, errors.New("metrics.listen: a lender-only node has no metrics listener (PEER-9); remove it or set role = \"full\""))
+		} else if err := checkLoopbackIP(m); err != nil {
+			errs = append(errs, fmt.Errorf("metrics.listen = %q: %w", m, err))
+		}
+	}
 	for i, l := range c.Endpoint.Listen {
 		if err := l.check(); err != nil {
 			errs = append(errs, fmt.Errorf("endpoint.listen entry %d (%s): %w", i+1, l, err))
@@ -472,6 +486,23 @@ func checkLoopback(addr string) error {
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
 		return errors.New("must be a loopback address such as 127.0.0.1:9000; LAN addresses are [[endpoint.listen]] entries")
+	}
+	return nil
+}
+
+// checkLoopbackIP accepts host:port where host is a loopback IP literal:
+// metrics are never served on a network address (OPS-4, SEC-8), and a
+// name could resolve to one.
+func checkLoopbackIP(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("want a loopback address and port such as 127.0.0.1:9101: %w", err)
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("bad port %q; want a loopback address such as 127.0.0.1:9101", port)
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+		return errors.New("must be a loopback IP address such as 127.0.0.1:9101 or [::1]:9101; metrics are never served on a network address")
 	}
 	return nil
 }
@@ -716,25 +747,5 @@ func (f *Flags) load(getenv func(string) (string, bool)) (*Loaded, error) {
 	if err := l.Validate(); err != nil {
 		return nil, fmt.Errorf("configuration: %w", err)
 	}
-	if err := lenderUnknown(l); err != nil {
-		return nil, fmt.Errorf("configuration: %w", err)
-	}
 	return l, nil
-}
-
-// lenderUnknown refuses a metrics setting in the lender-only profile
-// (PEER-9, OPS-4), which starts no metrics listener. No setting exists
-// yet, so the key is one this version does not know and a full node only
-// reports it. #43, adding the metrics settings: refuse them in Validate
-// for role = "lender", as endpoint.listen is, and drop this.
-func lenderUnknown(l *Loaded) error {
-	if l.Role != "lender" {
-		return nil
-	}
-	for _, k := range l.Unknown {
-		if k == "metrics" || strings.HasPrefix(k, "metrics.") || strings.HasPrefix(k, "endpoint.metrics") {
-			return fmt.Errorf("%s: a lender-only node has no metrics listener (PEER-9); remove it or set role = \"full\"", k)
-		}
-	}
-	return nil
 }

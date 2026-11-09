@@ -20,6 +20,7 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/metrics"
 	"github.com/borje/lendisk/internal/pace"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/quota"
@@ -141,7 +142,7 @@ func (a *app) serveCmd() *cobra.Command {
 
 			ctx, cancel := context.WithCancel(ctx)
 			defer cancel()
-			errc := make(chan error, 12) // gateway, LAN, loopback, replication, verification, undelete, farewell, alerts, quota, manifest, recovery, reload
+			errc := make(chan error, 13) // gateway, LAN, loopback, metrics, replication, verification, undelete, farewell, alerts, quota, manifest, recovery, reload
 			// Pacing (REPL-6, REPL-7, LEND-5): one pacer for every transfer
 			// over the tunnel, changed without a restart by the reloader.
 			pacer := pace.New(a.clock)
@@ -253,10 +254,32 @@ func (a *app) serveCmd() *cobra.Command {
 				running++
 				go func() { errc <- bridge.Serve(ctx, ln, br.LoopbackHandler(), log) }()
 
+				// Prometheus metrics (OPS-4, #43) on the loopback address
+				// metrics.listen names, which config load checked; none
+				// when it is empty. A scrape reads lendisk.db as status
+				// does, plus the worker's counters.
+				counters := &metrics.Counters{}
+				if cfg.Metrics.Listen != "" {
+					mln, err := listenLoopback(cfg.Metrics.Listen)
+					if err != nil {
+						cancel()
+						for i := 0; i < running; i++ {
+							<-errc
+						}
+						return fmt.Errorf("metrics: %w", err)
+					}
+					log.Info("metrics listening", "address", mln.Addr().String())
+					ms := &metrics.Server{Log: log, Collect: func(ctx context.Context) ([]metrics.Family, error) {
+						return a.metricsFamilies(ctx, db, profiles, cfg.Replication.Copies.Int(), counters)
+					}}
+					running++
+					go func() { errc <- ms.Serve(ctx, mln) }()
+				}
+
 				// Replication to friends (#18) never blocks the endpoint
 				// (REPL-9): it reads the store and lendisk.db only.
 				w = &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
-					Alerted: alerts.Check, Now: a.clock, Full: xch.Due, Fill: gw.Fill, Pace: pacer}
+					Alerted: alerts.Check, Now: a.clock, Full: xch.Due, Fill: gw.Fill, Pace: pacer, Metrics: counters}
 				if a.tuneReplication != nil {
 					a.tuneReplication(w)
 				}
@@ -376,4 +399,18 @@ func (a *app) serveCmd() *cobra.Command {
 			return first
 		},
 	}
+}
+
+// listenLoopback listens on addr and refuses an address that is not
+// loopback once bound (SEC-8): config load checked it already.
+func listenLoopback(addr string) (net.Listener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if ta, ok := ln.Addr().(*net.TCPAddr); !ok || !ta.IP.IsLoopback() {
+		ln.Close()
+		return nil, fmt.Errorf("%s is not a loopback address", ln.Addr())
+	}
+	return ln, nil
 }

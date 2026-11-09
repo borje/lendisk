@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/metrics"
 	"github.com/borje/lendisk/internal/pace"
 	"github.com/borje/lendisk/internal/state"
 )
@@ -105,6 +106,9 @@ type Worker struct {
 	// size (REPL-6, REPL-7); nil sends unpaced, at any time, in parts of
 	// pace.DefaultPartSize.
 	Pace *pace.Pacer
+	// Metrics counts what is sent to each place, what it acknowledged
+	// and the sends retried (OPS-4); nil counts nothing.
+	Metrics *metrics.Counters
 
 	// friendships reads the friendships; nil means DB.Friendships. Tests
 	// set it to fail.
@@ -663,6 +667,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				continue
 			}
 			condition(state.ConditionOK, "")
+			w.Metrics.Acked(place, p.Op)
 			log.Debug("replicated", row...)
 		case errors.Is(err, errSuperseded):
 			w.forget(place, r, p)
@@ -731,6 +736,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				log.Debug("replication: this node's store cannot be read; waiting", attrs...)
 			}
 			condition(state.ConditionStore, err.Error())
+			w.Metrics.Retry(place, metrics.RetryStore)
 			if prev != failing {
 				w.alerted() // the condition is recorded: alert.KindStoreUnreadable
 			}
@@ -739,6 +745,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		case errors.Is(err, ErrQuota):
 			log.Warn("replication paused for quota: the friend refuses new objects; retrying later", append(row, "err", err, "retry_in", pause)...)
 			condition(state.ConditionQuota, err.Error())
+			w.Metrics.Retry(place, metrics.RetryQuota)
 			if w.Full != nil {
 				w.Full(place)
 			}
@@ -747,6 +754,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		case errors.Is(err, ErrRemoved):
 			log.Warn("replication stopped: the friend refuses this node (removed?); retrying later", append(row, "err", err, "retry_in", pause)...)
 			condition(state.ConditionRemoved, err.Error())
+			w.Metrics.Retry(place, metrics.RetryRemoved)
 			pauseFor(ctx, pause, wake)
 		default:
 			failing = "network"
@@ -757,6 +765,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			}
 			log.Log(ctx, level, "replication: sending failed; retrying", append(row, "err", err, "retry_in", backoff)...)
 			condition(state.ConditionRetrying, err.Error())
+			w.Metrics.Retry(place, metrics.RetryNetwork)
 			sleep(ctx, backoff)
 			backoff = min(2*backoff, maxB)
 		}
@@ -1019,7 +1028,7 @@ func (w *Worker) putOnce(ctx context.Context, place string, r Replica, p state.P
 	// timeout blames the place (#61).
 	sr := w.storeReader(body, p.Size)
 	defer sr.Close()
-	body = w.Pace.Send(ctx, place, sr)
+	body = w.counted(place, w.Pace.Send(ctx, place, sr))
 	if w.OnRead != nil {
 		body = &observed{r: body, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
 	}
@@ -1160,7 +1169,7 @@ func (w *Worker) putPart(ctx context.Context, place string, mp Multipart, p stat
 	size := section.Size()
 	sr := w.storeReader(section, size)
 	defer sr.Close()
-	body := w.Pace.Send(ctx, place, sr)
+	body := w.counted(place, w.Pace.Send(ctx, place, sr))
 	if w.OnRead != nil {
 		body = &observed{r: body, n: off, fn: func(n int64) { w.OnRead(place, p.Seq, n) }}
 	}
@@ -1496,6 +1505,26 @@ func (l *localReader) failed() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.err
+}
+
+// counted counts what the client reads of body as sent to place
+// (OPS-4).
+func (w *Worker) counted(place string, body io.Reader) io.Reader {
+	if w.Metrics == nil {
+		return body
+	}
+	return &sentReader{r: body, fn: func(n int) { w.Metrics.Sent(place, int64(n)) }}
+}
+
+type sentReader struct {
+	r  io.Reader
+	fn func(int)
+}
+
+func (s *sentReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	s.fn(n)
+	return n, err
 }
 
 type observed struct {
