@@ -31,7 +31,8 @@ func (a *app) recoverCmd() *cobra.Command {
 		Long: `recover rebuilds a node whose machine is lost (ID-5). It reads the
 24-word recovery phrase from standard input, fetches the node's manifest
 from the friend at the address given (the tc… string on the recovery
-sheet) and from every other friend it names, keeping the newest, and
+sheet; typed with the sheet's line breaks or spaces in it, they are
+removed) and from every other friend it names, keeping the newest, and
 restores the friendships and buckets. It then asks each friend for the
 list of what it holds, to know where every object is. Nothing is
 downloaded: the local store starts empty.
@@ -44,7 +45,7 @@ and one named with --skip, is listed by the daemon instead.
 
 Run it on a fresh machine (empty config and data directories), then
 start the daemon with ` + "`lendisk serve`" + `.`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			skipped := map[string]bool{}
 			for _, s := range skip {
@@ -54,11 +55,19 @@ start the daemon with ` + "`lendisk serve`" + `.`,
 				}
 				skipped[id.String()] = true
 			}
-			return a.runRecover(cmd.Context(), args[0], skipped)
+			return a.runRecover(cmd.Context(), typedAddress(args), skipped)
 		},
 	}
 	cmd.Flags().StringSliceVar(&skip, "skip", nil, "a friend's node ID not to ask what it holds now; the daemon asks it later (repeatable)")
 	return cmd
+}
+
+// typedAddress is the address as the user typed it, maybe copied from
+// the recovery sheet with its line breaks, or as several arguments where
+// the shell split it at spaces: one string without whitespace, which an
+// address never holds (ID-7, #35).
+func typedAddress(args []string) string {
+	return strings.Join(strings.Fields(strings.Join(args, " ")), "")
 }
 
 // defaultListBudget is how long recover lists what friends hold before

@@ -25,6 +25,8 @@ overlay network that works behind NAT.
 
 ## Documentation
 
+- [docs/restore-without-lendisk.md](docs/restore-without-lendisk.md): reading your backups with no lendisk at all
+- [docs/store-layout.md](docs/store-layout.md): every file lendisk keeps, what a friend can see, how much disk to lend
 - [REQUIREMENTS.md](REQUIREMENTS.md): what the product does
 - [DESIGN.md](DESIGN.md): how it is built
 - [architecture.html](architecture.html): overview diagrams
@@ -111,6 +113,16 @@ them. If friends disagree about an object, restic's content-named files are
 checked against their names and otherwise the version most friends hold
 wins; a tie is listed in `status` and settled with
 `lendisk bucket resolve <bucket> <key> <friend>`.
+
+Print a recovery sheet for paper with `lendisk recovery-sheet`; the
+daemon alerts when it goes out of date. Without lendisk at all, your
+friends' replicas are still your repository: each friend runs
+`lendisk export --lent <stored name> <directory>` (the name is on your
+sheet; add `--kopia-layout` for Kopia) and hands you the directory, and
+the exports of enough friends combined are a repository restic or Kopia
+opens. [docs/restore-without-lendisk.md](docs/restore-without-lendisk.md)
+has the steps, including starting the storage engine, versitygw, alone on
+a store.
 
 ## Configuration
 

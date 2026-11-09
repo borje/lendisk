@@ -319,6 +319,37 @@ func TestRecoverRefusals(t *testing.T) {
 	}
 }
 
+// ID-5, ID-7 (#35): an address copied from the recovery sheet keeps the
+// sheet's line breaks and indent, or is split by the shell where it was
+// typed with spaces; recover takes it as the one string it is. Here it
+// is this node's own address, refused as such once parsed.
+func TestRecoverTakesAnAddressTypedWithTheSheetsLineBreaks(t *testing.T) {
+	parallel(t, 0)
+	n := newNode(t)
+	n.mustInit(t)
+	addr := n.status().Node.Address
+	other := newNode(t)
+	var lines []string
+	for s := addr; s != ""; {
+		k := min(len(s), 75)
+		lines = append(lines, "     "+s[:k])
+		s = s[k:]
+	}
+	if len(lines) < 2 {
+		t.Fatalf("address %q fits one line: the test shows nothing", addr)
+	}
+	typed := strings.Join(lines, "\n") + "\n"
+	for name, args := range map[string][]string{
+		"line breaks":     {"recover", typed},
+		"split by spaces": append([]string{"recover"}, strings.Fields(typed)...),
+	} {
+		code, _, e := other.run("y\n"+testPhrase+"\n", "", args...)
+		if code != 2 || !strings.Contains(e, "own") {
+			t.Errorf("%s: exit %d %s", name, code, e)
+		}
+	}
+}
+
 // S3-1, SEC-3 (#29): overflow targets in the manifest are shown with
 // their credential, for the user to put in the environment; with none,
 // nothing is said.

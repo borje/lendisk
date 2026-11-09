@@ -183,7 +183,7 @@ func (a *app) rootCmd() *cobra.Command {
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.recoverCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
 	root.AddCommand(a.endpointCmd())
-	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd(), a.undeleteCmd(), a.recoverySheetCmd())
+	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd(), a.undeleteCmd(), a.recoverySheetCmd(), a.exportCmd())
 	usageArgs(root)
 	return root
 }

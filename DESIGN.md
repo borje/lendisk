@@ -1303,9 +1303,10 @@ upstream bucket is Q-V.
   and `s3://<bucket>/<prefix>/<sealed>/` at each overflow target, and
   how many replicas a restore without lendisk combines: N − c + 1 with
   N the friends plus overflow targets, one when N ≤ c, none with no
-  place. Then the lendisk-free restore (P-5, LEND-6), matching #35: a
+  place. Then the lendisk-free restore (P-5, LEND-6): a
   friend hands over a replica made by `lendisk export --lent <stored
-  name> <dir>` (`--kopia-layout` for Kopia), or, for restic, a copy of
+  name> <dir>` (`sheet.ExportCommand`, the arguments `lendisk export`
+  takes, §3.5 LEND-6; `--kopia-layout` for Kopia), or, for restic, a copy of
   the bucket's store directory made with its lendisk stopped; an
   overflow target's keys are copied with any S3 client. The replicas,
   each in a directory `replica-1`, `replica-2`…, are combined as a plain
@@ -1332,6 +1333,19 @@ upstream bucket is Q-V.
   node that never printed a sheet is not alerted (*decision, #33*):
   nothing on paper can be stale. Former friends in their retention
   window are not on the sheet: they no longer admit this node.
+  *Typing the address back (#35).* `lendisk recover` takes one or more
+  arguments and removes all whitespace from them (`typedAddress`): an
+  address never holds any, so one copied with the sheet's line breaks
+  and indent, or typed with spaces the shell splits into several
+  arguments, is the same string
+  (`TestRecoverTakesAnAddressTypedWithTheSheetsLineBreaks`). A damaged
+  one is still refused by `transport.KeyOf`. *The printed steps end to
+  end:* `TestScenarioZeroLockIn` reads A's printed sheet for the
+  bucket's name at every friend, runs its export command on two
+  friends, its combine command and its restore line, and `restic check
+  --read-data` (§3.10 COMPAT-4); the Kopia test does the same with
+  `--kopia-layout` and the sheet's `kopia repository connect
+  filesystem` line.
 
 ### 3.2 Peers and invites
 
@@ -4293,9 +4307,47 @@ the handler's own reads and is never cancelled; nothing below
   buckets in the node's one store, beside its own, plus versioning or
   tombstones and the hash index. With lendisk stopped they are plain
   files on `posix` (EP-15); `lendisk export --lent lent-<id16>-<sealed>
-  <path>` writes the tool's own layout, excluding `.lendisk/`, naming
+  <path> [--kopia-layout]` writes the tool's own layout, excluding `.lendisk/`, naming
   the bucket as the store does since the lender does not know its real
-  name (REPL-8, SEC-16).
+  name (REPL-8, SEC-16). *Realisation (#35, package `export`):*
+  - *No daemon* (decided #35). The export walks
+    `<store>/lent-…/` directly, as posix lays it out (§3.10 COMPAT-4),
+    with no posix backend, database or lock: it works with lendisk
+    stopped, which is when a friend asks for it, and also with the
+    daemon running, since posix publishes an object by an atomic link
+    or rename; then an object tombed while the walk passes is counted
+    as gone and left out, and a write after the walk passed is not in
+    it. It needs only the config, for the store path.
+  - *What is left out:* `.lendisk/` at any depth (posix excludes it so,
+    and the tombs are `.lendisk/tomb/`), `.sgwtmp/` and `.vgwlocks/` at
+    the bucket's top (`gateway.ReservedDirs`; deeper, those names are a
+    borrower's keys), empty directories, anything but regular files,
+    and xattrs. A name not beginning `lent-` is a usage error (exit 2);
+    a missing bucket's error lists the store's `lent-` buckets.
+  - *Layouts.* Plain (restic, generic): one file per key at its key
+    path, which is restic's repository layout. `--kopia-layout`: each
+    flat blob ID at `export.KopiaPath`, the reverse of `repoimport`'s
+    mapping (§3.10 COMPAT-3): an ID of up to 20 characters is
+    `<id>.f`, a longer one `<id[0]>/<id[1:4]>/<id[4:]>.f`, and `.shards`
+    is written as Kopia 0.23.1 writes it in a new repository,
+    `{"default":[1,3],"maxNonShardedLength":20}`, so Kopia reads the
+    sharding rather than guessing it; a key with a `/` is no Kopia blob
+    and fails the export, saying to drop the flag. The lender does not
+    know the bucket's tool, so the user says it; a bucket holding
+    `kopia.repository` exported plain is exported, with a note on
+    stderr to add the flag.
+  - *Safety.* The destination must be new or an empty directory (an
+    export never merges or overwrites: the friend combines exports);
+    directories are made 0700 and files 0600 with `O_EXCL`. A failure
+    part way says to remove the directory and run again.
+  - *Tests:* `TestExportWritesEachKeyAtItsPathWithoutHousekeeping`,
+    `TestExportRefusals`, `TestKopiaLayoutIsTheReverseOfImport`,
+    `TestKopiaLayoutOfAResticBucketRefused`,
+    `TestKopiaOpensAnExportAsAFilesystemRepository` (Kopia 0.23.1
+    connects, verifies and restores; `internal/export`);
+    `TestExportRefusesWhatIsNoLentBucket`, `TestScenarioZeroLockIn`
+    (scenario 7, §3.10 COMPAT-4) and
+    `TestKopiaExportsFromTwoLendersFormARepository` (`internal/cli`).
 - **LEND-7** `init` suggests `lending.max_total` = `c × S` plus the
   retention margin of §4. The control API `quota` answer carries the
   quota, both sides' use and the answering node's repository size
@@ -5924,6 +5976,10 @@ the handler's own reads and is never cancelled; nothing below
   `snapshots/`, `kopia.repository`). Hiding keys as well would mean
   rewriting them on the lender's disk and losing P-5, so it is not
   done.
+- **SEC-2** The list of what a lender can observe is documented for
+  users in `docs/store-layout.md` (*What a friend can see of your
+  backups*, #35), with the note that bucket names are not on it and
+  that a generic bucket is readable.
 
 ### 3.10 Compatibility
 
@@ -6028,17 +6084,54 @@ the handler's own reads and is never cancelled; nothing below
     `internal/repoimport`.
 - **COMPAT-4** The documented layout on `posix` is
   `<store>/<bucket>/<key>` as plain files with versitygw's xattrs and
-  its `.sgwtmp/` and `.vgwlocks/` housekeeping directories; borrowers'
+  its housekeeping directories, `.sgwtmp/` in each bucket (temporary
+  files, `multipart/` parts) and `.vgwlocks/<bucket hash>/<shard>` at
+  the store's top (publish locks; found on a real store, #35); borrowers'
   buckets under `lent-<id16>-` and their sealed names (SEC-16), each
   with its `.lendisk/tomb/` directory (§3.6: one file per tombstone at
   `.lendisk/tomb/<key>/<unix nanoseconds>`, ignorable by a direct
   reader); the friends' sealed
-  manifests as `.lendisk/manifests/<node ID>` at the store's top (§3.1
-  ID-4); `lendisk.db` and its tables; and the export layout
+  manifests as `.lendisk/manifests/<node ID>` and the store marker
+  `.lendisk/store-marker` at the store's top (§3.1 ID-4, §3.3 EP-14);
+  `lendisk.db` and its tables; and the export layout
   (one file per key at its key path; Kopia's sharded form with
-  `--kopia-layout`). Every object lendisk stores carries
-  `x-amz-meta-lendisk-sha256`, so the hash index can be rebuilt from
-  the store.
+  `--kopia-layout`, §3.5 LEND-6). Every object a friend stores here
+  carries `x-amz-meta-lendisk-sha256` (`user.metadata` xattr), so the
+  lender's hash index can be rebuilt from the store; an own object
+  carries the capture token `lendisk-capture` instead (§3.3), its hash
+  being in the queue. *User documentation (#35):* `docs/store-layout.md`
+  (every directory, file and table; the export layout; SEC-2's list;
+  LEND-7's rule of thumb from §4) and `docs/restore-without-lendisk.md`
+  (P-5's procedure), linked from the README.
+  - *The engine alone.* versitygw 1.10.0, the version in `go.mod`
+    (`go install github.com/versity/versitygw/cmd/versitygw@v1.10.0`):
+    `versitygw --access <a> --secret <s> --port 127.0.0.1:7070 --readonly
+    posix --exclude-dirs .lendisk <store>`. The root account reads every
+    bucket; `--readonly` keeps the store unchanged, so restic needs
+    `--no-lock` and Kopia connects `--readonly`; `--exclude-dirs
+    .lendisk` hides tombs and manifests as lendisk's own `OpenBackend`
+    does. A friend's replica is copied out with any S3 client (rclone
+    in the guide) and combined with the recovery sheet's commands (§3.1
+    ID-7). Flat Kopia keys copied this way are laid out for Kopia's
+    filesystem storage by a bash loop in the guide doing what
+    `export.KopiaPath` does (checked by hand against Kopia 0.23.1).
+  - *Scenario 7 as a test* (`TestScenarioZeroLockIn`, on scenario 1's
+    four nodes): every daemon killed and D's store deleted; versitygw's
+    gateway and posix backend run embedded in the test
+    (`engineAlone`: `embedgw.RunVersityGW` with the binary's defaults,
+    read-only, `.lendisk` excluded, plus `AbsolutePaths` so posix does
+    not change the test process's directory; one at a time, the test
+    holding `serving`) on A's store for `restic --no-lock snapshots`,
+    then on B's and on C's for `rclone copy` of A's bucket under the
+    name A's printed sheet gives; the sheet's combine command and
+    `restic check --read-data` pass. Then the sheet's printed steps end
+    to end: its export command on B and C, its combine command, `restic
+    check --read-data` and its restore line, byte for byte.
+    `TestKopiaExportsFromTwoLendersFormARepository` does the same for
+    Kopia at one copy over two friends (each replica partial): A's own
+    copy through the engine alone to `kopia repository connect s3
+    --readonly`, and two `--kopia-layout` exports combined into a
+    filesystem repository that verifies and restores.
 
 ### 3.11 Overflow targets
 
