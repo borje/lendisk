@@ -60,6 +60,102 @@ type Status struct {
 	// Lending is the effective cap on the sum of the node's numbers
 	// (LEND-1, #24); absent when it cannot be read.
 	Lending *StatusLending `json:"lending,omitempty"`
+	// Bitrot is the bit-rot sample's progress and what it found (VER-5,
+	// #31); absent before its first check.
+	Bitrot *StatusBitrot `json:"bitrot,omitempty"`
+}
+
+// StatusBitrot is the bit-rot sampler's sweep of the store and the
+// rotten objects it found (VER-5, #31).
+type StatusBitrot struct {
+	// CycleStarted is when the sweep's current cycle began; Objects and
+	// Bytes what it checked since; Cycles the cycles done.
+	CycleStarted string `json:"cycle_started,omitempty"`
+	Cycles       int64  `json:"cycles"`
+	Objects      int64  `json:"objects"`
+	Bytes        int64  `json:"bytes"`
+	LastChecked  string `json:"last_checked,omitempty"`
+	// Rotten are the objects found rotten: own ones until a week after
+	// their repair, friends' while held.
+	Rotten []StatusRot `json:"rotten"`
+}
+
+// StatusRot is one rotten object. State is "repaired", "refetching"
+// (removed, waiting for a friend holding it), "kept" (no friend holds
+// its version) or, for a friend's object, "lent".
+type StatusRot struct {
+	Bucket   string `json:"bucket,omitempty"` // an own bucket
+	Friend   string `json:"friend,omitempty"` // a friend's object: its node ID
+	Sealed   string `json:"sealed,omitempty"` // and its bucket
+	Key      string `json:"key"`
+	SHA256   string `json:"sha256"`
+	Found    string `json:"found"`
+	FoundAt  string `json:"found_at"`
+	State    string `json:"state"`
+	Repaired string `json:"repaired_at,omitempty"`
+	Detail   string `json:"detail,omitempty"`
+}
+
+// bitrotStatus reads the sweep and the rotten objects.
+func bitrotStatus(ctx context.Context, db *state.DB, now time.Time) (*StatusBitrot, error) {
+	sw, ok, err := db.Sweep(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rs, err := db.Rots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok && len(rs) == 0 {
+		return nil, nil
+	}
+	out := &StatusBitrot{Cycles: sw.Cycles, Objects: sw.Objects, Bytes: sw.Bytes, Rotten: []StatusRot{}}
+	if ok {
+		out.CycleStarted, out.LastChecked = rfc3339(sw.CycleAt), rfc3339(sw.CheckedAt)
+	}
+	for _, r := range rs {
+		if !r.RepairedAt.IsZero() && now.Sub(r.RepairedAt) > state.RotShown {
+			continue
+		}
+		s := StatusRot{Key: r.Key, SHA256: r.SHA256, Found: r.Found, FoundAt: rfc3339(r.FoundAt), Detail: r.Detail,
+			Repaired: rfc3339(r.RepairedAt)}
+		switch {
+		case r.Lent():
+			s.Friend, s.Sealed, s.State = r.Borrower, r.Sealed, "lent"
+		case !r.RepairedAt.IsZero():
+			s.Bucket, s.State = r.Bucket, "repaired"
+		case !r.RemovedAt.IsZero():
+			s.Bucket, s.State = r.Bucket, "refetching"
+		default:
+			s.Bucket, s.State = r.Bucket, "kept"
+		}
+		out.Rotten = append(out.Rotten, s)
+	}
+	return out, nil
+}
+
+// bitrotLines are status's lines on the bit-rot sample.
+func bitrotLines(b *StatusBitrot) []string {
+	if b == nil {
+		return nil
+	}
+	var out []string
+	if b.CycleStarted != "" {
+		out = append(out, fmt.Sprintf("Bit-rot sample: %d objects, %s checked this cycle (since %s; %d cycles done)",
+			b.Objects, humanSize(b.Bytes), b.CycleStarted, b.Cycles))
+	}
+	for _, r := range b.Rotten {
+		switch r.State {
+		case "lent":
+			out = append(out, fmt.Sprintf("! bit-rot in friend %s's %s/%s here (found %s): this node cannot repair it; check the disk",
+				r.Friend, r.Sealed, r.Key, r.FoundAt))
+		case "repaired":
+			out = append(out, fmt.Sprintf("  bit-rot in %s/%s (found %s): %s at %s", r.Bucket, r.Key, r.FoundAt, r.Detail, r.Repaired))
+		default:
+			out = append(out, fmt.Sprintf("! bit-rot in %s/%s (found %s): %s", r.Bucket, r.Key, r.FoundAt, r.Detail))
+		}
+	}
+	return out
 }
 
 // StatusFormer is one ended friendship in its retention window.
@@ -752,6 +848,9 @@ friend, or with no room in the pool), which status shows.`,
 			if st.StoreMarkerMissing, _, err = db.GetNode(cmd.Context(), state.NodeMarkerMissing); err != nil {
 				return err
 			}
+			if st.Bitrot, err = bitrotStatus(cmd.Context(), db, a.now()); err != nil {
+				return err
+			}
 			for _, b := range bs {
 				q, bc := queues[b.Name], below[b.Name]
 				off, err := offsiteStatus(cmd.Context(), db, b, profiles.Get(b.Profile))
@@ -915,6 +1014,9 @@ friend, or with no room in the pool), which status shows.`,
 			if m := st.StoreMarkerMissing; m != "" {
 				fmt.Fprintf(a.out, "! Store marker %s is missing: the store may be unmounted or replaced, so nothing is reconciled;\n", m)
 				fmt.Fprintf(a.out, "  check the mount, and if the store is the right one: touch %s\n", m)
+			}
+			for _, l := range bitrotLines(st.Bitrot) {
+				fmt.Fprintln(a.out, l)
 			}
 			if st.Lending != nil {
 				fmt.Fprintf(a.out, "Lending: at most %s (%s); numbers and open invites take %s\n",

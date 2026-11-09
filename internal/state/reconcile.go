@@ -26,6 +26,9 @@ type IndexedKey struct {
 	Key   string
 	Seq   int64 // the latest done row
 	Local bool  // held locally: its object was in this node's store
+	// LocalAt is when this node last knew it there (queue.local); zero
+	// when not held.
+	LocalAt time.Time
 }
 
 // IndexedKeys returns up to limit keys of bucket whose latest done write
@@ -33,7 +36,7 @@ type IndexedKey struct {
 // in key order (bytes, as S3 orders them). A key with only pending rows
 // is not indexed.
 func (db *DB) IndexedKeys(ctx context.Context, bucket, after, upto string, limit int) ([]IndexedKey, error) {
-	q := `SELECT q.key, q.seq, q.local IS NOT NULL FROM queue q
+	q := `SELECT q.key, q.seq, q.local FROM queue q
 		WHERE q.bucket = ?1 AND q.key > ?2 AND (?3 = '' OR q.key <= ?3) AND q.state = 'done' AND q.op = 'put'
 			AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
 		ORDER BY q.key LIMIT ?4`
@@ -45,8 +48,12 @@ func (db *DB) IndexedKeys(ctx context.Context, bucket, after, upto string, limit
 	var out []IndexedKey
 	for rows.Next() {
 		var k IndexedKey
-		if err := rows.Scan(&k.Key, &k.Seq, &k.Local); err != nil {
+		var local sql.NullInt64
+		if err := rows.Scan(&k.Key, &k.Seq, &local); err != nil {
 			return nil, err
+		}
+		if k.Local = local.Valid; k.Local {
+			k.LocalAt = time.Unix(local.Int64, 0)
 		}
 		out = append(out, k)
 	}

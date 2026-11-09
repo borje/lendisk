@@ -746,4 +746,48 @@ var migrations = []Migration{
 			PRIMARY KEY (request, key)
 		) WITHOUT ROWID;`,
 	},
+	{
+		Version: 36, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Bit-rot sampling (VER-5, #31). bitrot_sweep is the sampler's place
+		-- in its sweep of the store, one row: the last object it checked
+		-- (store bucket, key), when the current cycle began, how many cycles
+		-- it finished, and the objects and bytes checked in this cycle.
+		-- Unix seconds.
+		CREATE TABLE bitrot_sweep (
+			id         INTEGER PRIMARY KEY CHECK (id = 1),
+			bucket     TEXT NOT NULL,
+			key        TEXT NOT NULL,
+			cycle_at   INTEGER NOT NULL,
+			cycles     INTEGER NOT NULL,
+			objects    INTEGER NOT NULL,
+			bytes      INTEGER NOT NULL,
+			checked_at INTEGER
+		);
+		-- Objects whose bytes no longer hash to what the index holds, one row
+		-- per store bucket and key. An own bucket's (borrower NULL): seq is
+		-- the queue row whose hash they failed, local_at its queue.local then
+		-- (a later one: the version was stored again); removed_at when the rotten
+		-- object was removed for its re-fetch, repaired_at when a verified
+		-- copy was stored again (or the key was written since), detail why
+		-- it is not. A lent bucket's: borrower is the friend's node ID and
+		-- sealed its bucket; the row lasts while the object does. Unix
+		-- seconds.
+		CREATE TABLE bitrot (
+			bucket      TEXT NOT NULL,
+			key         TEXT NOT NULL,
+			borrower    TEXT,
+			sealed      TEXT,
+			seq         INTEGER,
+			local_at    INTEGER,
+			sha256      TEXT NOT NULL,
+			found       TEXT NOT NULL,
+			size        INTEGER NOT NULL,
+			found_at    INTEGER NOT NULL,
+			removed_at  INTEGER,
+			repaired_at INTEGER,
+			detail      TEXT,
+			PRIMARY KEY (bucket, key)
+		);`,
+	},
 }

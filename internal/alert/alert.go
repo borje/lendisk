@@ -10,8 +10,9 @@
 // a bucket holding a Kopia format-1 repository (COMPAT-1, #79),
 // objects below copies past replication.replace_after (REPL-13, #26),
 // a friend's replica that failed verification or has not passed it
-// for days (VER-1, SEC-7, #27), and the store reconciler's held deletes
-// and missing store marker (EP-14, #8).
+// for days (VER-1, SEC-7, #27), the store reconciler's held deletes
+// and missing store marker (EP-14, #8), and bit-rot the sampler found in
+// own objects and in friends' (VER-5, #31).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -166,6 +167,18 @@ const (
 	// reconciled (EP-14, #8). No subject. It clears when a pass finds it
 	// again.
 	KindStoreMarkerMissing = "store_marker_missing"
+	// KindBitrot: the bit-rot sampler found own objects of a bucket whose
+	// bytes no longer hash to the version captured (VER-5, #31). Subject:
+	// the bucket. It holds while one is not repaired (kept, as no friend
+	// holds its version, or removed and not yet fetched again) and for
+	// state.RotShown after the last repair, so a disk that is failing is
+	// told even when every object came back.
+	KindBitrot = "bitrot"
+	// KindLentBitrot: the sampler found objects a friend stores here whose
+	// bytes no longer hash to the hash they were stored with (VER-5,
+	// LEND-4). Subject: the friend. This node cannot repair them; it holds
+	// while it holds them.
+	KindLentBitrot = "lent_bitrot"
 )
 
 // DefaultUncheckedAfter is Service.UncheckedAfter when zero.
@@ -187,6 +200,44 @@ func KopiaFormat1Message(b state.Bucket) string {
 func ReconcileHeldMessage(bucket string, r state.ReconcileState) string {
 	return fmt.Sprintf("bucket %s: %d of the %d objects this node held are missing from the store (since %s); they are not deleted at any friend, since an emptied or unmounted directory looks the same. If you removed them, allow their deletes: lendisk bucket reconcile %s --allow-deletes %d; otherwise put them back, or read them through from friends",
 		bucket, r.Held, r.HeldOf, r.HeldAt.UTC().Format(time.RFC3339), bucket, r.Held)
+}
+
+// BitrotMessage says what the sampler found rotten in an own bucket
+// (VER-5), rs its records, for the alert and status alike.
+func BitrotMessage(bucket string, rs []state.Rot) string {
+	var fixed, waiting, kept int
+	for _, r := range rs {
+		switch {
+		case !r.RepairedAt.IsZero():
+			fixed++
+		case !r.RemovedAt.IsZero():
+			waiting++
+		default:
+			kept++
+		}
+	}
+	first := rs[0]
+	var parts []string
+	if fixed > 0 {
+		parts = append(parts, fmt.Sprintf("%d fetched again from friends", fixed))
+	}
+	if waiting > 0 {
+		parts = append(parts, fmt.Sprintf("%d removed and waiting for a friend holding them to answer (a read fetches them)", waiting))
+	}
+	if kept > 0 {
+		parts = append(parts, fmt.Sprintf("%d kept rotten, as no friend holds their version", kept))
+	}
+	return fmt.Sprintf("bucket %s: %s whose bytes no longer match the hash they were captured with (first %s: %s, now %s, found %s): %s. The store's disk is corrupting data: check it (smartctl -a, the kernel log)",
+		bucket, countObjects(int64(len(rs))), first.Key, first.SHA256, first.Found, first.FoundAt.UTC().Format(time.RFC3339),
+		strings.Join(parts, ", "))
+}
+
+// LentBitrotMessage says what the sampler found rotten of a friend's
+// replicas here (VER-5, LEND-4), for the alert and status alike.
+func LentBitrotMessage(friend string, rs []state.Rot) string {
+	first := rs[0]
+	return fmt.Sprintf("friend %s: %s it stores here no longer match the hash they were stored with (first %s in its bucket %s, found %s). This node cannot repair a friend's data and leaves it as it is; the friend's challenges find it and place those copies elsewhere. This node's disk is corrupting data: check it (smartctl -a, the kernel log)",
+		friend, countObjects(int64(len(rs))), first.Key, first.Sealed, first.FoundAt.UTC().Format(time.RFC3339))
 }
 
 // QuotaHighPercent is the use of a quota above which KindQuotaHigh is
@@ -214,7 +265,7 @@ const PurgeWarning = 7 * 24 * time.Hour
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindFriendRefuses, KindPurgeSoon,
 	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
-	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing}
+	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -569,6 +620,25 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		if r := recs[b.Name]; r.Held > 0 {
 			out = append(out, alertOf(KindReconcileHeld, b.Name, ReconcileHeldMessage(b.Name, r)))
 		}
+	}
+	rots, err := s.DB.Rots(ctx)
+	if err != nil {
+		return nil, err
+	}
+	own, lent := map[string][]state.Rot{}, map[string][]state.Rot{}
+	for _, r := range rots {
+		switch {
+		case r.Lent():
+			lent[r.Borrower] = append(lent[r.Borrower], r)
+		case r.RepairedAt.IsZero() || now.Sub(r.RepairedAt) <= state.RotShown:
+			own[r.Bucket] = append(own[r.Bucket], r)
+		}
+	}
+	for _, b := range slices.Sorted(maps.Keys(own)) {
+		out = append(out, alertOf(KindBitrot, b, BitrotMessage(b, own[b])))
+	}
+	for _, f := range slices.Sorted(maps.Keys(lent)) {
+		out = append(out, alertOf(KindLentBitrot, f, LentBitrotMessage(f, lent[f])))
 	}
 	if m, _, err := s.DB.GetNode(ctx, state.NodeMarkerMissing); err != nil {
 		return nil, err

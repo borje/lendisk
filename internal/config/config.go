@@ -87,6 +87,9 @@ type Store struct {
 	// ReconcileDeleteLimit is a percentage: a guard against an unmounted
 	// or emptied store deleting a backup at every friend.
 	ReconcileDeleteLimit Number `toml:"reconcile_delete_limit" default:"10" help:"objects found missing from the store that, with the reconciler's own deletes of the last 7 days (or since the last confirmation), are more than this percentage of a bucket's objects are not deleted until you confirm with lendisk bucket reconcile (EP-14); 1 to 100, where 100 never asks"`
+	// BitrotSample is a decimal percentage (VER-5, #31).
+	BitrotSample    string `toml:"bitrot_sample" default:"0.1" help:"the share of the stored bytes, own buckets and friends' replicas alike, hashed each week and compared with the index to find bit-rot (VER-5): a percentage from 0.1 to 100, such as 1 for every object about twice a year"`
+	BitrotReadLimit string `toml:"bitrot_read_limit" default:"8M" help:"most bytes a second the bit-rot sample reads from the store (VER-5), so it never competes with backups for the disk; at least 16K, empty for no limit; changes apply without a restart"`
 }
 
 // Endpoint is the [endpoint] section (EP-1, EP-5, EP-17).
@@ -242,6 +245,7 @@ func (c *Config) Pace() pace.Settings {
 	s.Up, _ = rate(c.Replication.UploadLimit)
 	s.Down, _ = rate(c.Replication.DownloadLimit)
 	s.Schedule, _ = pace.ParseSchedule(c.Replication.Schedule)
+	s.Scrub, _ = rate(c.Store.BitrotReadLimit)
 	for _, p := range c.Replication.PeerLimit {
 		if s.Peers == nil {
 			s.Peers = map[string]pace.Rates{}
@@ -277,6 +281,7 @@ func (c *Config) checkPacing() []error {
 	for _, r := range []struct{ key, v string }{
 		{"replication.upload_limit", c.Replication.UploadLimit},
 		{"replication.download_limit", c.Replication.DownloadLimit},
+		{"store.bitrot_read_limit", c.Store.BitrotReadLimit},
 	} {
 		if _, err := rate(r.v); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", r.key, err))
@@ -356,6 +361,17 @@ func (c *Config) ReconcileEvery() time.Duration {
 	return d
 }
 
+// MinBitrotSample is the least share of the stored bytes, in percent, the
+// bit-rot sample may hash a week (VER-5).
+const MinBitrotSample = 0.1
+
+// BitrotSample is store.bitrot_sample, a percentage, which Validate
+// checked.
+func (c *Config) BitrotSample() float64 {
+	v, _ := strconv.ParseFloat(strings.TrimSpace(c.Store.BitrotSample), 64)
+	return v
+}
+
 // UnreachableAfter is alerts.unreachable_after, which Validate checked.
 func (c *Config) UnreachableAfter() time.Duration {
 	d, _ := time.ParseDuration(c.Alerts.UnreachableAfter)
@@ -395,6 +411,9 @@ func (c *Config) Validate() error {
 	}
 	if n, err := strconv.Atoi(string(c.Store.ReconcileDeleteLimit)); err != nil || n < 1 || n > 100 {
 		errs = append(errs, fmt.Errorf("store.reconcile_delete_limit = %q: want a whole percentage from 1 to 100", c.Store.ReconcileDeleteLimit))
+	}
+	if v, err := strconv.ParseFloat(strings.TrimSpace(c.Store.BitrotSample), 64); err != nil || !(v >= MinBitrotSample && v <= 100) {
+		errs = append(errs, fmt.Errorf("store.bitrot_sample = %q: want a percentage from 0.1 (VER-5's least) to 100, such as 1", c.Store.BitrotSample))
 	}
 	if err := checkLoopback(c.Endpoint.Loopback); err != nil {
 		errs = append(errs, fmt.Errorf("endpoint.loopback = %q: %w", c.Endpoint.Loopback, err))

@@ -157,9 +157,16 @@ func (a *app) serveCmd() *cobra.Command {
 			if a.tuneReconcile != nil {
 				a.tuneReconcile(rec)
 			}
+			// The bit-rot sample (VER-5): a share of the store each week,
+			// own objects and friends' alike, its reads paced.
+			sample := &gateway.SampleSettings{Percent: cfg.BitrotSample(), Pace: pacer.Scrub, Random: a.random,
+				Alerted: alerts.Check}
+			if a.tuneSample != nil {
+				a.tuneSample(sample)
+			}
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore, BeforeHash: a.beforeHash, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
-				Fetch: fetch, Reconcile: rec}
+				Fetch: fetch, Reconcile: rec, Sample: sample}
 			tun.Undeleter.Set(gw) // the undelete call (RET-3)
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()

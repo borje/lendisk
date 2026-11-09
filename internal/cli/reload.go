@@ -29,6 +29,7 @@ func withoutPacing(cfg config.Config) config.Config {
 	cfg.Replication.PartSize, cfg.Replication.Schedule = "", ""
 	cfg.Replication.UploadLimit, cfg.Replication.DownloadLimit = "", ""
 	cfg.Replication.PeerLimit, cfg.Lending.BorrowerLimit = nil, nil
+	cfg.Store.BitrotReadLimit = ""
 	return cfg
 }
 
@@ -108,7 +109,7 @@ func (r *reloader) reload(why string) {
 	r.Pace.Set(s)
 	r.Log.Info("configuration reloaded: pacing applied", "why", why, "part_size", s.PartSize,
 		"schedule", s.Schedule.String(), "upload_limit", s.Up, "download_limit", s.Down,
-		"peer_limits", len(s.Peers), "borrower_limits", len(s.Lend))
+		"peer_limits", len(s.Peers), "borrower_limits", len(s.Lend), "bitrot_read_limit", s.Scrub)
 	if !reflect.DeepEqual(withoutPacing(cfg.Config), withoutPacing(r.started)) {
 		r.Log.Warn("configuration: settings other than part_size, schedule and the limits changed; they take effect at the next start")
 	}

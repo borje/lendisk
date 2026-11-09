@@ -200,6 +200,41 @@ func TestReconcileSettings(t *testing.T) {
 	}
 }
 
+// VER-5 (#31): the bit-rot sample is a percentage of the stored bytes a
+// week, 0.1 (VER-5's least) by default and never below it, and its
+// disk reads are paced, 8M a second by default; empty is no limit.
+func TestBitrotSettings(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.BitrotSample() != 0.1 || l.Pace().Scrub != 8<<20 {
+		t.Fatalf("defaults %v %d", l.BitrotSample(), l.Pace().Scrub)
+	}
+	l, err = load(t, []string{"--config", writeFile(t, "[store]\nbitrot_sample = \"2.5\"\nbitrot_read_limit = \"1M\"\n")}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.BitrotSample() != 2.5 || l.Pace().Scrub != 1<<20 {
+		t.Fatalf("from the file %v %d", l.BitrotSample(), l.Pace().Scrub)
+	}
+	l, err = load(t, []string{"--config", none, "--store-bitrot-read-limit", ""}, map[string]string{"LENDISK_STORE_BITROT_SAMPLE": "100"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.BitrotSample() != 100 || l.Pace().Scrub != 0 {
+		t.Fatalf("from the flag and environment %v %d", l.BitrotSample(), l.Pace().Scrub)
+	}
+	for _, bad := range [][]string{{"--store-bitrot-sample", "0.05"}, {"--store-bitrot-sample", "0"},
+		{"--store-bitrot-sample", "101"}, {"--store-bitrot-sample", "1%"}, {"--store-bitrot-sample", "NaN"},
+		{"--store-bitrot-read-limit", "10K"}, {"--store-bitrot-read-limit", "fast"}} {
+		if _, err := load(t, append([]string{"--config", none}, bad...), nil); err == nil {
+			t.Errorf("accepted %v", bad)
+		}
+	}
+}
+
 func TestStoreAndEndpointSettings(t *testing.T) {
 	l, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "none.toml"), "--data-dir", "/srv/l"}, nil)
 	if err != nil {

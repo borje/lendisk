@@ -36,7 +36,11 @@ import (
 //     own store. A recovered node's store is empty by design (ID-5,
 //     ID-6) and fills through the read-through, so a key it never read
 //     is not held and its absence deletes nothing;
-//   - an indexed key whose object is listed is marked held.
+//   - an indexed key whose object is listed is marked held; one held
+//     whose file changed (ctime) after this node last knew it there is
+//     hashed again, and enqueued as a put if its bytes changed: an edit
+//     in place outside the endpoint, which EP-11 judges as any write
+//     (#88). Bytes the same mark it known again.
 //
 // Guards against mass deletion (a delete goes to every place, where
 // lenders keep it only as a tombstone for the retention window):
@@ -391,6 +395,14 @@ func (r *reconciler) bucket(ctx context.Context, bucket string) error {
 					mark = mark[:0]
 					return err
 				}
+				return nil
+			}
+			if r.edited(bucket, k.Key, k.LocalAt) {
+				ok, err := r.rehash(ctx, bucket, k)
+				if ok {
+					writes++
+				}
+				return err
 			}
 			return nil
 		},
@@ -544,6 +556,68 @@ func (r *reconciler) write(ctx context.Context, bucket, key string) (bool, error
 	}
 	r.d.noteFormat(bucket, key, k.format)
 	return !dup, nil
+}
+
+// edited reports whether key's file changed (its ctime) in a later
+// second than local, when this node last knew the key's version there.
+func (r *reconciler) edited(bucket, key string, local time.Time) bool {
+	fi, err := os.Lstat(filepath.Join(r.storeDir, bucket, filepath.FromSlash(key)))
+	return err == nil && fi.Mode().IsRegular() && changeTime(fi).Unix() > local.Unix()
+}
+
+// rehash hashes again a held key's object whose file changed after this
+// node last knew it (#88), under the key's lock: other bytes are
+// enqueued as a put, as an edit outside the endpoint; the same bytes
+// mark the version known again. It reports whether a row was queued.
+func (r *reconciler) rehash(ctx context.Context, bucket string, k state.IndexedKey) (bool, error) {
+	if class, err := r.d.classify(&bucket, &k.Key); err != nil || !captured(class) {
+		return false, err
+	}
+	unlock, err := r.d.keys.lock(ctx, bucket, k.Key)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+	v, err := r.d.DB.OwnVersion(ctx, bucket, k.Key)
+	if err != nil || v.Seq != k.Seq || !v.Held() || v.Pending || !r.edited(bucket, k.Key, v.Local) {
+		return false, err
+	}
+	n, sum, err := r.d.hashStored(ctx, bucket, k.Key)
+	if notFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if n == v.Size && sum == v.SHA256 {
+		return false, r.d.DB.MarkLocal(ctx, bucket, k.Key, sum)
+	}
+	r.log.Info("reconcile: an object was changed in place outside the endpoint; enqueued as a write", "bucket", bucket,
+		"key", k.Key, "sha256", sum)
+	return true, r.d.captureChanged(ctx, bucket, k.Key, n, sum)
+}
+
+// captureChanged enqueues an indexed key's object, changed in place
+// outside the endpoint, as a put of the bytes the caller hashed (n,
+// sum), in its class; FinishPut applies EP-11 as to any capture. The
+// caller holds the key's lock. A crash between the row and its finish
+// leaves a pending row with no token, which startup settles as landed.
+func (d *Decorator) captureChanged(ctx context.Context, bucket, key string, n int64, sum string) error {
+	k, err := d.kind(&bucket, &key)
+	if err != nil || !captured(k.class) {
+		return err
+	}
+	seqs, err := d.DB.BeginCaptures(ctx, []state.Capture{{Bucket: bucket, Key: key, Op: state.OpPut, Class: string(k.class),
+		Rewritable: k.rewritable, Reconciled: true}})
+	if err != nil {
+		return err
+	}
+	if _, err := d.DB.FinishPut(ctx, seqs[0], n, sum); err != nil {
+		d.strand(seqs...)
+		return err
+	}
+	d.noteFormat(bucket, key, k.format)
+	return nil
 }
 
 // delete enqueues the delete of a held key whose object is gone from

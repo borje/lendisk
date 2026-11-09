@@ -2461,6 +2461,17 @@ upstream bucket is Q-V.
     `TestMissingObjectEnqueuedAsDeleteOnlyIfHeldLocally` and
     `TestPassPagesThroughListingAndIndex` (`internal/gateway`, pages of
     3 keys).
+  - *Edits in place (#88's second item, #31).* A pass that lists a held
+    key's object stats it; if its status change time is in a later
+    second than `queue.local`, the file changed after this node last
+    knew it, so it is hashed again under the key's lock: other bytes are
+    enqueued as a put (`reconciled` = 1, `Decorator.captureChanged`,
+    EP-11 applying as to a capture), the same bytes (a `chmod`, a copy
+    back) refresh `queue.local` so the next pass does not hash it again
+    (`TestReconcilerRehashesObjectsChangedInPlace`). A `chown -R` or a
+    restore of the store with `cp -a` costs one pass that hashes
+    everything. The sampler (§3.6 VER-5) tells edits from rot the same
+    way. #88's first item (files still being copied) stays open.
   - *Rule for later code:* anything that removes an own bucket's object
     from the store without a captured delete (VER-5's re-fetch of a
     rotten object, post-v1 evict) must hold the key's lock and clear
@@ -3719,6 +3730,9 @@ upstream bucket is Q-V.
   (`TestAClosingWindowStopsAtTheEndOfThePart`). Deletes wait with the
   puts; re-placement's moves are FIFO rows and so obey both (REPL-13).
   The read-through ignores the schedule: a restore waits for no window.
+  The bit-rot sample's disk reads have a bucket of their own
+  (`store.bitrot_read_limit`, `Pacer.Scrub`, §3.6 VER-5), reloaded with
+  the rest; the schedule does not apply to them.
   *Decision: changes apply without a restart, from the file.* The
   daemon never writes its config (OPS-6), so it re-reads it: it looks
   at the file's modification time, size and inode every 10 s and
@@ -4688,14 +4702,126 @@ the handler's own reads and is never cancelled; nothing below
   client, hashed by lendisk and compared with the index; the method
   for overflow targets (S3-6), and for the evicted part of a bucket if
   evict mode arrives post-v1.
-- **VER-5** The sampler hashes a weekly sample of at least 0.1% of the
-  stored bytes through
-  the decorator and compares with the index, on both sides; neither
-  backend has a scrub of its own. On a mismatch the borrower deletes
-  and re-fetches the object (EP-10), holding the key's lock and
-  clearing its held-locally mark (`queue.local`) before it deletes, so
-  the store reconciler does not take the removal for the user's delete
-  (§3.3 EP-14).
+- **VER-5** The bit-rot sampler (`gateway/bitrot.go`, #31) runs in the
+  gateway once it serves, in both roles, and hashes a share of the
+  store against the index, on both sides; neither backend has a scrub
+  of its own.
+  - *How much.* `store.bitrot_sample`, a percentage of the stored bytes
+    a week (default 0.1, VER-5's least, refused below it; at most 100).
+    Every 10 minutes (`gateway.DefaultSampleEvery`) a step owes that
+    share of `state.DB.StoredBytes` (the own objects held locally plus
+    every friend's `lent_usage`, overhead and tombs included, so the
+    share errs high) for the time passed on the gateway's clock, never
+    more than the store holds, and hashes objects until it has paid; the
+    last object may run over, and an empty one counts a byte.
+  - *Paced.* Every read goes through `pace.Pacer.Scrub`, a token bucket
+    of its own (`store.bitrot_read_limit`, default 8M a second, at least
+    16K, empty for none; reloaded without a restart like the other
+    limits, §3.4 REPL-7), apart from every network limit: on a Pi the
+    sample must not compete with backups for a USB disk
+    (`TestSampleReadsArePaced`, `TestBitrotReadsHoldToTheirLimit`).
+  - *Which objects: a sweep, not a draw.* The step goes on from where
+    the last one stopped, in bucket name then the store's listing
+    order, over the own buckets and every friend's `lent-*` bucket,
+    wrapping after the last; its place (table `bitrot_sweep`, schema
+    36: the last object checked, the cycle's start, objects and bytes
+    checked in it, cycles done; `state.DB.Sweep`) survives a restart.
+    So the next object is always the one checked longest ago (or never),
+    every object is checked once a cycle, and a step stops when it comes
+    back past where it began rather than check anything twice
+    (`TestSampleCoversTheStoreInTurnAtTheConfiguredRate`). The injected
+    randomness (`SampleSettings.Random`) only picks the bucket the first
+    cycle starts at; the clock is the gateway's. *Decision (#31).* A
+    random draw finds rot at the same rate on average but leaves some
+    objects unchecked for many cycles; a sweep bounds the time to
+    detection by a cycle. Precedent: ZFS's scrub walks the whole pool
+    and resumes where it stopped; Ceph deep-scrubs each placement group
+    in turn, the longest unscrubbed first, randomising only when;
+    Garage's block scrub walks every block with a saved checkpoint,
+    paced by its `scrub-tranquility`, every 25 to 35 days at random.
+    Listing order is posix's: where it differs from byte order (a key
+    beside a directory of a longer name) an object may be visited a
+    cycle late, never lost to the sweep.
+  - *An own object* is checked if its key's latest done write is a put
+    held locally (`state.OwnVersion`) with no write in flight and not
+    held back by EP-11 (its bytes are the user's, replicated nowhere),
+    and not local-only; its bytes must hash to the queue row's size and
+    SHA-256 (`TestHeldBackAndBusyKeysAreSkipped`). A mismatch is checked
+    again holding the key's lock, the row read again and the object
+    hashed again (a misread or a write that landed in between decides
+    nothing):
+    - *An edit, not rot (#88).* A file whose status change time (ctime,
+      `changeTime`; set by every write, rename, link and xattr change,
+      and not by `touch -d` or `rsync -t`) is in a later second than
+      the row's `queue.local` changed after this node last knew it, so
+      its bytes are the user's: they are enqueued as a put (`reconciled`
+      = 1, `Decorator.captureChanged`), which EP-11 judges as any write
+      (`TestAnObjectChangedInPlaceIsAWriteNotRot`). Rot never moves the
+      ctime. *Accepted:* a clock stepped back by more than the time
+      since capture would make an edit look like rot (and its object be
+      fetched again as the version the index holds), and an edit within
+      the second of its capture likewise.
+    - *Rot.* Logged at error with `alert=true`, recorded (table
+      `bitrot`, schema 36: bucket, key, the row, its `queue.local` then,
+      both hashes, when found; `state.DB.RecordRot`) and alerted
+      (`bitrot`, §3.8). If a friend acknowledged that very version
+      (`state.Source`), the sampler, still holding the key's lock,
+      clears `queue.local` (`state.ClearLocal`, EP-14's rule for later
+      code), deletes the object through the backend (no capture, no
+      row), records the removal, releases the lock and fetches it again
+      through the read-through (`readThrough`, which verifies it and
+      marks it held, §3.3 EP-10). Nothing is enqueued and no friend is
+      asked to change anything
+      (`TestRottenLocalObjectIsAlertedRemovedAndRefetched`). If no
+      friend holding it answers, the object stays absent: a read
+      fetches it (EP-10), each later step tries again, and the reconciler
+      sees a key not held locally, so no delete
+      (`TestTheRefetchsRemovalIsNoDeleteToTheReconciler` runs a pass with
+      a delete limit of 100 between the removal and the fetch). With no
+      friend holding the version (not replicated yet, or held back) the
+      rotten object is kept, as it is all there is, and logged as such
+      (`TestRotNoFriendHoldsIsKeptAndAlerted`).
+    - *Follow-up.* Each step first goes over the records: a removed
+      object is fetched again; a kept one is looked at again once a
+      friend holds its version (recovery, undelete) or the version was
+      stored again (an identical re-upload moves `queue.local`); a key
+      written or deleted since is over; a repaired record is dropped
+      `state.RotShown` (7 days) after its repair.
+  - *A friend's object* is hashed against the hash it was stored with
+    (`x-amz-meta-lendisk-sha256` in its xattrs, LEND-4); a mismatch is
+    checked again holding `Lending`'s key lock (a put, rewrite or delete
+    of the key holds it until the store answers), then logged with
+    `alert=true`, recorded with the friend and its sealed bucket, and
+    alerted (`lent_bitrot`, §3.8). The object is left as it is
+    (`TestRottenLentObjectIsAlertedOnly`); the record ends when the
+    friend deletes or replaces it. Tombs are not sampled: a rotten tomb
+    an undelete brings back fails the borrower's verification as any
+    rotten object does.
+  - *Decision (#31): the lender does not tell the friend.* It cannot
+    repair a friend's data and must not change it (LEND-4: it holds
+    the borrower's bytes and their hash, nothing more). The friend learns it without a new call: its
+    daily challenge (VER-1, §3.6) samples eight objects of the replica,
+    so a rotten one fails a proof within about n/8 days for a replica of
+    n objects, at once with `lendisk verify --full`, and one failed
+    proof re-places the whole replica; meanwhile the read-through and
+    re-placement verify every byte they read from it and try the next
+    holder (§3.3 EP-10). A notice would be a new peer-protocol call and
+    the lender's unverifiable word, and would add no repair the
+    challenge does not start. The lender's own user gets the alert,
+    which names the friend and the key: friends can talk. Precedent:
+    Storj's storage nodes do not report their own corrupted pieces; the
+    satellite's audits find them. A notice may come later if the
+    challenge's latency proves too long in the field.
+  - *Status.* `status --json` adds `bitrot` (`cycle_started`, `cycles`,
+    `objects`, `bytes`, `last_checked`, and `rotten[]`: `bucket` or
+    `friend` and `sealed`, `key`, `sha256`, `found`, `found_at`,
+    `state` repaired, refetching, kept or lent, `repaired_at`,
+    `detail`), and `status` prints the cycle and a line per rotten
+    object. *AC:* `TestBitrotIsFoundOnBothSidesAndRepairedAtTheBorrower`
+    (`internal/cli`, real daemons): a byte flipped at A and another in
+    B's copy of A's bucket; a week on both clocks, A alerts and fetches
+    its object again from B, enqueueing nothing, and B alerts and keeps
+    A's object as it is.
 
 ### 3.7 Network
 
@@ -5183,7 +5309,20 @@ the handler's own reads and is never cancelled; nothing below
     store may be unmounted or replaced and nothing is reconciled (§3.3
     EP-14); the message names the path and says to check the mount and
     `touch` it. Cleared by the first pass that finds it
-    (`TestReconcileHoldAndMissingMarkerAreAlerted`).
+    (`TestReconcileHoldAndMissingMarkerAreAlerted`);
+  - `bitrot`, subject the bucket: the bit-rot sampler found own objects
+    whose bytes no longer hash to the version captured (§3.6 VER-5,
+    #31); the message names the first key and both hashes, how many were
+    fetched again, are waiting for a friend, or are kept as no friend
+    holds them, and says to check the disk (`alert.BitrotMessage`).
+    Held while one is not repaired and for `state.RotShown` (7 days)
+    after the last repair, so a failing disk is told even when every
+    object came back;
+  - `lent_bitrot`, subject the friend: objects that friend stores here
+    no longer hash to the hash they were stored with; the message says
+    this node cannot repair them and the friend's challenges find them,
+    and to check the disk (`alert.LentBitrotMessage`). Held while the
+    objects are (`TestBitrotIsAlertedOnBothSides`).
   The three quota alerts have hysteresis (#24 review): one stays raised
   until its condition has been false for `alert.Service.QuotaHold`
   (`DefaultQuotaHold`, 10 minutes), so a friend flipping it with every

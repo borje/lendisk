@@ -18,6 +18,7 @@ role = "lender"
 backend          = "posix"
 path             = "/var/lib/lendisk/store"   # on the USB disk; lent-<id>-<sealed> directories (SEC-16)
 free_space_floor = "5%"
+bitrot_read_limit = "4M"     # VER-5: keep the bit-rot sample gentle on the Pi's USB disk
 
 [tunnel]
 # The tunnel port is always 9000 inside WireGuard.
