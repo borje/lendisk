@@ -163,3 +163,39 @@ func TestAProbeAnswerRefreshesLastOKButKeepsFullAndStore(t *testing.T) {
 			ps[0].fullForLong(p.db, p.now), ps[0].gone(p.db, p.now))
 	}
 }
+
+// #65 review: a friend full for longer than replace_after that answers
+// every probe, then misses one, is neither unreachable nor gone: its
+// silence counts from its last answer, not from its first 507, so a
+// 15-minute blip does not move every copy it holds.
+func TestAFullFriendThatAnswersProbesIsNotGoneAfterOneMissedProbe(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.answer("B", ConditionOK)
+	p.answer("B", ConditionQuota)
+	end := p.now.Add(8 * 24 * time.Hour)
+	for p.now.Before(end) {
+		p.now = p.now.Add(15 * time.Minute)
+		if err := p.db.ProbeAnswered(ctx, "B", p.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.now = p.now.Add(15 * time.Minute)
+	p.answer("B", ConditionRetrying)
+	ps, err := poolPlaces(ctx, p.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pl := range ps {
+		if pl.peer != "B" {
+			continue
+		}
+		if pl.gone(p.db, p.now) || pl.unreachable(p.db, p.now) {
+			t.Fatalf("one missed probe after a week full and answering: gone %v, unreachable %v",
+				pl.gone(p.db, p.now), pl.unreachable(p.db, p.now))
+		}
+		return
+	}
+	t.Fatal("B not in the pool")
+}

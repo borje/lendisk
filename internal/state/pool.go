@@ -136,7 +136,11 @@ func (p poolPlace) failing() bool {
 // as long as it gives no ok). A friend failing for less is still
 // counted reachable: a blip is not an outage.
 func (p poolPlace) unreachable(db *DB, now time.Time) bool {
-	return p.failing() && now.Sub(p.failingSince()) >= db.rerouteAfter()
+	// A probe's answer during a full stretch moves last_ok on while the
+	// run of failures stays: one failed probe after it is a blip, not
+	// reroute_after of silence (#65 review).
+	return p.failing() && now.Sub(p.failingSince()) >= db.rerouteAfter() &&
+		(p.lastOK.IsZero() || now.Sub(p.lastOK) >= db.rerouteAfter())
 }
 
 // failingSince is when its run of failing answers began.
@@ -151,8 +155,11 @@ func (p poolPlace) failingSince() time.Time {
 // answer (or its first failure, if it never answered). It is no longer
 // room (REPL-12); re-placement (REPL-13, #26) moves what it held.
 func (p poolPlace) gone(db *DB, now time.Time) bool {
+	// Silence counts from the last answer, a probe's included (#65
+	// review): a friend full for a week that answers probes, then misses
+	// one, is not gone.
 	from := p.lastOK
-	if from.IsZero() || from.After(p.failingSince()) {
+	if from.IsZero() {
 		from = p.failingSince()
 	}
 	return p.unreachable(db, now) && now.Sub(from) >= db.replaceAfter()

@@ -2403,7 +2403,10 @@ upstream bucket is Q-V.
   `replication.reroute_after` (1 hour; a shorter failure is a blip),
   and gone once, in addition, `replication.replace_after` (7 days) has
   passed since its last answer (`last_ok`, or the failure's start if
-  it never answered). An unreachable friend with room is still chosen
+  it never answered). Both count from the last answer, a probe's
+  included: a friend full for a week that answers probes is neither
+  unreachable nor gone after one missed probe (#65 review). An
+  unreachable friend with room is still chosen
   when the reachable ones are not enough; a gone one is not.
   *Away is a run of failing answers, not one condition (#65, from the
   #21 review).* `place.since` restarts at every change of condition,
