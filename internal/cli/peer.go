@@ -157,7 +157,7 @@ Becoming friends again before then, with a new invite, keeps both.`,
 			return a.runPeerRemove(cmd.Context(), args[0])
 		},
 	}
-	cmd.AddCommand(add, list, remove, a.peerQuotaCmd())
+	cmd.AddCommand(add, list, remove, a.peerQuotaCmd(), a.peerForwardCmd())
 	return cmd
 }
 

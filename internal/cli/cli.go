@@ -51,7 +51,8 @@ type app struct {
 	storeCheck store.Checker
 	// serving, if set, is called once `serve` accepts S3 requests, with
 	// the loopback endpoint's address; in the lender-only profile, which
-	// has none, with "" once it lends (PEER-9).
+	// has none, with "" once it lends (PEER-9); and once `peer forward`
+	// listens, with its address, after it printed its lines (NET-7b).
 	serving func(addr string)
 	// regions offers the tunnel's relay regions; nil means the public map.
 	regions transport.RegionSource
