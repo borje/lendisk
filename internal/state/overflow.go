@@ -1,6 +1,7 @@
 package state
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -101,6 +102,11 @@ func scanOverflow(s interface{ Scan(...any) error }) (Overflow, error) {
 
 // AddOverflow inserts an overflow target; ErrExists if one has its name.
 func (db *DB) AddOverflow(ctx context.Context, o Overflow) error {
+	defer func() {
+		db.splitMu.Lock()
+		db.splitAt = time.Time{} // the pool changed: ask again
+		db.splitMu.Unlock()
+	}()
 	var price any
 	if o.PricePerGB > 0 {
 		price = o.PricePerGB
@@ -183,6 +189,64 @@ func (db *DB) OverflowHolds(ctx context.Context) (map[string]OverflowHold, error
 		out[name] = h
 	}
 	return out, rows.Err()
+}
+
+// splitCacheTTL is how long overflowSplit's answer is kept: it reads the
+// whole repository, and a capture asks it each time.
+const splitCacheTTL = 30 * time.Second
+
+// FriendsHold reports whether friends with quotas hold copies copies of
+// a repository of data bytes plus metadata bytes (DESIGN §4): with D the
+// data and m the metadata, held at every friend, Σ min(D, quota − m)
+// ≥ copies × D, each term floored at 0. capacity.Plan.FriendsHold is
+// the same rule, for status.
+func FriendsHold(data, metadata int64, copies int, quotas []int64) bool {
+	if data <= 0 {
+		return true
+	}
+	var room float64
+	for _, q := range quotas {
+		room += min(float64(data), max(float64(q)-float64(metadata), 0))
+	}
+	return room >= float64(max(copies, 1))*float64(data)
+}
+
+// overflowSplit reports whether placement is split (REPL-12 as of
+// v0.11.5, #38): there is an overflow target, and the node's friends
+// cannot hold `copies` copies of its repository (FriendsHold, the
+// capacity plan's rule). Then each data object goes to copies − 1
+// friends and one overflow target. The answer is kept splitTTL.
+func (db *DB) overflowSplit(ctx context.Context, q querier) (bool, error) {
+	ttl := cmp.Or(db.splitTTL, splitCacheTTL)
+	db.splitMu.Lock()
+	defer db.splitMu.Unlock()
+	if ttl > 0 && !db.splitAt.IsZero() && time.Since(db.splitAt) < ttl {
+		return db.splitVal, nil
+	}
+	var targets int
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM overflow`).Scan(&targets); err != nil {
+		return false, err
+	}
+	split := false
+	if targets > 0 {
+		u, err := repositoryUse(ctx, q)
+		if err != nil {
+			return false, err
+		}
+		ps, err := poolPlaces(ctx, q)
+		if err != nil {
+			return false, err
+		}
+		var quotas []int64
+		for _, p := range ps {
+			if !p.overflow {
+				quotas = append(quotas, p.quota)
+			}
+		}
+		split = !FriendsHold(u.Data, u.Metadata, cmp.Or(u.Copies, DefaultCopies), quotas)
+	}
+	db.splitAt, db.splitVal = time.Now(), split
+	return split, nil
 }
 
 // overflowHolding lists the overflow targets that hold or have queued a

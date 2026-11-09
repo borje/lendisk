@@ -7,10 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/minio/minio-go/v7"
 
 	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/overflow/overflowtest"
@@ -154,7 +157,8 @@ func TestCheckOverflowWarnsWhenVersioningIsOff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ch.Versioning != state.VersioningOff || !strings.Contains(strings.Join(ch.Notes, "\n"), "warning: versioning is off") {
+	if notes := strings.Join(ch.Notes, "\n"); ch.Versioning != state.VersioningOff || !strings.Contains(notes, "warning: versioning is off") ||
+		!strings.Contains(notes, "a delete there is final") {
 		t.Fatalf("check %+v", ch)
 	}
 }
@@ -175,5 +179,32 @@ func TestOverflowWrongCredentialIsRefusedNotRemoved(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "not-the-secret") {
 		t.Fatalf("the error shows the secret: %v", err)
+	}
+}
+
+// SEC-3, #38 review: a provider's error may name the access key (Garage's
+// 403 does); the overflow client's errors never show the credential, and
+// still say what kind of refusal they are.
+func TestOverflowErrorsNeverShowTheCredential(t *testing.T) {
+	o := state.Overflow{Name: "b2", Endpoint: "http://127.0.0.1:1", Bucket: "offsite"}
+	c, err := NewOverflow(o, overflow.Credential{AccessKey: "GKLEAKEDACCESS", SecretKey: "LEAKEDSECRET"}, func(b string) string { return b }, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, in := range []minio.ErrorResponse{
+		{StatusCode: 403, Code: "AccessDenied", Message: "Forbidden: No such key: GKLEAKEDACCESS"},
+		{StatusCode: 400, Code: "BadDigest", Message: "checksum mismatch for GKLEAKEDACCESS / LEAKEDSECRET"},
+	} {
+		err := c.classify(fmt.Errorf("sending x: %w", in))
+		if strings.Contains(err.Error(), "LEAKED") {
+			t.Fatalf("error shows the credential: %v", err)
+		}
+		var er minio.ErrorResponse
+		if !errors.As(err, &er) || er.Code != in.Code {
+			t.Fatalf("the provider's error is lost: %v", err)
+		}
+	}
+	if err := c.classify(fmt.Errorf("x: %w", minio.ErrorResponse{StatusCode: 400, Code: "BadDigest"})); !errors.Is(err, ErrRejected) {
+		t.Fatalf("BadDigest: %v", err)
 	}
 }

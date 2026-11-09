@@ -28,6 +28,7 @@ func newPool(t *testing.T) *pool {
 	t.Helper()
 	p := &pool{t: t, db: openTest(t), now: time.Unix(1_800_000_000, 0)}
 	p.db.Clock = func() time.Time { return p.now }
+	p.db.splitTTL = -1 // every capture asks again
 	return p
 }
 

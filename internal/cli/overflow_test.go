@@ -180,22 +180,25 @@ func copyTree(t *testing.T, from, to string) {
 }
 
 // Scenario 12's first half (REPL-12, S3-1, S3-2, S3-3, S3-7, #38),
-// scaled down: A backs up about 16 MB with restic at two copies to
-// friends B at 40 MB and C at 6 MB, so once C is full only one friend
-// has room and objects stay below copies. A adds an S3 bucket as an
-// overflow target: re-placement puts the missing copies there, the
-// bucket's metadata first; an alert says it is receiving copies, and
-// the snapshot becomes offsite-complete with every data object at two
-// places, one of them a friend. Copying the keys under the target's
+// scaled down: A backs up about 36 MB with restic at two copies, and
+// four friends hold 16 MB each, every friendship at 16 MB, so the
+// friends cannot hold two copies of it (the protectable size is under
+// 32 MB) and objects are below copies. A adds an S3 bucket as an
+// overflow target at 60 MB: placement is split (REPL-12 as of v0.11.5),
+// so re-placement puts a copy of every object at the target, the
+// bucket's metadata first, and moves one friend's copy of each object
+// two friends held there, deleting it at the friend. Once the
+// friendships' retention window (3 s here) is past and the friends
+// have purged those tombs, the objects no friend held get a friend
+// copy. An alert says
+// the target is receiving copies, and the snapshot becomes
+// offsite-complete with every data object at two places, one of them a
+// friend and the other the target. Copying the keys under the target's
 // prefix and the friends' replicas into one directory gives a
 // repository restic opens (S3-2 AC). The credential is in no file and
 // no log.
-//
-// Not covered: scenario 12's friends of equal quotas fill together, so
-// D6's choice leaves the objects written after they are full with one
-// copy, at the target (DESIGN §5 Q-AD).
 func TestScenarioOverflow(t *testing.T) {
-	serving(t, 3) // the provider is versitygw, in this process; three daemons
+	serving(t, 5) // the provider is versitygw, in this process; five daemons
 	scenarioOverflow(t, overflowtest.Start(t, "offsite", true), "backups/lendisk")
 }
 
@@ -208,7 +211,7 @@ func TestScenarioOverflowAtAnExternalProvider(t *testing.T) {
 	if ep == "" {
 		t.Skip("LENDISK_TEST_OVERFLOW_ENDPOINT not set (CI runs Garage: .github/garage.sh)")
 	}
-	parallel(t, 3)
+	parallel(t, 5)
 	srv := overflowtest.Connect(t, ep, os.Getenv("LENDISK_TEST_OVERFLOW_REGION"), os.Getenv("LENDISK_TEST_OVERFLOW_BUCKET"),
 		os.Getenv("LENDISK_TEST_OVERFLOW_ACCESS_KEY"), os.Getenv("LENDISK_TEST_OVERFLOW_SECRET_KEY"))
 	scenarioOverflow(t, srv, fmt.Sprintf("ci/%d", time.Now().UnixNano()))
@@ -216,33 +219,51 @@ func TestScenarioOverflowAtAnExternalProvider(t *testing.T) {
 
 func scenarioOverflow(t *testing.T, srv *overflowtest.Server, root string) {
 	env := overflowEnv(srv)
-	f := newCircleAt(t, 3, "40M", envList(env)...)
+	f := newCircleWith(t, 5, "16M", []string{"--retention", "3s"},
+		append(envList(env), envReplaceEvery+"=2s")...)
 	f.an.env = env
-	// A and C agree 6 MB: C fills while B has room, and from then fewer
-	// than two friends have room for a copy (D6 step 3).
-	var small string
-	for pid, pn := range f.friends {
-		if small != "" {
-			break
-		}
-		small = pid
-		if code, out, e := f.an.run("", "", "peer", "quota", pid, "6M"); code != 0 {
-			t.Fatalf("A's number: %s%s", out, e)
-		}
-		if code, out, e := pn.node.run("", "", "peer", "quota", f.aID.NodeID().String(), "6M"); code != 0 {
-			t.Fatalf("C's number: %s%s", out, e)
-		}
-	}
-	within(t, 60*time.Second, "6 MB between A and C", func() bool { return f.an.peerOf(small).Quota == 6<<20 })
-	id := f.backup("one", 16)
+	id := f.backup("one", 36)
 	within(t, 90*time.Second, "objects below copies, for want of room", func() bool {
 		return bucketOf(t, f.an.status(), "laptop").BelowCopies.Objects > 0
 	})
 
 	if code, out, e := f.an.run("", "", "overflow", "add", "s3", "b2", "--endpoint", srv.Endpoint, "--bucket", srv.Bucket,
-		"--prefix", root, "--region", srv.Region, "--max-bytes", "64M", "--price-per-gb", "0.006"); code != 0 {
+		"--prefix", root, "--region", srv.Region, "--max-bytes", "60M", "--price-per-gb", "0.006"); code != 0 {
 		t.Fatalf("overflow add: %s%s", out, e)
 	}
+	want := replicable(t, f.an, "laptop")
+	data := 0
+	for k := range want {
+		if strings.HasPrefix(k, "data/") {
+			data++
+		}
+	}
+	// Every object gets its copy at the target, and the doubly held
+	// ones' second friend copies are deleted.
+	within(t, 3*time.Minute, "a copy of every data object at the target, the friends' second copies deleted", func() bool {
+		st := f.an.status()
+		if !st.Capacity.OverflowSplit || len(st.Capacity.Overflow) != 1 || st.Capacity.Overflow[0].DataObjects != int64(data) {
+			return false
+		}
+		for _, p := range st.Places {
+			if p.Queue.Objects != 0 || p.Dropping != 0 {
+				return false
+			}
+		}
+		return true
+	})
+	// Past the friends' retention window: each purges its tombs at start,
+	// and A learns the room from their quota answers at its own start.
+	time.Sleep(4 * time.Second)
+	for _, pn := range f.friends {
+		pn.p.kill()
+		pn.start()
+	}
+	f.a.p.kill()
+	f.a.start()
+	within(t, 3*time.Minute, "a friend copy of the objects no friend held", func() bool {
+		return bucketOf(t, f.an.status(), "laptop").BelowCopies.Objects == 0
+	})
 	f.waitOffsite(id)
 	f.drain()
 	f.an.drained("b2", 90*time.Second)
@@ -259,13 +280,12 @@ func scenarioOverflow(t *testing.T, srv *overflowtest.Server, root string) {
 		t.Fatalf("no overflow_receiving alert: %+v", st.Alerts)
 	}
 	o := st.Capacity.Overflow[0]
-	if o.DataObjects == 0 || o.Use == 0 || o.MonthlyCost < 0 || o.Percent > 100 {
+	if o.DataObjects != int64(data) || o.Use == 0 || o.MonthlyCost < 0 || o.Percent > 100 {
 		t.Fatalf("overflow in status %+v", o)
 	}
 
-	// Every data object at two places, at least one a friend; the
-	// metadata at every place.
-	want := replicable(t, f.an, "laptop")
+	// Every data object at one friend and the target; the metadata at
+	// every place.
 	prefix := root + "/" + f.aID.SealedName("laptop") + "/"
 	keys, err := srv.Keys(t.Context(), prefix)
 	if err != nil {
@@ -281,16 +301,18 @@ func scenarioOverflow(t *testing.T, srv *overflowtest.Server, root string) {
 			}
 		}
 	}
+	target := map[string]bool{}
 	for k := range keys {
 		at[strings.TrimPrefix(k, prefix)]++
+		target[strings.TrimPrefix(k, prefix)] = true
 	}
 	for k := range want {
 		meta := !strings.HasPrefix(k, "data/")
 		switch {
-		case meta && at[k] != 3:
-			t.Errorf("metadata %s at %d places, want 3", k, at[k])
-		case !meta && (at[k] != 2 || !friendHolds[k]):
-			t.Errorf("data %s at %d places (a friend: %t), want 2 with a friend", k, at[k], friendHolds[k])
+		case meta && at[k] != len(f.friends)+1:
+			t.Errorf("metadata %s at %d places, want %d", k, at[k], len(f.friends)+1)
+		case !meta && (at[k] != 2 || !friendHolds[k] || !target[k]):
+			t.Errorf("data %s at %d places (a friend: %t, the target: %t), want one friend and the target", k, at[k], friendHolds[k], target[k])
 		}
 	}
 	// The target's copies carry their SHA-256 (REPL-10, S3-3).

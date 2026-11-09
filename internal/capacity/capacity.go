@@ -125,6 +125,22 @@ func (p Plan) Protectable() int64 { return p.largest(func(f Friend) int64 { retu
 // since a friend has no use for more of this node's disk than that.
 func (p Plan) FairProtectable() int64 { return p.largest(func(f Friend) int64 { return f.Size }) }
 
+// Split reports whether placement is split (REPL-12 as of v0.11.5,
+// #38): the plan has an overflow target and its friends cannot hold
+// Copies copies of the repository (state.FriendsHold, the rule
+// placement applies), so each data object goes to Copies − 1 friends and
+// one overflow target.
+func (p Plan) Split() bool {
+	if len(p.Overflow) == 0 {
+		return false
+	}
+	var quotas []int64
+	for _, f := range p.Friends {
+		quotas = append(quotas, f.Quota)
+	}
+	return !state.FriendsHold(p.Data, p.Metadata, p.Copies, quotas)
+}
+
 // Alerting reports whether the repository is above AlertPercent of the
 // protectable size (OPS-2).
 func (p Plan) Alerting() bool {

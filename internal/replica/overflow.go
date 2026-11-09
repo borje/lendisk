@@ -75,7 +75,7 @@ func NewOverflow(o state.Overflow, c overflow.Credential, seal func(bucket strin
 		return nil, fmt.Errorf("overflow target %s: %w", o.Name, err)
 	}
 	where := func(bucket, key string) (string, string) { return o.Bucket, OverflowKey(o.Prefix, seal(bucket), key) }
-	return &Client{core: core, where: where, overflow: true, root: root{o.Bucket, strings.Trim(o.Prefix, "/")}, stall: opts.stallTimeout(), created: map[string]bool{}}, nil
+	return &Client{core: core, where: where, overflow: true, cred: c, root: root{o.Bucket, strings.Trim(o.Prefix, "/")}, stall: opts.stallTimeout(), created: map[string]bool{}}, nil
 }
 
 // root is an overflow target's bucket and prefix (no slashes at its
@@ -84,10 +84,22 @@ type root struct{ bucket, prefix string }
 
 func (f *Client) classify(err error) error {
 	if f.overflow {
-		return classifyOverflow(err)
+		return redacted{classifyOverflow(err), f.cred}
 	}
 	return classify(err)
 }
+
+// redacted is an overflow target's error with the credential's keys
+// taken out of its message (SEC-3): a provider's 403 may name the access
+// key (Garage does), and the message reaches place.detail, the log,
+// alerts and webhooks. errors.Is and As still see the error inside.
+type redacted struct {
+	err  error
+	cred overflow.Credential
+}
+
+func (r redacted) Error() string { return r.cred.Redact(r.err.Error()) }
+func (r redacted) Unwrap() error { return r.err }
 
 // classifyOverflow marks a provider's refusals with the kind the worker
 // acts on: a checksum mismatch is ErrRejected (the worker re-hashes its
@@ -210,7 +222,7 @@ func (f *Client) CheckOverflow(ctx context.Context, name string, lifecycleDays i
 		c.Versioning = state.VersioningOff
 	}
 	if c.Versioning != state.VersioningEnabled {
-		c.Notes = append(c.Notes, fmt.Sprintf("warning: versioning is %s on bucket %s: a delete there cannot be undone by the provider, and a compromised node could remove these copies (S3-4); enable versioning if the provider has it",
+		c.Notes = append(c.Notes, fmt.Sprintf("warning: versioning is %s on bucket %s: a delete there is final: neither the provider nor lendisk keeps a deleted copy, and a compromised node could remove these copies (S3-4); enable versioning if the provider has it",
 			c.Versioning, bucket))
 	}
 

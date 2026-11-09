@@ -267,15 +267,18 @@ func unsentMetadata(ctx context.Context, tx querier, bucket, place string) (int6
 // capacity for it (quota less use and the metadata reserve), reachable
 // ones first, each by largest free fraction
 // (free ÷ quota), ties by node ID. A friend gone past replace_after,
-// removed, or full by its last answer is not room, nor is one lacking
-// some of the bucket's live metadata (unsentMetadata: re-placement sends
-// it first, #26), nor one whose replica of the bucket failed a challenge
-// (VER-1, #27); with reachableOnly,
-// neither is an unreachable one (re-routing, so rows do not move between
-// friends that both stopped answering). Fewer than n means the pool
-// lacks room: what fits is placed, and the deficit shows as bytes below
-// copies (§3.4).
-func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64, n int, exclude []string, reachableOnly bool) ([]string, error) {
+// removed, or full by its last answer is not room, nor is one whose
+// replica of the bucket failed a challenge (VER-1, #27). A friend lacking
+// some of the bucket's live metadata is room less that metadata, which
+// the caller places there first (placeMetadata); with reachableOnly it is
+// not room (its metadata first, #26), and neither is an unreachable one
+// (re-routing, so rows do not move between friends that both stopped
+// answering). Friends take at most maxFriends of the n (all, when
+// negative), overflow targets that answer the rest by D6's step 3
+// (chooseOverflow), and friends again what no target can take. Fewer
+// than n means the pool lacks room: what fits is placed, and the deficit
+// shows as bytes below copies (§3.4).
+func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64, n, maxFriends int, exclude []string, reachableOnly bool) ([]string, error) {
 	if n <= 0 {
 		return nil, nil
 	}
@@ -305,17 +308,24 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 			continue
 		}
 		if p.overflow {
-			overflow = append(overflow, p)
+			// A failing target is no candidate: its queued copies would
+			// hold the metadata barrier everywhere (#38 review).
+			if !p.unreachable(db, now) {
+				overflow = append(overflow, p)
+			}
 			continue
 		}
 		meta, err := unsentMetadata(ctx, tx, bucket, p.peer)
 		if err != nil {
 			return nil, err
 		}
-		if meta > 0 {
+		if meta > 0 && reachableOnly {
 			continue // its metadata first (REPL-13, #26)
 		}
-		free := freeRoom(p.quota, p.use, 0, live)
+		// A friend lacking some of the bucket's metadata is room all the
+		// same: placeTx queues the metadata there first (#38 review), so a
+		// copy never goes to an overflow target for want of it.
+		free := freeRoom(p.quota, p.use, meta, live)
 		if !fits(free, need) {
 			continue
 		}
@@ -330,27 +340,38 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 		}
 		return byFraction(a.peer, a.free, a.quota, b.peer, b.free, b.quota)
 	})
+	friends := n
+	if maxFriends >= 0 {
+		friends = min(n, maxFriends)
+	}
 	var out []string
-	for _, c := range cs[:min(n, len(cs))] {
+	for _, c := range cs[:min(friends, len(cs))] {
 		out = append(out, c.peer)
 	}
 	if len(out) < n && !reachableOnly {
-		more, err := chooseOverflow(ctx, tx, bucket, need, n-len(out), overflow, nil)
+		more, err := chooseOverflow(ctx, tx, bucket, need, n-len(out), overflow)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, more...)
+		// With no target to take it, the copy goes to a friend after all.
+		for _, c := range cs[min(friends, len(cs)):] {
+			if len(out) >= n {
+				break
+			}
+			out = append(out, c.peer)
+		}
 	}
 	return out, nil
 }
 
 // chooseOverflow is D6's step 3: up to n of the overflow targets ps for a
 // data copy of bucket that counts need bytes, by most free bytes (max_bytes
-// less use, less taken[place] when set, less the bucket's metadata not
+// less use, less the bucket's metadata not
 // placed there yet, which goes there with it), ties by name. A target
 // with no room for it gets none: placement stops there at max_bytes
 // (S3-7).
-func chooseOverflow(ctx context.Context, q querier, bucket string, need int64, n int, ps []poolPlace, taken map[string]int64) ([]string, error) {
+func chooseOverflow(ctx context.Context, q querier, bucket string, need int64, n int, ps []poolPlace) ([]string, error) {
 	type cand struct {
 		place string
 		free  int64
@@ -361,7 +382,7 @@ func chooseOverflow(ctx context.Context, q querier, bucket string, need int64, n
 		if err != nil {
 			return nil, err
 		}
-		free := capped(p.quota) - capped(max(p.use, 0)) - capped(taken[p.peer]) - capped(meta)
+		free := capped(p.quota) - capped(max(p.use, 0)) - capped(meta)
 		if free >= capped(need) {
 			cs = append(cs, cand{p.peer, free})
 		}
@@ -462,21 +483,40 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 			bucket, DefaultCopies).Scan(&copies); err != nil {
 			return err
 		}
+		// Split (REPL-12 as of v0.11.5): copies − 1 friends and one
+		// overflow target, while friends cannot hold copies of it all.
+		maxFriends := -1
+		split, err := db.overflowSplit(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if split {
+			held := 0
+			for _, t := range targets {
+				if _, ok := OverflowName(t); !ok {
+					held++
+				}
+			}
+			maxFriends = max(copies-1-held, 0)
+		}
 		var more []string
-		more, err = db.choose(ctx, tx, bucket, size+ObjectOverhead, copies-len(targets), append(slices.Clone(targets), skip...), false)
+		more, err = db.choose(ctx, tx, bucket, size+ObjectOverhead, copies-len(targets), maxFriends, append(slices.Clone(targets), skip...), false)
+		// A place given its first data copy of the bucket gets every
+		// metadata object of the bucket it lacks first, ahead of it in
+		// its FIFO (REPL-12, S3-2): an overflow target, or a friend
+		// added since re-placement last ran (#38 review).
+		for _, place := range more {
+			if err != nil {
+				break
+			}
+			_, err = placeMetadata(ctx, tx, bucket, place, db.now().Unix())
+		}
 		targets = append(targets, more...)
 	}
 	if err != nil {
 		return err
 	}
 	for _, place := range targets {
-		if _, ok := OverflowName(place); ok && op == OpPut && class == "data" {
-			// Its first data copy of the bucket there brings every
-			// metadata object of the bucket ahead of it (REPL-12, S3-2).
-			if _, err := placeMetadata(ctx, tx, bucket, place, db.now().Unix()); err != nil {
-				return err
-			}
-		}
 		if err := db.insertPlacement(ctx, tx, seq, place, heal); err != nil {
 			return err
 		}

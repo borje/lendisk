@@ -277,6 +277,9 @@ type replacer struct {
 	// friend with an address, and each overflow target holding data of
 	// it (REPL-12).
 	metaPlaces []string
+	// split: placement is split between copies − 1 friends and one
+	// overflow target (overflowSplit, REPL-12 as of v0.11.5).
+	split bool
 }
 
 // Replace runs one re-placement pass over every bucket (REPL-13, file
@@ -300,6 +303,9 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 	}
 	m := &replacer{db: db, friends: map[string]*rfriend{}, now: db.now(), unsent: map[[2]string]int64{},
 		sending: sending, lock: lock}
+	if m.split, err = db.overflowSplit(ctx, db); err != nil {
+		return st, err
+	}
 	if m.live, err = liveMetadata(ctx, db); err != nil {
 		return st, err
 	}
@@ -727,6 +733,50 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 			}
 		}
 	}
+	maxFriends := -1
+	if m.split {
+		// REPL-12 as of v0.11.5: copies − 1 friends and one overflow
+		// target. A friend copy an overflow copy replaces is moving
+		// there; with no overflow copy yet, the fullest friend's of an
+		// object held only at friends moves, if a target can take it.
+		var keep []prow
+		friendsHeld, overflowHeld := 0, 0
+		for _, r := range good {
+			f := m.friends[r.place]
+			switch {
+			case f != nil && !f.overflow && replaced[r.place] && r.state == PlacementAcked:
+				drain = append(drain, r)
+				continue
+			case f != nil && f.overflow:
+				overflowHeld++
+			default:
+				friendsHeld++
+			}
+			keep = append(keep, r)
+		}
+		good = keep
+		if overflowHeld == 0 && friendsHeld >= copies && copies > 1 {
+			var acked []prow
+			for _, r := range good {
+				if r.state == PlacementAcked {
+					acked = append(acked, r)
+				}
+			}
+			if len(acked) == len(good) {
+				ok, err := m.overflowFor(ctx, bucket, o, at)
+				if err != nil {
+					return nil, false, 0, err
+				}
+				if ok {
+					slices.SortFunc(acked, func(a, b prow) int { return m.fullness(a.place, b.place) })
+					drain = append(drain, acked[0])
+					good = slices.DeleteFunc(good, func(r prow) bool { return r.place == acked[0].place })
+					friendsHeld--
+				}
+			}
+		}
+		maxFriends = max(copies-1-friendsHeld, 0)
+	}
 	acked := 0
 	for _, r := range good {
 		if r.state == PlacementAcked {
@@ -736,7 +786,7 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 	below := false
 	switch {
 	case len(good) < copies:
-		to, err := m.choose(ctx, bucket, o, at, copies-len(good), commit)
+		to, err := m.choose(ctx, bucket, o, at, copies-len(good), maxFriends, commit)
 		if err != nil {
 			return nil, false, 0, err
 		}
@@ -814,7 +864,7 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 // there, never one with a row of it that holds, refused or is deleting
 // it, never one being drained of it, and never one that lacks the
 // bucket's live metadata; reachable ones first, by largest free fraction.
-func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[string]prow, n int, commit bool) ([]string, error) {
+func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[string]prow, n, maxFriends int, commit bool) ([]string, error) {
 	need := o.size + ObjectOverhead
 	type cand struct {
 		f    *rfriend
@@ -834,7 +884,12 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 		}
 		if f.overflow {
 			// D6 step 3: by free bytes, its missing metadata going
-			// there with the copy (write); never past max_bytes (S3-7).
+			// there with the copy (write); never past max_bytes (S3-7),
+			// and never to a failing target, whose queued copies would
+			// hold the metadata barrier (#38 review).
+			if !f.reachable {
+				continue
+			}
 			free := capped(f.quota) - capped(max(f.use, 0)) - capped(f.taken) - capped(meta)
 			if free >= capped(need) {
 				over = append(over, cand{f, free})
@@ -858,22 +913,51 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 		}
 		return byFraction(a.f.peer, a.free, capped(a.f.quota), b.f.peer, b.free, capped(b.f.quota))
 	})
-	// Overflow targets only for the copies no friend has room for.
+	// Overflow targets only for the copies no friend has room for, or
+	// beyond maxFriends when split; friends again for what no target
+	// can take.
 	slices.SortFunc(over, func(a, b cand) int {
 		if c := cmp.Compare(b.free, a.free); c != 0 {
 			return c
 		}
 		return cmp.Compare(a.f.peer, b.f.peer)
 	})
-	cs = append(cs, over...)
+	friends := n
+	if maxFriends >= 0 {
+		friends = min(n, maxFriends)
+	}
+	k := min(friends, len(cs))
+	order := append(append(slices.Clone(cs[:k]), over...), cs[k:]...)
 	var out []string
-	for _, c := range cs[:min(n, len(cs))] {
+	for _, c := range order[:min(n, len(order))] {
 		out = append(out, c.f.peer)
 		if commit {
 			c.f.taken = capped(c.f.taken + need)
 		}
 	}
 	return out, nil
+}
+
+// overflowFor reports whether an overflow target that answers has room
+// for a copy of o (choose's rule), without taking it.
+func (m *replacer) overflowFor(ctx context.Context, bucket string, o robj, at map[string]prow) (bool, error) {
+	need := o.size + ObjectOverhead
+	for _, f := range m.order {
+		if !f.overflow || !f.candidate || !f.reachable {
+			continue
+		}
+		if r, ok := at[f.peer]; ok && (r.holds() || r.state == PlacementRefused || r.state == PlacementDropping) {
+			continue
+		}
+		meta, err := m.unsentAt(ctx, bucket, f.peer)
+		if err != nil {
+			return false, err
+		}
+		if capped(f.quota)-capped(max(f.use, 0))-capped(f.taken)-capped(meta) >= capped(need) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // apply decides about seqs of bucket again from their rows as they now
@@ -883,6 +967,9 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 // them.
 func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []int64, meta bool) (ReplaceStats, error) {
 	var st ReplaceStats
+	if m.db.beforeApply != nil {
+		m.db.beforeApply(bucket, meta) // tests only
+	}
 	defer m.db.lockBucket(bucket)()
 	if m.lock != nil {
 		m.lock.Lock()
@@ -927,6 +1014,7 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 			return st, err
 		}
 		var ops []rop
+		short := false // counted below copies
 		if meta {
 			ops = m.metadataOps(o)
 		} else {
@@ -936,20 +1024,36 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 				return st, err
 			}
 			m.skipped += left
-			if below {
+			if short = below; below {
 				st.Below++
 				st.BelowBytes += size
 			}
 		}
 		for _, op := range ops {
 			if f := m.friends[op.place]; f != nil && f.overflow && !meta && op.kind == opPlace {
-				// The bucket's metadata goes to an overflow target with
-				// its first data copy there, ahead of it (REPL-12).
+				// The target's use as it is now, in this transaction: a
+				// capture since the scan may have taken the room (#38
+				// review), and max_bytes is never passed (S3-7).
 				k := [2]string{bucket, op.place}
-				bytes, err := m.unsentAt(ctx, bucket, op.place)
+				var use int64
+				if err := ptx.QueryRowContext(ctx, `SELECT coalesce((SELECT bytes FROM place_use WHERE place = ?), 0)`,
+					op.place).Scan(&use); err != nil {
+					return st, err
+				}
+				bytes, err := unsentMetadata(ctx, ptx, bucket, op.place)
 				if err != nil {
 					return st, err
 				}
+				if capped(max(use, 0))+capped(bytes)+capped(size+ObjectOverhead) > capped(f.quota) {
+					if !short {
+						short = true
+						st.Below++
+						st.BelowBytes += size
+					}
+					continue
+				}
+				// The bucket's metadata goes to an overflow target with
+				// its first data copy there, ahead of it (REPL-12).
 				placed, err := placeMetadata(ctx, ptx, bucket, op.place, now)
 				if err != nil {
 					return st, err

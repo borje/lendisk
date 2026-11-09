@@ -385,7 +385,7 @@ func printOverflow(w io.Writer, targets []manifest.Overflow) {
 		return
 	}
 	fmt.Fprintf(w, "\nOverflow targets: %d. Their credentials are shown this once and not written anywhere;\n", len(targets))
-	fmt.Fprintln(w, "put each in the environment of `lendisk serve` (SEC-3).")
+	fmt.Fprintln(w, "put each in the environment of `lendisk serve`, which does not start until they are there (SEC-3).")
 	for _, o := range targets {
 		fmt.Fprintf(w, "  %s: %s, bucket %s", o.Name, o.Endpoint, o.Bucket)
 		if o.Prefix != "" {

@@ -260,7 +260,10 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 	// The daemon: C returns and is listed; B and C admit A and take its
 	// next manifest version, above the one they held.
 	c.start()
-	fa := newProcNode(t, fresh, fast)
+	// The overflow target came back from the manifest, so the daemon
+	// starts only with its credential in the environment (SEC-3, #38).
+	fa := newProcNode(t, fresh, fast, "LENDISK_OVERFLOW_SPILL_ACCESS_KEY=OVERFLOWACCESS",
+		"LENDISK_OVERFLOW_SPILL_SECRET_KEY="+overflowSecret)
 	fa.start()
 	deadline = time.Now().Add(90 * time.Second)
 	for len(fresh.status().Recovery.Pending) != 0 {

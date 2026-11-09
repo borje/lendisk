@@ -415,7 +415,16 @@ answer) and a last-reachable time.
   3. Only if fewer than `copies` friends, reachable or not, have room,
      fill the rest from overflow targets by free bytes. An overflow
      target that gets its first data object of a bucket gets every
-     metadata object of the bucket first (§3.4).
+     metadata object of the bucket first (§3.4). *Split* (REQUIREMENTS
+     v0.11.5, Q-AD): while the capacity plan says the friends cannot
+     hold `copies` copies of the repository (`state.FriendsHold`, §4's
+     rule without overflow) and an overflow target exists, step 2
+     takes at most `copies − 1` friends and step 3 the rest, so the
+     friends' room goes to one copy of every object instead of
+     `copies` copies of the first ones; with no target that can take
+     the copy, a friend takes it after all. Re-placement follows the
+     same rule, and moves one friend copy of an object held only at
+     friends to a target (§3.11).
   4. If there are still too few places, place what can be placed and
      record the deficit for the re-placement worker (§3.4).
 
@@ -1100,7 +1109,13 @@ upstream bucket is Q-V.
   push manifests). Overflow target
   credentials found in the manifest are shown once, for the user to
   put in the environment (SEC-3); they are not written to disk
-  (`printOverflow`, naming the variables each goes in). The
+  (`printOverflow`, naming the variables each goes in). `recovery.Restore`
+  adds each target's row back from the manifest, all but the
+  credential (#38 review), so the rebuilt node's manifest still names
+  the target rather than erasing the only copy of its endpoint, and its
+  daemon refuses to start until the credential is in its environment.
+  The target is not listed: its copies are placed again as if missing.
+  The
   `placement` table (D6) and the hash index are then rebuilt from the
   control API `list` of each reachable place for each sealed bucket
   (§3.7): one paged call per bucket and place, not a request per
@@ -6632,8 +6647,10 @@ of the `copies`, and the estimated cost (S3-7).
   rules: with no enabled rule expiring non-current versions under the
   prefix it offers one, and creates it, added to the bucket's rules
   as `lendisk-<name>` with the retention in whole days, when given
-  `--lifecycle`. Any failure of the credential leaves no row, and the
-  provider's message is passed through `Credential.Redact`. `serve`
+  `--lifecycle`. Any failure of the credential leaves no row. Every error the
+  overflow client returns has the credential's keys taken out of its
+  message (`replica.redacted`; Garage's 403 names the access key), so
+  `place.detail`, the log, alerts and webhooks never carry it. `serve`
   refuses to start while any target's variables are unset
   (`checkOverflowCredentials`, before anything starts); a target added
   while the daemon runs is built at the worker's next friendship read,
@@ -6667,13 +6684,31 @@ of the `copies`, and the estimated cost (S3-7).
 - **Placement** (#38, D6 step 3, `state/overflow.go`). `poolPlaces`
   returns the targets after the friends, with `max_bytes` as quota.
   `choose` (capture) and the re-placement pass's choose take friends
-  first by D6's rule, and only for the copies still missing a target
-  by most free bytes: `max_bytes` less use, less the bucket's metadata
+  first by D6's rule, at most `copies − 1` of them while placement is
+  split (D6 step 3, `overflowSplit`, cached 30 s in the daemon since it
+  reads the whole repository; `status` shows it as
+  `capacity.overflow_split`), and for the copies still missing a target
+  that answers (one failing is no candidate: its queued copies would
+  hold the metadata barrier everywhere), by most free bytes: `max_bytes` less use, less the bucket's metadata
   it lacks, so a target never passes `max_bytes` (S3-7). A target
   chosen for a data copy is first given every live metadata object of
   the bucket it lacks (`placeMetadata`), in the same transaction and
   ahead of the data in its FIFO, at their own sequences, so the
-  barrier still sends each only after the data written before it.
+  barrier still sends each only after the data written before it. A
+  friend lacking some of the bucket's metadata (added since the last
+  pass) is room the same way at capture, its metadata queued with the
+  copy, so no copy goes to a target for want of it (#38 review). A
+  re-placement batch reads the target's `place_use` again in its
+  transaction before it places a copy there, so a capture between the
+  pass's scan and its batch cannot take it past `max_bytes`.
+  *Split re-placement:* an object whose copies are all at friends gets
+  a copy at a target in place of the fullest friend's (that copy is
+  counted out as drained, and the new copy records which it
+  replaces), which is deleted there once the target acknowledges; the
+  friend's room comes back when it purges the tomb after its retention
+  window (RET-1), and the objects that had no friend copy get one then
+  (`TestSplitPlacementGivesEveryObjectOneFriendAndTheTarget`,
+  `TestScenarioOverflow`).
   From then on each metadata put of the bucket goes there too
   (`overflowHolding`: a target with a queued or acknowledged data put
   of the bucket), and each delete of a key it holds or was sent. A
@@ -6695,7 +6730,7 @@ of the `copies`, and the estimated cost (S3-7).
   monthly cost estimate (use in GB of 10⁹ bytes times
   `--price-per-gb`, two decimals, no currency) when a price was given;
   never the credential. A target without versioning is labelled
-  "retention: client-side" (S3-4's label; the tombstones are #39).
+  "retention: none, deletes there are final" until #39 builds S3-4's client-side tombstones, which earn it the "retention: client-side" label; `overflow add` warns that deletes there are final.
 - **Testing** (#38). Unit and CLI tests run versitygw's posix backend
   in the test process as the provider (`overflow/overflowtest`; once
   per process, so a CLI test holds the gateway with `serving` and runs
@@ -6795,8 +6830,8 @@ Worked examples, `c = 2`:
    data room, so `D` ≤ 192 and the protectable size is just under 200
    GB. An overflow target at `max_bytes` 450 GB adds min(376, 446): 384 +
    376 = 760 ≥ 2 × 376, so every data object can have one copy at a
-   friend and the other at a friend or the target (whether D6's choice
-   reaches that placement is Q-AD). At about $6 per TB-month that is
+   friend and the other at a friend or the target (D6's split placement,
+   Q-AD). At about $6 per TB-month that is
    under $3 a month. A fifth friend with 400 GB of their own, at a 400
    GB quota, empties the target: 384 + min(376, 396) = 760 ≥ 752.
 
@@ -7142,23 +7177,16 @@ design and disappear with it.
   friend one number it could already estimate from what it holds of
   the bucket's metadata. REQUIREMENTS.md v0.10 lists it in SEC-2; it is
   rounded to 1 GB (§3.5).
-- **Q-AD (open, #38)** D6's choice and scenario 12. Friends of equal
-  quotas fill at the same rate, each data object going to `copies` of
-  them while they have room, so once they are full every later object
-  finds no friend with room and gets a single copy, at the overflow
-  target: below `copies`. Scenario 12 (four friends at 100 GB, 380 GB
-  to back up, a 450 GB target) wants every object at two places, one a
-  friend, which §4 shows is feasible (each object at one friend and the
-  target) but D6 does not reach, at capture or by re-placement (moving
-  a friend's second copy to the target frees nothing at the friend for
-  the retention window, RET-1). #38 builds D6 as written and tests it
-  where fewer than `copies` friends have room (`TestScenarioOverflow`:
-  one large friend and one small). Options: while the pool's friends
-  cannot hold `copies` × the repository (`Plan`), place at most
-  `copies − 1` copies of a new data object at friends and the rest at
-  a target; or reserve friend room for first copies. Either changes
-  REPL-12's "only for copies that no friend has room for", so it is
-  the user's call.
+- **Q-AD (resolved, #38)** D6's choice and scenario 12. Friends of
+  equal quotas fill at the same rate, each data object going to
+  `copies` of them while they have room, so once they are full every
+  later object finds no friend with room and gets a single copy, at the
+  overflow target. *Decision (the user, REQUIREMENTS v0.11.5):* while
+  the capacity plan says the friends cannot hold `copies` copies of the
+  repository, each data object goes to `copies − 1` friends and one
+  overflow target, at capture and in re-placement (D6 step 3, §3.11).
+  An object already at `copies` friends moves one copy to the target;
+  the friend's room returns after its retention window.
 - **Q-AC (gate, open)** Drain-back deletes at overflow targets (§3.11,
   S3-5). Check per tier-1 provider (B2, Wasabi, Hetzner, R2) whether a
   credential can allow delete markers but not version removal, and

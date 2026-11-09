@@ -18,6 +18,7 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
 	"github.com/borje/lendisk/internal/identity"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -71,7 +72,8 @@ type Client struct {
 	// overflow: an overflow target, which has one bucket, created by
 	// the user, and whose refusals classify reads as the provider's.
 	overflow bool
-	root     root // an overflow target's bucket and prefix
+	root     root                // an overflow target's bucket and prefix
+	cred     overflow.Credential // an overflow target's, to redact its errors (SEC-3)
 	stall    time.Duration
 	mu       sync.Mutex
 	created  map[string]bool // sealed names created at the friend by this client

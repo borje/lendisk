@@ -39,6 +39,10 @@ type StatusCapacity struct {
 	Alerting  bool  `json:"alerting"`
 	Deficit   int64 `json:"deficit"`
 	Coverable bool  `json:"coverable"`
+	// OverflowSplit is true while friends cannot hold Copies copies of
+	// the repository and an overflow target exists: each data object then
+	// goes to Copies − 1 friends and one overflow target (REPL-12).
+	OverflowSplit bool `json:"overflow_split"`
 	// Friends is each friendship's quota and use both ways.
 	Friends []StatusCapacityFriend `json:"friends"`
 	// Overflow is each overflow target's room, use and cost (S3-7).
@@ -146,7 +150,7 @@ func overflowLine(o StatusCapacityOverflow) string {
 	}
 	l += fmt.Sprintf("; versioning %s", o.Versioning)
 	if o.Versioning != state.VersioningEnabled {
-		l += " (retention: client-side)"
+		l += " (retention: none, deletes there are final)"
 	}
 	if o.VersionRemoval == state.VersionRemovalAllowed {
 		l += "; its credential can remove versions"
@@ -190,7 +194,7 @@ func (a *app) capacityStatus(ctx context.Context, db *state.DB, defaultCopies in
 		return nil, err
 	}
 	cover, ok := plan.Cover()
-	c.Coverable = ok
+	c.Coverable, c.OverflowSplit = ok, plan.Split()
 	low := func(since time.Time) string {
 		if since.IsZero() || now.Sub(since) < LowUseFor {
 			return ""
@@ -269,7 +273,12 @@ func capacityLines(c *StatusCapacity, role string) []string {
 			out = append(out, "  Overflow targets: none")
 		}
 		if len(c.Overflow) > 0 {
-			out = append(out, fmt.Sprintf("  Overflow targets: %d, for the copies no friend has room for", len(c.Overflow)))
+			l := fmt.Sprintf("  Overflow targets: %d, for the copies no friend has room for", len(c.Overflow))
+			if c.OverflowSplit {
+				l = fmt.Sprintf("  Overflow targets: %d; friends cannot hold %d copies of the repository, so each object goes to %s and an overflow target",
+					len(c.Overflow), c.Copies, plural(int64(c.Copies-1), "friend", "friends"))
+			}
+			out = append(out, l)
 		}
 		for _, o := range c.Overflow {
 			out = append(out, overflowLine(o))
