@@ -50,6 +50,11 @@ for r in replica-*/; do
 done`
 )
 
+// ExportCommand is the command the sheet tells a friend to run to
+// export a replica (LEND-6, #35), `--kopia-layout` added for a Kopia
+// bucket; `lendisk export` takes exactly these arguments.
+const ExportCommand = "lendisk export --lent <stored name> <directory>"
+
 // Sheet is what the page says; its JSON is `recovery-sheet --json`.
 type Sheet struct {
 	Printed time.Time `json:"printed_at"`
@@ -398,7 +403,7 @@ func (s Sheet) WriteText(w io.Writer) error {
 		"placed there. The replicas of any N - c + 1 of the N places hold every object "+
 		"(c is the bucket's copies; each bucket's count is above).")
 	p.para("   ", "To fetch a replica from a friend, with no lendisk on your side, the friend runs")
-	p.line("     lendisk export --lent <stored name> <directory>")
+	p.line("     " + ExportCommand)
 	p.para("   ", "(adding --kopia-layout for a Kopia bucket) and hands you the directory. "+
 		"For a restic bucket, a copy of <their store>/<stored name>/ made with their lendisk "+
 		"stopped does as well. From an overflow target, copy the keys under its s3:// path "+
