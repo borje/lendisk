@@ -5489,8 +5489,96 @@ the handler's own reads and is never cancelled; nothing below
   The container image recommends `network_mode: host` (D2). versitygw
   also builds on macOS, BSD and Windows, which keeps post-v1 ports
   open.
-- **COMPAT-3** `bucket import` walks the directory and puts each file
-  through the decorator, so it is captured but marked unacknowledged.
+- **COMPAT-3** `lendisk bucket import <name> <path> --profile
+  restic|kopia [--copies N] [--resume]` (#9) creates the bucket as
+  `bucket add` does (row, credential, directory through the posix
+  backend) and puts every object of the repository at `<path>` through
+  the capture decorator (§3.3 EP-2, EP-3), in the command's own process:
+  `Decorator.PutObject` over the posix backend with the state database,
+  streaming each file from disk, so its SHA-256 is taken as it passes
+  and nothing is read whole into memory or read twice. Each object gets
+  its done queue row with hash, size, class and `rewritable` flag, is
+  marked held locally (`queue.local`), gets its placements and the
+  format-1 mark (`noteFormat`) exactly as a tool's upload would, and has
+  no acknowledged placement, so it replicates like a fresh backup.
+  - *Why the decorator in process, not the S3 endpoint or the
+    reconciler* (decided 2026-11-09). Through the endpoint the command
+    would need the daemon running and its address (a test daemon's port
+    is chosen at serve) and would sign every request with the bucket's
+    credential, for the same decorator call at the end. Dropping the
+    files into the bucket directory for the store reconciler (EP-14)
+    would capture them in the same class with `queue.reconciled` set,
+    but only at the next pass (start, or 24 h later), reading every
+    object a second time to hash it, and counted in `status` as
+    changes outside the endpoint, which they are not. In process, the
+    import needs no daemon, like `bucket add`; a running daemon's
+    replication worker sees the rows at its next poll (1 s) and starts
+    sending while the import continues, and its reconciler leaves a key
+    alone while its row is pending and finds it indexed after. Nothing
+    else writes the new bucket meanwhile: its credential is printed
+    only at the end. A pending row left by a killed import is settled
+    by the daemon's next start (`ResolvePending`).
+  - *Layouts* (`internal/repoimport`). restic: the path must have
+    `config` at its top; every file's key is its path, since restic's
+    default layout (restic 0.19.1 `internal/backend/layout`) is used by
+    its local and S3 backends alike: `config`, `data/<2 hex>/<id>`,
+    `keys`, `index`, `snapshots`, `locks` flat, every object named by
+    64 hex digits. Anything else is skipped: restic's local temporary
+    files `<name>-tmp-<random>`, rest-server's
+    `<id>.rest-server-temp<random>`, stray files. rest-server (0.14.0,
+    `repo/repo.go` `getObjectPath`) stores each repository in that
+    same layout at `<data>/<repo>`, or with `--private-repos` at
+    `<data>/<user>` and `<data>/<user>/<repo>` (`MaxFolderDepth` 2);
+    the user gives the repository's directory. A path that is
+    rest-server's data directory (no `config`, repositories below it
+    to that depth) is refused naming each repository, since each is a
+    bucket of its own. Kopia: the path must hold
+    `kopia.repository.f`. Kopia's filesystem storage (0.23.1
+    `repo/blob/sharded`) splits a blob ID longer than `.shards`'
+    `maxNonShardedLength` (20) into directories by the shard sizes
+    (`{"default":[1,3]}` in a repository 0.23.1 creates, so
+    `p8bf4fa…` is `p/8bf/4fa….f`; `[3,3]` where `.shards` predates
+    it, which 0.23.1 also writes for `--format-version=1`; per-prefix
+    `overrides` possible) and appends `.f`; its S3 storage uses the
+    blob ID as the key. Whatever the sizes, the key is every directory
+    name and the file name joined with `.f` removed, which is how
+    Kopia's own `ListBlobs` reads the files back
+    (`getBlobIDFromFileName`); a file without `.f` (`.shards`, a
+    temporary `<path>.tmp.<hex>`) is not a blob.
+  - *Left out:* local-only keys (restic `locks/*`, a dead process's
+    stale lock that would block restic at the bucket; Kopia `_log*`),
+    counted in the output; they would get no queue row anyway.
+  - *Kopia format 1 (COMPAT-1, #79).* A first walk counts the objects
+    and bytes and asks the profile what each key says of the format
+    (`profile.Profile.Format`): a `format1_keys` key with no
+    `upgraded_keys` key anywhere in the repository refuses the import
+    before the bucket exists, saying it is format version 1, naming the
+    key and `kopia repository set-parameters --upgrade`. An upgraded
+    repository (its leftover `n*` blobs beside the poison blob or `x*`)
+    is imported and not marked, as §3.3 EP-7 says.
+  - *Progress* on stderr: the object count and size first, then a line
+    each time another whole percent of the bytes is in, and at the end;
+    stdout gets the summary, the copies notes of `bucket add`, and the
+    tool lines with `restic snapshots` and `kopia repository connect
+    s3` in place of `restic init` and `kopia repository create s3`
+    (`bucket show` still prints the creating lines).
+  - *Stopped partway* (an I/O error, a full disk, a kill): the bucket
+    keeps what was imported, and the error says so and to run the same
+    command with `--resume`, which takes the existing bucket (same
+    profile; `--copies` is refused with it) and skips each key whose
+    latest done row is a put of the file's size. A file put again would
+    in any case be dropped by `FinishPut` as an identical re-upload.
+  - *Tests:* `TestImportedResticRepositoryListsItsSnapshots` (a real
+    restic repository at rest-server's `<data>/<user>`, the data
+    directory refused, then `restic snapshots` and `restic check
+    --read-data` through the endpoint),
+    `TestImportedKopiaFilesystemRepositoryOpensThroughS3` (a real
+    sharded Kopia repository; `repository connect s3` from the printed
+    lines, `snapshot list` and a byte-for-byte restore), both checking
+    every object queued with its hash and none acknowledged;
+    `TestImportOfKopiaFormat1RepositoryRefused`,
+    `TestImportResumesIntoItsBucket` (`internal/cli`); the layouts in
+    `internal/repoimport`.
 - **COMPAT-4** The documented layout on `posix` is
   `<store>/<bucket>/<key>` as plain files with versitygw's xattrs and
   its `.sgwtmp/` and `.vgwlocks/` housekeeping directories; borrowers'
