@@ -404,6 +404,58 @@ func TestCompletionReservesItsCopyAgainstTheFloor(t *testing.T) {
 	l.wantUsage(2*ov + int64(len(whole)))
 }
 
+// LEND-2 (#92): a completion whose copy fits above the floor alone, but
+// not beside the writes in flight, is answered 503 SlowDown, which the
+// borrower retries, as a put is (#89): a 507 would pause it for quota
+// over a write in flight that may yet fail.
+func TestACompletionThatFitsButForWritesInFlightIsRetried(t *testing.T) {
+	const total, floor = 1 << 30, 1 << 30 / 20
+	var free atomic.Uint64
+	free.Store(total)
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.statfs = func(string) (store.Space, error) { return store.Space{Total: total, Free: free.Load()}, nil }
+	})
+	p1, p2 := bytes.Repeat([]byte("1"), 5<<20), []byte("tail")
+	whole := append(append([]byte{}, p1...), p2...)
+	id, err := l.create("data/big", hashMeta(whole))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c1, err := l.part("data/big", id, 1, p1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2, err := l.part("data/big", id, 2, p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An abandoned send: admitted for 1 MiB, it ends short.
+	s := newStalledReader([]byte("cut short"))
+	done := make(chan error, 1)
+	go func() { done <- l.putDirect("data/abandoned", s, 1<<20, hashMeta(bytes.Repeat([]byte("a"), 1<<20))) }()
+	within(t, "the abandoned put reading", s.reading)
+
+	free.Store(floor + uint64(len(whole)) + 1<<19) // room for the copy, not for the write in flight too
+	if err := l.complete("data/big", id, c1, c2); code(err) != "SlowDown" || status(err) != 503 {
+		t.Fatalf("a completion below the floor only beside a write in flight: %v (status %d)", err, status(err))
+	}
+	free.Store(floor + uint64(len(whole)) - 1) // no room for the copy alone
+	if err := l.complete("data/big", id, c1, c2); code(err) != "QuotaExceeded" || status(err) != 507 {
+		t.Fatalf("a completion below the floor alone: %v (status %d)", err, status(err))
+	}
+	if _, ok := l.stored("data/big"); ok {
+		t.Fatal("completed below the floor")
+	}
+	free.Store(floor + uint64(len(whole)) + 1<<19)
+	close(s.release)
+	if err := within(t, "the abandoned put", done); err == nil {
+		t.Fatal("the short body was stored")
+	}
+	if err := l.complete("data/big", id, c1, c2); err != nil {
+		t.Fatalf("the retry once the write in flight ended: %v", err)
+	}
+}
+
 // LEND-4, REPL-10: a borrower's put without x-amz-meta-lendisk-sha256,
 // or with something that is not a SHA-256, is refused and nothing is
 // stored; so is a multipart create.

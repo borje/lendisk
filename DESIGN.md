@@ -2661,7 +2661,20 @@ upstream bucket is Q-V.
   passed since its last answer (`last_ok`, or the failure's start if
   it never answered). Both count from the last answer, a probe's
   included: a friend full for a week that answers probes is neither
-  unreachable nor gone after one missed probe (#65 review). An
+  unreachable nor gone after one missed probe (#65 review). A friend
+  answering `503 SlowDown` is `busy`, an answer like `ok`, for a
+  while: an honest one lasts only while another write is in flight
+  there. *Decision (#92 review):* a friend `busy` and nothing else for
+  `reroute_after` on end (its `since` older) counts as unreachable
+  (`poolPlace.busyForLong`): its unsent data goes elsewhere and it no
+  longer holds deletes, so a broken or hostile friend cannot hold
+  copies back for ever by answering `SlowDown`. It is never gone,
+  since it keeps answering (`last_ok` moves on). Past
+  `alerts.unreachable_after` (24 h) busy it raises
+  `friend_unreachable`, its message saying it answers busy
+  (`TestABusyFriendIsAwayOnlyOnceBusyForRerouteAfter`,
+  `TestAFriendBusyPastThresholdRaisesAlert`). An
+  ok answer ends the stretch. An
   unreachable friend with room is still chosen
   when the reachable ones are not enough; a gone one is not.
   *Away is a run of failing answers, not one condition (#65, from the
@@ -2920,11 +2933,16 @@ upstream bucket is Q-V.
   A row a later write of the key replaced stays as it is. A re-upload
   also heals them.
   Table `place` keeps each place's last answer:
-  `condition` (`ok`, `retrying`, `quota`, `removed`, and `store` while
+  `condition` (`ok`, `retrying`, `quota`, `removed`, `busy` when it
+  answered `503 SlowDown` (#92), and `store` while
   it waits because this node's store cannot be read), `detail`, `since`,
   `failing_since` (the start of its run of failing answers, #65) and
-  `last_ok`, D6's last-reachable time: its last acknowledgement or
-  answered probe. A sender whose FIFO is empty,
+  `last_ok`, D6's last-reachable time: its last acknowledgement,
+  answered probe or busy answer. `busy` is not failing: it sets
+  `last_ok` and clears `failing_since` as `ok` does, and is away only
+  once it lasts `reroute_after` (above); `status` shows it as "busy (it asks
+  to send again shortly)", `status --json` as `state: "busy"` (a new
+  value, no new field). A sender whose FIFO is empty,
   including at daemon start, sets `store` back to `ok` without touching
   `last_ok` (`state.ResetPlaceCondition`): the rows it waited on went
   for another reason than its answer, such as a refusal for the store.
@@ -3397,13 +3415,19 @@ upstream bucket is Q-V.
   until its stall bound (2 minutes) ended the body. With the reset the
   friend reads only what had reached it, then fails
   (`TestAnAbandonedSendResetsItsConnection`,
-  `TestARetryAfterAnAbandonedSendSucceeds`). A path that is down
+  `TestARetryAfterAnAbandonedSendSucceeds`). The connection is
+  forgotten once the transport puts it back in its pool (the trace's
+  `PutIdleConn`) or the request has returned, so a stall noticed on
+  the last slow read never resets a connection another request may
+  use (#92, `TestAnAbandonResetsOnlyTheRequestsOwnConnection`). A
+  path that is down
   carries the reset no better than the FIN; the friend's stall bound
   ends that body, and its 503s (§3.5 LEND-2) keep this node retrying
   meanwhile rather than paused for quota. `gonet.TCPConn` exposes no
   linger, so the endpoint is reached by reflection, as tailcat's own
   `closeProxyConn` does; if gonet changes, the reset degrades to a
-  plain close.
+  plain close, logged as a warning with the friend's node ID (#92,
+  `TestAResetThatFallsBackToACloseIsLogged`).
 - **Operations.** `Put` streams the object from the store into
   `PutObject`; an object larger than the part size (or than one PUT,
   5 GiB) goes into the low-level multipart calls (`replica.Multipart`:
@@ -3432,8 +3456,20 @@ upstream bucket is Q-V.
 - **Errors.** The client's S3 errors are mapped to the replica
   interface's: a `507 QuotaExceeded` from a friend's decorator becomes
   "paused for quota" (LEND-2), while its `503 SlowDown` (fits, but not
-  beside the writes in flight, §3.5 LEND-2) is retried like any other
-  error; a `403` that says this node is not a
+  beside the writes in flight, §3.5 LEND-2; or this node at its cap of
+  requests in flight there, §3.7) becomes "busy" (`replica.ErrBusy`):
+  retried with backoff like a network error, but recorded as the
+  place's condition `busy`, counted as retry reason `busy`, and logged
+  at info, not as a failure (*decision, #92:* the friend answered, so
+  a friend briefly busy behind another borrower's writes is neither
+  unreachable nor rerouted nor alerted as `friend_unreachable`; one
+  busy for `reroute_after` on end is, see §3.4 Reachability;
+  `TestABusyFriendIsRetriedWithoutFailing`). Only `SlowDown` is busy:
+  the lender's other 503s (`ServiceUnavailable`: a gateway still
+  starting, relationships it cannot read) say it is failing and stay
+  `retrying` (`TestFriendRefusalsAreDistinct`). A probe answered
+  `SlowDown` is a sign of life like any answer
+  (`TestABusyProbeAnswerIsASignOfLife`); a `403` that says this node is not a
   friend becomes "removed" (PEER-5, SEC-15): the tunnel middleware's
   `AccessDenied` whose message is `state.NoRelationship`, or
   versitygw's `InvalidAccessKeyId` (its IAM no longer resolves the
@@ -4228,7 +4264,10 @@ the handler's own reads and is never cancelled; nothing below
   write. A completion is checked against the floor alone, for the size
   of its parts: posix assembles the object in a staging file while the
   parts still exist, so it needs that much again for a while; the
-  parts are already counted against quota. A create of a bucket the
+  parts are already counted against quota. The same rule splits its
+  answer (#92): `507` when the copy does not fit above the floor
+  alone, `503 SlowDown` when it fits only without the writes in flight
+  (`reserveFloor`, `TestACompletionThatFitsButForWritesInFlightIsRetried`). A create of a bucket the
   borrower already has is not refused, and the same bytes put again
   add nothing and are not refused. The error is lendisk's own
   `s3err.APIError` (versitygw's `ErrQuotaExceeded` is a 403) and is
@@ -5766,14 +5805,14 @@ the handler's own reads and is never cancelled; nothing below
     retried part counts again); `lendisk_replication_objects_total`
     `{place,op}`, rows acknowledged, `op` put or delete; and
     `lendisk_replication_retries_total{place,reason}`, failed sends that
-    wait to be retried, `reason` network, store, quota or removed.
+    wait to be retried, `reason` network, store, quota, removed or busy.
   - *Gauges* are read from `lendisk.db` at each scrape by the functions
     `status` uses (`cli.metricsFamilies`), so the two never disagree:
     per place (status's Places) `lendisk_place_queue_objects`,
     `_queue_bytes`, `_lag_seconds`, `_refused_objects`,
     `_dropping_copies`, `_last_ok_timestamp_seconds`, and
     `lendisk_place_state{place,state}`, 1 for the current condition of
-    ok, retrying, quota, removed, store, none; per friend (§3.5 LEND-7,
+    ok, retrying, quota, removed, store, busy, none; per friend (§3.5 LEND-7,
     `capacity`) `lendisk_friend_quota_bytes`, `_used_there_bytes`,
     `_used_here_bytes`, with `lendisk_repository_bytes` and
     `lendisk_protectable_bytes`; `lendisk_alerts{kind}`, pending alerts
@@ -6812,7 +6851,7 @@ design and disappear with it.
      `403 AccessDenied`, `412 PreconditionFailed` and `400 BadDigest`
      reach the worker as four distinct errors (`replica.ErrQuota`,
      `ErrRemoved`, `ErrImmutable`, `ErrRejected`), and a `500` or `503`
-     as none of them, through a real tailcat tunnel with minio-go
+     as none of them (since #92 a `503 SlowDown` is `ErrBusy`), through a real tailcat tunnel with minio-go
      v7.4.1 (`TestFriendRefusalsAreDistinct`). minio-go parses the
      error document of a `PUT` whatever the status. Since #53 not every
      403 means removed: only an `AccessDenied` whose message names

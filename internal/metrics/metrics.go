@@ -419,6 +419,7 @@ const (
 	RetryStore   = "store"   // this node's store could not be read
 	RetryQuota   = "quota"   // the place is full for this node (507)
 	RetryRemoved = "removed" // the place refuses this node
+	RetryBusy    = "busy"    // the place asks to send again shortly (503 SlowDown, #92)
 )
 
 // Sent counts n body bytes sent to place.
@@ -466,7 +467,7 @@ func (c *Counters) Families() []Family {
 	acked := Family{Name: "lendisk_replication_objects_total", Type: Counter,
 		Help: "Queue rows the place acknowledged, by operation (put, delete)."}
 	retries := Family{Name: "lendisk_replication_retries_total", Type: Counter,
-		Help: "Sends to the place that failed and wait to be retried, by reason (network, store, quota, removed)."}
+		Help: "Sends to the place that failed and wait to be retried, by reason (network, store, quota, removed, busy)."}
 	if c == nil {
 		return []Family{sent, acked, retries}
 	}

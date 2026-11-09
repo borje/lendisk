@@ -482,3 +482,31 @@ func TestStatusShowsAnUnreadableStoreAsTheCause(t *testing.T) {
 		t.Fatalf("status text:\n%s", text)
 	}
 }
+
+// #92, LEND-2: a friend that answered 503 SlowDown shows as busy, with
+// its answer as the detail and last_ok at that answer, not as retrying.
+func TestStatusShowsABusyFriend(t *testing.T) {
+	parallel(t, 0)
+	n := newNode(t)
+	n.mustInit(t)
+	ctx := context.Background()
+	db, err := state.Open(ctx, n.data, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: "B", Address: "tcB", OwnNumber: 1 << 30, PeerNumber: 1 << 30, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	detail := "busy: the friend asks to send again shortly: SlowDown"
+	if err := db.SetPlaceCondition(ctx, "B", state.ConditionBusy, detail, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if p := n.place("B"); p.State != "busy" || p.Detail != detail || p.LastOK == "" {
+		t.Fatalf("place %+v", p)
+	}
+	_, text, _ := n.run("", "", "status")
+	if !strings.Contains(text, "B (friend): busy (it asks to send again shortly),") {
+		t.Fatalf("status text:\n%s", text)
+	}
+}

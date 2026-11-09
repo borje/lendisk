@@ -20,7 +20,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/borje/lendisk/internal/alert"
-	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/identity"
 )
 
@@ -137,17 +136,15 @@ func (f *fourFriends) waitOffsite(id string) {
 	}
 }
 
-// drain waits until A's queue to every running friend is empty. It
-// allows the lender's stall bound and a minute more: a send A abandons
-// as stalled (no progress for its 10 s StallTimeout under load) keeps
-// its bytes counted in flight at the lender until the lender's bridge
-// ends the body (bridge.DefaultStall), and near the quota the lender
-// answers A's retries 507 until then.
+// drain waits until A's queue to every running friend is empty. A send
+// A abandons as stalled resets its connection, so the lender gives back
+// what it reserved at once, and a retry meanwhile is answered 503 (busy)
+// rather than 507 (#89, #92): 90 s is enough.
 func (f *fourFriends) drain() {
 	f.t.Helper()
 	for id, pn := range f.friends {
 		if pn.p != nil && !pn.p.exited() {
-			if p := f.an.drained(id, bridge.DefaultStall+time.Minute); p.Refused != 0 {
+			if p := f.an.drained(id, 90*time.Second); p.Refused != 0 {
 				f.t.Fatalf("place %+v", p)
 			}
 		}

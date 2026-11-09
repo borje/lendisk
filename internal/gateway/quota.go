@@ -369,6 +369,9 @@ func (l *Lending) watch(b *body, peer string, n int64) {
 
 // reserveFloor admits n bytes against the floor alone: room the store
 // needs briefly for bytes already counted (a completion's copy).
+// Refused with errQuotaExceeded when the store's free space less n is
+// below the floor, and with errInFlight when it is only below it beside
+// what every write in flight may add, as reserve does (#92).
 func (l *Lending) reserveFloor(n int64) (release func(), err error) {
 	sp, err := l.statfs()
 	if err != nil {
@@ -378,10 +381,15 @@ func (l *Lending) reserveFloor(n int64) (release func(), err error) {
 	floor := store.FloorBytes(l.floor(), sp.Total)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if sp.Free < floor+uint64(l.reserved)+uint64(n) {
+	if sp.Free < floor+uint64(n) {
 		l.log().Warn("lending: refused a completion below the store's free-space floor",
 			"free", sp.Free, "in_flight", l.reserved, "size", n, "floor", floor)
 		return nil, errQuotaExceeded
+	}
+	if sp.Free < floor+uint64(l.reserved)+uint64(n) {
+		l.log().Info("lending: asked a completion to wait: it fits above the floor, but not beside the writes in flight",
+			"free", sp.Free, "in_flight", l.reserved, "size", n, "floor", floor)
+		return nil, errInFlight
 	}
 	l.reserved += n
 	return func() {

@@ -61,8 +61,9 @@ import (
 // Alert kinds (OPS-2). The key of an alert is its kind, then ':' and its
 // subject when it has one.
 const (
-	// KindFriendUnreachable: a friend has not answered for longer than
-	// alerts.unreachable_after; the subject is its node ID.
+	// KindFriendUnreachable: a friend has not answered, or has answered
+	// only busy (#92), for longer than alerts.unreachable_after; the
+	// subject is its node ID.
 	KindFriendUnreachable = "friend_unreachable"
 	// KindStoreUnreadable: this node's store cannot be read, and
 	// replication waits (#57); no subject.
@@ -540,6 +541,15 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 	minRetrying := orDefault(s.MinRetrying, time.Hour)
 	for _, f := range fs {
 		c := conds[f.Peer]
+		// Busy (503 SlowDown) and nothing else for the threshold: it
+		// answers, but holds this node's copies back as surely (#92).
+		if c.Condition == state.ConditionBusy && now.Sub(c.Since) >= after {
+			msg := fmt.Sprintf("friend %s has answered only busy (503 SlowDown, asking this node to send again shortly) since %s (longer than %v); "+
+				"replication to it waits and its unsent copies go to other friends: %s",
+				f.Peer, c.Since.UTC().Format(time.RFC3339), after, c.Detail)
+			out = append(out, alertOf(KindFriendUnreachable, f.Peer, msg))
+			continue
+		}
 		// Retrying for at least MinRetrying, and silent for at least the
 		// threshold counted from its last answer: a friend that went off
 		// long before the next backup tried it has been gone since then.

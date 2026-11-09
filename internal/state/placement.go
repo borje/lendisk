@@ -46,6 +46,12 @@ const (
 	// cannot be read now (a disk not mounted, EMFILE, EIO; #57). Not the
 	// place's fault; the detail says what failed.
 	ConditionStore = "store"
+	// ConditionBusy: the place asked this node to send again shortly
+	// (503 SlowDown: the write fits, but not beside the writes in flight
+	// there, or this node has too many requests in flight; LEND-2, #92).
+	// It answered, so it is not failing: LastOK advances, as at a probe's
+	// answer, and a run of failing answers ends.
+	ConditionBusy = "busy"
 )
 
 // Causes of a refusal against the bucket (placement.cause): the node's
@@ -451,15 +457,15 @@ type PlaceCondition struct {
 }
 
 // SetPlaceCondition records how place answered at now. Since changes only
-// when the condition does; ConditionOK also sets LastOK, and
-// ConditionRemoved RefusedAt. FailingSince starts with the first
+// when the condition does; ConditionOK and ConditionBusy also set
+// LastOK, and ConditionRemoved RefusedAt. FailingSince starts with the first
 // failing answer (retrying, quota, removed) after an ok, is kept while
 // the answers keep failing whatever their kind and through
 // ConditionStore (this node's failure, not the place's answer), and is
 // cleared by ok (#65).
 func (db *DB) SetPlaceCondition(ctx context.Context, place, condition, detail string, now time.Time) error {
 	_, err := db.ExecContext(ctx, `INSERT INTO place (place, condition, detail, since, last_ok, refused_at, failing_since)
-		VALUES (?1, ?2, ?3, ?4, CASE WHEN ?2 = 'ok' THEN ?4 END, CASE WHEN ?2 = 'removed' THEN ?4 END,
+		VALUES (?1, ?2, ?3, ?4, CASE WHEN ?2 IN ('ok', 'busy') THEN ?4 END, CASE WHEN ?2 = 'removed' THEN ?4 END,
 			CASE WHEN ?2 IN ('retrying', 'quota', 'removed') THEN ?4 END)
 		ON CONFLICT (place) DO UPDATE SET
 			since = CASE WHEN place.condition = excluded.condition THEN place.since ELSE excluded.since END,

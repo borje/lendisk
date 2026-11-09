@@ -46,6 +46,7 @@ type Tailcat struct {
 	dialKeyFor func(identity.NodeID) key.NodePrivate // a client's, by friend
 	region     *tailcfg.DERPRegion
 	logf       logger.Logf
+	log        *slog.Logger // what the transport itself reports
 
 	// probeTimeout bounds the transport's own check of a client after
 	// a dial through it failed; quietFor is how long a client's open
@@ -116,6 +117,7 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 	t := &Tailcat{
 		key:    nodePrivate(id),
 		region: region,
+		log:    log,
 		logf: func(format string, args ...any) {
 			log.Debug(strings.TrimSpace(fmt.Sprintf(format, args...)), "component", "tailcat")
 		},
@@ -615,13 +617,18 @@ func (tc *tunnelConn) Close() error {
 // sender abandoning a request body uses it, so the friend ends that
 // request, and gives back what it reserved for it, at once (#89). A
 // connection that is not gVisor's, or whose internals have changed, is
-// closed as usual.
+// closed as usual, and that is logged as a warning (#92): the friend
+// then holds what it reserved until its stall bound ends the body.
 func (tc *tunnelConn) Reset() error {
 	if c, ok := tc.Conn.(*gonet.TCPConn); ok {
 		if ep := gonetEndpoint(c); ep != nil {
 			ep.SocketOptions().SetLinger(tcpip.LingerOption{Enabled: true, Timeout: 0})
+			return tc.Close()
 		}
 	}
+	tc.c.t.log.Warn("transport: a tunnel connection could not be reset and was closed instead; "+
+		"the friend reads on what the tunnel holds of the abandoned send until its stall bound ends it",
+		"peer", tc.c.peer.String(), "conn", fmt.Sprintf("%T", tc.Conn))
 	return tc.Close()
 }
 
