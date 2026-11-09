@@ -344,7 +344,18 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 		}
 	}
 	st.Skipped = m.skipped
-	if len(errs) == 0 && ctx.Err() == nil {
+	// A pass that went through every bucket answered the pool, even
+	// when a bucket's batch failed (#90), so what it left short is
+	// stuck. Counting a failed bucket as answered is the sound choice:
+	// not counting it would keep its short objects, and with one
+	// record per pass every bucket's, waiting for as long as the error
+	// repeats, and `status --wait` with them; a failure that persists
+	// needs a person, which is what stuck says. The worker tries a
+	// failed pass again at its next re-routing tick (Worker.replace),
+	// so a passing failure is stuck for a minute, then placed. A pass
+	// cut short by its context answered nothing past where it stopped:
+	// the pass stays due.
+	if ctx.Err() == nil {
 		if _, err := db.ExecContext(ctx, `INSERT INTO replace_pass (id, pool, done_at) VALUES (1, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET pool = excluded.pool, done_at = excluded.done_at`,
 			pool, db.now().Unix()); err != nil {
@@ -355,7 +366,8 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 }
 
 // passDue reports whether a re-placement pass is due: the pool differs
-// from the one the last pass that finished answered, or no pass has.
+// from the one the last pass that went through every bucket answered
+// (with or without a failed batch, #90), or no pass has.
 // The daemon runs one within five polls of a change (#26); until it
 // has, an object short of places may yet be placed.
 func (db *DB) passDue(ctx context.Context) (bool, error) {
