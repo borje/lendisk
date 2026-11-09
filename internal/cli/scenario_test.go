@@ -46,14 +46,25 @@ func newFourFriends(t *testing.T, aEnv ...string) *fourFriends {
 // newFourFriendsAt is newFourFriends with every friendship at quota.
 func newFourFriendsAt(t *testing.T, quota string, aEnv ...string) *fourFriends {
 	t.Helper()
+	return newCircleAt(t, 4, quota, aEnv...)
+}
+
+// newCircleAt is newFourFriendsAt with size nodes: A and size − 1
+// friends, each pair friends at quota.
+func newCircleAt(t *testing.T, size int, quota string, aEnv ...string) *fourFriends {
+	t.Helper()
 	if _, err := exec.LookPath("restic"); err != nil {
 		t.Skip("restic not installed")
 	}
 	if testing.Short() {
 		t.Skip("long")
 	}
-	an, bn, cn, dn := newNode(t), newNode(t), newNode(t), newNode(t)
-	for _, n := range []*node{an, bn, cn, dn} {
+	nodes := make([]*node, size)
+	for i := range nodes {
+		nodes[i] = newNode(t)
+	}
+	an := nodes[0]
+	for _, n := range nodes {
 		n.regions = an.regions // one relay for all
 		p, _ := identity.NewPhrase()
 		if code, _, e := n.run(p+"\n", "", "init", "--restore"); code != 0 {
@@ -64,14 +75,13 @@ func newFourFriendsAt(t *testing.T, quota string, aEnv ...string) *fourFriends {
 	fast := envReplFast + "=1"
 	f := &fourFriends{t: t, an: an, a: newProcNode(t, an, append([]string{fast}, aEnv...)...),
 		friends: map[string]*procNode{}, aID: an.identity(), src: t.TempDir()}
-	for _, n := range []*node{bn, cn, dn} {
+	for _, n := range nodes[1:] {
 		pn := newProcNode(t, n, fast)
 		pn.start()
 		f.friends[n.identity().NodeID().String()] = pn
 	}
 	f.a.start()
-	nodes := []*node{an, bn, cn, dn}
-	for i, lender := range nodes { // six invites
+	for i, lender := range nodes { // every pair: six invites for four
 		for _, borrower := range nodes[i+1:] {
 			s := lender.invite("--quota", quota)
 			if code, _, errOut := borrower.run("\n", "", "peer", "add", s); code != 0 {
@@ -175,8 +185,9 @@ func (f *fourFriends) placedAsSpecified() {
 // copies. `restic backup` on A finishes against A's store;
 // `status --wait laptop` returns once the snapshot is offsite at two
 // copies, and `status` says so by restic's snapshot ID; every data
-// object is at two of B, C and D and the metadata at all three. The
-// protectable size of about 120 GB is LEND-7's, #37.
+// object is at two of B, C and D and the metadata at all three; the
+// protectable size is about 120 GB (LEND-7, #37: 80 from each of three
+// friends, less the metadata each holds, at two copies).
 func TestScenarioFirstBackupIsOffsiteAtTwoCopies(t *testing.T) {
 	parallel(t, 4)
 	f := newFourFriends(t)
@@ -192,6 +203,9 @@ func TestScenarioFirstBackupIsOffsiteAtTwoCopies(t *testing.T) {
 		t.Fatalf("bucket %+v, offsite %+v", b, b.Offsite)
 	}
 	f.placedAsSpecified()
+	if c := capacityOf(t, f.an.status()); c.Protectable < 115<<20 || c.Protectable > 120<<20 || c.Alerting {
+		t.Errorf("protectable %d bytes, want about 120 MB: %+v", c.Protectable, c)
+	}
 }
 
 // Scenario 2, a friend offline (REPL-9, REPL-12, OPS-2; #20), on A's

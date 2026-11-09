@@ -1474,10 +1474,10 @@ upstream bucket is Q-V.
   (SEC-15's 60 seconds) and repeats on every connection until
   answered; a raising is in force once both numbers allow it. Nothing
   is proposed, nothing is pending and the daemon never changes a
-  number by itself. When a bucket has a deficit (D6, step 4), `status`
-  and the OPS-2 alert name the friends with the smallest free fraction
-  and, per friendship, the number that would cover the deficit at
-  `copies`; the two people set it.
+  number by itself. When the repository is above 90% of the protectable
+  size, `status` and the OPS-2 alert name, per friendship with the least
+  room, the number that would cover it at `copies` (§3.5 LEND-7, #37:
+  the shortfall shared by water-filling); the two people set it.
   *Realised (#24).* `lendisk peer quota <node ID> <size>` commits
   `state.DB.SetOwnNumber` (a malformed ID or size is a usage error, a
   stranger "not a friend"); it refuses with `state.MaxTotalError` a
@@ -1609,7 +1609,10 @@ upstream bucket is Q-V.
   refused at config load in this profile. versitygw still runs, behind
   the bridge's tunnel listener only. Its friendship rows are like any other; the quota its
   friends lend it back has no buckets to fill, and `status` shows it as
-  unused. Adding a bucket later is a change of `role` and a restart.
+  unused: a "Lending only:" line with what it lends, what its friends
+  use of it and the quota received (`capacity.lent`, `lent_used`,
+  `received`, `received_unused`; #37, §3.5 LEND-7). Adding a bucket
+  later is a change of `role` and a restart.
 - **PEER-5, PEER-12, ending a friendship (#25).** `lendisk peer
   remove <node ID>` (a malformed ID is a usage error, a stranger "not
   a friend") commits `state.DB.RemoveFriendship`: in one transaction
@@ -4355,13 +4358,86 @@ the handler's own reads and is never cancelled; nothing below
   key's latest done write, if a put), rounded up to a whole GiB
   (`control.RoundSize`; *decision, #24*: up, so a small repository is
   never reported as none, and to the GiB, so a friend learns no
-  closer). The request carries the caller's the same way. The protectable
-  size is computed by bisection on `S` over Σ min(D, quotaⱼ − m) +
-  Σ (overflow `max_bytes` − m) ≥ c × D, with `m` the bucket's metadata
-  bytes from the index and `D = S − m`, and the fair-quota bound with
-  `quotaⱼ` replaced by `sizeⱼ`; the derivation is §4. The
-  "under half used for 30 days" note compares the daily use samples
-  both sides already report in `quota`.
+  closer). The request carries the caller's the same way.
+  *Realised (#37), package `capacity`.* Pure arithmetic on a
+  `capacity.Plan`, which `capacity.Read` takes from `lendisk.db`; nothing
+  is stored but the low-use marks below.
+  - *The repository* (`state.DB.RepositoryUse`) is counted as places
+    count it, each live object plus its 4 KiB overhead: the data part
+    and the metadata part `m` (classes `metadata` and `snapshot`, held at
+    every friend, §3.4), and `c`, the largest `copies` of a bucket holding
+    live data (`replication.copies` with none). *Decision:* one `c` for
+    the node, the largest, rather than a per-bucket sum: conservative,
+    and exact for the usual single bucket. `status` shows the local copy
+    beside it (`RepositorySize`, the live bytes in the store).
+  - *Protectable size* (`Plan.Protectable`): the largest `S` with
+    Σ min(D, quotaⱼ − m) + Σ (overflow `max_bytes` − m) ≥ c × D over the
+    friendships with an address, each term floored at 0, `m` scaled with
+    `S` at the repository's present metadata share (1% while it holds no
+    data) and `D = S − m`; the feasible set is an interval from 0, so a
+    bisection finds its end. The fair bound (`Plan.FairProtectable`)
+    puts each friend's reported repository size in place of its quota.
+    Overflow targets are a parameter (`Plan.Overflow`), none until #38;
+    `status` lists them (`capacity.overflow`, empty).
+  - *Guidance* (`Plan.Cover`). While the repository is above 90% of the
+    protectable size (`capacity.AlertPercent`), the numbers aim at
+    `S ÷ 0.9` (`Plan.Target`), so that setting them clears the alert
+    and covers any deficit with that margin. *Decision (#37): the
+    shortfall is shared by water-filling.* The friendships with the
+    least room are raised to one common level, the lowest that is
+    enough, and only those below it are named; with two friends at two
+    copies both are named (the LEND-8 AC), and a friend that already
+    has room is not. Each number is the smallest quota whose room under
+    placement's rule (`capacity.PlacementRoom`: quota less `m` less the
+    metadata reserve of §3.4, the larger of 3 × `m` and 1% of the quota)
+    reaches the level, rounded up to a whole MiB (a whole GiB from
+    10 GiB), so the named number lets placement put the copies there,
+    not only the §4 formula. With fewer friends than `copies` and not
+    enough overflow no number covers it (`coverable: false`): status
+    and the alert say to add a friend or an overflow target.
+  - *Under half used for 30 days.* Migration 37 adds
+    `friendship.low_there_since` and `low_here_since`: each quota call,
+    either way (`QuotaReported`, `QuotaAnswered`, `state.markLowUse`),
+    marks since when this node's use there (`place_use` with what its
+    deletes will free, as `PlaceUse` counts it) or the friend's use here
+    (`lent_usage`) has been below half the quota, keeps an earlier mark,
+    and clears it at half or more or a zero quota. The call is hourly
+    (§3.2), so a mark is right to the hour; a friendship not called for
+    a while keeps its mark. *Decision:* a "since" mark rather than daily
+    samples: one condition needs one timestamp. `status` flags a side
+    whose mark is `cli.LowUseFor` (30 days) old on its clock, saying the
+    two could lower the number; a lender-only node's own side is not
+    flagged, since it uses nothing by design (PEER-9).
+  - *`init`* asks, after the phrase, for the expected repository size
+    and `copies` (`--repository-size` and `--copies` answer without
+    asking; Enter or the end of input skips, so a script piping the
+    phrase is asked nothing more), prints `c × S` plus 20%
+    (`capacity.SuggestMaxTotal`), the disk the node then needs and the
+    rule of thumb, and writes `lending.max_total` (and `copies`, when not
+    the default) into the config it creates; with a config already
+    there it says what to set. A lender-only node is not asked.
+  - *`status`* (`capacity` in `status --json`: `repository_size`,
+    `metadata`, `local_copy`, `copies`, `protectable`,
+    `fair_protectable`, `alerting`, `deficit`, `coverable`, `friends[]`
+    with `peer`, `quota`, `use_there`, `use_here`, `repository_size`,
+    `cover`, `low_there_since`, `low_here_since`; `overflow[]`; `lent`,
+    `lent_used`, `received`, `received_unused`) prints one "Capacity:"
+    block; on a lender-only node a "Lending only:" line with what it
+    lends, what its friends use, and the quota received, unused until it
+    has a bucket (PEER-9). The `protectable_size` alert is §3.8.
+  - *Tests:* `internal/capacity` (§4's examples and scenario 1's figure,
+    the fair bound, overflow, too few friends, the AC's numbers),
+    `TestRepositoryUseSplitsDataFromMetadata`,
+    `TestQuotaCallsMarkSinceWhenUseIsUnderHalf`,
+    `TestStatusShowsCapacityAndTheNumbersThatCoverADeficit`,
+    `TestFriendshipsUnderHalfUsedFor30DaysAreFlagged`,
+    `TestALenderOnlyNodesStatusShowsLentSpaceAndUnusedQuota`,
+    `TestInitSuggestsWhatToLend`,
+    `TestQuotaACNamesTheNumbersAndCopiesResumeAtTheRaisedFriend` (the
+    LEND-8 AC with three daemons: raising A–B alone resumes A's copies
+    at B through the quota exchange and re-placement, #24 and #26, with
+    nothing else done), `TestScenarioQuota` (scenario 6), and scenario
+    1's protectable size in `TestScenarioFirstBackupIsOffsiteAtTwoCopies`.
 
 ### 3.6 Deletion, retention and verification
 
@@ -5495,8 +5571,22 @@ the handler's own reads and is never cancelled; nothing below
     says when it was printed, what changed (a friend's address, a
     friend, overflow target or bucket added or removed) and to run
     `lendisk recovery-sheet` again, which clears it at the next pass
-    (`TestFriendsAddressChangeAlertsToRegenerateTheSheet`).
-  The three quota alerts have hysteresis (#24 review): one stays raised
+    (`TestFriendsAddressChangeAlertsToRegenerateTheSheet`);
+  - `protectable_size`, no subject: the repository, as places count
+    it, is above 90% of the protectable size (`capacity.Plan.Alerting`,
+    §3.5 LEND-7, #37). The message gives both sizes and `copies`, says
+    copies beyond it are paused for quota when it is past it, and names
+    per friendship the quota that would cover it, "friend <ID>: 68G (now
+    50G)", for both sides to set with `peer quota`
+    (`alert.ProtectableMessage`); with fewer friends than `copies` it
+    says to add a friend or an overflow target instead. `Service.Copies`
+    is `replication.copies`, the `c` of a node with no bucket
+    (`TestRepositoryNearTheProtectableSizeNamesANumberPerFriendship`,
+    `TestTooFewFriendsToProtectSaysSo`).
+  The four quota alerts (`quota_high`, `quota_exhausted`,
+  `lent_over_quota`, `protectable_size`) have hysteresis (#24 review;
+  the last since #37, as a repository near the line crosses it with
+  each backup and prune): one stays raised
   until its condition has been false for `alert.Service.QuotaHold`
   (`DefaultQuotaHold`, 10 minutes), so a friend flipping it with every
   quota call gets one delivery per window, not one per call
@@ -6224,11 +6314,16 @@ and every place also holds the metadata `m` (about 1% of `S`). With
 
     Σⱼ min(D, qⱼ − m) + Σₖ (Oₖ − m) ≥ c × D
 
+and the protectable size (LEND-7) is the largest `S` that satisfies it
+(each term floored at 0: a friend too small for the metadata holds no
+data, it does not take room from the others; §3.5 *Realised (#37)*).
 Below, `m` is left out where the example has margin to spare, and
-counted where a fit is close.
-
-and the protectable size (LEND-7) is the largest `S` that satisfies it.
-A friend has no use for more of your disk than its own repository
+counted where a fit is close. Placement leaves a little more free at
+each friend than `m`: the metadata reserve of §3.4, about `3m` more. The
+formula does not count it; the alert at 90% of the protectable size
+comes first, and the numbers `status` names to cover a shortfall do
+count it, so setting them is enough for placement too. A friend
+ has no use for more of your disk than its own repository
 `Sⱼ` needs, so fair quotas satisfy `qⱼ ≤ Sⱼ`; with friends no bigger
 than you, the rule becomes: **you are fully protected while `S ≤ ΣSⱼ /
 c`**, your backup at most half your friends' combined at two copies.

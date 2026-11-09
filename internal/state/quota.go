@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -150,10 +151,40 @@ type QuotaReport struct {
 // returns the friendship as it now stands; ErrNotFound if peer is no
 // friend.
 func (db *DB) QuotaReported(ctx context.Context, peer string, r QuotaReport, now time.Time) (Friendship, error) {
-	return scanFriendship(db.QueryRowContext(ctx, `UPDATE friendship
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return Friendship{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE friendship
 		SET peer_number = ?, peer_use = ?, peer_repo_size = ?, peer_protocol = ?, seen_at = ?, reported_at = ?
-		WHERE peer_key = ? RETURNING `+friendshipCols,
-		r.Number, r.Use, r.RepositorySize, nullString(r.Protocol), now.Unix(), now.UnixNano(), peer))
+		WHERE peer_key = ?`,
+		r.Number, r.Use, r.RepositorySize, nullString(r.Protocol), now.Unix(), now.UnixNano(), peer); err != nil {
+		return Friendship{}, err
+	}
+	f, err := markLowUse(ctx, tx, peer, now)
+	if err != nil {
+		return f, err
+	}
+	return f, tx.Commit()
+}
+
+// markLowUse marks at now since when each side of the friendship with
+// peer has used less than half of its quota (LEND-7, #37), keeping an
+// earlier mark, and clears a side's mark once it uses half or more or
+// the quota is zero. This node's use there is place_use (with what its
+// queued deletes will free, as PlaceUse counts it); the friend's here
+// is lent_usage. It returns the friendship as it now stands.
+func markLowUse(ctx context.Context, tx *sql.Tx, peer string, now time.Time) (Friendship, error) {
+	return scanFriendship(tx.QueryRowContext(ctx, `UPDATE friendship SET
+		low_there_since = CASE WHEN q.quota > 0 AND 2 * q.there < q.quota THEN coalesce(low_there_since, ?2) END,
+		low_here_since = CASE WHEN q.quota > 0 AND 2 * q.here < q.quota THEN coalesce(low_here_since, ?2) END
+		FROM (SELECT min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)) AS quota,
+			coalesce((SELECT u.bytes FROM place_use u WHERE u.place = f.peer_key), 0)
+				+ coalesce((SELECT fr.bytes FROM place_freed fr WHERE fr.place = f.peer_key), 0) AS there,
+			coalesce((SELECT l.bytes FROM lent_usage l WHERE l.peer_key = f.peer_key), 0) AS here
+			FROM friendship f WHERE f.peer_key = ?1) AS q
+		WHERE peer_key = ?1 RETURNING `+friendshipCols, peer, now.Unix()))
 }
 
 // QuotaAnswer is a friend's answer to this node's quota call: its
@@ -213,6 +244,9 @@ func (db *DB) QuotaAnswered(ctx context.Context, peer string, sent int64, sentAt
 		ON CONFLICT (place) DO UPDATE SET bytes = excluded.bytes`, peer, freed); err != nil {
 		return f, err
 	}
+	if f, err = markLowUse(ctx, tx, peer, now); err != nil {
+		return f, err
+	}
 	return f, tx.Commit()
 }
 
@@ -265,4 +299,30 @@ func (db *DB) RepositorySize(ctx context.Context) (int64, error) {
 		AND NOT EXISTS (SELECT 1 FROM queue l
 			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')`).Scan(&n)
 	return n, err
+}
+
+// RepositoryUse is the node's repository as capacity planning counts it
+// (LEND-7, #37): as places count it, each live object with
+// ObjectOverhead, split into data and metadata (the metadata and
+// snapshot classes, held at every place, §3.4), and the largest copies
+// of a bucket holding live data.
+type RepositoryUse struct {
+	Data, Metadata int64
+	Copies         int
+}
+
+// RepositoryUse reads the node's repository as capacity planning
+// counts it: each key's latest done write, if a put.
+func (db *DB) RepositoryUse(ctx context.Context) (RepositoryUse, error) {
+	var u RepositoryUse
+	err := db.QueryRowContext(ctx, `SELECT
+		coalesce(sum(CASE WHEN q.class IN ('metadata', 'snapshot') THEN 0 ELSE q.size + ?1 END), 0),
+		coalesce(sum(CASE WHEN q.class IN ('metadata', 'snapshot') THEN q.size + ?1 ELSE 0 END), 0),
+		coalesce(max(CASE WHEN q.class IN ('metadata', 'snapshot') THEN NULL ELSE coalesce(b.copies, ?2) END), 0)
+		FROM queue q LEFT JOIN buckets b ON b.name = q.bucket
+		WHERE q.op = 'put' AND q.state = 'done'
+		AND NOT EXISTS (SELECT 1 FROM queue l
+			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')`,
+		ObjectOverhead, DefaultCopies).Scan(&u.Data, &u.Metadata, &u.Copies)
+	return u, err
 }

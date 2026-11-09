@@ -799,4 +799,16 @@ var migrations = []Migration{
 			PRIMARY KEY (bucket, key)
 		);`,
 	},
+	{
+		Version: 37, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Capacity planning (LEND-7, #37): since when each side of a
+		-- friendship has used less than half of its quota, as each quota
+		-- call finds it. low_there_since is this node's use at the friend
+		-- (place_use), low_here_since the friend's use here (lent_usage).
+		-- NULL while it uses half or more, or the quota is zero. Unix
+		-- seconds.
+		ALTER TABLE friendship ADD COLUMN low_there_since INTEGER;
+		ALTER TABLE friendship ADD COLUMN low_here_since INTEGER;`,
+	},
 }

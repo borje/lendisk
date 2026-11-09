@@ -129,6 +129,7 @@ func TestAnUnmatchableUploadIsAlertedUntilItSettles(t *testing.T) {
 	ctx := t.Context()
 	db := openDB(t)
 	addFriend(t, db, "B")
+	addFriend(t, db, "C") // two copies' worth of pool: no protectable_size (#37)
 	seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: "data/big", Op: state.OpPut, Class: "data"}})
 	if err != nil {
 		t.Fatal(err)

@@ -209,7 +209,7 @@ func (a *app) runRecover(ctx context.Context, addr string, skip map[string]bool)
 		return err
 	}
 	if !cfg.FileExists {
-		if err := writeInitialConfig(cfg); err != nil {
+		if err := writeInitialConfig(cfg, 0, 0); err != nil {
 			return err
 		}
 	}
