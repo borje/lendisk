@@ -32,6 +32,12 @@ type Friendship struct {
 	PeerProtocol       string // the friend's protocol version (NET-6)
 	Path               string // how the last answered call went: direct or relayed
 	ExchangeError      string // why the last call failed; "" once one is answered
+
+	// Since when each side has used less than half of the quota, as the
+	// quota calls found it (LEND-7, #37): LowThereSince this node at the
+	// friend, LowHereSince the friend here. Zero while it uses half or
+	// more.
+	LowThereSince, LowHereSince time.Time
 }
 
 // ErrDialKeyTaken means a dial key is already another friend's dial key
@@ -303,15 +309,16 @@ func addFriendship(ctx context.Context, x interface {
 }
 
 const friendshipCols = `peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention, dial_key,
-	told_number, seen_at, peer_repo_size, peer_use, lent_there, peer_protocol, path, exchange_error`
+	told_number, seen_at, peer_repo_size, peer_use, lent_there, peer_protocol, path, exchange_error,
+	low_there_since, low_here_since`
 
 func scanFriendship(row interface{ Scan(...any) error }) (Friendship, error) {
 	var f Friendship
 	var created int64
 	var addr, dial, proto, path, exErr sql.NullString
-	var own, peer, ownRet, peerRet, told, seen, size, use, there sql.NullInt64
+	var own, peer, ownRet, peerRet, told, seen, size, use, there, lowThere, lowHere sql.NullInt64
 	err := row.Scan(&f.Peer, &created, &addr, &own, &peer, &ownRet, &peerRet, &dial,
-		&told, &seen, &size, &use, &there, &proto, &path, &exErr)
+		&told, &seen, &size, &use, &there, &proto, &path, &exErr, &lowThere, &lowHere)
 	if errors.Is(err, sql.ErrNoRows) {
 		return f, ErrNotFound
 	} else if err != nil {
@@ -328,6 +335,12 @@ func scanFriendship(row interface{ Scan(...any) error }) (Friendship, error) {
 		f.SeenAt = time.Unix(seen.Int64, 0)
 	}
 	f.PeerProtocol, f.Path, f.ExchangeError = proto.String, path.String, exErr.String
+	if lowThere.Valid {
+		f.LowThereSince = time.Unix(lowThere.Int64, 0)
+	}
+	if lowHere.Valid {
+		f.LowHereSince = time.Unix(lowHere.Int64, 0)
+	}
 	return f, nil
 }
 

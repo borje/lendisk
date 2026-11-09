@@ -293,3 +293,86 @@ func TestRepositorySizeIsTheLiveBytes(t *testing.T) {
 		t.Fatalf("repository size %d, want %d", n, want)
 	}
 }
+
+// LEND-7 (#37): the repository as capacity planning counts it, as
+// places do: its live data and its live metadata, each object with its
+// overhead, and the largest copies of a bucket holding data.
+func TestRepositoryUseSplitsDataFromMetadata(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	if u, err := p.db.RepositoryUse(ctx); err != nil || u != (RepositoryUse{}) {
+		t.Fatalf("no buckets: %+v %v", u, err)
+	}
+	p.bucket("laptop", 2)
+	p.bucket("nas", 3)
+	p.bucket("empty", 4)
+	p.put("laptop", "data/1", "data", 2)
+	p.put("laptop", "data/2", "data", 3)
+	p.del("laptop", "data/1", "data")
+	p.put("laptop", "index/1", "metadata", 1)
+	p.put("nas", "snapshots/1", "snapshot", 0.5)
+	p.put("nas", "data/3", "data", 4)
+	u, err := p.db.RepositoryUse(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.Data != 7*unit || u.Metadata != unit+unit/2 || u.Copies != 3 {
+		t.Fatalf("%+v, want data %d, metadata %d, copies 3", u, 7*unit, unit+unit/2)
+	}
+}
+
+// LEND-7 (#37): each quota call marks since when each side of a
+// friendship has used less than half of the quota (this node at the
+// friend, by its count reconciled from the friend's; the friend here,
+// by this node's count as lender), and clears the mark once it uses
+// half. A quota of zero marks nothing.
+func TestQuotaCallsMarkSinceWhenUseIsUnderHalf(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 100)
+	t0 := p.now
+	if _, err := p.db.QuotaReported(ctx, "B", QuotaReport{Number: 100 * unit}, t0); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := p.db.GetFriendship(ctx, "B")
+	if !f.LowThereSince.Equal(t0) || !f.LowHereSince.Equal(t0) {
+		t.Fatalf("nothing used: %+v", f)
+	}
+	// The friend stores 60 here; this node 10 there: only this side is low.
+	if err := p.db.SetLentUsage(ctx, "B", 60*unit, t0); err != nil {
+		t.Fatal(err)
+	}
+	t1 := t0.Add(24 * time.Hour)
+	if _, err := p.db.QuotaAnswered(ctx, "B", 100*unit, t1, QuotaAnswer{Number: 100 * unit, Lent: 10 * unit}, t1); err != nil {
+		t.Fatal(err)
+	}
+	f, _ = p.db.GetFriendship(ctx, "B")
+	if !f.LowThereSince.Equal(t0) || !f.LowHereSince.IsZero() {
+		t.Fatalf("this node low since t0, the friend not: %+v", f)
+	}
+	// This node now stores 60 there: no side is low.
+	t2 := t1.Add(24 * time.Hour)
+	if _, err := p.db.QuotaAnswered(ctx, "B", 100*unit, t2, QuotaAnswer{Number: 100 * unit, Lent: 60 * unit}, t2); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ = p.db.GetFriendship(ctx, "B"); !f.LowThereSince.IsZero() || !f.LowHereSince.IsZero() {
+		t.Fatalf("both use more than half: %+v", f)
+	}
+	// Both numbers go to 200: 60 of 200 is under half again.
+	t3 := t2.Add(time.Hour)
+	if _, _, err := p.db.SetOwnNumber(ctx, "B", 200*unit, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.db.QuotaReported(ctx, "B", QuotaReport{Number: 200 * unit}, t3); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ = p.db.GetFriendship(ctx, "B"); !f.LowThereSince.Equal(t3) || !f.LowHereSince.Equal(t3) {
+		t.Fatalf("both under half of 200: %+v", f)
+	}
+	if _, err := p.db.QuotaReported(ctx, "B", QuotaReport{Number: 0}, t3.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ = p.db.GetFriendship(ctx, "B"); !f.LowThereSince.IsZero() || !f.LowHereSince.IsZero() {
+		t.Fatalf("a quota of zero: %+v", f)
+	}
+}

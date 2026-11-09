@@ -12,8 +12,9 @@
 // a friend's replica that failed verification or has not passed it
 // for days (VER-1, SEC-7, #27), the store reconciler's held deletes
 // and missing store marker (EP-14, #8), bit-rot the sampler found in
-// own objects and in friends' (VER-5, #31), and a printed recovery
-// sheet gone out of date (ID-7, #33).
+// own objects and in friends' (VER-5, #31), a printed recovery
+// sheet gone out of date (ID-7, #33), and the repository above 90% of
+// the protectable size (LEND-7, LEND-8, #37).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -52,6 +53,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/borje/lendisk/internal/capacity"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/version"
 )
@@ -185,6 +187,12 @@ const (
 	// or a friend, overflow target or bucket was added or removed. No
 	// subject. It clears when `lendisk recovery-sheet` prints it again.
 	KindRecoverySheetStale = "recovery_sheet_stale"
+	// KindProtectable: the repository is above capacity.AlertPercent of
+	// the protectable size (OPS-2, LEND-7, #37). No subject. The message
+	// names, per friendship, the number that would cover it (LEND-8), or
+	// says a friend or an overflow target is needed. A quota alert: it
+	// clears QuotaHold after its condition ends.
+	KindProtectable = "protectable_size"
 )
 
 // DefaultUncheckedAfter is Service.UncheckedAfter when zero.
@@ -260,7 +268,7 @@ func (s *Service) quotaHold() time.Duration { return orDefault(s.QuotaHold, Defa
 
 // quotaKind reports whether kind is a quota alert (hysteresis, QuotaHold).
 func quotaKind(kind string) bool {
-	return kind == KindQuotaHigh || kind == KindQuotaExhausted || kind == KindLentOverQuota
+	return kind == KindQuotaHigh || kind == KindQuotaExhausted || kind == KindLentOverQuota || kind == KindProtectable
 }
 
 // PurgeWarning is how long before an ended friendship's purge
@@ -271,7 +279,8 @@ const PurgeWarning = 7 * 24 * time.Hour
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindFriendRefuses, KindPurgeSoon,
 	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
-	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot, KindRecoverySheetStale}
+	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot, KindRecoverySheetStale,
+	KindProtectable}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -333,6 +342,10 @@ type Service struct {
 	// node's state (sheet.Stale, ID-7): when it was printed and what
 	// changed since, nil when nothing did or none was printed.
 	Sheet func(ctx context.Context) (printed time.Time, changes []string, err error)
+
+	// Copies is replication.copies, the copies capacity planning counts
+	// for a node with no bucket (default state.DefaultCopies).
+	Copies int
 
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
@@ -722,6 +735,13 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		return nil, err
 	}
 	out = append(out, quota...)
+	plan, err := capacity.Read(ctx, s.DB, cmp.Or(s.Copies, state.DefaultCopies))
+	if err != nil {
+		return nil, err
+	}
+	if plan.Alerting() {
+		out = append(out, alertOf(KindProtectable, "", ProtectableMessage(plan)))
+	}
 	if s.Sheet != nil {
 		printed, changes, err := s.Sheet(ctx)
 		if err != nil {
@@ -789,6 +809,35 @@ func (s *Service) quotaConditions(ctx context.Context, fs []state.Friendship, co
 	return out, nil
 }
 
+// ProtectableMessage says that the repository of plan is above
+// capacity.AlertPercent of its protectable size and names, per
+// friendship, the number that would cover it (OPS-2, LEND-8, #37).
+func ProtectableMessage(plan capacity.Plan) string {
+	what := fmt.Sprintf("the repository (%s as friends count it) is above %d%% of the protectable size (%s at %d copies)",
+		capacity.Human(plan.Size()), capacity.AlertPercent, capacity.Human(plan.Protectable()), plan.Copies)
+	if plan.Protectable() < plan.Size() {
+		what += ": copies beyond it are paused for quota and some objects are below copies"
+	}
+	cover, ok := plan.Cover()
+	if !ok {
+		return what + fmt.Sprintf(". With %s at %d copies no quota covers it: add another friend or an overflow target",
+			plural(int64(len(plan.Friends)), "friend", "friends"), plan.Copies)
+	}
+	return what + ". To cover it, agree these quotas, each side running lendisk peer quota <friend> <size>: " + CoverList(plan, cover)
+}
+
+// CoverList lists cover's numbers in plan's friendship order, as
+// "friend B: 68M (now 50M)".
+func CoverList(plan capacity.Plan, cover map[string]int64) string {
+	var parts []string
+	for _, f := range plan.Friends {
+		if n, ok := cover[f.Peer]; ok {
+			parts = append(parts, fmt.Sprintf("friend %s: %s (now %s)", f.Peer, capacity.Format(n), capacity.Format(f.Quota)))
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
 // gb writes bytes for a person: GiB with one decimal, or bytes below one
 // MiB.
 func gb(n int64) string {
@@ -796,6 +845,13 @@ func gb(n int64) string {
 		return fmt.Sprintf("%d bytes", n)
 	}
 	return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+}
+
+func plural(n int64, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }
 
 func countObjects(n int64) string {

@@ -63,6 +63,11 @@ type Status struct {
 	// Bitrot is the bit-rot sample's progress and what it found (VER-5,
 	// #31); absent before its first check.
 	Bitrot *StatusBitrot `json:"bitrot,omitempty"`
+	// Capacity is capacity planning: the local copy, use at each friend
+	// and overflow target, what each friend is lent and uses, the
+	// protectable size and what would cover a deficit (LEND-7, LEND-8,
+	// #37).
+	Capacity *StatusCapacity `json:"capacity,omitempty"`
 }
 
 // StatusBitrot is the bit-rot sampler's sweep of the store and the
@@ -887,6 +892,9 @@ friend, or with no room in the pool), which status shows.`,
 			if st.Places, err = places(cmd.Context(), db, a.now()); err != nil {
 				return err
 			}
+			if st.Capacity, err = a.capacityStatus(cmd.Context(), db, cfg.Replication.Copies.Int(), a.now()); err != nil {
+				return err
+			}
 			as, err := db.ActiveAlerts(cmd.Context())
 			if err != nil {
 				return err
@@ -1021,6 +1029,9 @@ friend, or with no room in the pool), which status shows.`,
 			if st.Lending != nil {
 				fmt.Fprintf(a.out, "Lending: at most %s (%s); numbers and open invites take %s\n",
 					humanSize(st.Lending.MaxTotal), st.Lending.From, humanSize(st.Lending.Numbers))
+			}
+			for _, l := range capacityLines(st.Capacity, st.Node.Role) {
+				fmt.Fprintln(a.out, l)
 			}
 			if len(st.Places) > 0 {
 				fmt.Fprintf(a.out, "Places:  %d\n", len(st.Places))

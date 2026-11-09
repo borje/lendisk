@@ -7,11 +7,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/capacity"
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
@@ -24,6 +26,7 @@ const (
 
 func (a *app) initCmd() *cobra.Command {
 	var restore bool
+	var plan initPlan
 	cmd := &cobra.Command{
 		Use:   "init",
 		Short: "Create this node's identity and recovery phrase",
@@ -33,17 +36,94 @@ have written it down. The phrase is never stored; it is the only way to
 recover the node after losing this machine.
 
 With --restore, init reads an existing phrase from standard input
-instead and recreates the same identity on this machine.`,
+instead and recreates the same identity on this machine.
+
+Then init asks how large the repository you back up will be and at how
+many copies, and says how much to lend your friends in total, written
+as lending.max_total into the config it creates (LEND-7).
+--repository-size and --copies answer without asking; with nothing more
+on standard input, init asks nothing.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return a.runInit(cmd.Context(), restore)
+			if err := plan.parse(); err != nil {
+				return usageError{err}
+			}
+			return a.runInit(cmd.Context(), restore, plan)
 		},
 	}
 	cmd.Flags().BoolVar(&restore, "restore", false, "recreate the identity from an existing recovery phrase read from stdin")
+	cmd.Flags().StringVar(&plan.sizeFlag, "repository-size", "", "the expected size of the repository you back up, such as 100G (LEND-7); asked if not given")
+	cmd.Flags().IntVar(&plan.copies, "copies", 0, "how many friends hold each object (EP-6); asked if not given")
 	return cmd
 }
 
-func (a *app) runInit(ctx context.Context, restore bool) error {
+// initPlan is what init learns for capacity planning (LEND-7): the
+// expected repository size and copies, from flags or asked.
+type initPlan struct {
+	sizeFlag string
+	size     int64
+	copies   int
+}
+
+func (p *initPlan) parse() error {
+	if p.sizeFlag != "" {
+		n, err := parseNumber(p.sizeFlag)
+		if err != nil {
+			return fmt.Errorf("--repository-size: %w", err)
+		}
+		p.size = n
+	}
+	if p.copies < 0 || p.copies > maxCopies {
+		return fmt.Errorf("--copies %d: want 1 to %d", p.copies, maxCopies)
+	}
+	return nil
+}
+
+// maxCopies bounds the copies init accepts.
+const maxCopies = 20
+
+// askPlan asks for what the flags left out. An empty answer to the size,
+// or the end of input, skips capacity planning: a script that pipes a
+// phrase is asked nothing more. An empty answer to copies takes
+// defaultCopies (replication.copies).
+func (a *app) askPlan(p *initPlan, defaultCopies int) error {
+	if p.size == 0 {
+		for try := 0; ; try++ {
+			fmt.Fprint(a.out, "\nExpected repository size, such as 100G (Enter to skip): ")
+			line, err := a.readLine()
+			if err != nil || line == "" {
+				fmt.Fprintln(a.out)
+				return nil
+			}
+			if p.size, err = parseNumber(line); err == nil {
+				break
+			}
+			if try == confirmAttempts-1 {
+				return fmt.Errorf("repository size: %w", err)
+			}
+			fmt.Fprintf(a.out, "%v\n", err)
+		}
+	}
+	for try := 0; p.copies == 0; try++ {
+		fmt.Fprintf(a.out, "Copies of each object at friends [%d]: ", defaultCopies)
+		line, err := a.readLine()
+		if err != nil || line == "" {
+			p.copies = defaultCopies
+			break
+		}
+		if c, err := strconv.Atoi(line); err == nil && c >= 1 && c <= maxCopies {
+			p.copies = c
+			break
+		}
+		if try == confirmAttempts-1 {
+			return fmt.Errorf("copies %q: want a whole number from 1 to %d", line, maxCopies)
+		}
+		fmt.Fprintf(a.out, "Want a whole number from 1 to %d.\n", maxCopies)
+	}
+	return nil
+}
+
+func (a *app) runInit(ctx context.Context, restore bool, plan initPlan) error {
 	cfg, log, err := a.load(a.errOut)
 	if err != nil {
 		return err
@@ -82,6 +162,20 @@ func (a *app) runInit(ctx context.Context, restore bool) error {
 	if err != nil {
 		return err
 	}
+	// LEND-7; a lender-only node backs up nothing (PEER-9).
+	defaultCopies := cfg.Replication.Copies.Int()
+	if cfg.Role == "full" {
+		if plan.size > 0 && plan.copies == 0 {
+			plan.copies = defaultCopies
+		}
+		if err := a.askPlan(&plan, defaultCopies); err != nil {
+			return err
+		}
+	}
+	var lend int64
+	if plan.size > 0 {
+		lend = capacity.SuggestMaxTotal(plan.size, plan.copies)
+	}
 	nodeID := id.NodeID().String()
 
 	// Check the database before writing the key: a database that belongs to
@@ -108,7 +202,7 @@ func (a *app) runInit(ctx context.Context, restore bool) error {
 	}
 	a.chooseRegion(ctx, cfg, db, log)
 	if !cfg.FileExists {
-		if err := writeInitialConfig(cfg); err != nil {
+		if err := writeInitialConfig(cfg, lend, plan.copies); err != nil {
 			return err
 		}
 	}
@@ -116,7 +210,41 @@ func (a *app) runInit(ctx context.Context, restore bool) error {
 
 	fmt.Fprintf(a.out, "\nNode ID: %s\n", nodeID)
 	fmt.Fprintf(a.out, "Config:  %s\nData:    %s\n", cfg.Path, cfg.DataDir)
+	if lend > 0 {
+		a.planLines(cfg, plan, lend)
+	}
 	return nil
+}
+
+// planLines say what to lend and how much disk the node needs (LEND-7,
+// DESIGN §4): c × S plus the tombstone margin, and S more for the local
+// copy.
+func (a *app) planLines(cfg *config.Loaded, plan initPlan, lend int64) {
+	size := capacity.RoundUp(plan.size)
+	disk := capacity.RoundUp(plan.size + lend)
+	fmt.Fprintf(a.out, "\nFor a repository of %s at %d copies, lend about %s in total: %d × %s, plus %d%% for what friends keep for the retention window.\n",
+		formatSize(size), plan.copies, formatSize(lend), plan.copies, formatSize(size), capacity.TombstoneMargin)
+	if cfg.FileExists {
+		fmt.Fprintf(a.out, "Set it as lending.max_total = %q in %s.\n", formatSize(lend), cfg.Path)
+	} else {
+		fmt.Fprintf(a.out, "It is lending.max_total in %s.\n", cfg.Path)
+	}
+	fmt.Fprintf(a.out, "This disk then holds about %s: the local copy and what you lend.\n", formatSize(disk))
+	fmt.Fprintf(a.out, "You are fully protected while your repository is at most your friends' repositories combined divided by %d;\n", plan.copies)
+	fmt.Fprintln(a.out, "`lendisk status` shows the protectable size once you have friends.")
+	if sp, err := a.storeSpace(cfg); err == nil && sp < uint64(disk) {
+		fmt.Fprintf(a.out, "! The store's filesystem holds %s, less than that.\n", humanSize(int64(min(sp, uint64(1<<62)))))
+	}
+}
+
+// storeSpace is the size of the store's filesystem.
+func (a *app) storeSpace(cfg *config.Loaded) (uint64, error) {
+	statfs := a.lendStatfs
+	if statfs == nil {
+		statfs = a.checker().Statfs
+	}
+	sp, err := statfs(cfg.StorePath())
+	return sp.Total, err
 }
 
 // newPhraseConfirmed shows a fresh phrase and asks for some of its words
@@ -183,7 +311,7 @@ func (a *app) readLine() (string, error) {
 
 // writeInitialConfig writes a minimal config file when none exists. It is
 // the user's file from then on; the daemon never writes it (OPS-6).
-func writeInitialConfig(cfg *config.Loaded) error {
+func writeInitialConfig(cfg *config.Loaded, maxTotal int64, copies int) error {
 	body := fmt.Sprintf(`# lendisk configuration. Written once by `+"`lendisk init`"+`; edit freely.
 # Every setting also has a flag and a LENDISK_* environment variable.
 # Friendships, buckets and overflow targets are not here: they live in
@@ -196,6 +324,13 @@ data_dir = %q
 level = %q
 format = %q
 `, filepath.Join(cfg.DataDir, state.FileName), cfg.Role, cfg.DataDir, cfg.Log.Level, cfg.Log.Format)
+	if maxTotal > 0 {
+		// LEND-7: what init suggested from the expected repository size.
+		body += fmt.Sprintf("\n[lending]\n# c × S plus 20%% for what friends keep for the retention window (LEND-7).\nmax_total = %q\n", formatSize(maxTotal))
+	}
+	if copies > 0 && copies != cfg.Replication.Copies.Int() {
+		body += fmt.Sprintf("\n[replication]\ncopies = %d\n", copies)
+	}
 	f, err := os.OpenFile(cfg.Path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("writing initial config: %w", err)

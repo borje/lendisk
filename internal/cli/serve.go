@@ -142,6 +142,7 @@ func (a *app) serveCmd() *cobra.Command {
 			// gateway, whose captures may hold back a changed key (EP-11).
 			alerts := &alert.Service{DB: db, Log: log, Node: nodeID, Command: cfg.Alerts.Command, Webhook: cfg.Alerts.Webhook,
 				UnreachableAfter: cfg.UnreachableAfter(), BelowAfter: cfg.ReplaceAfter(), Now: a.clock,
+				Copies: cfg.Replication.Copies.Int(),
 				// The printed recovery sheet against the node's state (ID-7).
 				Sheet: func(ctx context.Context) (time.Time, []string, error) { return sheet.Stale(ctx, db, id) }}
 			if a.tuneAlerts != nil {
