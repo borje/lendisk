@@ -217,16 +217,26 @@ func TestSampleCoversTheStoreInTurnAtTheConfiguredRate(t *testing.T) {
 		t.Fatalf("sweep %+v %v %v", sw, ok, err)
 	}
 
-	// A restarted sampler goes on from where the sweep was, and owes at
-	// its first step what passed since the last one (#31 review): a
-	// daemon restarted more often than it steps still samples.
+	// A restarted sampler goes on from where the sweep was, carries what
+	// it owed (here 1500 bytes paid ahead) and owes at its first step what
+	// passed since the last one (#31 review): a daemon restarted more
+	// often than it steps still samples, and pays only what it owes.
 	last := checked[len(checked)-1]
+	sw.Owed = -1500
+	if err := h.db.SaveSweep(t.Context(), sw); err != nil {
+		t.Fatal(err)
+	}
 	checked = nil
 	clock.add(week)
 	s = h.sampler(SampleSettings{Percent: 1}, clock, &checked)
 	h.step(s)
-	if next := fmt.Sprintf("%s/data/%02d", lent, first); len(checked) == 0 || checked[0] != next {
-		t.Fatalf("after %s a restarted sampler checked %v; want %s first", last, checked, next)
+	owed := float64(stored)/100 - 1500
+	want, forgotten := int(math.Ceil(owed/1000)), int(math.Ceil(float64(stored)/100/1000))
+	if want == forgotten || want < 1 {
+		t.Fatalf("the test's numbers do not tell carried from forgotten debt: %d, %d", want, forgotten)
+	}
+	if next := fmt.Sprintf("%s/data/%02d", lent, first); len(checked) != want || checked[0] != next {
+		t.Fatalf("after %s a restarted sampler checked %v; want %d objects from %s", last, checked, want, next)
 	}
 }
 

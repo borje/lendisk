@@ -4725,7 +4725,8 @@ the handler's own reads and is never cancelled; nothing below
     sweep, so a restart neither forgives the time it was down nor
     repeats what it paid: a daemon restarted more often than it steps
     still samples, and one down for a week owes that week at its first
-    step (#31 review). A clock set back restarts the count.
+    step (#31 review; the coverage test restarts with 1500 bytes paid
+    ahead and checks exactly what is owed). A clock set back restarts the count.
   - *Paced.* Every read goes through `pace.Pacer.Scrub`, a token bucket
     of its own (`store.bitrot_read_limit`, default 8M a second, at least
     16K, empty for none; reloaded without a restart like the other
@@ -4768,13 +4769,32 @@ the handler's own reads and is never cancelled; nothing below
     until its capture records it; a key marked held from a listing
     (`MarkLocalSeqs`), a recovered or undeleted row and a row of an
     earlier release have none: *unverified*. Then:
-    - *the same identity, other bytes:* rot (writing a file moves its
-      modification time, replacing it changes its inode, rot changes
-      neither);
-    - *another size, modification time or inode:* an edit outside the
+    - *the same inode and modification time, other bytes:* rot (writing
+      a file moves its modification time, replacing it changes its
+      inode, rot changes neither), also when the size differs: a file
+      that lost its tail without a write (fsck) is damage, not an edit
+      (`sameFile`; `TestATruncatedFileIsRotNotAnEdit`: a truncated
+      rewritable restic `config` is repaired, not enqueued, and the
+      reconciler leaves it to the sampler);
+    - *another modification time or inode:* an edit outside the
       endpoint, the user's write (#88);
-    - *no identity recorded:* other bytes are taken for the user's
-      write, never for rot; the right bytes record the identity;
+    - *no identity recorded (unverified):* the right bytes record the
+      identity; other bytes are taken for the user's write, never for
+      rot, with one exception. *Decision (#31 second review):* an
+      unverified file of a key its profile names rewritable (restic's
+      `config`, Kopia's `kopia.repository`, `kopia.blobcfg` and
+      `kopia.maintenance`) whose bytes differ from the version a friend
+      holds is not captured, since EP-11 does not hold a rewritable
+      key's change back and the bytes would replicate over the friend's
+      copy; it is recorded and alerted as rot ("an unverified file
+      differed from the version a friend holds") and replaced by the
+      friend's verified copy. The realistic case is a damaged store
+      copied back onto a recovered node; a user who meant the bytes
+      writes them again through the endpoint
+      (`TestAnUnverifiedRewritableKeyIsRepairedNotCaptured`). Any other
+      key's unverified bytes are captured: EP-11 holds the change back,
+      with `key_changed`, wherever a friend still holds another version,
+      so nothing replicates over it;
     - *a change of mode, owner or xattrs alone* (a chmod, a tagging or
       retention call) moves the ctime only and is no edit: rot under it
       is still rot (`TestRotUnderAMetadataChangeIsStillRot`; for a
@@ -4790,11 +4810,16 @@ the handler's own reads and is never cancelled; nothing below
     edit look like rot, and its object is replaced by the version the
     index holds; so does an edit of the same size within the
     filesystem's timestamp granularity of the capture (a few
-    milliseconds on ext4). Bytes never verified are never judged rot,
-    so on an upgraded node (and after recovery) rot found before a first
-    verifying read is taken for an edit, which EP-11 holds back for any
-    key a friend acknowledged other bytes of
-    (`TestBytesNeverVerifiedAreNeverRot`).
+    milliseconds on ext4). Any inode change counts as an edit: a store
+    moved with `cp -a`, rsync, `btrfs send`, or served by a FUSE
+    filesystem without stable inodes re-stamps nothing and costs a paced
+    re-hash of every object at the next reconcile pass (the same bytes
+    record the new identity). Bytes never verified are not judged rot
+    (but for the rewritable exception above), so on an upgraded node, or
+    after recovery, rot found before a first verifying read is taken for
+    an edit, which EP-11 holds back for a key a friend acknowledged
+    other bytes of; a key no friend holds other bytes of has nothing to
+    protect (`TestBytesNeverVerifiedAreNeverRot`).
   - *An own object* is checked if its key's latest done write is a put
     held locally (`state.OwnVersion`) with no write in flight and not
     held back by EP-11 (its bytes are the user's, replicated nowhere),
@@ -4805,7 +4830,10 @@ the handler's own reads and is never cancelled; nothing below
     file (a misread, or a file being written, decides nothing); then,
     holding the key's lock, the row and the file's identity must still
     be the ones read (`TestTheSampleHoldsNoLockWhileItHashes`: a write of
-    the key goes through during the second read):
+    the key goes through during the second read;
+    `TestAWriteBeforeTheSamplersLockWins` and
+    `TestAWriteBeforeTheReconcilersLockWins`: a write landing between
+    the read and the lock is neither rot nor captured as what was read):
     - *An edit* (or bytes never verified) is enqueued as a put
       (`reconciled` = 1, `Decorator.captureChanged`), which EP-11 judges
       as any write (`TestAnObjectChangedInPlaceIsAWriteNotRot`).

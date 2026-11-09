@@ -116,6 +116,9 @@ type reconciler struct {
 	// listed, if set, is called with each listing's page size. Tests
 	// only.
 	listed func(n int32)
+	// beforeLock, if set, runs when a re-hash has read an object and has
+	// not yet taken its key's lock. Tests only.
+	beforeLock func()
 }
 
 func (r *reconciler) page() int {
@@ -404,7 +407,9 @@ func (r *reconciler) bucket(ctx context.Context, bucket string) error {
 			}
 			// A verified key whose file is another one now was edited
 			// (#88); an unverified one is the sampler's to verify.
-			if k.Stamp != "" && r.d.stampOf(bucket, k.Key) != k.Stamp {
+			// A file of the same inode and modification time but another
+			// size lost bytes without a write: rot, the sampler's.
+			if cur := r.d.stampOf(bucket, k.Key); k.Stamp != "" && cur != k.Stamp && !sameFile(cur, k.Stamp) {
 				ok, err := r.rehash(ctx, bucket, k)
 				if ok {
 					writes++
@@ -585,6 +590,9 @@ func (r *reconciler) rehash(ctx context.Context, bucket string, k state.IndexedK
 	}
 	if err != nil {
 		return false, err
+	}
+	if r.beforeLock != nil {
+		r.beforeLock()
 	}
 	unlock, err := r.d.keys.lock(ctx, bucket, k.Key)
 	if err != nil {

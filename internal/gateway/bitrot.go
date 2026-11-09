@@ -39,9 +39,12 @@ import (
 // Rot is told from an edit by the file's identity, never by a clock:
 // queue.stamp is the inode, size and modification time of the file whose
 // bytes this node wrote or hashed to the row's hash. Other bytes in the
-// file of that identity are rot; in another file (an edit, or bytes
-// never verified, stamp empty) they are the user's write, enqueued as
-// one (#88). A mismatch is read twice, holding no lock; the row and the
+// file of that inode and modification time are rot, whatever its size
+// (a lost tail is damage); in another file (an edit, or bytes never
+// verified, stamp empty) they are the user's write, enqueued as one
+// (#88), except an unverified file of a rewritable key whose version a
+// friend holds, which EP-11 would not hold back: that is repaired as
+// rot. A mismatch is read twice, holding no lock; the row and the
 // file are checked again under the key's lock before anything is done.
 // Rot is recorded and alerted (state.Rot, Alerted) and, when a friend
 // holds the captured version, replaced in place by a verified copy
@@ -51,6 +54,22 @@ import (
 // A friend's rotten object is alerted and left alone: the lender cannot
 // repair it, and the friend's challenges (VER-1) and the read-through's
 // verification judge it there.
+
+// unverifiedDetail begins the record of a rewritable key's unverified
+// file found differing from the version a friend holds.
+const unverifiedDetail = "an unverified file differed from the version a friend holds"
+
+// sameFile reports whether two file identities (fileStamp) are of one
+// file not written since: the same inode and modification time. Their
+// sizes may differ: a file that lost its tail (fsck) without a write
+// moving its modification time is rot, not an edit (#31 review).
+func sameFile(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	pa, pb := strings.Split(a, ":"), strings.Split(b, ":")
+	return len(pa) == 3 && len(pb) == 3 && pa[0] == pb[0] && pa[2] == pb[2]
+}
 
 // DefaultSamplePercent is SampleSettings.Percent when zero: VER-5's
 // least, 0.1% of the stored bytes a week.
@@ -91,6 +110,9 @@ type sampler struct {
 	// checked, if set, is called with each object the sweep visits.
 	// Tests only.
 	checked func(bucket, key string)
+	// beforeLock, if set, runs when a mismatch has been read twice and
+	// its key's lock is not yet taken. Tests only.
+	beforeLock func()
 }
 
 // storeBucket is a bucket in the store: an own one, or a friend's
@@ -397,6 +419,9 @@ func (s *sampler) checkOwn(ctx context.Context, o sampled) error {
 	if !ok || stamp2 != stamp || n2 != n || sum2 != sum {
 		return ctx.Err()
 	}
+	if s.beforeLock != nil {
+		s.beforeLock()
+	}
 	return s.mismatchOwn(ctx, bucket, key, v, n, sum, stamp)
 }
 
@@ -435,21 +460,45 @@ func (s *sampler) mismatchOwn(ctx context.Context, bucket, key string, seen stat
 	if v.Seq != seen.Seq || v.Stamp != seen.Stamp || !v.Held() || v.Pending || v.Changed || s.d.stampOf(bucket, key) != stamp {
 		return nil // written, deleted, held back or changed since it was read
 	}
-	if v.Stamp != stamp {
-		how := "an object was changed in place outside the endpoint"
-		if v.Stamp == "" {
-			how = "an object this node never verified holds other bytes than its version"
-		}
-		s.log.Info("bit-rot: "+how+"; enqueued as a write, not taken for rot", "bucket", bucket, "key", key, "sha256", sum)
-		return s.d.captureChanged(ctx, bucket, key, n, sum, stamp)
-	}
-	r := state.Rot{Bucket: bucket, Key: key, Seq: v.Seq, Stamp: v.Stamp, SHA256: v.SHA256, Found: sum, Size: v.Size,
-		FoundAt: s.now()}
 	src, ok, err := s.d.DB.Source(ctx, bucket, key)
 	if err != nil {
 		return err
 	}
-	if !ok || src.SHA256 != v.SHA256 || len(src.Places) == 0 || s.d.Fetch == nil {
+	held := ok && src.SHA256 == v.SHA256 && len(src.Places) > 0 && s.d.Fetch != nil
+	unverified := false
+	if !sameFile(v.Stamp, stamp) {
+		k, err := s.d.kind(&bucket, &key)
+		if err != nil {
+			return err
+		}
+		// An unverified file of a rewritable key whose version a friend
+		// holds is not the user's write: EP-11 would not hold it back, and
+		// it would replicate over the friend's copy (a damaged store
+		// copied back onto a recovered node). It is repaired as rot.
+		if v.Stamp != "" || !k.rewritable || !held {
+			how := "an object was changed in place outside the endpoint"
+			if v.Stamp == "" {
+				how = "an object this node never verified holds other bytes than its version"
+			}
+			s.log.Info("bit-rot: "+how+"; enqueued as a write, not taken for rot", "bucket", bucket, "key", key, "sha256", sum)
+			return s.d.captureChanged(ctx, bucket, key, n, sum, stamp)
+		}
+		unverified = true
+	}
+	r := state.Rot{Bucket: bucket, Key: key, Seq: v.Seq, Stamp: stamp, SHA256: v.SHA256, Found: sum, Size: v.Size,
+		FoundAt: s.now()}
+	if unverified {
+		r.Detail = unverifiedDetail
+		s.log.Error("bit-rot: a rewritable key's file this node never verified differs from the version a friend holds; it is not replicated, and the friend's verified copy replaces it. If you wrote it on purpose, write it again through the endpoint",
+			"alert", true, "bucket", bucket, "key", key, "sha256", v.SHA256, "found", sum, "friends", len(src.Places))
+		r.Refetch = true
+		if err := s.d.DB.RecordRot(ctx, r); err != nil {
+			return err
+		}
+		s.alerted()
+		return s.replace(ctx, r, src)
+	}
+	if !held {
 		r.Detail = "no friend holds the version captured, so the rotten object is kept: it is all there is"
 		s.log.Error("bit-rot: an object in the store no longer matches the hash it was captured with, and no friend holds that version; it is kept as it is. Check the disk",
 			"alert", true, "bucket", bucket, "key", key, "sha256", v.SHA256, "found", sum)
@@ -480,6 +529,9 @@ func (s *sampler) replace(ctx context.Context, r state.Rot, src state.Source) er
 			return ctx.Err()
 		}
 		detail := "no friend holding its version could serve it yet; the rotten copy stays until one does, and the sampler tries again"
+		if strings.HasPrefix(r.Detail, unverifiedDetail) {
+			detail = unverifiedDetail + "; " + detail
+		}
 		if r.Detail != detail {
 			r.Detail = detail
 			s.log.Warn("bit-rot: fetching a rotten object's version failed; trying again at the next step", "bucket", r.Bucket,
@@ -488,7 +540,11 @@ func (s *sampler) replace(ctx context.Context, r state.Rot, src state.Source) er
 		}
 		return nil
 	}
-	r.Refetch, r.RepairedAt, r.Detail = false, s.now(), "replaced by a verified copy from a friend"
+	how := "replaced by a verified copy from a friend"
+	if strings.HasPrefix(r.Detail, unverifiedDetail) {
+		how = unverifiedDetail + "; " + how
+	}
+	r.Refetch, r.RepairedAt, r.Detail = false, s.now(), how
 	s.log.Info("bit-rot: a rotten object is whole again", "bucket", r.Bucket, "key", r.Key)
 	if err := s.d.DB.RecordRot(ctx, r); err != nil {
 		return err
@@ -507,7 +563,7 @@ func (s *sampler) repair(ctx context.Context, r state.Rot) error {
 	}
 	defer unlock()
 	v, err := s.d.DB.OwnVersion(ctx, r.Bucket, r.Key)
-	if err != nil || v.Seq != r.Seq || v.Stamp != r.Stamp || v.Pending || s.d.stampOf(r.Bucket, r.Key) != r.Stamp {
+	if err != nil || v.Seq != r.Seq || v.Pending || !sameFile(s.d.stampOf(r.Bucket, r.Key), r.Stamp) {
 		return err // followUp's next step sees what changed
 	}
 	src, ok, err := s.d.DB.Source(ctx, r.Bucket, r.Key)
@@ -556,7 +612,7 @@ func (s *sampler) followUp(ctx context.Context, now time.Time) error {
 		if v.Pending {
 			continue
 		}
-		if v.Seq != r.Seq || v.Stamp != r.Stamp || s.d.stampOf(r.Bucket, r.Key) != r.Stamp {
+		if v.Seq != r.Seq || !sameFile(s.d.stampOf(r.Bucket, r.Key), r.Stamp) {
 			// The key was written or deleted, or its file replaced: the
 			// sweep judges what is there now.
 			r.Refetch, r.RepairedAt, r.Detail = false, now, "written, deleted or stored again since"
