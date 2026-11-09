@@ -228,10 +228,12 @@ type Service struct {
 	// it is alerted (default 24h).
 	UnreachableAfter time.Duration
 	// MinRetrying is how long a place must have been retrying before it
-	// counts as unreachable (default 1 hour): reachability is learned
-	// only from replication, so without it a nightly backup meeting a
-	// one-minute blip 24h after the last answer would alert at once.
-	// The reachability probe (#65) may let this be revisited.
+	// counts as unreachable (default 1 hour). The reachability probe
+	// (#65) keeps a running node's last answer from a friend within
+	// replica.DefaultProbeEvery, but not across this node's own downtime:
+	// a node off for longer than UnreachableAfter, meeting a one-minute
+	// blip as it starts, would otherwise alert at its first pass. Kept
+	// (#65 decision): an hour is four failed probes in a row.
 	MinRetrying time.Duration
 	// MinRefusing is how long a friend must have kept refusing this
 	// node as no friend, from its first refusal to its last, before

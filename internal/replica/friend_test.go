@@ -333,3 +333,57 @@ type httptestDiscard struct{}
 func (httptestDiscard) Header() http.Header         { return http.Header{} }
 func (httptestDiscard) Write(b []byte) (int, error) { return len(b), nil }
 func (httptestDiscard) WriteHeader(int)             {}
+
+// OPS-2, D6 (#65): the reachability probe is one small authenticated
+// request through the tunnel, the borrower's bucket list (GET /, which
+// a lender answers from its mapping table), signed with the node's ID;
+// a lender refusing this node as no friend is ErrRemoved, any other
+// failure is retried.
+func TestProbeAsksForTheBucketListThroughTheTunnel(t *testing.T) {
+	self := newID(t)
+	var mu sync.Mutex
+	answer := func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/xml")
+		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult><Buckets></Buckets></ListAllMyBucketsResult>`)
+	}
+	var seen []request
+	f, _ := tunnelLender(t, self, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, request{Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone()})
+		a := answer
+		mu.Unlock()
+		a(w)
+	}))
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	if err := f.Probe(ctx); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	n, r := len(seen), request{}
+	if n > 0 {
+		r = seen[0]
+	}
+	mu.Unlock()
+	if n != 1 || r.Method != http.MethodGet || r.Path != "/" ||
+		!strings.Contains(r.Header.Get("Authorization"), "Credential="+self.NodeID().String()+"/") {
+		t.Fatalf("probe sent %d requests, the first %s %s %v", n, r.Method, r.Path, r.Header)
+	}
+	for _, c := range []struct {
+		status    int
+		code, msg string
+		removed   bool
+	}{
+		{403, "AccessDenied", "lendisk: " + state.NoRelationship, true},
+		{403, "InvalidAccessKeyId", "test", true},
+		{500, "InternalError", "test", false},
+	} {
+		mu.Lock()
+		answer = func(w http.ResponseWriter) { s3ErrorMsg(w, c.status, c.code, c.msg) }
+		mu.Unlock()
+		err := f.Probe(ctx)
+		if err == nil || errors.Is(err, ErrRemoved) != c.removed {
+			t.Errorf("%d %s: %v", c.status, c.code, err)
+		}
+	}
+}

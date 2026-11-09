@@ -36,7 +36,9 @@ import (
 // an object larger than the part size goes in parts, recorded there as
 // they complete, so a restart continues at the next part (REPL-6). Every
 // body sent is paced by Pace (REPL-7), and nothing is sent outside its
-// schedule.
+// schedule. A sender with nothing to send probes its place every
+// ProbeEvery (Prober, OPS-2, D6, #65), so an idle friend's condition
+// and last answer stay current.
 type Worker struct {
 	DB       *state.DB
 	StoreDir string // the posix store: an object is <StoreDir>/<bucket>/<key>
@@ -69,6 +71,12 @@ type Worker struct {
 	// PauseRetry is how long a place paused for quota or removed waits
 	// before trying again (default an hour, LEND-2).
 	PauseRetry time.Duration
+	// ProbeEvery is how long a sender with nothing to send (its FIFO
+	// empty, its head held at the barrier, or the schedule closed) waits
+	// after its last send or probe before it probes its place (Prober,
+	// #65; default DefaultProbeEvery). A sender probes once when it
+	// starts idle.
+	ProbeEvery time.Duration
 	// StoreStall is how long one call into the store (opening and
 	// stating an object, stating its bucket's directory, one read while
 	// it is sent or re-hashed) may take before it fails as the store's
@@ -190,6 +198,12 @@ func (w *Worker) statFile(name string) (fs.FileInfo, error) {
 
 func (w *Worker) storeStall() time.Duration { return orDefault(w.StoreStall, time.Minute) }
 
+// DefaultProbeEvery is how often an idle friend is probed (#65): often
+// enough that its last answer (place.last_ok) is never much older than
+// this while it answers, so OPS-2's alert counts from when it really
+// stopped, and rare enough to cost nothing (one small request).
+const DefaultProbeEvery = 15 * time.Minute
+
 func (w *Worker) now() time.Time {
 	if w.Now != nil {
 		return w.Now()
@@ -244,6 +258,7 @@ func (w *Worker) Run(ctx context.Context) {
 		done   chan struct{}
 	}
 	senders := map[string]*sender{}
+	unbuilt := map[string]bool{} // friends whose client failed to build, recorded as retrying
 	stop := func(s *sender) { s.cancel(); <-s.done }
 	defer func() {
 		for _, s := range senders {
@@ -306,9 +321,23 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			r, err := w.connect(f)
 			if err != nil {
-				w.Log.Error("replication: cannot build the friend's client", "peer", f.Peer, "err", err)
+				// No sender, so nothing else would ever record its
+				// condition: it is retrying, with the reason, and so
+				// unreachable and alerted like a friend that does not
+				// answer (#65). Recorded once per failing run; tried again
+				// at every pass.
+				if !unbuilt[f.Peer] {
+					w.Log.Error("replication: cannot build the friend's client; retrying", "peer", f.Peer, "err", err)
+					if err := w.DB.SetPlaceCondition(context.Background(), f.Peer, state.ConditionRetrying,
+						"cannot build the friend's client: "+err.Error(), w.now()); err != nil {
+						w.Log.Error("replication: recording the place's condition failed", "peer", f.Peer, "err", err)
+					} else {
+						unbuilt[f.Peer] = true
+					}
+				}
 				continue
 			}
+			delete(unbuilt, f.Peer)
 			sctx, cancel := context.WithCancel(ctx)
 			s := &sender{addr: f.Address, cancel: cancel, done: make(chan struct{})}
 			senders[f.Peer] = s
@@ -318,6 +347,11 @@ func (w *Worker) Run(ctx context.Context) {
 			if !seen[p] {
 				stop(s)
 				delete(senders, p)
+			}
+		}
+		for p := range unbuilt {
+			if !seen[p] {
+				delete(unbuilt, p)
 			}
 		}
 		if !sleep(ctx, 5*poll) {
@@ -468,6 +502,58 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	}
 	defer w.done(place)
 	wake := w.wake(place)
+	// The reachability probe (#65): when the sender has nothing to send
+	// and nothing reached the place for ProbeEvery (no send, no probe;
+	// at once when the sender starts idle). It runs on this goroutine,
+	// so never beside one of its sends.
+	every := orDefault(w.ProbeEvery, DefaultProbeEvery)
+	var contacted time.Time // the last send or probe
+	probeFailed := false    // the last probe failed, and was logged
+	probe := func() {
+		pr, ok := r.(Prober)
+		if !ok || !contacted.IsZero() && w.now().Sub(contacted) < every {
+			return
+		}
+		err := pr.Probe(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		contacted = w.now()
+		switch {
+		case err == nil:
+			// A sign of life, not an acknowledgement: last_ok advances,
+			// retrying and removed end, a 507 or a wait on the store
+			// stands (state.ProbeAnswered).
+			if err := w.DB.ProbeAnswered(context.Background(), place, contacted); err != nil {
+				log.Error("replication: recording the probe's answer failed", "err", err)
+			}
+			if probeFailed {
+				log.Info("replication: the friend answers the reachability probe again")
+			}
+			probeFailed = false
+		case errors.Is(err, ErrRemoved):
+			level := slog.LevelDebug
+			if !probeFailed {
+				level = slog.LevelWarn
+			}
+			log.Log(ctx, level, "replication: the friend refuses this node (removed?) at the reachability probe", "err", err)
+			condition(state.ConditionRemoved, err.Error())
+			probeFailed = true
+		case stale && w.waitingOnStore(place):
+			// Waiting on this node's store: that condition, and its
+			// alert, stand until a row goes (#57).
+			log.Debug("replication: the reachability probe failed", "err", err)
+		default:
+			level := slog.LevelDebug
+			if !probeFailed {
+				level = slog.LevelWarn
+			}
+			log.Log(ctx, level, "replication: the friend does not answer the reachability probe; probing again later",
+				"err", err, "retry_in", every)
+			condition(state.ConditionRetrying, err.Error())
+			probeFailed = true
+		}
+	}
 	for ctx.Err() == nil {
 		w.done(place) // the previous row's outcome is recorded
 		p, ok, err := w.next(ctx, place)
@@ -490,6 +576,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				}
 			}
 			failing = ""
+			probe()
 			sleep(ctx, poll)
 			continue
 		}
@@ -501,6 +588,9 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			if err != nil || held {
 				if err != nil && ctx.Err() == nil {
 					log.Error("replication: reading the metadata barrier failed", "err", err)
+				}
+				if held {
+					probe() // nothing goes there while it holds
 				}
 				sleep(ctx, poll)
 				continue
@@ -527,6 +617,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 				log.Info("replication: outside the schedule; waiting for it to open", "schedule", w.Pace.Settings().Schedule.String())
 				closed = true
 			}
+			probe() // carries no object, so not held to the schedule
 			sleep(ctx, poll)
 			continue
 		}
@@ -544,6 +635,10 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		err = w.send(ctx, place, r, p)
 		if ctx.Err() != nil {
 			return // stopping; the row stays queued
+		}
+		contacted = w.now() // its outcome is the place's answer, or its condition
+		if err == nil {
+			probeFailed = false
 		}
 		if err != nil && !errors.Is(err, errSuperseded) && !errors.Is(err, errLocal) &&
 			!errors.Is(err, ErrImmutable) && !errors.Is(err, ErrRejected) {
@@ -665,6 +760,13 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			backoff = min(2*backoff, maxB)
 		}
 	}
+}
+
+// waitingOnStore reports whether place's recorded condition is
+// ConditionStore; false if it cannot be read.
+func (w *Worker) waitingOnStore(place string) bool {
+	cs, err := w.DB.PlaceConditions(context.Background())
+	return err == nil && cs[place].Condition == state.ConditionStore
 }
 
 // refuse takes a row out of the FIFO for good and raises its alert: in

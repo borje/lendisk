@@ -121,25 +121,46 @@ type poolPlace struct {
 	cond   string
 	since  time.Time // when cond began
 	lastOK time.Time // zero if never
+	// failing is when its run of failing answers began (place.
+	// failing_since, or since if unset): the same as since unless it
+	// changed between retrying, quota and removed (#65).
+	failingAt time.Time
 }
 
 func (p poolPlace) failing() bool {
 	return p.cond == ConditionRetrying || p.cond == ConditionRemoved
 }
 
-// unreachable: failing for reroute_after. A friend failing for less is
-// still counted reachable: a blip is not an outage.
+// unreachable: failing now, without an ok answer for reroute_after
+// (#65: a friend alternating between network errors and 507s is away
+// as long as it gives no ok). A friend failing for less is still
+// counted reachable: a blip is not an outage.
 func (p poolPlace) unreachable(db *DB, now time.Time) bool {
-	return p.failing() && now.Sub(p.since) >= db.rerouteAfter()
+	// A probe's answer during a full stretch moves last_ok on while the
+	// run of failures stays: one failed probe after it is a blip, not
+	// reroute_after of silence (#65 review).
+	return p.failing() && now.Sub(p.failingSince()) >= db.rerouteAfter() &&
+		(p.lastOK.IsZero() || now.Sub(p.lastOK) >= db.rerouteAfter())
+}
+
+// failingSince is when its run of failing answers began.
+func (p poolPlace) failingSince() time.Time {
+	if p.failingAt.IsZero() {
+		return p.since
+	}
+	return p.failingAt
 }
 
 // gone: unreachable, and silent for replace_after since its last
 // answer (or its first failure, if it never answered). It is no longer
 // room (REPL-12); re-placement (REPL-13, #26) moves what it held.
 func (p poolPlace) gone(db *DB, now time.Time) bool {
+	// Silence counts from the last answer, a probe's included (#65
+	// review): a friend full for a week that answers probes, then misses
+	// one, is not gone.
 	from := p.lastOK
-	if from.IsZero() || from.After(p.since) {
-		from = p.since
+	if from.IsZero() {
+		from = p.failingSince()
 	}
 	return p.unreachable(db, now) && now.Sub(from) >= db.replaceAfter()
 }
@@ -154,11 +175,12 @@ func (p poolPlace) reroutable(db *DB, now time.Time) bool {
 	return p.unreachable(db, now) || p.full()
 }
 
-// fullForLong: it has answered 507 for reroute_after. A 507 can pass (the
-// lender counts writes in flight and its floor, LEND-2), so only a long
-// one lets Reroute drop copies there.
+// fullForLong: it has answered 507, without an ok answer for
+// reroute_after (a network error between 507s does not restart it,
+// #65). A 507 can pass (the lender counts writes in flight and its
+// floor, LEND-2), so only a long one lets Reroute drop copies there.
 func (p poolPlace) fullForLong(db *DB, now time.Time) bool {
-	return p.full() && now.Sub(p.since) >= db.rerouteAfter()
+	return p.full() && now.Sub(p.failingSince()) >= db.rerouteAfter()
 }
 
 type querier interface {
@@ -169,7 +191,7 @@ type querier interface {
 func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT f.peer_key,
 		min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)), coalesce(u.bytes, 0) + coalesce(fr.bytes, 0),
-		coalesce(c.condition, ''), coalesce(c.since, 0), c.last_ok
+		coalesce(c.condition, ''), coalesce(c.since, 0), c.last_ok, c.failing_since
 		FROM friendship f LEFT JOIN place_use u ON u.place = f.peer_key LEFT JOIN place c ON c.place = f.peer_key
 		LEFT JOIN place_freed fr ON fr.place = f.peer_key
 		WHERE coalesce(f.address, '') != '' ORDER BY f.peer_key`)
@@ -181,13 +203,16 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 	for rows.Next() {
 		var p poolPlace
 		var since int64
-		var lastOK sql.NullInt64
-		if err := rows.Scan(&p.peer, &p.quota, &p.use, &p.cond, &since, &lastOK); err != nil {
+		var lastOK, failing sql.NullInt64
+		if err := rows.Scan(&p.peer, &p.quota, &p.use, &p.cond, &since, &lastOK, &failing); err != nil {
 			return nil, err
 		}
 		p.since = time.Unix(since, 0)
 		if lastOK.Valid {
 			p.lastOK = time.Unix(lastOK.Int64, 0)
+		}
+		if failing.Valid {
+			p.failingAt = time.Unix(failing.Int64, 0)
 		}
 		out = append(out, p)
 	}
