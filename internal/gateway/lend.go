@@ -98,6 +98,7 @@ type Lending struct {
 	afterUndeleteKey    func(key string)
 	afterUndeleteChoose func() // undelete has chosen a key's tomb, holding its locks
 	afterReviveLink     func() error
+	afterPutLooked      func() // a put found its key absent and has not yet read its tombs
 
 	tombDirs sync.Mutex // creating and removing directories for tombs and revivals
 

@@ -4135,7 +4135,10 @@ the handler's own reads and is never cancelled; nothing below
   with `If-None-Match: *`, which posix evaluates under its publish lock
   together with the publication, so of two racing writes of one key
   the second is refused (or accepted unstored if it carries the same
-  bytes). Multipart create and completion and deletes hold a per-key
+  bytes: posix also checks `If-None-Match` before reading the body, so
+  on a `412` the put reads `HEAD`'s hash and, if it is the declared
+  one, hashes and discards the rest of the body as for a stored key;
+  #32). Multipart create and completion and deletes hold a per-key
   lock; none of them waits on a body. A key with no object but a
   tombstone is checked against the tombstones' hashes the same way, at
   `PutObject`, `CreateMultipartUpload` and completion: no tombstone of
@@ -4321,7 +4324,12 @@ the handler's own reads and is never cancelled; nothing below
   `CreateMultipartUpload` and completion, so a tombstoned key takes
   only its own bytes back until it is purged, except a rewrite marked
   with the newest tomb's hash, stored beside the tombs (§3.5
-  *Rewrites*, #74).
+  *Rewrites*, #74). A put that found the key absent before an undelete
+  or a re-put revived it, and its tombstones gone after, publishes
+  under `If-None-Match: *` and is refused by the store; the revived
+  object of its own hash answers it with the stored ETag, so the
+  borrower sees no conflict (EP-11), and other bytes stay `412`
+  (`TestSameBytesPutAfterARevivalFoundTheKeyAbsentSucceeds`, #32).
   *Crash safety:* the row is written, pending, before the rename and
   marked kept after it; a revival marks it pending before the link.
   At every start, before anything is served and before the reconcile,
