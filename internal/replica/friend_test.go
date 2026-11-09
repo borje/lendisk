@@ -1,6 +1,7 @@
 package replica
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -48,6 +49,12 @@ type request struct {
 // tunnel, a lender whose answers the test chooses.
 func tunnelLender(t *testing.T, self *identity.Identity, h http.Handler) (*Friend, identity.NodeID) {
 	t.Helper()
+	return tunnelLenderWith(t, self, h, Options{DialTimeout: 20 * time.Second})
+}
+
+// tunnelLenderWith is tunnelLender with the client's options.
+func tunnelLenderWith(t *testing.T, self *identity.Identity, h http.Handler, o Options) (*Friend, identity.NodeID) {
+	t.Helper()
 	d := transporttest.Start(t)
 	lender := newID(t)
 	srv, err := transport.NewTailcat(lender, d.Region, quiet)
@@ -68,7 +75,7 @@ func tunnelLender(t *testing.T, self *identity.Identity, h http.Handler) (*Frien
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { dl.Close() })
-	f, err := NewFriend(self, lender.NodeID(), srv.Address(), dl.Dial, Options{DialTimeout: 20 * time.Second})
+	f, err := NewFriend(self, lender.NodeID(), srv.Address(), dl.Dial, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,5 +392,121 @@ func TestProbeAsksForTheBucketListThroughTheTunnel(t *testing.T) {
 		if err == nil || errors.Is(err, ErrRemoved) != c.removed {
 			t.Errorf("%d %s: %v", c.status, c.code, err)
 		}
+	}
+}
+
+// #89, LEND-2: a send the client abandons as stalled resets its
+// connection, so the lender's read of the body fails as soon as it has
+// read what had reached it, and it gives back what it reserved for the
+// write, rather than reading on what the tunnel still holds of the
+// abandoned body, at its own pace, until a FIN or its stall bound ends
+// it.
+func TestAnAbandonedSendResetsItsConnection(t *testing.T) {
+	self := newID(t)
+	resume := make(chan struct{})
+	type ended struct {
+		read int64
+		err  error
+	}
+	got := make(chan ended, 1)
+	f, _ := tunnelLenderWith(t, self, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimSuffix(r.URL.Path, "/")
+		if strings.Count(path, "/") == 1 { // bucket create
+			return
+		}
+		// A lender busy elsewhere: it reads the start of the body,
+		// then nothing until the client has given up.
+		if _, err := io.CopyN(io.Discard, r.Body, 64<<10); err != nil {
+			got <- ended{0, err}
+			return
+		}
+		<-resume
+		n, err := io.Copy(io.Discard, r.Body)
+		got <- ended{n, err}
+	}), Options{DialTimeout: 20 * time.Second, StallTimeout: time.Second})
+	body := make([]byte, 64<<20)
+	sum := sha256.Sum256(body)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	err := f.Put(ctx, Object{Bucket: "laptop", Key: "data/big", Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:]),
+		Body: bytes.NewReader(body)})
+	if err == nil || !strings.Contains(err.Error(), "no progress") {
+		t.Fatalf("a send the lender stopped reading: %v", err)
+	}
+	close(resume)
+	select {
+	case e := <-got:
+		// What reached the lender before the reset may still be read;
+		// what the client still held is not, and no FIN follows it
+		// (that read ended in io.ErrUnexpectedEOF only after the rest of
+		// the client's buffer, at the lender's pace).
+		if e.err == nil || !strings.Contains(e.err.Error(), "connection reset") {
+			t.Fatalf("the lender read %d more bytes of the abandoned body, then %v", e.read, e.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the lender still reads the abandoned body 5 s on")
+	}
+}
+
+// #89, LEND-2: a send abandoned mid-body, retried within a few seconds,
+// succeeds. The lender is the gateway's reservation in small: a put
+// holds one while its body is read, and a put arriving meanwhile is
+// asked to retry (503 SlowDown). It is busy when the send stalls, then
+// reads slowly, so the reservation ends only when the reset reaches it,
+// not after the rest of what the client had buffered.
+func TestARetryAfterAnAbandonedSendSucceeds(t *testing.T) {
+	self := newID(t)
+	resume := make(chan struct{})
+	var reserved sync.Mutex
+	f, _ := tunnelLenderWith(t, self, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := strings.TrimSuffix(r.URL.Path, "/")
+		if strings.Count(path, "/") == 1 { // bucket create
+			return
+		}
+		if !reserved.TryLock() {
+			io.Copy(io.Discard, r.Body)
+			s3Error(w, http.StatusServiceUnavailable, "SlowDown")
+			return
+		}
+		defer reserved.Unlock()
+		first := strings.HasSuffix(path, "/data/big")
+		for read := int64(0); ; read += 16 << 10 {
+			if first && read == 64<<10 {
+				<-resume
+			}
+			if first && read >= 64<<10 {
+				time.Sleep(100 * time.Millisecond)
+			}
+			if _, err := io.CopyN(io.Discard, r.Body, 16<<10); err == io.EOF {
+				break
+			} else if err != nil {
+				return
+			}
+		}
+		w.Header().Set("ETag", `"0123"`)
+	}), Options{DialTimeout: 20 * time.Second, StallTimeout: time.Second})
+	body := make([]byte, 64<<20)
+	sum := sha256.Sum256(body)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	err := f.Put(ctx, Object{Bucket: "laptop", Key: "data/big", Size: int64(len(body)), SHA256: hex.EncodeToString(sum[:]),
+		Body: bytes.NewReader(body)})
+	if err == nil || !strings.Contains(err.Error(), "no progress") {
+		t.Fatalf("a send the lender stopped reading: %v", err)
+	}
+	close(resume)
+	abandoned := time.Now()
+	for {
+		err := put(t, f, "laptop", "data/retry", []byte("retried"))
+		if err == nil {
+			break
+		}
+		if errors.Is(err, ErrQuota) {
+			t.Fatalf("the retry was refused for quota: %v", err)
+		}
+		if time.Since(abandoned) > 6*time.Second {
+			t.Fatalf("the retry still fails 6 s after the send was abandoned: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 }

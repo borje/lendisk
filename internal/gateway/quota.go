@@ -98,6 +98,13 @@ var (
 	// a 403, which a borrower could not tell from other refusals.
 	errQuotaExceeded = s3err.APIError{Code: "QuotaExceeded", HTTPStatusCode: 507,
 		Description: "lendisk: this friendship's quota is used up, or the lender's disk is below its free-space floor; nothing was stored"}
+	// errInFlight: the write fits the quota and the floor, but not
+	// beside the writes still in flight, which may yet fail (a send the
+	// borrower abandoned holds its reservation until its body ends). A
+	// 503 SlowDown, which the borrower retries with backoff, not a 507,
+	// which pauses it for quota (#89).
+	errInFlight = s3err.APIError{Code: "SlowDown", HTTPStatusCode: 503,
+		Description: "lendisk: this write fits, but not beside the writes still in flight; send it again shortly"}
 	errNoHash = s3err.APIError{Code: "InvalidRequest", HTTPStatusCode: 400,
 		Description: "lendisk: an object sent to a friend must carry its SHA-256, in hex, as x-amz-meta-lendisk-sha256"}
 	errBadDigest = s3err.APIError{Code: "BadDigest", HTTPStatusCode: 400,
@@ -261,11 +268,14 @@ func (l *Lending) abandonAfter() time.Duration {
 
 // reserve admits n more bytes from peer (LEND-1, LEND-2), checked
 // against its current count under Lending.mu: refused with
-// errQuotaExceeded when the count, plus what its writes in flight may
-// add, plus n would exceed the friendship's quota, or when the store's
-// free space less what every write in flight may add, less n, would be
-// below the floor. The returned function gives back the reservation;
-// the write counts what it stored itself.
+// errQuotaExceeded when the count plus n would exceed the friendship's
+// quota, or the store's free space less n would be below the floor;
+// refused with errInFlight when it fits alone but not beside what the
+// writes in flight may add (the borrower's, for the quota; every one,
+// for the floor): those may yet fail, an abandoned send among them, so
+// the borrower retries rather than pausing for quota (#89). The
+// returned function gives back the reservation; the write counts what
+// it stored itself.
 func (l *Lending) reserve(ctx context.Context, peer string, n int64) (release func(), err error) {
 	f, err := l.DB.GetFriendship(ctx, peer)
 	if errors.Is(err, state.ErrNotFound) {
@@ -288,15 +298,21 @@ func (l *Lending) reserve(ctx context.Context, peer string, n int64) (release fu
 		l.log().Error("lending: reading the borrower's usage failed; refusing the write", "peer", peer, "err", err)
 		return nil, errInternal
 	}
-	if u.used+u.reserved+n > f.Quota() {
+	if u.used+n > f.Quota() {
 		l.log().Info("lending: refused a write over the friendship's quota", "peer", peer,
 			"used", u.used, "in_flight", u.reserved, "size", n, "quota", f.Quota())
 		return nil, errQuotaExceeded
 	}
-	if sp.Free < floor+uint64(l.reserved)+uint64(n) {
+	if sp.Free < floor+uint64(n) {
 		l.log().Warn("lending: refused a write below the store's free-space floor", "peer", peer,
 			"free", sp.Free, "in_flight", l.reserved, "size", n, "floor", floor)
 		return nil, errQuotaExceeded
+	}
+	if u.used+u.reserved+n > f.Quota() || sp.Free < floor+uint64(l.reserved)+uint64(n) {
+		l.log().Info("lending: asked a write to wait: it fits, but not beside the writes in flight", "peer", peer,
+			"used", u.used, "in_flight", u.reserved, "size", n, "quota", f.Quota(),
+			"free", sp.Free, "in_flight_all", l.reserved, "floor", floor)
+		return nil, errInFlight
 	}
 	u.reserved += n
 	l.reserved += n
