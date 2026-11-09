@@ -215,14 +215,53 @@ func (fx *fixture) run() {
 // drained waits until place's FIFO is empty.
 func (fx *fixture) drained(place string) {
 	fx.t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, ok, err := fx.db.NextPlacement(fx.t.Context(), place); err == nil && !ok {
-			return
+	fx.settle(place+" not drained", func() bool {
+		_, ok, err := fx.db.NextPlacement(fx.t.Context(), place)
+		return err == nil && !ok
+	})
+}
+
+// settle waits until ok. It fails with what when the placement rows
+// stop moving (no row at any place changes for 10 s: a stalled FIFO,
+// such as one waiting on an hourly pass) or after 2 minutes (rows that
+// move but never settle). It has no fixed deadline from the call: the
+// senders' work is CPU-bound under -race (SQLite is pure Go), and a
+// loaded CI runner takes a second or more per row, so such a deadline
+// fails FIFOs that are draining (TestNoTwoFriendsEverHoldASnapshotWithoutItsPacks
+// on a runner 7 to 14 times slower than a laptop).
+func (fx *fixture) settle(what string, ok func() bool) {
+	fx.t.Helper()
+	const stall, limit = 10 * time.Second, 2 * time.Minute
+	start := time.Now()
+	last, moved, looked := fx.progress(), start, start
+	for !ok() {
+		now := time.Now()
+		if now.Sub(looked) >= 100*time.Millisecond {
+			if p := fx.progress(); p != last {
+				last, moved = p, now
+			}
+			looked = now
+		}
+		switch {
+		case now.Sub(moved) > stall:
+			fx.t.Fatalf("%s: no placement row changed for %v", what, stall)
+		case now.Sub(start) > limit:
+			fx.t.Fatalf("%s after %v", what, limit)
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	fx.t.Fatalf("%s not drained", place)
+}
+
+// progress describes every placement row's state. It changes whenever
+// a row is placed, taken, acknowledged, refused, moved or cancelled.
+func (fx *fixture) progress() string {
+	var s string
+	if err := fx.db.QueryRow(`SELECT coalesce(group_concat(r, ','), '') FROM (
+		SELECT place || ' ' || seq || ' ' || state || ' ' || coalesce(started_at, '') AS r
+		FROM placement ORDER BY place, seq)`).Scan(&s); err != nil {
+		return "error: " + err.Error()
+	}
+	return s
 }
 
 func (fx *fixture) condition(place string) state.PlaceCondition {
