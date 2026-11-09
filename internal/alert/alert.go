@@ -11,8 +11,9 @@
 // objects below copies past replication.replace_after (REPL-13, #26),
 // a friend's replica that failed verification or has not passed it
 // for days (VER-1, SEC-7, #27), the store reconciler's held deletes
-// and missing store marker (EP-14, #8), and bit-rot the sampler found in
-// own objects and in friends' (VER-5, #31).
+// and missing store marker (EP-14, #8), bit-rot the sampler found in
+// own objects and in friends' (VER-5, #31), and a printed recovery
+// sheet gone out of date (ID-7, #33).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -179,6 +180,11 @@ const (
 	// LEND-4). Subject: the friend. This node cannot repair them; it holds
 	// while it holds them.
 	KindLentBitrot = "lent_bitrot"
+	// KindRecoverySheetStale: the recovery sheet last printed no longer
+	// matches the node's state (ID-7, #33): a friend's address changed,
+	// or a friend, overflow target or bucket was added or removed. No
+	// subject. It clears when `lendisk recovery-sheet` prints it again.
+	KindRecoverySheetStale = "recovery_sheet_stale"
 )
 
 // DefaultUncheckedAfter is Service.UncheckedAfter when zero.
@@ -265,7 +271,7 @@ const PurgeWarning = 7 * 24 * time.Hour
 var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotReplicated, KindPlaceRefused,
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindFriendRefuses, KindPurgeSoon,
 	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
-	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot}
+	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot, KindRecoverySheetStale}
 
 // Message is the JSON object the hook receives on stdin and the webhook
 // as its body (OPS-3). Fields are added, never renamed or removed;
@@ -323,6 +329,10 @@ type Service struct {
 	// may go without passing a challenge before KindReplicaUnchecked
 	// (default DefaultUncheckedAfter).
 	UncheckedAfter time.Duration
+	// Sheet, if set, compares the last printed recovery sheet with the
+	// node's state (sheet.Stale, ID-7): when it was printed and what
+	// changed since, nil when nothing did or none was printed.
+	Sheet func(ctx context.Context) (printed time.Time, changes []string, err error)
 
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
@@ -712,6 +722,17 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 		return nil, err
 	}
 	out = append(out, quota...)
+	if s.Sheet != nil {
+		printed, changes, err := s.Sheet(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if len(changes) > 0 {
+			msg := fmt.Sprintf("the recovery sheet printed at %s is out of date: %s. Print it again with `lendisk recovery-sheet` and replace the old copy",
+				printed.UTC().Format(time.RFC3339), strings.Join(changes, ", "))
+			out = append(out, alertOf(KindRecoverySheetStale, "", msg))
+		}
+	}
 	formers, err := s.DB.FormerFriends(ctx)
 	if err != nil {
 		return nil, err

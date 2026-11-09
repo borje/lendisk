@@ -1289,16 +1289,49 @@ upstream bucket is Q-V.
   holds only objects restic read, each the version the node wrote,
   and some data packs (those only the older snapshot needs) are never
   fetched; the test asserts that some stay unread, not which.
-- **ID-7** The sheet is generated from the manifest; a lender's `tc…`
-  string changes only when its key or its configured bootstrap region
-  changes (SEC-14), so regeneration is rare. Each bucket is listed with
-  its sealed name and the `lent-<id16>-<sealed>` name it has in every
-  lender's store (SEC-16), which is what a restore with lendisk stopped
-  (P-5) needs, together with the number of replicas it must combine
-  (N − c + 1, from the pool size and the bucket's `copies`) and the
-  command that combines them: `rclone copy` or `aws s3 sync` from each
-  replica into one directory, excluding `.lendisk/`, `--ignore-existing`
-  after the first.
+- **ID-7** `lendisk recovery-sheet` (#33, package `sheet`) prints the
+  sheet from the manifest's content (`manifest.Build`, ID-4): plain
+  ASCII within 80 columns, a `tc…` address cut into lines to type as one
+  string. In order: the phrase, the node ID, each friend's ID and
+  address, each overflow target's name, endpoint, bucket and prefix with
+  the note that its access key is needed (the keys themselves only with
+  `--with-secrets`, S3-8; "none" while the list is empty, until #38),
+  the restore commands (`lendisk recover <address>`, `lendisk serve`,
+  `lendisk bucket show`, `restic restore`/`kopia snapshot restore`),
+  each bucket with its profile, `copies`, sealed name, the
+  `lent-<id16>-<sealed>` name it has in every friend's store (SEC-16)
+  and `s3://<bucket>/<prefix>/<sealed>/` at each overflow target, and
+  how many replicas a restore without lendisk combines: N − c + 1 with
+  N the friends plus overflow targets, one when N ≤ c, none with no
+  place. Then the lendisk-free restore (P-5, LEND-6), matching #35: a
+  friend hands over a replica made by `lendisk export --lent <stored
+  name> <dir>` (`--kopia-layout` for Kopia), or, for restic, a copy of
+  the bucket's store directory made with its lendisk stopped; an
+  overflow target's keys are copied with any S3 client. The replicas,
+  each in a directory `replica-1`, `replica-2`…, are combined as a plain
+  union (one key has the same bytes everywhere, EP-11), leaving out the
+  housekeeping directories `gateway.ReservedDirs` (`.lendisk/`,
+  `.sgwtmp/`, `.vgwlocks/`): `cp -R "$r". repo/` per replica then `rm
+  -rf` of the three, or `rsync -a --exclude=/.lendisk/ …`
+  (`sheet.CombineCp`, `sheet.CombineRsync`; the test runs the printed
+  commands). Last, the reminder that the restic or Kopia password is a
+  separate secret. *Decision (#33): the phrase.* It is never stored
+  (ID-3), so the sheet has a labelled blank for each of its 24 words;
+  `--with-phrase` reads it from stdin (the prompt on stderr, stdout
+  being the sheet), refuses one that does not derive this node, and
+  prints it with a warning; nothing logs it and the record below omits
+  it. `--json` prints the same `sheet.Sheet`.
+  *Regeneration.* Each print records the sheet's content, without
+  time, phrase or keys, in the `node` key `recovery_sheet` (with
+  `printed_at`; no migration). The alert service compares it with the
+  content built now (`sheet.Stale`, injected as `alert.Service.Sheet`)
+  and raises `recovery_sheet_stale` (§3.8) naming what changed: a
+  friend's address (a friend's `tc…` string changes only when its key
+  or bootstrap region does, SEC-14, so this is rare), a friend,
+  overflow target or bucket added or removed, a bucket's `copies`. A
+  node that never printed a sheet is not alerted (*decision, #33*):
+  nothing on paper can be stale. Former friends in their retention
+  window are not on the sheet: they no longer admit this node.
 
 ### 3.2 Peers and invites
 
@@ -5404,7 +5437,13 @@ the handler's own reads and is never cancelled; nothing below
     no longer hash to the hash they were stored with; the message says
     this node cannot repair them and the friend's challenges find them,
     and to check the disk (`alert.LentBitrotMessage`). Held while the
-    objects are (`TestBitrotIsAlertedOnBothSides`).
+    objects are (`TestBitrotIsAlertedOnBothSides`);
+  - `recovery_sheet_stale`, no subject: the recovery sheet last printed
+    no longer matches the node's state (§3.1 ID-7, #33); the message
+    says when it was printed, what changed (a friend's address, a
+    friend, overflow target or bucket added or removed) and to run
+    `lendisk recovery-sheet` again, which clears it at the next pass
+    (`TestFriendsAddressChangeAlertsToRegenerateTheSheet`).
   The three quota alerts have hysteresis (#24 review): one stays raised
   until its condition has been false for `alert.Service.QuotaHold`
   (`DefaultQuotaHold`, 10 minutes), so a friend flipping it with every
