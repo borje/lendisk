@@ -2662,8 +2662,19 @@ upstream bucket is Q-V.
   it never answered). Both count from the last answer, a probe's
   included: a friend full for a week that answers probes is neither
   unreachable nor gone after one missed probe (#65 review). A friend
-  answering `503 SlowDown` is `busy`, an answer like `ok`: never
-  unreachable however long it lasts (#92). An
+  answering `503 SlowDown` is `busy`, an answer like `ok`, for a
+  while: an honest one lasts only while another write is in flight
+  there. *Decision (#92 review):* a friend `busy` and nothing else for
+  `reroute_after` on end (its `since` older) counts as unreachable
+  (`poolPlace.busyForLong`): its unsent data goes elsewhere and it no
+  longer holds deletes, so a broken or hostile friend cannot hold
+  copies back for ever by answering `SlowDown`. It is never gone,
+  since it keeps answering (`last_ok` moves on). Past
+  `alerts.unreachable_after` (24 h) busy it raises
+  `friend_unreachable`, its message saying it answers busy
+  (`TestABusyFriendIsAwayOnlyOnceBusyForRerouteAfter`,
+  `TestAFriendBusyPastThresholdRaisesAlert`). An
+  ok answer ends the stretch. An
   unreachable friend with room is still chosen
   when the reachable ones are not enough; a gone one is not.
   *Away is a run of failing answers, not one condition (#65, from the
@@ -2928,8 +2939,8 @@ upstream bucket is Q-V.
   `failing_since` (the start of its run of failing answers, #65) and
   `last_ok`, D6's last-reachable time: its last acknowledgement,
   answered probe or busy answer. `busy` is not failing: it sets
-  `last_ok` and clears `failing_since` as `ok` does
-  (`TestABusyFriendIsNeverAway`); `status` shows it as "busy (it asks
+  `last_ok` and clears `failing_since` as `ok` does, and is away only
+  once it lasts `reroute_after` (above); `status` shows it as "busy (it asks
   to send again shortly)", `status --json` as `state: "busy"` (a new
   value, no new field). A sender whose FIFO is empty,
   including at daemon start, sets `store` back to `ok` without touching
@@ -3450,8 +3461,9 @@ upstream bucket is Q-V.
   retried with backoff like a network error, but recorded as the
   place's condition `busy`, counted as retry reason `busy`, and logged
   at info, not as a failure (*decision, #92:* the friend answered, so
-  a friend busy for hours behind another borrower's writes is neither
-  unreachable nor rerouted nor alerted as `friend_unreachable`;
+  a friend briefly busy behind another borrower's writes is neither
+  unreachable nor rerouted nor alerted as `friend_unreachable`; one
+  busy for `reroute_after` on end is, see §3.4 Reachability;
   `TestABusyFriendIsRetriedWithoutFailing`). Only `SlowDown` is busy:
   the lender's other 503s (`ServiceUnavailable`: a gateway still
   starting, relationships it cannot read) say it is failing and stay

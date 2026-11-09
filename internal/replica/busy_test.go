@@ -14,8 +14,8 @@ import (
 // #92, LEND-2: a friend that answers 503 SlowDown (busy: the write fits,
 // but not beside its writes in flight) answered. The worker shows it as
 // busy, not retrying: its last answer moves last_ok on and starts no run
-// of failing answers, so it is never rerouted or alerted as unreachable
-// for it. The send is retried with backoff, not paused for quota, and
+// of failing answers, so a short busy stretch is neither rerouted nor
+// alerted (state and alert bound a long one). The send is retried with backoff, not paused for quota, and
 // counted as a busy retry; no alert is raised. Once the friend accepts,
 // it is ok.
 func TestABusyFriendIsRetriedWithoutFailing(t *testing.T) {

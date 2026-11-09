@@ -133,14 +133,27 @@ func (p poolPlace) failing() bool {
 
 // unreachable: failing now, without an ok answer for reroute_after
 // (#65: a friend alternating between network errors and 507s is away
-// as long as it gives no ok). A friend failing for less is still
-// counted reachable: a blip is not an outage.
+// as long as it gives no ok), or busy for reroute_after on end
+// (busyForLong). A friend failing or busy for less is still counted
+// reachable: a blip is not an outage.
 func (p poolPlace) unreachable(db *DB, now time.Time) bool {
 	// A probe's answer during a full stretch moves last_ok on while the
 	// run of failures stays: one failed probe after it is a blip, not
 	// reroute_after of silence (#65 review).
 	return p.failing() && now.Sub(p.failingSince()) >= db.rerouteAfter() &&
-		(p.lastOK.IsZero() || now.Sub(p.lastOK) >= db.rerouteAfter())
+		(p.lastOK.IsZero() || now.Sub(p.lastOK) >= db.rerouteAfter()) ||
+		p.busyForLong(db, now)
+}
+
+// busyForLong: it has answered 503 SlowDown (busy) and nothing else
+// for reroute_after. A busy answer is not a failure and moves last_ok
+// on, but an honest one lasts only while another write is in flight
+// there: one that lasts longer is a friend that is broken or holding
+// this node's copies back, and counts as unreachable (its unsent data
+// goes elsewhere, it no longer holds deletes) though never as gone,
+// since it keeps answering (#92).
+func (p poolPlace) busyForLong(db *DB, now time.Time) bool {
+	return p.cond == ConditionBusy && now.Sub(p.since) >= db.rerouteAfter()
 }
 
 // failingSince is when its run of failing answers began.

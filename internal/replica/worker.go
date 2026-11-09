@@ -760,8 +760,8 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			// The friend answered: the write fits there, but not beside
 			// its writes in flight (an abandoned send's among them), or
 			// this node is at its cap of requests there. Busy, not
-			// failing: retried with backoff, never paused for quota nor
-			// counted towards unreachable (#92).
+			// failing: retried with backoff, never paused for quota; only
+			// a long busy stretch counts as away (state, #92).
 			failing = "busy"
 			level := slog.LevelDebug
 			if prev != failing {

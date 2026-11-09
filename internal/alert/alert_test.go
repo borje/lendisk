@@ -161,6 +161,51 @@ func TestFriendUnreachablePastThresholdRaisesAlert(t *testing.T) {
 	}
 }
 
+// OPS-2 (#92): a friend that has answered only busy (503 SlowDown) for
+// unreachable_after holds this node's copies back as surely as one that
+// does not answer: friend_unreachable says it answers busy. A shorter
+// busy stretch raises nothing, and an ok answer clears it.
+func TestAFriendBusyPastThresholdRaisesAlert(t *testing.T) {
+	db := openDB(t)
+	addFriend(t, db, "B")
+	t0 := time.Unix(1_800_000_000, 0)
+	c := &clock{t: t0}
+	s := &Service{DB: db, Log: quiet, Now: c.now, UnreachableAfter: 24 * time.Hour}
+	for at := t0; !at.After(t0.Add(24*time.Hour - time.Minute)); at = at.Add(30 * time.Minute) {
+		if err := db.SetPlaceCondition(t.Context(), "B", state.ConditionBusy, "busy: SlowDown", at); err != nil {
+			t.Fatal(err)
+		}
+		c.set(at)
+		if err := s.evaluate(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if as := active(t, db); len(as) != 0 {
+			t.Fatalf("alerted after %v busy: %v", at.Sub(t0), as)
+		}
+	}
+	c.set(t0.Add(24 * time.Hour))
+	if err := db.SetPlaceCondition(t.Context(), "B", state.ConditionBusy, "busy: SlowDown", c.now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.evaluate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	a, ok := active(t, db)["friend_unreachable:B"]
+	if !ok || !strings.Contains(a.Message, "busy") {
+		t.Fatalf("busy for 24 h: %+v", active(t, db))
+	}
+	if err := db.SetPlaceCondition(t.Context(), "B", state.ConditionOK, "", t0.Add(25*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	c.set(t0.Add(25 * time.Hour))
+	if err := s.evaluate(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if as := active(t, db); len(as) != 0 {
+		t.Fatalf("not cleared: %v", as)
+	}
+}
+
 // PEER-5, OPS-2 (#83): a friend that keeps refusing this node as no
 // friend of it (its place `removed`) has probably ended the friendship
 // without this node hearing: friend_refuses says so and how to end it
