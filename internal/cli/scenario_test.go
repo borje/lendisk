@@ -20,6 +20,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"github.com/borje/lendisk/internal/alert"
+	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/identity"
 )
 
@@ -131,16 +132,22 @@ func (f *fourFriends) waitOffsite(id string) {
 	f.t.Helper()
 	code, out, errOut := f.an.run("", "", "status", "--wait", "laptop", "--timeout", "3m")
 	if code != 0 || out != "snapshot "+id+" is offsite at 2 copies\n" {
-		f.t.Fatalf("status --wait: exit %d\n%s%s", code, out, errOut)
+		_, js, _ := f.an.run("", "", "status", "--json")
+		f.t.Fatalf("status --wait: exit %d\n%s%s\nstatus --json:\n%s", code, out, errOut, js)
 	}
 }
 
-// drain waits until A's queue to every running friend is empty.
+// drain waits until A's queue to every running friend is empty. It
+// allows the lender's stall bound and a minute more: a send A abandons
+// as stalled (no progress for its 10 s StallTimeout under load) keeps
+// its bytes counted in flight at the lender until the lender's bridge
+// ends the body (bridge.DefaultStall), and near the quota the lender
+// answers A's retries 507 until then.
 func (f *fourFriends) drain() {
 	f.t.Helper()
 	for id, pn := range f.friends {
 		if pn.p != nil && !pn.p.exited() {
-			if p := f.an.drained(id, 90*time.Second); p.Refused != 0 {
+			if p := f.an.drained(id, bridge.DefaultStall+time.Minute); p.Refused != 0 {
 				f.t.Fatalf("place %+v", p)
 			}
 		}

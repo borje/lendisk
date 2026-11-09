@@ -47,6 +47,13 @@ import (
 // places; Offsite reports them as stuck, with the reason, so status
 // says why rather than waiting silently. Local-only keys are never
 // queued and so never counted.
+//
+// A put short of places is stuck only once re-placement has answered
+// the pool as it is (passDue): after a quota rises, a friend is added
+// or comes back, the copies the pass is about to place are waiting, not
+// stuck (#37: `status --wait` right after a quota raise gave up on
+// them). A changed key and an unmatchable pending put stay stuck: no
+// pass places them.
 
 // Write is one captured write: its sequence, key and capture time.
 // Seq is 0 when there is none.
@@ -165,6 +172,19 @@ func (db *DB) Offsite(ctx context.Context, bucket string, target int64) (Offsite
 	}
 	if o.shorts, err = db.shorts(ctx, bucket, o.Copies, holders); err != nil {
 		return o, err
+	}
+	// A re-placement pass due may place what is short (#26): nothing
+	// it could place is stuck until it has answered the pool as it is.
+	due, err := db.passDue(ctx)
+	if err != nil {
+		return o, err
+	}
+	if due {
+		for i, s := range o.shorts {
+			if !s.pending && !s.immutable {
+				o.shorts[i].stuck = false
+			}
+		}
 	}
 	// The highest valid w: each short put r rules out [r, next).
 	// Scanning by r descending, w only falls, and an interval passed

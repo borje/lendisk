@@ -139,11 +139,13 @@ func TestARemovedOrGoneFriendHoldsNoCopy(t *testing.T) {
 		t.Fatalf("C unreachable for two hours: %+v", o)
 	}
 	p.condition("C", ConditionRetrying, p.now.Add(-8*24*time.Hour), p.now.Add(-9*24*time.Hour))
+	p.replace() // B alone is left: nowhere for the copy
 	o := p.offsite("laptop", 0)
 	if o.Complete() || o.Stuck.Objects != 1 || o.Stuck.Gone != 1 {
 		t.Fatalf("C gone past replace_after: %+v", o)
 	}
 	p.condition("C", ConditionRemoved, p.now.Add(-time.Minute), p.now.Add(-time.Hour))
+	p.replace()
 	if o := p.offsite("laptop", 0); o.Complete() || o.Stuck.Gone != 1 {
 		t.Fatalf("C refusing this node: %+v", o)
 	}

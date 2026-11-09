@@ -570,6 +570,8 @@ func TestThePoolFingerprintChangesWithThePool(t *testing.T) {
 	})
 	step("a friend gone", func() { p.gone("C") })
 	step("a friend back", func() { p.condition("C", ConditionOK, p.now, p.now) })
+	step("a friend paused for quota", func() { p.condition("C", ConditionQuota, p.now, p.now) })
+	step("its pause ended", func() { p.db.ResumePlace(ctx, "C", p.now) })
 	step("copies changed", func() { p.db.SetCopies(ctx, "laptop", 1) })
 	step("a friend removed", func() { p.db.RemoveFriendship(ctx, "C", false, p.now) })
 }

@@ -137,9 +137,12 @@ func (db *DB) SetCopies(ctx context.Context, bucket string, copies int) error {
 
 // PoolFingerprint describes what re-placement answers to: each friend
 // with an address, its quota, whether it refuses this node, is gone
-// past replace_after, or counts more than its quota; each bucket's
-// copies; and each replica marked unverified (VER-1, #27). The worker
-// runs a pass whenever it changes (#26).
+// past replace_after, counts more than its quota, or is full by its last
+// answer (paused for quota, LEND-2: no room until it acknowledges again
+// or the quota rises); each bucket's copies; and each replica marked
+// unverified (VER-1, #27). The worker runs a pass whenever it changes
+// (#26), and Offsite counts no object short of places as stuck while it
+// differs from the pool the last pass answered (passDue).
 func (db *DB) PoolFingerprint(ctx context.Context) (string, error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
@@ -148,8 +151,8 @@ func (db *DB) PoolFingerprint(ctx context.Context) (string, error) {
 	now := db.now()
 	var b strings.Builder
 	for _, p := range ps {
-		fmt.Fprintf(&b, "%s %d %t %t %t;", p.peer, p.quota, p.cond == ConditionRemoved, p.gone(db, now),
-			capped(p.use) > capped(p.quota))
+		fmt.Fprintf(&b, "%s %d %t %t %t %t;", p.peer, p.quota, p.cond == ConditionRemoved, p.gone(db, now),
+			capped(p.use) > capped(p.quota), p.full())
 	}
 	rows, err := db.QueryContext(ctx, `SELECT name, copies FROM buckets ORDER BY name`)
 	if err != nil {
@@ -280,6 +283,13 @@ type replacer struct {
 // goes on: the errors are returned with what the others did.
 func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64) bool, lock sync.Locker) (ReplaceStats, error) {
 	var st ReplaceStats
+	// The pool this pass answers, read before the places it decides on:
+	// a change during the pass leaves the record behind it, so the next
+	// pass is still due.
+	pool, err := db.PoolFingerprint(ctx)
+	if err != nil {
+		return st, err
+	}
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
 		return st, err
@@ -334,7 +344,31 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 		}
 	}
 	st.Skipped = m.skipped
+	if len(errs) == 0 && ctx.Err() == nil {
+		if _, err := db.ExecContext(ctx, `INSERT INTO replace_pass (id, pool, done_at) VALUES (1, ?, ?)
+			ON CONFLICT (id) DO UPDATE SET pool = excluded.pool, done_at = excluded.done_at`,
+			pool, db.now().Unix()); err != nil {
+			errs = append(errs, fmt.Errorf("recording the re-placement pass: %w", err))
+		}
+	}
 	return st, errors.Join(append(errs, ctx.Err())...)
+}
+
+// passDue reports whether a re-placement pass is due: the pool differs
+// from the one the last pass that finished answered, or no pass has.
+// The daemon runs one within five polls of a change (#26); until it
+// has, an object short of places may yet be placed.
+func (db *DB) passDue(ctx context.Context) (bool, error) {
+	now, err := db.PoolFingerprint(ctx)
+	if err != nil {
+		return false, err
+	}
+	var last string
+	err = db.QueryRowContext(ctx, `SELECT pool FROM replace_pass WHERE id = 1`).Scan(&last)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	return err == nil && last != now, err
 }
 
 // overQuota returns, for a friend that holds more live bytes than its

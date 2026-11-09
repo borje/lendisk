@@ -3152,12 +3152,15 @@ upstream bucket is Q-V.
   (`internal/state/replace.go`), run by the replication worker
   (`replica.Worker.replace`) whenever the pool's fingerprint changes
   (`state.DB.PoolFingerprint`: each friend with an address, its quota,
-  whether it refuses this node, is gone past `replace_after` or counts
-  more than its quota, each bucket's `copies`, and each replica marked
+  whether it refuses this node, is gone past `replace_after`, counts
+  more than its quota or is paused for quota (its last answer a 507:
+  no room until it acknowledges again or the quota rises,
+  `ResumePlace`), each bucket's `copies`, and each replica marked
   unverified (#27); read every five
   polls, so a friend added, removed (`peer remove` or its remove call,
-  §3.2), gone, back, or a quota or `copies` changed starts a pass
-  within seconds, whichever process wrote the change), and hourly
+  §3.2), gone, back, paused for quota or resumed, or a quota or
+  `copies` changed starts a pass within seconds, whichever process
+  wrote the change), and hourly
   (`Worker.ReplaceEvery`) for what no change announces: a refusal, a
   copy `Reroute` dropped, a deficit from capture. A pass looks at each
   bucket's *live* objects only (the key's latest done write is a put,
@@ -3930,7 +3933,20 @@ upstream bucket is Q-V.
     `TestDroppedAndUnplacedCopiesAreStuckQueuedOnesWait`,
     `TestStatusWaitStopsWhenAFriendRefusesEverything`). A copy still
     `queued` at an unreachable friend is waiting, not stuck: `Reroute`
-    may move it.
+    may move it. *Decision (#37 flake): nothing is stuck while a
+    re-placement pass is due.* A pass that finishes records the pool
+    it answered (its `PoolFingerprint`, table `replace_pass`, schema
+    38); while
+    the pool differs (a quota raised, a friend added, back or resumed
+    from a pause for quota, before the worker's next look) or no pass
+    has run, a short put is waiting for the pass, not stuck, whatever
+    its reason; only a changed key (`immutable`) and an unmatchable
+    pending put stay stuck, as no pass places them. Otherwise
+    `status --wait` run right after `peer quota` on both sides exited 4
+    for an object the pass seconds later placed
+    (`TestAnObjectWithoutRoomWaitsForThePassAQuotaRaiseIsDue`,
+    `TestAPauseForQuotaEndingMakesAPassDue`). With the daemon stopped
+    no pass runs, and such objects wait with it.
   - *a pending put* (#20 review), any data or metadata put whose queue
     row is not done yet, has no placement at all; a completed multipart
     upload is even answered before its row is hashed and done (§3.3,

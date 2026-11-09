@@ -125,6 +125,7 @@ func TestARemovedFriendHoldsNoCopyAndNothingWaitsForIt(t *testing.T) {
 	if states[d1] != PlacementAcked || states[d2] != PlacementAbandoned || states[d3] != PlacementDropped {
 		t.Fatalf("B's rows after removal: %v", states)
 	}
+	p.answered() // as of a pass that found nowhere for them
 	o := p.offsite("laptop", 0)
 	if o.Complete() || o.Stuck.Gone == 0 {
 		t.Fatalf("offsite with B removed: %+v", o)

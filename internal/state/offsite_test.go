@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 )
@@ -184,6 +185,7 @@ func TestAFriendRefusingEverythingLeavesTheWatermarkHonest(t *testing.T) {
 	if len(refusedAtD) == 0 {
 		t.Fatal("no data object was placed at D")
 	}
+	p.answered() // as of a pass that found nowhere else for them
 	o := p.offsite("laptop", snap)
 	if o.Reached() || o.Watermark != refusedAtD[0]-1 {
 		t.Fatalf("with D refusing everything: %+v, want the watermark before seq %d", o, refusedAtD[0])
@@ -228,10 +230,99 @@ func TestDroppedAndUnplacedCopiesAreStuckQueuedOnesWait(t *testing.T) {
 	if _, err := p.db.Exec(`UPDATE placement SET state = 'dropped' WHERE seq = ? AND place = 'C'`, dropped); err != nil {
 		t.Fatal(err)
 	}
+	p.answered()
 	o := p.offsite("laptop", dropped)
 	if o.Watermark != lonely-1 || o.Waiting.Objects != 3 || o.Stuck.Objects != 2 || o.Stuck.Dropped != 1 ||
 		o.Stuck.Unplaced != 1 || o.Stuck.Refused != 0 {
 		t.Fatalf("offsite %+v", o)
+	}
+}
+
+// answered records that re-placement answered the pool as it is now,
+// without running a pass: what a pass that placed nothing leaves.
+func (p *pool) answered() {
+	p.t.Helper()
+	fp, err := p.db.PoolFingerprint(context.Background())
+	if err != nil {
+		p.t.Fatal(err)
+	}
+	if _, err := p.db.Exec(`INSERT OR REPLACE INTO replace_pass (id, pool, done_at) VALUES (1, ?, ?)`,
+		fp, p.now.Unix()); err != nil {
+		p.t.Fatal(err)
+	}
+}
+
+// REPL-11, LEND-8 (#37): an object the pool had no room for is stuck
+// once re-placement has answered the pool; after a quota rises it
+// waits for the pass the change makes due, which places the missing
+// copy, rather than `status --wait` giving up on it in between.
+func TestAnObjectWithoutRoomWaitsForThePassAQuotaRaiseIsDue(t *testing.T) {
+	p := newPool(t)
+	p.bucket("laptop", 2)
+	p.friend("B", 10)
+	p.friend("C", 1.5)
+	first := p.put("laptop", "data/1", "data", 1) // at B and C: C is full
+	p.ackAll(first)
+	second := p.put("laptop", "data/2", "data", 1)
+	if got := p.places(second); !slices.Equal(got, []string{"B"}) {
+		t.Fatalf("data/2 placed at %v, want B alone", got)
+	}
+	p.ackAll(second)
+	if s := p.replace(); s.Below != 1 || s.Placed != 0 {
+		t.Fatalf("a pass with C full: %+v", s)
+	}
+	if o := p.offsite("laptop", second); o.Reached() || o.Stuck.Objects != 1 || o.Stuck.Unplaced != 1 {
+		t.Fatalf("with C full: %+v", o)
+	}
+
+	if _, err := p.db.Exec(`UPDATE friendship SET own_number = ?1, peer_number = ?1 WHERE peer_key = 'C'`, 10*unit); err != nil {
+		t.Fatal(err)
+	}
+	if o := p.offsite("laptop", second); o.Reached() || o.Waiting.Objects != 1 || o.Stuck.Objects != 0 {
+		t.Fatalf("with C's quota raised and the pass due: %+v", o)
+	}
+	if s := p.replace(); s.Placed != 1 {
+		t.Fatalf("the pass after the raise: %+v", s)
+	}
+	if o := p.offsite("laptop", second); o.Reached() || o.Waiting.Objects != 1 || o.Stuck.Objects != 0 {
+		t.Fatalf("queued at C: %+v", o)
+	}
+	p.ackRow("C", second)
+	if o := p.offsite("laptop", second); !o.Reached() {
+		t.Fatalf("acknowledged at C: %+v", o)
+	}
+}
+
+// LEND-2, LEND-8 (#37): a friend paused for quota is no room for
+// re-placement, so a pass while it was paused placed nothing there; the
+// pause ending (the quota rose, ResumePlace, or it acknowledged again)
+// changes the pool, so a pass places the copies that waited for room.
+func TestAPauseForQuotaEndingMakesAPassDue(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.bucket("laptop", 2)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.condition("C", ConditionQuota, p.now, p.now)
+	seq := p.put("laptop", "data/1", "data", 1)
+	p.ackAll(seq)
+	if got := p.places(seq); !slices.Equal(got, []string{"B"}) {
+		t.Fatalf("placed at %v with C paused for quota, want B alone", got)
+	}
+	if s := p.replace(); s.Placed != 0 || s.Below != 1 {
+		t.Fatalf("a pass with C paused: %+v", s)
+	}
+	if o := p.offsite("laptop", seq); o.Stuck.Unplaced != 1 {
+		t.Fatalf("with C paused and the pass done: %+v", o)
+	}
+	if err := p.db.ResumePlace(ctx, "C", p.now); err != nil {
+		t.Fatal(err)
+	}
+	if o := p.offsite("laptop", seq); o.Stuck.Objects != 0 || o.Waiting.Objects != 1 {
+		t.Fatalf("with C's pause ended: %+v", o)
+	}
+	if s := p.replace(); s.Placed != 1 {
+		t.Fatalf("the pass after the pause ended: %+v", s)
 	}
 }
 
