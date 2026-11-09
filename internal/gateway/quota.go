@@ -587,6 +587,9 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 		}
 		return l.putAgain(b, want, old)
 	}
+	if l.afterPutLooked != nil {
+		l.afterPutLooked()
+	}
 	ts, err := l.tombsOf(ctx, peer, sealed, key)
 	if err != nil {
 		return none, err
@@ -675,12 +678,27 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 		return none, b.failed
 	}
 	if preconditionFailed(err) {
-		// Another put of the key was published while this one streamed.
+		// The key was published since this put found it absent: another
+		// put, or an undelete's revival (#32). posix checks If-None-Match
+		// before it reads the body as well as at publication, so the body
+		// may be unread: the same hash is answered as putAgain answers it,
+		// the rest of the body hashed and discarded (nothing left to lock
+		// for) and the stored copy kept. Only another hash is refused; a
+		// key emptied again meanwhile is not a conflict, and the
+		// borrower's retry finds what it holds now.
 		old, has, herr := l.existing(ctx, *in.Bucket, key)
-		if herr == nil && has && old.sha256 == want && b.n == old.size && b.hex() == want {
-			return s3response.PutObjectOutput{ETag: old.etag}, nil
+		if herr != nil {
+			l.log().Error("lending: reading the stored object failed; refusing the put", "bucket", *in.Bucket, "key", key, "err", herr)
+			return none, errInternal
 		}
-		return none, errKeyChanged
+		if !has {
+			return none, errInternal
+		}
+		if old.sha256 != want {
+			return none, errKeyChanged
+		}
+		b.onEOF, b.onFull = nil, nil
+		return l.putAgain(b, want, old)
 	}
 	if err != nil {
 		return out, err
