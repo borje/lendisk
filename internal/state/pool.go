@@ -616,6 +616,11 @@ func column(ctx context.Context, tx querier, q string, args ...any) ([]string, e
 // replica is behind until it returns, and its FIFO then brings it
 // level).
 //
+// A drain-back copy (#40) holds no barrier: its object keeps `copies`
+// acknowledged copies, one at the overflow target it moves from, until
+// it lands, and it waits behind every other row in its FIFO
+// (NextPlacement), so holding the barrier would stop that FIFO for good.
+//
 // Rows a pending seed holds (REPL-8, seed.go) count in neither check,
 // as an unreachable place's do not (#21): the seeded friend's replica
 // of the bucket lags while the disk travels, and every other place goes
@@ -642,7 +647,7 @@ func (db *DB) Held(ctx context.Context, seq int64) (bool, error) {
 		WHEN q.class IN ('metadata', 'snapshot') THEN EXISTS (
 			SELECT 1 FROM placement p JOIN queue d ON d.seq = p.seq
 			WHERE p.bucket = q.bucket AND p.seq < q.seq AND p.state = 'queued' AND p.op = 'put' AND d.class = 'data'
-			AND NOT `+seedHeld+`
+			AND NOT `+seedHeld+` AND NOT `+drainBack+`
 			AND NOT EXISTS (SELECT 1 FROM queue l
 				WHERE l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq AND l.seq < q.seq AND l.state = 'done'))
 			OR EXISTS (SELECT 1 FROM queue u WHERE u.state = 'pending' AND u.bucket = q.bucket AND u.seq < q.seq
@@ -871,7 +876,8 @@ type waitingRow struct {
 func (db *DB) waiting(ctx context.Context, place string, barrier bool) ([]waitingRow, error) {
 	rows, err := db.QueryContext(ctx, `SELECT p.seq, p.bucket, coalesce(q.size, 0) + ?2,
 		(SELECT group_concat(h.place, char(31)) FROM placement h WHERE h.seq = p.seq),
-		(SELECT min(l.seq) FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
+		(SELECT min(l.seq) FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done'),
+		`+drainBack+`
 		FROM placement p JOIN queue q ON q.seq = p.seq
 		WHERE p.place = ?1 AND p.state = 'queued' AND p.op = 'put' AND q.class = 'data' ORDER BY p.seq`,
 		place, ObjectOverhead)
@@ -880,17 +886,20 @@ func (db *DB) waiting(ctx context.Context, place string, barrier bool) ([]waitin
 	}
 	var out []waitingRow
 	var next []sql.NullInt64
+	var drains []bool
 	for rows.Next() {
 		var r waitingRow
 		var holders string
 		var n sql.NullInt64
-		if err := rows.Scan(&r.seq, &r.bucket, &r.need, &holders, &n); err != nil {
+		var d bool
+		if err := rows.Scan(&r.seq, &r.bucket, &r.need, &holders, &n, &d); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		r.holders = strings.Split(holders, "\x1f")
 		out = append(out, r)
 		next = append(next, n)
+		drains = append(drains, d)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil || !barrier {
@@ -912,7 +921,7 @@ func (db *DB) waiting(ctx context.Context, place string, barrier bool) ([]waitin
 			meta[r.bucket] = ms
 		}
 		j, _ := slices.BinarySearch(ms, r.seq+1)
-		out[i].barrier = j < len(ms) && (!next[i].Valid || ms[j] < next[i].Int64)
+		out[i].barrier = !drains[i] && j < len(ms) && (!next[i].Valid || ms[j] < next[i].Int64)
 	}
 	return out, nil
 }

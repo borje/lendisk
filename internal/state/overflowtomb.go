@@ -86,10 +86,43 @@ func (db *DB) HoldOverflowDelete(ctx context.Context, place string, seq int64, n
 	if err != nil || !o.ClientSide() {
 		return false, err
 	}
+	return db.insertTomb(ctx, place, seq, now, now.Add(o.Retention), false)
+}
+
+// DeniedRetry is how long a delete an overflow target refused for want
+// of permission waits before it is tried again (S3-5, #40).
+const DeniedRetry = 24 * time.Hour
+
+// DenyOverflowDelete records that overflow target place refused the
+// delete of row seq for want of permission (S3-5, #40): a credential
+// without delete permission leaves drained copies and deleted objects
+// at the target. The copy stays there as a tomb marked denied, counted
+// in the target's use and in status (TombHold.Denied), and the delete
+// is tried again after DeniedRetry, so a permission granted later
+// empties the target. A row held already (a client-side tomb whose
+// delete was refused) is marked so and given back. For a row not held
+// yet, the caller then acknowledges it as for a sent delete.
+func (db *DB) DenyOverflowDelete(ctx context.Context, place string, seq int64, now time.Time) error {
+	r, err := db.ExecContext(ctx, `UPDATE overflow_tomb SET denied_at = ?, due_at = ?, claimed_at = NULL
+		WHERE place = ? AND seq = ?`, now.Unix(), now.Add(DeniedRetry).Unix(), place, seq)
+	if err != nil {
+		return err
+	}
+	if n, err := r.RowsAffected(); err != nil || n > 0 {
+		return err
+	}
+	_, err = db.insertTomb(ctx, place, seq, now, now.Add(DeniedRetry), true)
+	return err
+}
+
+// insertTomb holds row seq at place, a queued delete or a dropping copy,
+// as a tomb deleted at now and due at due; denied marks it refused for
+// want of permission. Holding again is harmless.
+func (db *DB) insertTomb(ctx context.Context, place string, seq int64, now, due time.Time, denied bool) (bool, error) {
 	var bucket, key, op, st string
 	var size int64
 	var sha sql.NullString
-	err = db.QueryRowContext(ctx, `SELECT bucket, key, op, state, coalesce(size, 0), sha256 FROM placement
+	err := db.QueryRowContext(ctx, `SELECT bucket, key, op, state, coalesce(size, 0), sha256 FROM placement
 		WHERE place = ? AND seq = ?`, place, seq).Scan(&bucket, &key, &op, &st, &size, &sha)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -103,7 +136,7 @@ func (db *DB) HoldOverflowDelete(ctx context.Context, place string, seq int64, n
 		// is the tomb's; the version is the last put the target took.
 		size = max(-size, 0)
 		sha = sql.NullString{}
-		err := db.QueryRowContext(ctx, `SELECT sha256 FROM placement
+		err = db.QueryRowContext(ctx, `SELECT sha256 FROM placement
 			WHERE place = ? AND bucket = ? AND key = ? AND op = 'put' AND seq < ?
 			AND state IN ('acked', 'drained', 'abandoned') AND sha256 IS NOT NULL
 			ORDER BY seq DESC LIMIT 1`, place, bucket, key, seq).Scan(&sha)
@@ -111,9 +144,13 @@ func (db *DB) HoldOverflowDelete(ctx context.Context, place string, seq int64, n
 			return false, err
 		}
 	}
-	_, err = db.ExecContext(ctx, `INSERT OR IGNORE INTO overflow_tomb (place, seq, bucket, key, sha256, size, drained, deleted_at, due_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, place, seq, bucket, key, sha, size, nullTrue(drained),
-		now.Unix(), now.Add(o.Retention).Unix())
+	var deniedAt any
+	if denied {
+		deniedAt = now.Unix()
+	}
+	_, err = db.ExecContext(ctx, `INSERT OR IGNORE INTO overflow_tomb (place, seq, bucket, key, sha256, size, drained, deleted_at, due_at,
+		denied_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, place, seq, bucket, key, sha, size, nullTrue(drained),
+		now.Unix(), due.Unix(), deniedAt)
 	return err == nil, err
 }
 
@@ -251,17 +288,26 @@ func (db *DB) UnclaimOverflowTombs(ctx context.Context, place string, seqs []int
 }
 
 // TombHold is what an overflow target holds as client-side tombstones:
-// how many, their bytes (counted in its use), and when the next is due.
+// how many, their bytes (counted in its use), and when the next is due;
+// and the deletes it refused for want of permission (S3-5, #40), whose
+// copies stay there, counted in its use, until a daily retry succeeds.
 type TombHold struct {
 	Tombs   int64
 	Bytes   int64
-	NextDue time.Time
+	NextDue time.Time // zero when no tomb waits for its window
+	// Denied and DeniedBytes are the copies, drained or deleted, the
+	// target refused to delete (DenyOverflowDelete).
+	Denied      int64
+	DeniedBytes int64
 }
 
 // OverflowTombHolds returns each overflow target's tombstones that has
 // any, by name.
 func (db *DB) OverflowTombHolds(ctx context.Context) (map[string]TombHold, error) {
-	rows, err := db.QueryContext(ctx, `SELECT place, count(*), sum(size), min(due_at) FROM overflow_tomb GROUP BY place`)
+	rows, err := db.QueryContext(ctx, `SELECT place, count(*) FILTER (WHERE denied_at IS NULL),
+		coalesce(sum(size) FILTER (WHERE denied_at IS NULL), 0), min(due_at) FILTER (WHERE denied_at IS NULL),
+		count(*) FILTER (WHERE denied_at IS NOT NULL), coalesce(sum(size) FILTER (WHERE denied_at IS NOT NULL), 0)
+		FROM overflow_tomb GROUP BY place`)
 	if err != nil {
 		return nil, err
 	}
@@ -270,11 +316,13 @@ func (db *DB) OverflowTombHolds(ctx context.Context) (map[string]TombHold, error
 	for rows.Next() {
 		var place string
 		var h TombHold
-		var due int64
-		if err := rows.Scan(&place, &h.Tombs, &h.Bytes, &due); err != nil {
+		var due sql.NullInt64
+		if err := rows.Scan(&place, &h.Tombs, &h.Bytes, &due, &h.Denied, &h.DeniedBytes); err != nil {
 			return nil, err
 		}
-		h.NextDue = time.Unix(due, 0)
+		if due.Valid {
+			h.NextDue = time.Unix(due.Int64, 0)
+		}
 		if name, ok := OverflowName(place); ok {
 			out[name] = h
 		}

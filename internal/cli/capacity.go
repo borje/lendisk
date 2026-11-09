@@ -122,6 +122,12 @@ type StatusCapacityOverflow struct {
 	Tombstones       int64  `json:"tombstones,omitempty"`
 	TombstoneBytes   int64  `json:"tombstone_bytes,omitempty"`
 	TombstoneNextDue string `json:"tombstone_next_due,omitempty"`
+	// DeleteDenied and DeleteDeniedBytes are the copies, drained back
+	// to friends or deleted, the target refused to delete for want of
+	// permission (S3-5, #40): they stay there, in Use, and the delete
+	// is tried again daily. Absent when none.
+	DeleteDenied      int64 `json:"delete_denied,omitempty"`
+	DeleteDeniedBytes int64 `json:"delete_denied_bytes,omitempty"`
 }
 
 // overflowStatus reads each overflow target's room, use and cost (S3-7).
@@ -145,9 +151,11 @@ func overflowStatus(ctx context.Context, db *state.DB) ([]StatusCapacityOverflow
 			Prefix: o.Prefix, DataObjects: h.DataObjects, DataBytes: h.DataBytes, PricePerGB: o.PricePerGB,
 			Versioning: o.Versioning, Lifecycle: o.Lifecycle, VersionRemoval: o.VersionRemoval, EnvPrefix: o.EnvPrefix,
 			Retention: o.RetentionMode()}
-		if t := tombs[o.Name]; t.Tombs > 0 {
+		t := tombs[o.Name]
+		if t.Tombs > 0 {
 			so.Tombstones, so.TombstoneBytes, so.TombstoneNextDue = t.Tombs, t.Bytes, rfc3339(t.NextDue)
 		}
+		so.DeleteDenied, so.DeleteDeniedBytes = t.Denied, t.DeniedBytes
 		if o.MaxBytes > 0 {
 			so.Percent = h.Use * 100 / o.MaxBytes
 		}
@@ -176,6 +184,11 @@ func overflowLine(o StatusCapacityOverflow) string {
 			l += fmt.Sprintf("; %d deletes held, %s", o.Tombstones, h(o.TombstoneBytes))
 		}
 		l += ")"
+	}
+	if o.DeleteDenied > 0 {
+		// S3-5 (#40): a credential without delete permission.
+		l += fmt.Sprintf("; %d copies kept, %s: its credential may not delete them (tried again daily)",
+			o.DeleteDenied, h(o.DeleteDeniedBytes))
 	}
 	if o.VersionRemoval == state.VersionRemovalAllowed {
 		l += "; its credential can remove versions"

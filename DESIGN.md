@@ -3223,7 +3223,7 @@ upstream bucket is Q-V.
   heals an object that vanished from the store outside lendisk too, as
   a read of it would. Overflow targets (#38) are places like friends
   in a pass: an overflow target is never drained for being over
-  `max_bytes` (drain-back is #40), but one gone past `replace_after` is. A failed
+  `max_bytes` (its copies move back to friends only by drain-back, §3.11, #40), but one gone past `replace_after` is. A failed
   verification (#27) is one: see *Unverified replicas* below.
   - *Metadata first.* Each live metadata object gets a row at every
     friend with an address whose row of it is not `queued`, `acked`,
@@ -6603,8 +6603,9 @@ route to the rest (D12).
 An overflow target is a place in the pool like a friend (D6), with
 `max_bytes` as its capacity, and is only a candidate for a data copy
 when fewer than `copies` friends have room (D6, step 3). The
-re-placement worker drains it back to friends whenever they have room
-(§3.4). `status` shows what it holds, the objects for which it is one
+re-placement worker drains it back to friends once they have room
+for the repository (§3.4; *Hysteresis* and *Drain-back* below).
+`status` shows what it holds, the objects for which it is one
 of the `copies`, and the estimated cost (S3-7).
 
 - **S3-1** `overflow add s3 <name> --endpoint … --bucket … --prefix …
@@ -6732,14 +6733,110 @@ of the `copies`, and the estimated cost (S3-7).
   A delete, or a drain, goes to a versioned target at once (a delete
   marker); one for a target without versioning is held as a
   client-side tombstone (#39, *Retention and undelete* below).
-- **Hysteresis** (#38 review, for #40). The split decision flips as
-  the repository or the pool changes, and a move in flight is cancelled
-  as surplus when it flips back; that is acceptable here, since a move
-  only adds a copy before it deletes one. #40's drain-back, which
-  moves copies from targets to friends, must not run on the same
-  threshold: it needs a margin (drain back only once the friends hold
-  `copies` copies with room to spare), or the two will move the same
-  copies back and forth.
+- **Hysteresis** (#38 review; realised #40). The split decision flips
+  as the repository or the pool changes, and a move in flight is
+  cancelled as surplus when it flips back; that is acceptable here,
+  since a move only adds a copy before it deletes one. Drain-back,
+  which moves copies from targets to friends, does not run on the same
+  threshold, or the two would move the same copies back and forth: it
+  runs only while the friends hold `copies` copies (`FriendsHold`, with
+  their quotas now) of the *largest the repository has been in the
+  last 30 days* (`state.DrainWindow`; `overflowDrain`), and never while
+  placement is split. The repository is sampled at every look the
+  split takes (at most every 30 s, at capture and at each pass) into
+  table `repository_peak` (migration 42: per UTC day, the day's
+  largest data bytes, metadata bytes and copies, each the day's
+  maximum on its own, so `copies` is the largest any bucket had in the
+  window; only days after the window's start and up to today are read).
+  A clock run ahead and back cannot block drain-back or wipe the
+  history (#40 review): a day after today is folded into today's, so
+  it ages out with the window, and days past the window are deleted
+  except the newest 31, whatever the clock says
+  (`TestTheRepositoryPeakSurvivesAClockThatJumps`). After the upgrade
+  to migration 42 the table starts empty, so drain-back may run at once
+  on the repository as it is, with no window behind it. So the split turns on at once when the repository
+  outgrows the friends (REPL-12), and turns off as soon as they hold it
+  again, but the copies the split moved stay at the target until the
+  friends hold everything the repository was in the last 30 days.
+  *Decision (#40): a window in time, not a margin in size.* A size
+  margin (drain back only at, say, 110% of `copies` × the repository)
+  fails scenario 12 itself: with F at 400 GB the friends hold
+  4 × 96 + 376 = 760 GB against 2 × 376 = 752 GB, 101%, and the target
+  must empty. A margin small enough for that (1%) is smaller than one
+  prune: restic's `forget --prune` routinely frees several percent,
+  and the next backups grow it back, which would move every split copy
+  back to friends and out again each cycle. What swings a repository
+  is that shrink and regrow, so the hysteresis is the regrow's horizon:
+  a prune frees no target copy until the repository has stayed small
+  for the window, and a growth back to where it was never re-triggers
+  a move, since the copies are still at the target. A friend added or a
+  quota raised counts at once, since the window is over the
+  repository, not the pool. Precedent: Kubernetes' horizontal
+  autoscaler scales down only to the largest recommendation of its
+  stabilization window (`behavior.scaleDown.stabilizationWindowSeconds`)
+  and up at once, for the same flapping. 30 days covers a monthly
+  prune schedule, and costs at most a month of the target's fee for
+  copies friends could hold. What remains is a repository that grows
+  steadily across the threshold after a drain-back (scenario 12's F
+  leaves 1% to spare): the split then moves one copy of each object to
+  the target again, once, as REPL-12 asks
+  (`TestTheSplitAndDrainBackNeverMoveACopyBackAndForth`: grown past the
+  threshold, pruned below it and grown again four times, no copy
+  leaves the target, and after the window the copies move back and
+  stay). A drain-back copy already sent when the split returns lands
+  all the same, and the split then moves that object's copy to the
+  target once more: one move back, not a cycle.
+- **Drain-back** (#40, REPL-13, scenario 12). The re-placement pass
+  (§3.4) of a bucket not split, while drain-back runs, takes a last
+  round (`dataRound`, after the round that places missing copies, so a
+  drain never takes a friend's room from an object below copies): an
+  object whose copies are all acknowledged, `copies` of them at intact
+  places, one or more at a target, gets a friend copy in place of each
+  target copy, by D6's choice among friends only (`choose`,
+  `friendsOnly`), in sequence order, which is oldest first; the row
+  records the target it replaces (`placement.replaces`). The target's
+  copy is marked dropping when that row is acknowledged
+  (`AckPlacement`), and only while the object keeps `copies`
+  acknowledged copies at intact places without it (`keepReplaced`,
+  #38 review; `TestADrainedTargetCopyStaysWhileTheObjectNeedsIt`);
+  otherwise a later pass drops it when it may. While drain-back runs,
+  a target copy a friend copy replaces is counted out; while it does
+  not, that friend copy is a surplus and is cancelled while unsent
+  (`TestAnUnsentDrainBackCopyIsCancelledWhenDrainBackTurnsOff`), as a
+  split's move is. A surplus copy goes from an overflow target before
+  any friend unless placement is split. *Lowest priority:* a queued
+  row replacing a target copy (`state.drainBack`, `Placement.DrainBack`)
+  comes after every other row of its friend's FIFO, newer captures and
+  dropping rows included (`NextPlacement`), and holds no metadata
+  barrier (`Held`; `waiting` counts it as holding none), since its
+  object keeps `copies` acknowledged copies until it lands and a
+  barrier it held would stop the FIFO it waits at the end of
+  (`TestDrainBackComesLastInTheFriendsFIFOAndHoldsNoBarrier`). Sends
+  and the target's deletes go through the senders, so only inside the
+  schedule (REPL-7;
+  `TestDrainBackSendsOnlyInsideTheScheduleAndAfterNewerCopies`). Once
+  a target holds, has queued and is deleting no copy of a live data
+  object of a bucket, its copies of the bucket's metadata are dropped
+  too (`dropIdleMetadata`, end of each bucket's pass: acknowledged ones
+  marked dropping, unsent ones cancelled), so the target holds nothing
+  and `status` shows it empty
+  (`TestDrainBackEmptiesTheTargetOnceAFriendJoins`,
+  `TestScenarioOverflowDrainsBackToANewFriend`). Every delete at the
+  target, drained data and metadata alike, goes the
+  retention-preserving way (*Retention and undelete* below). A
+  metadata row still dropping when the target is chosen again for a
+  data copy is not queued again with it; the pass after its delete
+  lands puts it back, ahead of later data in the FIFO. Whether a
+  target holds data of a bucket is one condition (`holdsLiveData`: a
+  queued, acknowledged or dropping copy of a live data object) for
+  sending it the bucket's metadata (`overflowHolding`) and for dropping
+  it there, so an old put row of a key deleted since never makes a pass
+  place what the next drops (#40 review,
+  `TestAnIdleTargetsMetadataIsNotPlacedAndDroppedOnEveryPass`). A copy
+  placed again at a place clears the `replaces` of the object's other
+  rows naming that place, so a friend copy that once drained the
+  target never counts out the target's copy the split placed there
+  later (#40 review, `TestAStaleDrainBackPointerDoesNotCountATargetCopyOut`).
 - **Alerts and status** (#38, S3-7). `overflow_receiving` while a
   target holds or has queued a live data copy (it costs money);
   `overflow_high` at 90% of `max_bytes` and `overflow_full` at 100%,
@@ -6883,6 +6980,23 @@ of the `copies`, and the estimated cost (S3-7).
   provider cannot separate the two (Q-AC), the choice is the user's:
   with no delete permission at all, drained copies stay at the target
   as dead weight until the user removes them, and `status` counts them.
+  *Realised (#40).* The overflow client returns a 403 `AccessDenied`
+  to a delete as `replica.ErrDeleteDenied`. The worker then keeps the
+  copy as a tomb marked denied (`state.DenyOverflowDelete`;
+  `overflow_tomb.denied_at`, migration 42), acknowledges the row as
+  sent, and goes on with the target's FIFO, which a delete retried for
+  ever would stop; a client-side tomb whose held delete is refused is
+  marked the same way. A denied tomb stays in the target's use and is
+  due again after a day (`state.DeniedRetry`), so a permission granted
+  later empties the target; a deleted user object kept so is kept as
+  well. `status` shows them per target as `delete_denied` and
+  `delete_denied_bytes`, outside `tombstones`, and the text line says
+  "N copies kept, size: its credential may not delete them (tried
+  again daily)"
+  (`TestDrainedCopiesTheTargetMayNotDeleteStayAndAreCounted`,
+  `TestARefusedHeldDeleteIsKeptCountedAndTriedAgainDaily`,
+  `TestAnOverflowDeleteRefusedForPermissionIsDeleteDenied`,
+  `TestStatusCountsCopiesTheTargetMayNotDelete`).
 - **S3-6** Stored checksums are read with `StatObject` (the ETag,
   where it is an MD5 of a single-part object) and compared where the
   type matches; sample downloads (VER-2) are the check everywhere.

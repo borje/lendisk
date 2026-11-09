@@ -25,8 +25,10 @@ import (
 // metadata object of the bucket in the same transaction, ahead of the
 // data in its FIFO; it then receives each later metadata put and every
 // delete of a key it holds; it is never a target or a source of
-// re-routing; and it counts towards `copies`, the pool size and the
-// offsite holders like a friend.
+// re-routing; it counts towards `copies`, the pool size and the
+// offsite holders like a friend; and its copies move back to friends
+// by drain-back (REPL-13, #40: overflowDrain here, replace.go), with
+// its metadata once it holds no data of a bucket.
 
 // OverflowPrefix begins every overflow target's place name.
 const OverflowPrefix = "overflow:"
@@ -251,9 +253,99 @@ func (db *DB) overflowSplit(ctx context.Context, q querier) (bool, error) {
 			}
 		}
 		split = !FriendsHold(u.Data, u.Metadata, cmp.Or(u.Copies, DefaultCopies), quotas)
+		// Every look at the repository is a sample for drain-back's
+		// hysteresis (overflowDrain), where q can write: a capture's
+		// transaction, or the database.
+		if x, ok := q.(execer); ok {
+			if err := recordPeak(ctx, x, u, db.now()); err != nil {
+				return false, err
+			}
+		}
 	}
 	db.splitAt, db.splitVal, db.splitKey = time.Now(), split, key
 	return split, nil
+}
+
+// DrainWindow is how long drain-back remembers the repository's largest
+// size (overflowDrain, #40).
+const DrainWindow = 30 * 24 * time.Hour
+
+// overflowDrain reports whether copies at overflow targets may move back
+// to friends (REPL-13, §4.11, #40): there is an overflow target, and
+// the node's friends hold `copies` copies (FriendsHold, with their
+// quotas now) of the largest the repository has been in the last
+// DrainWindow, each of its data bytes, metadata bytes and copies taken
+// at its largest that day. That is the hysteresis against the split
+// (overflowSplit), which turns on as soon as they cannot hold the
+// repository as it is now: a prune shrinking the repository, and the
+// growth that follows it, never move copies back and forth, since
+// drain-back waits until the friends hold what the repository was
+// before the prune, or until the window has passed. A friend added or a
+// quota raised counts at once (scenario 12). It records the repository
+// as it is now first.
+func (db *DB) overflowDrain(ctx context.Context) (bool, error) {
+	var targets int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM overflow`).Scan(&targets); err != nil || targets == 0 {
+		return false, err
+	}
+	u, err := repositoryUse(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	now := db.now()
+	if err := recordPeak(ctx, db, u, now); err != nil {
+		return false, err
+	}
+	var peak RepositoryUse
+	if err := db.QueryRowContext(ctx, `SELECT coalesce(max(data), 0), coalesce(max(metadata), 0), coalesce(max(copies), 0)
+		FROM repository_peak WHERE day > ? AND day <= ?`, peakDay(now.Add(-DrainWindow)), peakDay(now)).Scan(&peak.Data, &peak.Metadata, &peak.Copies); err != nil {
+		return false, err
+	}
+	ps, err := poolPlaces(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	var quotas []int64
+	for _, p := range ps {
+		if !p.overflow {
+			quotas = append(quotas, p.quota)
+		}
+	}
+	return FriendsHold(peak.Data, peak.Metadata, cmp.Or(peak.Copies, DefaultCopies), quotas), nil
+}
+
+// peakDay is t's day in repository_peak: days since the Unix epoch.
+func peakDay(t time.Time) int64 { return t.Unix() / 86400 }
+
+// peakKept is how many of the newest days recordPeak keeps whatever
+// the clock says: a clock run forward deletes no history by them.
+const peakKept = 31
+
+// recordPeak keeps u as a sample of the repository at now in
+// repository_peak (its day's largest of each). A day after now's, left
+// by a clock that ran ahead, is folded into now's day, so it ages out
+// with the window rather than holding drain-back back until the clock
+// reaches it. Days past DrainWindow are deleted, except the newest
+// peakKept, so a clock that jumps ahead and back keeps the history.
+func recordPeak(ctx context.Context, x execer, u RepositoryUse, now time.Time) error {
+	today := peakDay(now)
+	if _, err := x.ExecContext(ctx, `INSERT INTO repository_peak (day, data, metadata, copies)
+		SELECT ?1, max(data), max(metadata), max(copies) FROM repository_peak WHERE day > ?1 HAVING count(*) > 0
+		ON CONFLICT (day) DO UPDATE SET data = max(data, excluded.data), metadata = max(metadata, excluded.metadata),
+			copies = max(copies, excluded.copies)`, today); err != nil {
+		return err
+	}
+	if _, err := x.ExecContext(ctx, `DELETE FROM repository_peak WHERE day > ?`, today); err != nil {
+		return err
+	}
+	if _, err := x.ExecContext(ctx, `INSERT INTO repository_peak (day, data, metadata, copies) VALUES (?, ?, ?, ?)
+		ON CONFLICT (day) DO UPDATE SET data = max(data, excluded.data), metadata = max(metadata, excluded.metadata),
+			copies = max(copies, excluded.copies)`, today, u.Data, u.Metadata, u.Copies); err != nil {
+		return err
+	}
+	_, err := x.ExecContext(ctx, `DELETE FROM repository_peak WHERE day <= ?
+		AND day NOT IN (SELECT day FROM repository_peak ORDER BY day DESC LIMIT ?)`, peakDay(now.Add(-DrainWindow)), peakKept)
+	return err
 }
 
 // splitKey is what overflowSplit's answer depends on besides the
@@ -264,13 +356,26 @@ const splitKey = `SELECT coalesce((SELECT group_concat(peer_key || ':' || coales
 	coalesce((SELECT group_concat(name || ':' || max_bytes, ',') FROM overflow), '') || '|' ||
 	coalesce((SELECT group_concat(name || ':' || copies, ',') FROM buckets), '')`
 
-// overflowHolding lists the overflow targets that hold or have queued a
-// data copy of bucket, in place order.
+// overflowHolding lists the overflow targets that hold, have queued or
+// are deleting a copy of a live data object of bucket, in place order
+// (holdsLiveData).
 func overflowHolding(ctx context.Context, q querier, bucket string) ([]string, error) {
 	return column(ctx, q, `SELECT p FROM (SELECT '`+OverflowPrefix+`' || name AS p FROM overflow)
-		WHERE EXISTS (SELECT 1 FROM placement h JOIN queue hq ON hq.seq = h.seq
-			WHERE h.place = p AND h.bucket = ?1 AND h.state IN ('queued', 'acked') AND h.op = 'put' AND hq.class = 'data')
-		ORDER BY p`, bucket)
+		WHERE `+holdsLiveData("p", "?1")+` ORDER BY p`, bucket)
+}
+
+// holdsLiveData is the SQL condition that the overflow target place
+// holds, has queued or is deleting a copy of a live data object (the
+// key's latest done write) of bucket: then the bucket's metadata goes
+// there (overflowHolding, REPL-12), and otherwise it is dropped there
+// (dropIdleMetadata, #40). One condition for both, so the two never
+// place and drop the same metadata in turn (#40 review). place and
+// bucket are SQL expressions.
+func holdsLiveData(place, bucket string) string {
+	return `EXISTS (SELECT 1 FROM placement h JOIN queue hq ON hq.seq = h.seq
+		WHERE h.place = ` + place + ` AND h.bucket = ` + bucket + ` AND h.op = 'put' AND hq.class = 'data'
+		AND h.state IN ('queued', 'acked', 'dropping')
+		AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = hq.bucket AND l.key = hq.key AND l.seq > hq.seq AND l.state = 'done'))`
 }
 
 // placeMetadata puts every live metadata object of bucket that place

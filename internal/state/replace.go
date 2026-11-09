@@ -39,8 +39,19 @@ import (
 //     (the lender keeps a tomb for the window, RET-1);
 //   - surplus copies (copies lowered, or a gone friend back while its
 //     replacement waits) are cancelled while unsent, the fullest place
-//     first, then marked dropping while more than `copies` are
-//     acknowledged.
+//     first (an overflow target before any friend unless placement is
+//     split), then marked dropping while more than `copies` are
+//     acknowledged;
+//   - drain-back (#40): while the friends hold the repository with the
+//     hysteresis of overflowDrain, and placement is not split, a last
+//     round gives each object with an acknowledged copy at an overflow
+//     target a friend copy in its place, oldest first, where a friend
+//     has room after every other copy is placed; the target's copy is
+//     deleted once that one is acknowledged (AckPlacement,
+//     keepReplaced). A drain-back copy is the lowest priority in its
+//     friend's FIFO and holds no metadata barrier (NextPlacement,
+//     Held). A target left with no data of a bucket has its metadata
+//     of the bucket deleted too (dropIdleMetadata).
 //
 // Rules a caller must keep: the bytes of a new copy come only from the
 // node's store, as for any placement row (no lender forwards, PEER-11);
@@ -283,6 +294,13 @@ type replacer struct {
 	// moves: this round may move a copy held only at friends to a
 	// target (the second round of a split bucket, dataRound).
 	moves bool
+	// drainBack: copies at overflow targets may move back to friends
+	// (overflowDrain, never while split); a target's copy a friend's
+	// replaces is then moving, and counted out.
+	drainBack bool
+	// drains: this round moves copies from targets to friends (the last
+	// round while drainBack).
+	drains bool
 }
 
 // Replace runs one re-placement pass over every bucket (REPL-13, file
@@ -309,6 +327,10 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 	if m.split, err = db.overflowSplit(ctx, db); err != nil {
 		return st, err
 	}
+	if m.drainBack, err = db.overflowDrain(ctx); err != nil {
+		return st, err
+	}
+	m.drainBack = m.drainBack && !m.split
 	if m.live, err = liveMetadata(ctx, db); err != nil {
 		return st, err
 	}
@@ -582,13 +604,23 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 	// missing copies only, the second moves copies to a target with the
 	// room the first left, so moves never take a target's room from an
 	// object with fewer copies.
-	rounds := []bool{false}
-	if m.split && copies >= 2 {
-		rounds = append(rounds, true)
+	// While drain-back runs, a last round moves copies from targets to
+	// friends with the room every other copy left (#40).
+	const (
+		placeRound = iota
+		moveRound
+		drainRound
+	)
+	rounds := []int{placeRound}
+	switch {
+	case m.split && copies >= 2:
+		rounds = append(rounds, moveRound)
+	case m.drainBack:
+		rounds = append(rounds, drainRound)
 	}
 	var below, belowBytes int64
-	for _, moves := range rounds {
-		m.moves = moves
+	for _, r := range rounds {
+		m.moves, m.drains = r == moveRound, r == drainRound
 		s, b, bb, err := m.dataRound(ctx, bucket, copies)
 		st.add(s)
 		below, belowBytes = b, bb
@@ -599,8 +631,15 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 			break
 		}
 	}
-	m.moves = false
+	m.moves, m.drains = false, false
 	st.Below, st.BelowBytes = below, belowBytes
+	if ctx.Err() == nil {
+		s, err := m.dropIdleMetadata(ctx, bucket)
+		st.add(s)
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if ctx.Err() == nil {
 		if err := m.recordBelow(ctx, bucket, below, belowBytes); err != nil {
 			errs = append(errs, err)
@@ -716,6 +755,12 @@ func (m *replacer) reachable(place string) bool {
 	return f != nil && f.reachable
 }
 
+// overflowPlace reports whether place is an overflow target in the pool.
+func (m *replacer) overflowPlace(place string) bool {
+	f := m.friends[place]
+	return f != nil && f.overflow
+}
+
 // fullness orders places for a surplus copy to go: the smallest free
 // fraction first (the fullest), ties by node ID.
 func (m *replacer) fullness(a, b string) int {
@@ -811,6 +856,43 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 			}
 		}
 		maxFriends = max(copies-1-friendsHeld, 0)
+	} else if m.drainBack {
+		// Drain-back (#40): a target's copy a friend's copy replaces is
+		// moving back, and counted out; it is deleted once that one is
+		// acknowledged. While drain-back is off, such a friend copy is a
+		// surplus and cancelled unsent, as a split's move is when the
+		// split turns off.
+		var keep []prow
+		for _, r := range good {
+			if m.overflowPlace(r.place) && replaced[r.place] && r.state == PlacementAcked {
+				drain = append(drain, r)
+				continue
+			}
+			keep = append(keep, r)
+		}
+		good = keep
+		if m.drains && len(ops) == 0 && len(drain) == 0 && len(good) == copies {
+			var targets []prow
+			for _, r := range good {
+				if r.state != PlacementAcked {
+					targets = nil
+					break
+				}
+				if m.overflowPlace(r.place) {
+					targets = append(targets, r)
+				}
+			}
+			if len(targets) > 0 {
+				to, err := m.choose(ctx, bucket, o, at, len(targets), -1, commit, true)
+				if err != nil {
+					return nil, false, 0, err
+				}
+				for i, p := range to {
+					ops = append(ops, rop{kind: opPlace, place: p, replaces: targets[i].place})
+				}
+				return ops, false, left, nil
+			}
+		}
 	}
 	acked := 0
 	for _, r := range good {
@@ -821,7 +903,7 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 	below := false
 	switch {
 	case len(good) < copies:
-		to, err := m.choose(ctx, bucket, o, at, copies-len(good), maxFriends, commit)
+		to, err := m.choose(ctx, bucket, o, at, copies-len(good), maxFriends, commit, false)
 		if err != nil {
 			return nil, false, 0, err
 		}
@@ -850,9 +932,18 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 				queued = append(queued, r)
 			}
 		}
-		// Unreachable friends first (the others answer, #26 review),
-		// then the fullest.
+		// An overflow target first unless placement is split (it is
+		// the second choice, always: §4.11), then unreachable friends
+		// (the others answer, #26 review), then the fullest.
 		byFull := func(a, b prow) int {
+			if !(m.split && copies >= 2) {
+				if oa, ob := m.overflowPlace(a.place), m.overflowPlace(b.place); oa != ob {
+					if oa {
+						return -1
+					}
+					return 1
+				}
+			}
 			ra, rb := m.reachable(a.place), m.reachable(b.place)
 			if ra != rb {
 				if rb {
@@ -899,7 +990,8 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 // there, never one with a row of it that holds, refused or is deleting
 // it, never one being drained of it, and never one that lacks the
 // bucket's live metadata; reachable ones first, by largest free fraction.
-func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[string]prow, n, maxFriends int, commit bool) ([]string, error) {
+// friendsOnly leaves overflow targets out (drain-back, #40).
+func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[string]prow, n, maxFriends int, commit, friendsOnly bool) ([]string, error) {
 	need := o.size + ObjectOverhead
 	type cand struct {
 		f    *rfriend
@@ -922,7 +1014,7 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 			// there with the copy (write); never past max_bytes (S3-7),
 			// and never to a failing target, whose queued copies would
 			// hold the metadata barrier (#38 review).
-			if !f.reachable {
+			if !f.reachable || friendsOnly {
 				continue
 			}
 			free := capped(f.quota) - capped(max(f.use, 0)) - capped(f.taken) - capped(meta)
@@ -1145,6 +1237,14 @@ func (m *replacer) write(ctx context.Context, tx *preparedTx, seq int64, op rop,
 	var err error
 	switch op.kind {
 	case opPlace:
+		// A copy placed here again is no longer one another row of the
+		// object replaces: a stale pointer would count it out as moving
+		// (decide, drain-back) though nothing replaces it now (#40
+		// review). Only the rows' bookkeeping changes.
+		if _, err := tx.ExecContext(ctx, `UPDATE placement SET replaces = NULL WHERE seq = ? AND replaces = ? AND place != ?`,
+			seq, op.place, op.place); err != nil {
+			return 0, err
+		}
 		exists := false
 		for _, row := range rows {
 			exists = exists || row.place == op.place
@@ -1191,6 +1291,94 @@ const markDropping = `UPDATE placement SET state = '` + PlacementDropping + `'
 	WHERE place = ?1 AND seq = ?2 AND state = 'acked' AND op = 'put'
 	AND seq = (SELECT max(x.seq) FROM placement x
 		WHERE x.place = placement.place AND x.bucket = placement.bucket AND x.key = placement.key)`
+
+// dropIdleMetadata deletes bucket's metadata at each overflow target
+// that holds, has queued or is deleting no copy of a live data object of
+// it (#40): a
+// target holds the metadata only for the data it holds (REPL-12), so
+// once drain-back has moved its data copies back to friends it is empty
+// (scenario 12) and costs nothing. An acknowledged copy is marked
+// dropping (a delete in the target's FIFO, deleted the
+// retention-preserving way, S3-4); an unsent one is cancelled; one a
+// sender holds is left for the next pass.
+func (m *replacer) dropIdleMetadata(ctx context.Context, bucket string) (ReplaceStats, error) {
+	var st ReplaceStats
+	var targets []string
+	for _, f := range m.order {
+		if f.overflow {
+			targets = append(targets, f.peer)
+		}
+	}
+	if len(targets) == 0 {
+		return st, nil
+	}
+	defer m.db.lockBucket(bucket)()
+	if m.lock != nil {
+		m.lock.Lock()
+		defer m.lock.Unlock()
+	}
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return st, err
+	}
+	defer tx.Rollback()
+	for _, t := range targets {
+		var idle bool
+		if err := tx.QueryRowContext(ctx, `SELECT NOT `+holdsLiveData("?1", "?2"), t, bucket).Scan(&idle); err != nil {
+			return st, err
+		}
+		if !idle {
+			continue
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT p.seq, p.state, p.started_at IS NOT NULL FROM placement p JOIN queue q ON q.seq = p.seq
+			WHERE p.place = ? AND p.bucket = ? AND p.op = 'put' AND q.class IN ('metadata', 'snapshot')
+			AND p.state IN ('queued', 'acked') ORDER BY p.seq`, t, bucket)
+		if err != nil {
+			return st, err
+		}
+		type row struct {
+			seq   int64
+			state string
+			taken bool
+		}
+		var rs []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.seq, &r.state, &r.taken); err != nil {
+				rows.Close()
+				return st, err
+			}
+			rs = append(rs, r)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return st, err
+		}
+		for _, r := range rs {
+			var res sql.Result
+			switch {
+			case r.state == PlacementAcked:
+				if res, err = tx.ExecContext(ctx, markDropping, t, r.seq); err != nil {
+					return st, err
+				}
+				if n, _ := res.RowsAffected(); n > 0 {
+					st.Dropping++
+				}
+			case r.taken || m.sending != nil && m.sending(t, r.seq):
+				m.skipped++
+			default:
+				if res, err = tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'
+					AND started_at IS NULL`, t, r.seq); err != nil {
+					return st, err
+				}
+				if n, _ := res.RowsAffected(); n > 0 {
+					st.Cancelled++
+				}
+			}
+		}
+	}
+	return st, tx.Commit()
+}
 
 // recordBelow keeps bucket's below-copies record: its start is kept
 // while objects stay below, and the row goes when none are.
