@@ -64,6 +64,17 @@ func lendTo(t *testing.T, quota int64, setup func(h *harness)) *lent {
 		setup(h)
 	}
 	h.serve(false)
+	// The gateway reconciles every borrower at start, in the background;
+	// waiting for it keeps it from landing in the middle of a test (a
+	// reconcile aborts uploads it judges abandoned).
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if _, at, err := h.db.LentUsage(context.Background(), b.NodeID().String()); err == nil && !at.IsZero() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the gateway's start reconcile did not finish")
+		}
+	}
 	l := &lent{h: h, id: b, c: h.pairClient(b), bucket: aws.String(b.SealedName("laptop"))}
 	l.store = LentName(b.NodeID(), *l.bucket)
 	l.dir = filepath.Join(h.store, l.store)
