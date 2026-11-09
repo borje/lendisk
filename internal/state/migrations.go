@@ -816,9 +816,10 @@ var migrations = []Migration{
 		SQL: `
 		-- The pool the last re-placement pass answered (REPL-11, REPL-13):
 		-- its PoolFingerprint, and when the pass ended (unix seconds). One
-		-- row, written by a pass that finished without error. Offsite
-		-- reads it: while the pool differs, a pass is due, and an object
-		-- short of places is waiting for it rather than stuck.
+		-- row, written by a pass that went through every bucket, a failed
+		-- batch or not, unless cancelled (#90). Offsite reads it: while
+		-- the pool differs, a pass is due, and an object short of places
+		-- is waiting for it rather than stuck.
 		CREATE TABLE replace_pass (
 			id      INTEGER PRIMARY KEY CHECK (id = 1),
 			pool    TEXT NOT NULL,

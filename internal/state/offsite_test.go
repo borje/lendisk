@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -323,6 +324,62 @@ func TestAPauseForQuotaEndingMakesAPassDue(t *testing.T) {
 	}
 	if s := p.replace(); s.Placed != 1 {
 		t.Fatalf("the pass after the pause ended: %+v", s)
+	}
+}
+
+// REPL-11, OPS-2 (#90): a pass that ends with an error on one bucket
+// still answers the pool. Objects short of places, in the bucket that
+// failed and in a bucket with no room, show as stuck rather than
+// waiting for a pass that already ran and keeps failing.
+func TestAPassThatFailsOnABucketStillLetsShortObjectsBeStuck(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.bucket("phone", 2) // re-placed first: buckets go by name
+	p.bucket("work", 2)
+	placed := p.put("phone", "data/1", "data", 1)
+	noRoom := p.put("phone", "data/2", "data", 1)
+	failing := p.put("work", "data/1", "data", 0.4)
+	for _, seq := range []int64{placed, noRoom, failing} {
+		p.ackAll(seq)
+	}
+	p.friend("C", 1.5) // room for phone's data/1 and work's data/1
+	if _, err := p.db.Exec(fmt.Sprintf(`CREATE TRIGGER fail BEFORE INSERT ON placement WHEN NEW.seq = %d
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`, failing)); err != nil {
+		t.Fatal(err)
+	}
+	if o := p.offsite("phone", noRoom); o.Stuck.Objects != 0 || o.Waiting.Objects != 2 {
+		t.Fatalf("with C added and the pass due: %+v", o)
+	}
+	if _, err := p.db.Replace(ctx, nil, nil); err == nil {
+		t.Fatal("no error from the failing bucket")
+	}
+	if got := p.places(placed); !slices.Equal(got, []string{"B", "C"}) {
+		t.Fatalf("phone data/1 at %v, want B and C", got)
+	}
+	if o := p.offsite("phone", noRoom); o.Reached() || o.Stuck.Objects != 1 || o.Stuck.Unplaced != 1 {
+		t.Fatalf("phone, C full: %+v", o)
+	}
+	if o := p.offsite("work", failing); o.Reached() || o.Stuck.Objects != 1 || o.Stuck.Unplaced != 1 {
+		t.Fatalf("work, its batch failed: %+v", o)
+	}
+}
+
+// OPS-2 (#90): a pass cut short by its context answers nothing: what
+// it never reached may yet be placed by the next.
+func TestACancelledPassLeavesThePassDue(t *testing.T) {
+	p := newPool(t)
+	p.friend("B", 10)
+	p.bucket("laptop", 2)
+	seq := p.put("laptop", "data/1", "data", 1)
+	p.ackAll(seq)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := p.db.Replace(ctx, nil, nil); err == nil {
+		t.Fatal("no error from a cancelled pass")
+	}
+	if due, err := p.db.passDue(context.Background()); err != nil || !due {
+		t.Fatalf("after a cancelled pass: due %t, %v", due, err)
 	}
 }
 

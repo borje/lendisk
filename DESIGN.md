@@ -3934,9 +3934,18 @@ upstream bucket is Q-V.
     `TestStatusWaitStopsWhenAFriendRefusesEverything`). A copy still
     `queued` at an unreachable friend is waiting, not stuck: `Reroute`
     may move it. *Decision (#37 flake): nothing is stuck while a
-    re-placement pass is due.* A pass that finishes records the pool
-    it answered (its `PoolFingerprint`, table `replace_pass`, schema
-    38); while
+    re-placement pass is due.* A pass that goes through every bucket
+    records the pool it answered (its `PoolFingerprint`, table
+    `replace_pass`, schema 38), even when a bucket's batch failed
+    (#90); a pass cut short by its context records nothing. A failed
+    bucket counts as answered: otherwise a bucket whose batch keeps
+    failing would leave its short objects (and, with one record per
+    pass, every bucket's) waiting forever, `status --wait` with them,
+    where stuck says a person is needed; the worker retries a failed
+    pass at its next re-routing tick, so a passing failure is stuck for
+    about a minute
+    (`TestAPassThatFailsOnABucketStillLetsShortObjectsBeStuck`,
+    `TestACancelledPassLeavesThePassDue`). While
     the pool differs (a quota raised, a friend added, back or resumed
     from a pause for quota, before the worker's next look) or no pass
     has run, a short put is waiting for the pass, not stuck, whatever
