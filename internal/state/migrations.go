@@ -811,4 +811,18 @@ var migrations = []Migration{
 		ALTER TABLE friendship ADD COLUMN low_there_since INTEGER;
 		ALTER TABLE friendship ADD COLUMN low_here_since INTEGER;`,
 	},
+	{
+		Version: 38, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The pool the last re-placement pass answered (REPL-11, REPL-13):
+		-- its PoolFingerprint, and when the pass ended (unix seconds). One
+		-- row, written by a pass that finished without error. Offsite
+		-- reads it: while the pool differs, a pass is due, and an object
+		-- short of places is waiting for it rather than stuck.
+		CREATE TABLE replace_pass (
+			id      INTEGER PRIMARY KEY CHECK (id = 1),
+			pool    TEXT NOT NULL,
+			done_at INTEGER NOT NULL
+		);`,
+	},
 }
