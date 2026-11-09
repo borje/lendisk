@@ -141,8 +141,13 @@ func TestASurplusCopyBeingSentIsNotCancelled(t *testing.T) {
 		t.Fatalf("C's row in flight is %s", s)
 	}
 	close(fx.places["C"].hold)
-	// Acknowledged at C, it is now a surplus acknowledged copy: one of
-	// the two is deleted.
+	// Wait for C's outcome first: B alone holding it while C's put is
+	// still on its way is not the answer (that let this test pass by
+	// luck while no pass ever looked again, CI on 64c5649).
+	waitFor(t, "C's send recorded", func() bool { return fx.rowState("C", seq) != state.PlacementQueued })
+	// Acknowledged at C, it is now a surplus acknowledged copy, which no
+	// change to the pool announces: one of the two is deleted at the
+	// next re-routing tick.
 	waitFor(t, "one copy left", func() bool {
 		return fx.holds("B", "laptop", "data/1") != fx.holds("C", "laptop", "data/1")
 	})

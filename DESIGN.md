@@ -3139,7 +3139,18 @@ upstream bucket is Q-V.
     place (smallest free fraction)
     (`TestASurplusCopyAtAnUnreachableFriendGoesFirst`). A row a sender holds is left
     alone and the worker looks again at its next re-routing tick
-    (`TestASurplusCopyBeingSentIsNotCancelled`).
+    (`TestASurplusCopyBeingSentIsNotCancelled`). Held means taken
+    (`started_at`, through a failed send and its retries) or in the
+    worker's sending set: such a copy may land, and its acknowledgement
+    changes no fingerprint, so the pass counts every surplus copy it
+    leaves for that reason (`ReplaceStats.Skipped`) whether or not it
+    had anything else to do for the object, and the worker runs again
+    at each tick until none is left
+    (`TestAPassLeavingATakenSurplusCopyAsksToLookAgain`). The same goes
+    for a held row at an unverified friend, drained once acknowledged
+    (`TestAPassLeavingATakenCopyAtAnUnverifiedFriendAsksToLookAgain`).
+    While such a row waits on an unreachable friend, that is a pass per
+    tick (a minute).
   - *Removed friends (#25 review).* A friend removed has no friendship
     row, so its copies are not good copies and are replaced; once the
     replacements are acknowledged its acknowledged rows are `dropping`.

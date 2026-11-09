@@ -73,6 +73,59 @@ func TestASurplusCopyAtAnUnreachableFriendGoesFirst(t *testing.T) {
 	p.wantPlaces("data/1", d1, "B", "D")
 }
 
+// EP-6, REPL-13 (#26, CI failure on 64c5649): a surplus copy its
+// sender has taken may land, so the pass leaves it alone, and says so
+// (Skipped) even when it has nothing else to do for the object: no
+// change to the pool follows the copy's acknowledgement, and without
+// it the worker would not look again for an hour.
+func TestAPassLeavingATakenSurplusCopyAsksToLookAgain(t *testing.T) {
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("laptop", 2)
+	d1 := p.put("laptop", "data/1", "data", 1)
+	p.wantPlaces("data/1", d1, "B", "C")
+	p.ackRow("B", d1)
+	if !p.start("C", d1) {
+		t.Fatal("C's row not taken")
+	}
+	if err := p.db.SetCopies(context.Background(), "laptop", 1); err != nil {
+		t.Fatal(err)
+	}
+	if s := p.replace(); s.Skipped != 1 || s.Cancelled != 0 || s.Dropping != 0 {
+		t.Fatalf("pass with C's copy taken: %+v, want one skipped and nothing done", s)
+	}
+	p.wantState("C", d1, PlacementQueued)
+	p.wantState("B", d1, PlacementAcked)
+	p.ackRow("C", d1)
+	if s := p.replace(); s.Skipped != 0 || s.Dropping != 1 {
+		t.Fatalf("pass with both acknowledged: %+v, want one dropping", s)
+	}
+}
+
+// REPL-13, VER-1 (#26, #27): a copy at an unverified friend that its
+// sender has taken is left alone, and the pass says so: once it is
+// acknowledged it is drained, which no change to the pool announces.
+func TestAPassLeavingATakenCopyAtAnUnverifiedFriendAsksToLookAgain(t *testing.T) {
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.friend("D", 10)
+	p.bucket("laptop", 2)
+	d1 := p.put("laptop", "data/1", "data", 1)
+	p.ackRow("B", d1)
+	if !p.start("C", d1) {
+		t.Fatal("C's row not taken")
+	}
+	if err := p.db.RecordUnverified(context.Background(), "C", "laptop", "injected", p.now); err != nil {
+		t.Fatal(err)
+	}
+	if s := p.replace(); s.Skipped != 1 {
+		t.Fatalf("pass with C's copy taken: %+v, want one skipped", s)
+	}
+	p.wantState("C", d1, PlacementQueued)
+}
+
 // OPS-2 (#26 review): a batch that fails does not keep the pass from
 // recording what is below copies.
 func TestBelowCopiesIsRecordedWhenABatchFails(t *testing.T) {
