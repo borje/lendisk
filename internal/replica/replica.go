@@ -130,4 +130,11 @@ var (
 	// refused for every place, one that still matches only at this
 	// place (#57).
 	ErrRejected = errors.New("hash rejected by the place")
+	// ErrBusy: the friend asks this node to send again shortly (503
+	// SlowDown: the write fits, but not beside the writes in flight
+	// there, LEND-2; or this node is at its cap of requests in flight
+	// there, §3.7). The friend answered, so the place is busy, not
+	// failing: retried with backoff, never rerouted or alerted as
+	// unreachable for it (#92).
+	ErrBusy = errors.New("busy: the friend asks to send again shortly")
 )

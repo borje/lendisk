@@ -173,20 +173,30 @@ type resetter interface{ Reset() error }
 // a FIN queued behind what the tunnel still holds of the body, which
 // the friend goes on reading until its own stall bound ends it, holding
 // what it reserved for the write and answering this node's retries 507
-// meanwhile (#89). The caller calls ended once the request has
-// returned: its connection may be back in the pool, another request's,
-// and is never reset after that.
+// meanwhile (#89). Once the connection is back in the pool (the trace's
+// PutIdleConn) or the caller has called ended, after the request
+// returned, it may be another request's, and is never reset (#92).
 func abandoning(ctx context.Context, cancel context.CancelFunc) (_ context.Context, abandon, ended func()) {
 	var mu sync.Mutex
 	var conn net.Conn
 	done := false
-	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) {
-		mu.Lock()
-		if !done {
-			conn = i.Conn
-		}
-		mu.Unlock()
-	}})
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GotConn: func(i httptrace.GotConnInfo) {
+			mu.Lock()
+			if !done {
+				conn = i.Conn
+			}
+			mu.Unlock()
+		},
+		// The connection goes back to the pool before the request
+		// returns (#92): from then it may be another request's, so a
+		// stall noticed after it, on the last slow read, resets nothing.
+		PutIdleConn: func(error) {
+			mu.Lock()
+			conn = nil
+			mu.Unlock()
+		},
+	})
 	abandon = func() {
 		mu.Lock()
 		if r, ok := conn.(resetter); ok && !done {
@@ -310,6 +320,10 @@ func classify(err error) error {
 		return fmt.Errorf("%w: %w", ErrImmutable, err)
 	case er.Code == "BadDigest" || er.Code == "InvalidDigest" || er.Code == "XAmzContentSHA256Mismatch":
 		return fmt.Errorf("%w: %w", ErrRejected, err)
+	case er.Code == "SlowDown":
+		// Only the friend's pacing: its other 503s (a gateway still
+		// starting, a database it cannot read) are failures (#92).
+		return fmt.Errorf("%w: %w", ErrBusy, err)
 	}
 	return err
 }

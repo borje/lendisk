@@ -305,7 +305,9 @@ type StatusPlace struct {
 	Removed bool `json:"removed,omitempty"`
 	// State is how the place answered last: ok, retrying, quota (paused
 	// for quota, LEND-2), removed (PEER-5); store when it waits because
-	// this node's store cannot be read, Detail saying why (#57); empty
+	// this node's store cannot be read, Detail saying why (#57); busy
+	// when it answered 503 SlowDown, asking this node to send again
+	// shortly (its writes in flight, LEND-2; not failing, #92); empty
 	// before its first answer.
 	State  string `json:"state"`
 	Detail string `json:"detail,omitempty"`
@@ -366,6 +368,7 @@ var placeStates = map[string]string{
 	state.ConditionQuota:    "paused for quota",
 	state.ConditionRemoved:  "removed",
 	state.ConditionStore:    "waiting for this node's store",
+	state.ConditionBusy:     "busy (it asks to send again shortly)",
 	"":                      "not contacted yet",
 }
 

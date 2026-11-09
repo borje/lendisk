@@ -16,7 +16,7 @@ import (
 // placeStateNames are the values of lendisk_place_state's state label:
 // StatusPlace.State, "none" before the place's first answer.
 var placeStateNames = []string{state.ConditionOK, state.ConditionRetrying, state.ConditionQuota,
-	state.ConditionRemoved, state.ConditionStore, "none"}
+	state.ConditionRemoved, state.ConditionStore, state.ConditionBusy, "none"}
 
 // bitrotStates are StatusRot.State's values.
 var bitrotStates = []string{"kept", "refetching", "repaired", "lent"}
@@ -49,8 +49,8 @@ func (a *app) metricsFamilies(ctx context.Context, db *state.DB, profiles profil
 	lag := gauge("lendisk_place_lag_seconds", "Age of the oldest object waiting to be sent to the place (REPL-11).")
 	ref := gauge("lendisk_place_refused_objects", "Objects the place refused for good and not written again since.")
 	drop := gauge("lendisk_place_dropping_copies", "Copies re-placement is deleting at the place (REPL-13).")
-	pst := gauge("lendisk_place_state", "1 for the place's condition as it answered last (ok, retrying, quota, removed, store, none), 0 for the others.")
-	lastOK := gauge("lendisk_place_last_ok_timestamp_seconds", "When the place last acknowledged anything or answered a probe (Unix time).")
+	pst := gauge("lendisk_place_state", "1 for the place's condition as it answered last (ok, retrying, quota, removed, store, busy, none), 0 for the others.")
+	lastOK := gauge("lendisk_place_last_ok_timestamp_seconds", "When the place last acknowledged anything, answered a probe or answered busy (Unix time).")
 	for _, p := range ps {
 		add(&pq, float64(p.Queue.Objects), "place", p.Place)
 		add(&pqb, float64(p.Queue.Bytes), "place", p.Place)

@@ -199,3 +199,78 @@ func TestAFullFriendThatAnswersProbesIsNotGoneAfterOneMissedProbe(t *testing.T) 
 	}
 	t.Fatal("B not in the pool")
 }
+
+// #92: a friend that answers 503 SlowDown (busy: the write fits, but
+// not beside the writes in flight there) answered. It is neither
+// unreachable nor full however long it stays busy: nothing is
+// re-routed, no barrier is let go, and last_ok moves on with each busy
+// answer, so a failure after them counts from the last one. A busy
+// answer ends a run of failing answers, as ok does.
+func TestABusyFriendIsNeverAway(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.friend("D", 10)
+	p.bucket("laptop", 1)
+	d := p.put("laptop", "data/1", "data", 1)
+	for _, f := range p.places(d) {
+		p.ack(f, d)
+	}
+	m := p.put("laptop", "index/1", "metadata", 0.1) // B, C and D
+	p.ack("C", m)
+	p.ack("D", m)
+	del := p.del("laptop", "data/1", "data")
+	cond := func() PlaceCondition {
+		t.Helper()
+		c, err := p.db.PlaceConditions(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c["B"]
+	}
+	p.answer("B", ConditionRetrying) // a blip before it turned busy
+	p.now = p.now.Add(10 * time.Minute)
+	start := p.now
+	for p.now.Sub(start) < 25*time.Hour {
+		p.answer("B", ConditionBusy)
+		if c := cond(); c.Condition != ConditionBusy || !c.LastOK.Equal(p.now) || !c.FailingSince.IsZero() ||
+			!c.Since.Equal(start) {
+			t.Fatalf("busy for %v: %+v", p.now.Sub(start), c)
+		}
+		if !p.held(del) {
+			t.Fatalf("away after %v of busy answers", p.now.Sub(start))
+		}
+		p.now = p.now.Add(20 * time.Minute)
+	}
+	ps, err := poolPlaces(ctx, p.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pl := range ps {
+		if pl.peer == "B" && (pl.failing() || pl.full() || pl.reroutable(p.db, p.now)) {
+			t.Fatalf("busy for a day: failing %t, full %t, reroutable %t", pl.failing(), pl.full(), pl.reroutable(p.db, p.now))
+		}
+	}
+	d2 := p.put("laptop", "data/2", "data", 1)
+	p.db.Exec(`UPDATE placement SET place = 'B' WHERE seq = ? AND state = 'queued'`, d2)
+	p.answer("B", ConditionBusy)
+	if moved, _, err := p.db.Reroute(ctx, nil, nil); err != nil || moved != 0 {
+		t.Fatalf("moved %d from a busy friend: %v", moved, err)
+	}
+	// Busy, then silent: away reroute_after after its last busy answer.
+	last := p.now
+	p.now = p.now.Add(time.Minute)
+	p.answer("B", ConditionRetrying)
+	if c := cond(); !c.FailingSince.Equal(p.now) || !c.LastOK.Equal(last) {
+		t.Fatalf("a failure after busy: %+v", c)
+	}
+	p.now = last.Add(59 * time.Minute)
+	if !p.held(del) {
+		t.Fatal("away within reroute_after of its last busy answer")
+	}
+	p.now = p.now.Add(2 * time.Minute)
+	if p.held(del) {
+		t.Fatal("not away an hour after its last busy answer")
+	}
+}

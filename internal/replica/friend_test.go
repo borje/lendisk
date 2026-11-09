@@ -192,8 +192,9 @@ func s3ErrorMsg(w http.ResponseWriter, status int, code, msg string) {
 
 // Q-Y.3, LEND-2, PEER-5, EP-11, REPL-10: a friend's quota (507),
 // removal (403 saying there is no relationship, or naming an unknown
-// access key) and immutability (412) refusals, and a rejected hash,
-// reach the worker through the tunnel as distinct errors; anything else,
+// access key) and immutability (412) refusals, a rejected hash, and its
+// 503 SlowDown (busy, #92) reach the worker through the tunnel as
+// distinct errors; anything else, a 503 of a lender still starting and
 // other 403s included (#53), is none of them and is retried.
 func TestFriendRefusalsAreDistinct(t *testing.T) {
 	self := newID(t)
@@ -221,13 +222,15 @@ func TestFriendRefusalsAreDistinct(t *testing.T) {
 			s3Error(w, 400, "BadDigest")
 		case key == "flaky":
 			s3Error(w, 500, "InternalError")
+		case key == "starting":
+			s3Error(w, 503, "ServiceUnavailable")
 		default:
 			s3Error(w, 503, "SlowDown")
 		}
 	}))
-	kinds := []error{ErrQuota, ErrRemoved, ErrImmutable, ErrRejected}
+	kinds := []error{ErrQuota, ErrRemoved, ErrImmutable, ErrRejected, ErrBusy}
 	for key, want := range map[string]error{"quota": ErrQuota, "removed": ErrRemoved, "immutable": ErrImmutable,
-		"rotted": ErrRejected, "flaky": nil, "busy": nil,
+		"rotted": ErrRejected, "flaky": nil, "busy": ErrBusy, "starting": nil,
 		"unknown-key": ErrRemoved, "denied": nil, "bad-signature": nil, "skewed": nil} {
 		err := put(t, f, "laptop", "data/"+key, []byte("x"))
 		if err == nil {

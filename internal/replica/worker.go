@@ -488,7 +488,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	pause := orDefault(w.PauseRetry, time.Hour)
 	backoff := minB
 	// failing is the kind of failure the last outcome was ("store",
-	// "network"), or "" for any other outcome: the first failure of a
+	// "network", "busy"), or "" for any other outcome: the first failure of a
 	// kind after anything else is alerted and backs off from minB, so a
 	// store failure is alerted whatever the network did before (#61).
 	failing := ""
@@ -525,7 +525,7 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 		}
 		contacted = w.now()
 		switch {
-		case err == nil:
+		case err == nil || errors.Is(err, ErrBusy):
 			// A sign of life, not an acknowledgement: last_ok advances,
 			// retrying and removed end, a 507 or a wait on the store
 			// stands (state.ProbeAnswered).
@@ -756,6 +756,23 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			condition(state.ConditionRemoved, err.Error())
 			w.Metrics.Retry(place, metrics.RetryRemoved)
 			pauseFor(ctx, pause, wake)
+		case errors.Is(err, ErrBusy):
+			// The friend answered: the write fits there, but not beside
+			// its writes in flight (an abandoned send's among them), or
+			// this node is at its cap of requests there. Busy, not
+			// failing: retried with backoff, never paused for quota nor
+			// counted towards unreachable (#92).
+			failing = "busy"
+			level := slog.LevelDebug
+			if prev != failing {
+				backoff = minB
+				level = slog.LevelInfo
+			}
+			log.Log(ctx, level, "replication: the friend is busy with writes in flight; retrying", append(row, "err", err, "retry_in", backoff)...)
+			condition(state.ConditionBusy, err.Error())
+			w.Metrics.Retry(place, metrics.RetryBusy)
+			sleep(ctx, backoff)
+			backoff = min(2*backoff, maxB)
 		default:
 			failing = "network"
 			level := slog.LevelDebug
