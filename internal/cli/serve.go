@@ -25,6 +25,7 @@ import (
 	"github.com/borje/lendisk/internal/quota"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/sheet"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/undelete"
 	"github.com/borje/lendisk/internal/verify"
@@ -140,7 +141,9 @@ func (a *app) serveCmd() *cobra.Command {
 			// of their own: nothing else waits for them. Made before the
 			// gateway, whose captures may hold back a changed key (EP-11).
 			alerts := &alert.Service{DB: db, Log: log, Node: nodeID, Command: cfg.Alerts.Command, Webhook: cfg.Alerts.Webhook,
-				UnreachableAfter: cfg.UnreachableAfter(), BelowAfter: cfg.ReplaceAfter(), Now: a.clock}
+				UnreachableAfter: cfg.UnreachableAfter(), BelowAfter: cfg.ReplaceAfter(), Now: a.clock,
+				// The printed recovery sheet against the node's state (ID-7).
+				Sheet: func(ctx context.Context) (time.Time, []string, error) { return sheet.Stale(ctx, db, id) }}
 			if a.tuneAlerts != nil {
 				a.tuneAlerts(alerts)
 			}

@@ -116,15 +116,15 @@ var (
 	errNotFriend = s3err.APIError{Code: "AccessDenied", HTTPStatusCode: 403, Description: "lendisk: " + state.NoRelationship}
 )
 
-// reservedDirs are the top-level directories of a bucket that belong to
+// ReservedDirs are the top-level directories of a bucket that belong to
 // lendisk (tombstones, §3.6) or to versitygw's posix backend.
-var reservedDirs = []string{".lendisk", ".sgwtmp", ".vgwlocks"}
+var ReservedDirs = []string{".lendisk", ".sgwtmp", ".vgwlocks"}
 
 // reserved reports whether a key's first segment names a reserved
 // directory, in any case: a case-insensitive filesystem would put it
 // there.
 func reserved(seg string) bool {
-	for _, d := range reservedDirs {
+	for _, d := range ReservedDirs {
 		if strings.EqualFold(seg, d) {
 			return true
 		}
