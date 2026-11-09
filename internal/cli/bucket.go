@@ -147,7 +147,33 @@ places than it has (REPL-13); ` + "`lendisk status`" + ` shows the re-placement.
 		},
 	}
 	set.Flags().IntVar(&setCopies, "copies", 0, "how many friends hold each object (required)")
-	cmd.AddCommand(add, list, show, resolve, set)
+	var allow int64
+	reconcile := &cobra.Command{
+		Use:   "reconcile <name> --allow-deletes N",
+		Short: "Allow the deletes the store reconciler held back for a bucket",
+		Long: `The daemon compares each bucket's directory in the store with what it
+captured (EP-14), and enqueues objects removed outside the S3 endpoint as
+deletes, which every friend then applies (keeping each as a tombstone
+for its retention window). When more than store.reconcile_delete_limit
+percent of a bucket's objects are missing at once, as when a directory
+was emptied or a disk is not mounted, it deletes none of them and holds
+them back. ` + "`lendisk status`" + ` shows how many. If you removed them,
+allow their deletes with --allow-deletes and that count (or more): the
+daemon's next pass, within a minute, enqueues them. Otherwise put the
+objects back, and the hold ends.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !cmd.Flags().Changed("allow-deletes") {
+				return usageError{errors.New("--allow-deletes is required: the count status shows")}
+			}
+			if allow < 1 {
+				return usageError{errors.New("--allow-deletes must be at least 1")}
+			}
+			return a.runBucketReconcile(cmd.Context(), args[0], allow)
+		},
+	}
+	reconcile.Flags().Int64Var(&allow, "allow-deletes", 0, "let the next pass delete up to this many missing objects (required)")
+	cmd.AddCommand(add, list, show, resolve, set, reconcile)
 	return cmd
 }
 
@@ -179,6 +205,34 @@ func (a *app) runBucketSet(ctx context.Context, name string, copies int) error {
 		fmt.Fprintf(a.out, "Your pool has %d places, fewer than copies %d: objects are held at fewer places until more friends join (`lendisk invite --quota <size>`).\n",
 			places, copies)
 	}
+	return nil
+}
+
+// runBucketReconcile allows bucket's held deletes (EP-14, #8); the
+// running daemon's reconciler enqueues them.
+func (a *app) runBucketReconcile(ctx context.Context, name string, n int64) error {
+	_, db, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if _, err := db.GetBucket(ctx, name); errors.Is(err, state.ErrNotFound) {
+		return fmt.Errorf("no bucket %q; `lendisk bucket list` shows them", name)
+	} else if err != nil {
+		return err
+	}
+	held, err := db.AllowDeletes(ctx, name, n)
+	switch {
+	case errors.Is(err, state.ErrNothingHeld):
+		return fmt.Errorf("no deletes of bucket %s are held back; nothing to allow", name)
+	case errors.Is(err, state.ErrAllowTooFew):
+		return fmt.Errorf("%d deletes are held back for bucket %s, more than %d; allow at least %d (`lendisk status` shows them)",
+			held, name, n, held)
+	case err != nil:
+		return err
+	}
+	fmt.Fprintf(a.out, "The daemon's next reconcile pass of %s, within a minute, enqueues up to %d deletes of objects missing from the store; each friend keeps what it deletes as a tombstone for its retention window. If more are missing by then, it holds them back again.\n",
+		name, n)
 	return nil
 }
 

@@ -130,6 +130,8 @@ if none exists.
 | `store.backend` | `posix` | the only store in v1: plain files |
 | `store.path` | `<data_dir>/store` | the store directory; its filesystem needs xattrs |
 | `store.free_space_floor` | `5%` | refuse writes below this much free space (`5%`, `20G`) |
+| `store.reconcile_every` | `24h` | how often, besides at start, the store is compared with what was captured, so objects written or removed outside the S3 endpoint are replicated |
+| `store.reconcile_delete_limit` | `10` | percent: a pass finding more of a bucket's objects missing deletes none until `lendisk bucket reconcile <bucket> --allow-deletes N` (100 never asks) |
 | `endpoint.loopback` | `127.0.0.1:9000` | the S3 endpoint for tools on this machine; loopback only |
 | `endpoint.listen` | none | S3 endpoints for other machines on your LAN, opt-in and repeatable: `address` or `interface` + `port`, `tls` = `generate` (default), `files` (with `cert`, `key`) or `off`. `lendisk endpoint cert` prints the generated certificate's fingerprint |
 | `tunnel.region` | nearest | the relay region in this node's address; changing it changes the address |
@@ -154,6 +156,7 @@ Files:
 | `<config>/locks/` | 0700 | the lock `peer add` takes while redeeming |
 | `<data>/lendisk.db` | 0600 | SQLite state: everything lendisk creates or learns, including each bucket's credential and each friendship. Migrated forward automatically; a copy `lendisk.db.schema-<n>.bak` is kept before each migration |
 | `<data>/store/` | 0700 | one directory per bucket, holding the backup tool's files as plain files (metadata in xattrs), plus what you lend friends, under `lent-…` buckets. With lendisk stopped, `restic -r <data>/store/<bucket>` opens the repository. Don't change files here while lendisk runs |
+| `<data>/store/.lendisk/store-marker` | 0600 | made by the daemon's first reconcile; while it is missing (an unmounted or replaced store) nothing is reconciled, so an empty directory never deletes your backup at friends. If the store is right, `touch` it back |
 | `<data>/store/.lendisk/manifests/` | 0700 | each friend's encrypted node manifest, which it fetches to recover |
 | `<data>/store/lent-…/.lendisk/tomb/` | 0700 | what a friend deleted, kept until the retention window ends; a direct reader of the bucket ignores it |
 | `<data>/run/gw.sock` | 0600 | the internal socket between lendisk and its embedded S3 gateway |

@@ -21,6 +21,7 @@ import (
 	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/control"
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/logging"
 	"github.com/borje/lendisk/internal/manifest"
@@ -66,6 +67,9 @@ type app struct {
 	// tuneAlerts, if set, adjusts the alert service before it starts
 	// (its interval); tests only.
 	tuneAlerts func(*alert.Service)
+	// tuneReconcile, if set, adjusts the store reconciler's settings
+	// before the gateway starts (its poll); tests only.
+	tuneReconcile func(*gateway.ReconcileSettings)
 	// tuneManifest, if set, adjusts the manifest pusher before it
 	// starts (its poll); tests only.
 	tuneManifest func(*manifest.Pusher)

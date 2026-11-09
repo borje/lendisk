@@ -149,9 +149,16 @@ func (a *app) serveCmd() *cobra.Command {
 					"seq", c.Seq, "acknowledged_sha256", c.Acknowledged, "sha256", c.SHA256)
 				alerts.Check()
 			}
+			// The store reconciler (EP-14): at start, every
+			// store.reconcile_every, and for deletes the user allowed.
+			rec := &gateway.ReconcileSettings{Every: cfg.ReconcileEvery(), DeleteLimit: cfg.Store.ReconcileDeleteLimit.Int(),
+				Alerted: alerts.Check}
+			if a.tuneReconcile != nil {
+				a.tuneReconcile(rec)
+			}
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
 				Profiles: profiles, AfterStore: a.afterStore, BeforeHash: a.beforeHash, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
-				Fetch: fetch}
+				Fetch: fetch, Reconcile: rec}
 			ready := make(chan struct{})
 			go func() { errc <- gw.Run(ctx, ready) }()
 			select {

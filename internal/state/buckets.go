@@ -69,8 +69,8 @@ func (db *DB) AddBucket(ctx context.Context, b Bucket) error {
 	return err
 }
 
-// DeleteBucket removes a bucket row, and its replicas' verification
-// records (#27).
+// DeleteBucket removes a bucket row, its replicas' verification
+// records (#27) and its reconciler record (EP-14).
 func (db *DB) DeleteBucket(ctx context.Context, name string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -81,6 +81,9 @@ func (db *DB) DeleteBucket(ctx context.Context, name string) error {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM replica_check WHERE bucket = ?`, name); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM reconcile WHERE bucket = ?`, name); err != nil {
 		return err
 	}
 	return tx.Commit()

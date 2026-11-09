@@ -674,4 +674,32 @@ var migrations = []Migration{
 		-- before this migration, and the previous release's writes).
 		ALTER TABLE place ADD COLUMN failing_since INTEGER;`,
 	},
+	{
+		Version: 33, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The store reconciler (EP-14, #8). queue.local: when this node knew
+		-- the done put's object to be in its own store (unix seconds): the
+		-- capture stored it, the read-through fetched it, or a reconcile
+		-- pass listed it. NULL on a recovered row until its object is read
+		-- through, and on rows of earlier releases until a pass lists them.
+		-- Only a key whose latest done row is a put marked here, and whose
+		-- object the store no longer has, is enqueued as a delete.
+		ALTER TABLE queue ADD COLUMN local INTEGER;
+		-- 1 on a row the reconciler wrote (found outside the endpoint),
+		-- NULL otherwise; status counts them.
+		ALTER TABLE queue ADD COLUMN reconciled INTEGER;
+		CREATE INDEX queue_reconciled ON queue (bucket) WHERE reconciled = 1;
+		-- Per own bucket: the last pass, the deletes it held back for the
+		-- user's confirmation (held of held_of objects held locally, since
+		-- held_at), and the deletes the user allowed for the next pass
+		-- (lendisk bucket reconcile --allow-deletes). Unix seconds.
+		CREATE TABLE reconcile (
+			bucket    TEXT PRIMARY KEY,
+			passed_at INTEGER,
+			held      INTEGER,
+			held_of   INTEGER,
+			held_at   INTEGER,
+			allowed   INTEGER
+		);`,
+	},
 }

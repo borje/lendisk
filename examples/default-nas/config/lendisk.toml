@@ -28,6 +28,8 @@ metrics = "127.0.0.1:9100"   # Prometheus (OPS-4)
 backend          = "posix"
 path             = "/var/lib/lendisk/store"
 free_space_floor = "5%"      # LEND-2: refuse borrowers' writes below this
+reconcile_every  = "24h"     # EP-14: compare the store with what was captured
+reconcile_delete_limit = 10  # EP-14: more missing than this % deletes nothing until confirmed
 
 [tunnel]
 # The tunnel port is always 9000 inside WireGuard (lender-facing S3 + control API).
