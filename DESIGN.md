@@ -5533,6 +5533,42 @@ the handler's own reads and is never cancelled; nothing below
   written, and then, from the borrower's own map, one line per bucket
   held at that peer, e.g.
   `laptop  restic -r s3:http://127.0.0.1:9100/s4k2…`.
+  *Built (#34, `cli.runPeerForward`):* `lendisk peer forward <node ID>
+  <loopback IP:port>`; any address that is not a loopback IP literal is
+  a usage error (SEC-8). It dials with `transport.NewFriendDialer`, one
+  tailcat dial per accepted connection, spliced byte for byte
+  (`cli.splice`); it adds, removes and rewrites nothing, so the
+  friend's gate, bridge and `Lending` see the tool's own requests. The
+  buckets listed are those of the node's own map with an acknowledged
+  placement at that friend (`state.DB.HeldAt`). Per bucket it prints
+  the bucket, its sealed name and object count, then
+  `rclone copy ":s3,provider=Other,env_auth=true,endpoint='http://<addr>',list_version=2:<sealed>" <bucket>`
+  (rclone reads the pasted `AWS_*` variables; `list_version=2`, since
+  the gate refuses v1 listings) and, for a restic bucket,
+  `restic --no-lock -o s3.region=us-east-1 -r s3:http://<addr>/<sealed> snapshots`
+  (`--no-lock`, since a lock is a write the friend refuses; the region,
+  since without one minio-go first asks `GetBucketLocation`, which the
+  gate refuses, and only then falls back to us-east-1). A backup tool
+  cannot write through the forward: `Lending` refuses a borrower's put
+  without `x-amz-meta-lendisk-sha256` (LEND-4), so `restic prune`
+  through it fails at its lock and changes nothing at the friend, while
+  a delete a client does send is a tombstone (RET-1). Run at enough friends into
+  one directory named for the bucket, the copies are the repository
+  (P-5); the lender's `.lendisk/` never appears in a borrower's
+  listing. restic 0.19.1 and rclone 1.76 send only shapes the gate
+  admits through it (`TestPeerForwardRefusesPruneAndOffList`,
+  `TestScenario10RestoreStraightFromFriends`, a byte-for-byte tap in
+  front of the forward). *One dialling process (#69):* the forward
+  dials with the node's dial key for that friend, as the daemon does,
+  and two tailcat clients of one key at one relay stall each other. So
+  `serve` and `peer forward` both take `<config>/locks/dial.lock`
+  (flock, dropped by the kernel when the process ends), and whichever
+  comes second is refused, naming the other. Restoring straight from
+  friends thus means stopping `serve` meanwhile, as `recover` already
+  asks. Precedent: Tailscale's `tailscale nc` and Syncthing's CLI ask
+  the running daemon instead; lendisk has no daemon IPC beyond
+  `lendisk.db`, and a forward through the daemon would be a second
+  socket SEC-8 does not name.
 - **NET-8** The internal `Transport` interface is `Listen`,
   `Dial(peerKey)`, `Admit(func(peerKey) bool)`, `PeerOf(conn)`,
   `Disconnect(peerKey)`, `PathInfo`. `Admit` must be called before

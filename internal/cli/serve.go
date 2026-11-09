@@ -53,6 +53,12 @@ func (a *app) serveCmd() *cobra.Command {
 				return err
 			}
 			nodeID := id.NodeID().String()
+			// One process dials friends with this node's keys (#69, NET-7b).
+			release, err := takeDialLock(cfg.ConfigDir(), "serving")
+			if err != nil {
+				return err
+			}
+			defer release()
 			if cfg.Alerts.Command != "" {
 				// Refused now, not at the first alert (OPS-3).
 				if err := alert.CheckCommand(cfg.Alerts.Command); err != nil {
