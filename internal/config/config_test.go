@@ -235,6 +235,25 @@ func TestBitrotSettings(t *testing.T) {
 	}
 }
 
+// VER-2 (#39): the overflow sample is a percentage of each target's
+// bytes a week, 0.1 by default.
+func TestOverflowSampleSetting(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil || l.OverflowSample() != 0.1 {
+		t.Fatalf("default %v, %v", l.OverflowSample(), err)
+	}
+	l, err = load(t, []string{"--config", none}, map[string]string{"LENDISK_REPLICATION_OVERFLOW_SAMPLE": "2"})
+	if err != nil || l.OverflowSample() != 2 {
+		t.Fatalf("from the environment %v, %v", l.OverflowSample(), err)
+	}
+	for _, bad := range []string{"0", "-1", "101", "1%"} {
+		if _, err := load(t, []string{"--config", none, "--replication-overflow-sample", bad}, nil); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
 func TestStoreAndEndpointSettings(t *testing.T) {
 	l, err := load(t, []string{"--config", filepath.Join(t.TempDir(), "none.toml"), "--data-dir", "/srv/l"}, nil)
 	if err != nil {

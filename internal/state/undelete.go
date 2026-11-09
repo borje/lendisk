@@ -391,3 +391,57 @@ func (db *DB) AdoptRestored(ctx context.Context, place, bucket string, request i
 	}
 	return n, tx.Commit()
 }
+
+// PlaceDeleted reports whether the copy of key that place held was
+// removed by a delete of the key: its latest row there that holds or
+// held the key is a delete, or it has none (a recovered node). A copy
+// re-placement drained or moved away (a put drained or dropping) is no
+// delete of the user's, and an overflow target's undelete leaves it
+// (S3-4, #39), whatever a friend's undelete has restored meanwhile.
+func (db *DB) PlaceDeleted(ctx context.Context, place, bucket, key string) (bool, error) {
+	var op string
+	err := db.QueryRowContext(ctx, `SELECT op FROM placement WHERE place = ? AND bucket = ? AND key = ?
+		AND state IN ('queued', 'acked', 'dropping', 'drained') ORDER BY seq DESC LIMIT 1`, place, bucket, key).Scan(&op)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	return op == OpDelete, err
+}
+
+// KeyLive reports whether key's latest done write in bucket is a put:
+// the index holds it live.
+func (db *DB) KeyLive(ctx context.Context, bucket, key string) (bool, error) {
+	var op string
+	err := db.QueryRowContext(ctx, `SELECT op FROM queue WHERE bucket = ? AND key = ? AND state = 'done'
+		ORDER BY seq DESC LIMIT 1`, bucket, key).Scan(&op)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return op == OpPut, err
+}
+
+// AdoptCandidates returns, of keys live at place, those AdoptRestored
+// would adopt: a key whose latest done write is a delete place
+// acknowledged, or one with no history that the preview of request
+// listed, with no write in flight. An overflow target's undelete reads
+// the hashes of these only (#39).
+func (db *DB) AdoptCandidates(ctx context.Context, place, bucket string, request int64, keys []string) ([]string, error) {
+	var out []string
+	for _, k := range keys {
+		var ok bool
+		err := db.QueryRowContext(ctx, `SELECT NOT EXISTS (SELECT 1 FROM queue WHERE bucket = ?2 AND key = ?3 AND state = 'pending')
+			AND CASE (SELECT op FROM queue WHERE bucket = ?2 AND key = ?3 AND state = 'done' ORDER BY seq DESC LIMIT 1)
+				WHEN 'delete' THEN EXISTS (SELECT 1 FROM placement WHERE place = ?1 AND state = 'acked'
+					AND seq = (SELECT max(seq) FROM queue WHERE bucket = ?2 AND key = ?3 AND state = 'done'))
+				WHEN 'put' THEN 0
+				ELSE EXISTS (SELECT 1 FROM undelete_key WHERE request = ?4 AND key = ?3) END`,
+			place, bucket, k, request).Scan(&ok)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}

@@ -14,7 +14,14 @@ import (
 // re-placement (replace.go) as a removed friend is, for that bucket
 // alone, and gets no new data copies of it, until a full check passes.
 
-// ReplicaKey names one friend's replica of one bucket.
+// replicaPlaces is every place a replica can be at, as a table of
+// (peer_key, address): friends, and overflow targets, whose address is
+// never empty (VER-2, S3-6, #39).
+const replicaPlaces = `(SELECT peer_key, address FROM friendship
+	UNION ALL SELECT '` + OverflowPrefix + `' || name, 'overflow' FROM overflow)`
+
+// ReplicaKey names one place's replica of one bucket: a friend's, or an
+// overflow target's (#39).
 type ReplicaKey struct {
 	Place, Bucket string
 }
@@ -108,7 +115,7 @@ const heldSince = `(SELECT min(h.acked_at) FROM placement h
 func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name, c.checked_at, c.verified_at, c.full_at,
 		c.unverified_at, coalesce(c.detail, ''), coalesce(c.error, ''), c.error_at, `+heldSince+`
-		FROM friendship f CROSS JOIN buckets b
+		FROM `+replicaPlaces+` f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
 		WHERE c.place IS NOT NULL OR coalesce(f.address, '') != '' AND EXISTS (SELECT 1 FROM placement p
 			WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state = 'acked' AND p.op = 'put')
@@ -143,7 +150,7 @@ func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 // anyway, so a FIFO that never empties (a friend at quota, a slow
 // uplink) does not starve it (#27 review).
 func (db *DB) DueReplicas(ctx context.Context, now time.Time, every, retry time.Duration) ([]ReplicaKey, error) {
-	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name FROM friendship f CROSS JOIN buckets b
+	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name FROM `+replicaPlaces+` f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
 		WHERE coalesce(f.address, '') != '' AND c.unverified_at IS NULL
 		AND (c.checked_at IS NULL OR c.checked_at <= ?1) AND (c.error_at IS NULL OR c.error_at <= ?2)

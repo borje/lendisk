@@ -4843,9 +4843,9 @@ the handler's own reads and is never cancelled; nothing below
   cannot remove versions: it copies the last version before the marker
   onto the same key (`CopyObject` with the source version id), which
   makes it current again and leaves the marker to the lifecycle rule.
-  Elsewhere it clears the borrower's own client-side tombstones
-  (S3-4). Overflow targets are not built yet (#36); the friends' side
-  is (#32):
+  Elsewhere it cancels the borrower's own client-side tombstones
+  (S3-4). Both are realised in #39 (§3.11 *Retention and undelete*);
+  the friends' side is #32's:
   - *The command.* `lendisk undelete <bucket> [--since <time>]
     [--rewrites] [--yes]` (`internal/cli/undelete.go`) asks the daemon
     through `lendisk.db` (table `undelete_request`, schema 34:
@@ -5133,7 +5133,8 @@ the handler's own reads and is never cancelled; nothing below
 - **VER-2** Samples are whole-object `GetObject` calls by the replica
   client, hashed by lendisk and compared with the index; the method
   for overflow targets (S3-6), and for the evicted part of a bucket if
-  evict mode arrives post-v1.
+  evict mode arrives post-v1. Realised for overflow targets in #39
+  (§3.11 *Verification*).
 - **VER-5** The bit-rot sampler (`gateway/bitrot.go`, #31) runs in the
   gateway once it serves, in both roles, and hashes a share of the
   store against the index, on both sides; neither backend has a scrub
@@ -6728,8 +6729,9 @@ of the `copies`, and the estimated cost (S3-7).
   re-placement pass, which places copies that were below `copies`),
   `BelowCopies`, `Replacing` and the offsite holders (#20 review). It
   is never a target of re-routing; as a source it is a friend's like.
-  Deletes go straight to the provider: client-side tombstones for an
-  unversioned bucket (S3-4) are #39.
+  A delete, or a drain, goes to a versioned target at once (a delete
+  marker); one for a target without versioning is held as a
+  client-side tombstone (#39, *Retention and undelete* below).
 - **Hysteresis** (#38 review, for #40). The split decision flips as
   the repository or the pool changes, and a move in flight is cancelled
   as surplus when it flips back; that is acceptable here, since a move
@@ -6749,8 +6751,14 @@ of the `copies`, and the estimated cost (S3-7).
   bucket, prefix, `env_prefix`, what `overflow add` found, and the
   monthly cost estimate (use in GB of 10⁹ bytes times
   `--price-per-gb`, two decimals, no currency) when a price was given;
-  never the credential. A target without versioning is labelled
-  "retention: none, deletes there are final" until #39 builds S3-4's client-side tombstones, which earn it the "retention: client-side" label; `overflow add` warns that deletes there are final.
+  never the credential. Since #39 also `retention` (`provider` or
+  `client-side`) and, for a client-side target holding deletes,
+  `tombstones`, `tombstone_bytes` and `tombstone_next_due`; the text
+  line labels such a target "(retention: client-side; N deletes held,
+  size)", and `overflow add` warns that its retention is client-side
+  and guards against mistakes, not a compromised node. The replicas at
+  a target are listed with the friends' (VER-4) and alerted the same
+  way (`replica_unverified`, `replica_unchecked`).
 - **Testing** (#38). Unit and CLI tests run versitygw's posix backend
   in the test process as the provider (`overflow/overflowtest`; once
   per process, so a CLI test holds the gateway with `serving` and runs
@@ -6758,11 +6766,102 @@ of the `copies`, and the estimated cost (S3-7).
   12's first half (`TestScenarioOverflowAtAnExternalProvider`) against
   a Garage container (`.github/garage.sh`, the image pinned at
   v2.5.0); the test skips without its `LENDISK_TEST_OVERFLOW_*`
-  variables.
+  variables. #39 adds `TestScenarioOverflowRetentionAtAnUnversionedProvider`
+  to that job, and an `overflow-versioned` job against RustFS
+  (`.github/rustfs.sh`, `rustfs/rustfs:1.0.3`, a bucket with
+  versioning made through the AWS CLI; `LENDISK_TEST_OVERFLOW_VERSIONED_*`)
+  running `TestAVersionedProviderUndeletesByCopyingTheVersionBeforeTheMarker`
+  and `TestScenarioOverflowRetentionAtAVersionedProvider`. Locally the
+  same scenarios run against versitygw with versioning on and off
+  (`TestScenarioOverflowRetentionVersioned`, `…Unversioned`);
+  `overflowtest` sets versitygw's `CopyObjectThreshold` to 5 GiB, since
+  its default of 0 refuses every copy.
 - **S3-4** Buckets without versioning get lendisk-side tombstones: the
   delete is recorded locally and issued after the window; `status`
   labels the target "retention: client-side". Drain-back deletes go
   the same way.
+  *Retention and undelete, realised (#39).* A target is client-side
+  when `overflow add` found versioning anything but enabled
+  (`state.Overflow.ClientSide`; *suspended* counts, as a delete there
+  removes the null version). Versioning is read only at `overflow
+  add`: enabling it later changes nothing until the target is added
+  again (no command re-reads it yet).
+  - *Versioned target.* The worker sends the delete (a drain's too) as
+    a plain `DeleteObject`: a delete marker, left to the lifecycle
+    rule. `undelete` lists the bucket's versions under
+    `<prefix>/<sealed name>/` (`Client.ListDeleted`), gathered by key,
+    since a provider need not list a key's versions together (RustFS
+    1.0.3 lists every delete marker of a page before its versions);
+    a key whose current version (`IsLatest`) is a delete marker made
+    at or after `since` comes back as the newest version made before
+    the marker, read once with a HEAD for its
+    `x-amz-meta-lendisk-sha256`; a key whose earlier versions the
+    lifecycle rule purged has nothing to bring back. `Client.Restore`
+    copies that version onto the key (`CopyObject` with the source
+    version id, keeping its metadata; `ComposeObject` with the hash
+    as metadata above 5 GiB), which makes it current and leaves the
+    marker. A copy is made before it is recorded (`RecordRestored`, as
+    a friend's page); one whose record is lost is adopted after the
+    run as a friend's is (`Client.ListLive`, `state.AdoptCandidates`,
+    then a HEAD of each candidate only).
+  - *Unversioned target.* The worker's `send` holds a delete for such
+    a target (`state.HoldOverflowDelete`) instead of sending it, and
+    acknowledges the row as for a sent delete: table `overflow_tomb`
+    (migration 41: place, the placement row held, bucket, key, the
+    version's hash where the target acknowledged one, its size with
+    the overhead, drained, deleted and due times, claim time). The
+    window is the target's `--retention`, from when the delete would
+    have been sent. The tomb's bytes stay in the target's use
+    (triggers on the table), so `max_bytes` and the cost estimate
+    count what the provider still holds. The target's own sender, at
+    most once a poll and only while the schedule is open, claims the
+    tombs due (`DueOverflowTombs`) and sends each delete, then drops
+    the tomb; a failed delete gives back its claim and the rest's. A
+    tomb whose key the target holds again (an acknowledged put of the
+    key there at or after the tomb's row: written again, or an
+    undelete's record) is dropped unsent (`DropSupersededTombs`), so
+    a held delete never removes a newer copy. Tombs live in
+    `lendisk.db`: a restart neither forgets nor hastens one
+    (`TestAClientSideTombstoneIsDueOnlyAfterTheWindowAndSurvivesARestart`,
+    `TestAnUnversionedTargetGetsItsDeleteOnlyAfterTheWindow`).
+    `undelete` claims the tombs of deletes (not drains) made at or
+    after `since` and still inside their window
+    (`ClaimOverflowTombs`), checks with a HEAD that the target still
+    holds each key with the bytes deleted, records it
+    (`RecordRestored`), drops the tombs that record supersedes, and
+    gives back the rest, which are sent when due. A claim marks a tomb
+    for one process: the worker never sends a tomb an undelete
+    claimed, and an undelete never claims one past its window, so the
+    two never meet on the same tomb; a claim older than an hour died
+    with its process and is free again.
+  - *Drained copies.* A copy re-placement drained or moved away is no
+    delete of the user's: undelete leaves it at both kinds of target
+    (`state.PlaceDeleted`: the target's last row of the key that holds
+    or held it must be a delete; a drain's tomb is marked drained),
+    whatever order the places are asked in. A friend that restores the
+    key first makes the target's record an acknowledgement of the same
+    version (`TestUndeleteLeavesACopyDrainedFromAVersionedTarget`).
+  - *`--rewrites`* applies to friends only: a target holds the
+    versions a rewrite replaced as non-current versions or not at all,
+    and none is brought back.
+  - *Decision (#39), from precedent.* restic has no notion of provider
+    versioning: a prune's `DeleteObject` leaves delete markers, and its
+    documentation leaves recovery to the provider's tools and advises
+    object lock or an append-only credential. rclone deletes leave
+    markers too (`--s3-versions` and `--s3-version-at` list and read
+    old versions; B2's default hides rather than deletes), and getting
+    a version back is a copy of it (`rclone copy --s3-version-at`),
+    not a marker's removal; its client-side retention for providers
+    without versioning is `--backup-dir`, which moves each deleted or
+    overwritten file aside instead of deleting it. Kopia reads a
+    versioned bucket as of a time (`--point-in-time`: the newest
+    version before it of each blob) and relies on object lock and the
+    lifecycle rule for retention. So lendisk copies the newest version
+    before the marker (Kopia's point-in-time choice, rclone's
+    mechanism), which needs no version-removal permission (S3-5), and
+    holds deletes rather than moving objects aside: a move is a copy
+    and a delete at the provider, doubling the bytes for the window,
+    where a held delete costs a row.
 - **S3-5** Drain-back has to delete at the target, so the recommended
   credential may create delete markers (`s3:DeleteObject` without a
   version id) and read earlier versions (`s3:GetObjectVersion`, for
@@ -6775,6 +6874,41 @@ of the `copies`, and the estimated cost (S3-7).
 - **S3-6** Stored checksums are read with `StatObject` (the ETag,
   where it is an MD5 of a single-part object) and compared where the
   type matches; sample downloads (VER-2) are the check everywhere.
+  *Verification, realised (#39).* A target's replicas are due daily
+  with the friends' (`DueReplicas` and `ReplicaChecks` read friends and
+  targets alike), and `verify.Verifier.Check` sends a target's to
+  `checkTarget`: up to `DefaultSamples` random acknowledged objects of
+  the replica are read with a HEAD in checksum mode
+  (`Client.Stat`). The object must be there with its size; its
+  `x-amz-meta-lendisk-sha256`, where present, must be the index's;
+  the provider's stored `x-amz-checksum-sha256` of the whole object,
+  where it returns one (single-part objects sent with it, S3-3; a
+  composite multipart checksum is not compared), must be the index's;
+  failing that, an ETag of 32 hex digits without a part count
+  (`ObjectStat.MD5ETag`) must be the MD5 of the local copy, read and
+  checked against its capture hash first (gone or changed: skipped, as
+  for a challenge). Any other ETag is not compared. The weekly sample
+  (VER-2, `sampleStep`) owes `replication.overflow_sample` percent
+  (default 0.1, above 0 up to 100) of the bytes each target holds a
+  week, stepped every 10 minutes like the bit-rot sweep, its step time
+  and debt kept in table `overflow_sample` (migration 41), and
+  downloads random acknowledged objects whole through `Pace.Fetch`
+  (REPL-7's global `download_limit`; `peer_limit` names friends only,
+  so a target has no limit of its own) until it has paid, hashing each
+  against the index. `lendisk verify <bucket> --peer overflow:<name>
+  [--full]` runs the daily check, or with `--full` downloads every
+  object of the replica (VER-3). Outcomes are a friend's: a missing
+  object, other bytes or a mismatched checksum, read again with
+  `StillChallengeable` first, marks the replica unverified, which
+  alerts (`replica_unverified`) and drains its copies (REPL-13); an
+  error decides nothing. *Decision:* the daily stored-checksum check
+  is added to VER-2's sample because 0.1% a week downloads a small
+  target's objects months apart, which `replica_unchecked` (3 days)
+  would report as unknown; eight HEADs a day per replica cost
+  nothing at any provider (`TestATargetIsCheckedDailyByTheProvidersStoredChecksums`,
+  `TestTheSampleDownloadsAShareOfTheTargetsBytesAWeek`,
+  `TestASampleThatDoesNotMatchTheIndexAlerts`,
+  `TestAFullCheckOfATargetDownloadsEveryObject`).
 
 ## 4. Capacity planning
 
@@ -7214,4 +7348,7 @@ design and disappear with it.
   window. Where it cannot, the user chooses between a credential that
   can remove versions and drained copies left in place. Check also that
   undelete's server-side copy of an earlier version onto the same key
-  (§3.6) works with that credential at each provider.
+  (§3.6) works with that credential at each provider. *#39:* the copy
+  works at RustFS 1.0.3 and versitygw with the root credential (CI's
+  `overflow-versioned` job); the per-provider credential checks stay
+  open.

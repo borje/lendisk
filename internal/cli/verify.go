@@ -42,15 +42,21 @@ unverified until --full passes. Exit codes: 0 verified or passed; 1 an
 error, no answer from the friend, nothing to check, or the daemon stopped;
 2 a usage error; 3 timed out; 4 verification failed: the friend does not
 hold what it acknowledged, its replica is marked unverified, and its
-copies move to other friends.`,
+copies move to other friends.
+
+An overflow target (--peer overflow:<name>) cannot answer a challenge:
+it is checked by the provider's stored checksums of random objects it
+holds, and with --full by downloading every object and hashing it
+against the index (VER-2, S3-6), within the download limits.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			bucket := args[0]
 			if peer == "" {
 				return usageError{errors.New("name the friend whose replica to check with --peer <node ID>")}
 			}
-			if _, err := identity.ParseNodeID(peer); err != nil {
-				return usageError{fmt.Errorf("--peer %q is not a node ID: %w", peer, err)}
+			target, isTarget := state.OverflowName(peer)
+			if _, err := identity.ParseNodeID(peer); err != nil && !isTarget {
+				return usageError{fmt.Errorf("--peer %q is not a node ID or overflow:<name>: %w", peer, err)}
 			}
 			if timeout < 0 {
 				return usageError{fmt.Errorf("--timeout %v is negative; 0 waits without a limit", timeout)}
@@ -74,7 +80,13 @@ copies move to other friends.`,
 			if !found {
 				return fmt.Errorf("no bucket %q on this node: `lendisk status` lists them", bucket)
 			}
-			if _, err := db.GetFriendship(ctx, peer); errors.Is(err, state.ErrNotFound) {
+			if isTarget {
+				if _, err := db.GetOverflow(ctx, target); errors.Is(err, state.ErrNotFound) {
+					return fmt.Errorf("no overflow target %s on this node: `lendisk status` lists them", target)
+				} else if err != nil {
+					return err
+				}
+			} else if _, err := db.GetFriendship(ctx, peer); errors.Is(err, state.ErrNotFound) {
 				return fmt.Errorf("node %s is not a friend of this node: `lendisk peer list` lists them", peer)
 			} else if err != nil {
 				return err
@@ -134,6 +146,9 @@ func (a *app) verifyOutcome(ctx context.Context, db *state.DB, bucket, peer stri
 	switch o.Outcome {
 	case state.VerifyPassed:
 		how := "by random ranges"
+		if _, ok := state.OverflowName(peer); ok {
+			how = "by the provider's stored checksums" // S3-6
+		}
 		if full {
 			how = "whole, by hash"
 		}

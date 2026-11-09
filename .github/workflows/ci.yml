@@ -66,10 +66,28 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq restic
       - name: Garage
         run: .github/garage.sh lendisk-ci-garage "$RUNNER_TEMP/garage" >> "$GITHUB_ENV"
-      - run: go test -race -timeout 15m -run 'TestScenarioOverflowAtAnExternalProvider' -v ./internal/cli
+      - run: go test -race -timeout 15m -run 'TestScenarioOverflowAtAnExternalProvider|TestScenarioOverflowRetentionAtAnUnversionedProvider' -v ./internal/cli
       - name: stop Garage
         if: always()
         run: docker rm -f lendisk-ci-garage
+
+  # Tier 1 (DESIGN §3.11): a provider with versioning, RustFS (#39).
+  overflow-versioned:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: restic
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq restic
+      - name: RustFS
+        run: .github/rustfs.sh lendisk-ci-rustfs >> "$GITHUB_ENV"
+      - run: go test -race -timeout 5m -run 'TestAVersionedProviderUndeletesByCopyingTheVersionBeforeTheMarker' -v ./internal/replica
+      - run: go test -race -timeout 15m -run 'TestScenarioOverflowRetentionAtAVersionedProvider' -v ./internal/cli
+      - name: stop RustFS
+        if: always()
+        run: docker rm -f lendisk-ci-rustfs
 
   build:
     runs-on: ubuntu-latest

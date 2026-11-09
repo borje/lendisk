@@ -231,7 +231,9 @@ func (f *Client) CheckOverflow(ctx context.Context, name string, lifecycleDays i
 		c.Versioning = state.VersioningOff
 	}
 	if c.Versioning != state.VersioningEnabled {
-		c.Notes = append(c.Notes, fmt.Sprintf("warning: versioning is %s on bucket %s: a delete there is final: neither the provider nor lendisk keeps a deleted copy, and a compromised node could remove these copies (S3-4); enable versioning if the provider has it",
+		c.Notes = append(c.Notes, fmt.Sprintf("warning: versioning is %s on bucket %s: retention: client-side: lendisk holds each delete there "+
+			"for the retention window and sends it only then, so `lendisk undelete` can bring the copies back meanwhile; "+
+			"this guards against mistakes, not against a compromised node, which could remove these copies (S3-4); enable versioning if the provider has it",
 			c.Versioning, bucket))
 	}
 

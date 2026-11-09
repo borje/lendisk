@@ -887,4 +887,48 @@ var migrations = []Migration{
 			added_at        INTEGER NOT NULL
 		);`,
 	},
+	{
+		Version: 41, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Client-side tombstones at overflow targets without versioning
+		-- (S3-4, #39): a delete the worker would send to such a target is
+		-- held here and issued only once due_at (deleted_at plus the
+		-- target's retention) has passed; undelete cancels it within the
+		-- window. seq is the placement row it holds: the key's delete, or
+		-- a copy re-placement drained (drained 1). sha256 is the version
+		-- the target holds, when known; size what it counts there (with
+		-- the object overhead), kept in place_use until the delete is
+		-- issued. claimed_at marks a tomb the worker is issuing or an
+		-- undelete is restoring, so the two never meet; a claim older than
+		-- an hour has died with its process. Unix seconds.
+		CREATE TABLE overflow_tomb (
+			place      TEXT NOT NULL,
+			seq        INTEGER NOT NULL,
+			bucket     TEXT NOT NULL,
+			key        TEXT NOT NULL,
+			sha256     TEXT,
+			size       INTEGER NOT NULL,
+			drained    INTEGER,
+			deleted_at INTEGER NOT NULL,
+			due_at     INTEGER NOT NULL,
+			claimed_at INTEGER,
+			PRIMARY KEY (place, seq)
+		);
+		CREATE INDEX overflow_tomb_due ON overflow_tomb (place, due_at);
+		CREATE INDEX overflow_tomb_key ON overflow_tomb (place, bucket, key);
+		CREATE TRIGGER overflow_tomb_insert AFTER INSERT ON overflow_tomb BEGIN
+			INSERT OR IGNORE INTO place_use (place, bytes) VALUES (NEW.place, 0);
+			UPDATE place_use SET bytes = bytes + NEW.size WHERE place = NEW.place;
+		END;
+		CREATE TRIGGER overflow_tomb_delete AFTER DELETE ON overflow_tomb BEGIN
+			UPDATE place_use SET bytes = bytes - OLD.size WHERE place = OLD.place;
+		END;
+		-- The overflow verification sample (VER-2, #39): per target, when
+		-- the last step ran and the bytes it owes (negative: paid ahead).
+		CREATE TABLE overflow_sample (
+			place   TEXT PRIMARY KEY,
+			step_at INTEGER NOT NULL,
+			owed    INTEGER NOT NULL
+		);`,
+	},
 }

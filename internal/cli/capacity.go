@@ -111,6 +111,17 @@ type StatusCapacityOverflow struct {
 	// EnvPrefix names the credential's variables: <env_prefix>ACCESS_KEY
 	// and <env_prefix>SECRET_KEY.
 	EnvPrefix string `json:"env_prefix"`
+	// Retention is who keeps deleted copies for the window (S3-4):
+	// "provider" (versioning and its lifecycle rule) or "client-side"
+	// (no versioning: lendisk holds each delete until the window ends).
+	Retention string `json:"retention"`
+	// Tombstones and TombstoneBytes are the deletes held for a
+	// client-side target and what they still hold there (in Use);
+	// TombstoneNextDue when the first is sent (RFC 3339, UTC). Absent
+	// when none.
+	Tombstones       int64  `json:"tombstones,omitempty"`
+	TombstoneBytes   int64  `json:"tombstone_bytes,omitempty"`
+	TombstoneNextDue string `json:"tombstone_next_due,omitempty"`
 }
 
 // overflowStatus reads each overflow target's room, use and cost (S3-7).
@@ -123,12 +134,20 @@ func overflowStatus(ctx context.Context, db *state.DB) ([]StatusCapacityOverflow
 	if err != nil {
 		return nil, err
 	}
+	tombs, err := db.OverflowTombHolds(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := []StatusCapacityOverflow{}
 	for _, o := range targets {
 		h := holds[o.Name]
 		so := StatusCapacityOverflow{Name: o.Name, MaxBytes: o.MaxBytes, Use: h.Use, Endpoint: o.Endpoint, Bucket: o.Bucket,
 			Prefix: o.Prefix, DataObjects: h.DataObjects, DataBytes: h.DataBytes, PricePerGB: o.PricePerGB,
-			Versioning: o.Versioning, Lifecycle: o.Lifecycle, VersionRemoval: o.VersionRemoval, EnvPrefix: o.EnvPrefix}
+			Versioning: o.Versioning, Lifecycle: o.Lifecycle, VersionRemoval: o.VersionRemoval, EnvPrefix: o.EnvPrefix,
+			Retention: o.RetentionMode()}
+		if t := tombs[o.Name]; t.Tombs > 0 {
+			so.Tombstones, so.TombstoneBytes, so.TombstoneNextDue = t.Tombs, t.Bytes, rfc3339(t.NextDue)
+		}
 		if o.MaxBytes > 0 {
 			so.Percent = h.Use * 100 / o.MaxBytes
 		}
@@ -149,8 +168,14 @@ func overflowLine(o StatusCapacityOverflow) string {
 		l += fmt.Sprintf("; about %.2f a month at %g per GB", o.MonthlyCost, o.PricePerGB)
 	}
 	l += fmt.Sprintf("; versioning %s", o.Versioning)
-	if o.Versioning != state.VersioningEnabled {
-		l += " (retention: none, deletes there are final)"
+	if o.Retention == state.RetentionClientSide {
+		// S3-4: lendisk holds each delete for the window; this guards
+		// against mistakes, not a compromised node.
+		l += " (retention: client-side"
+		if o.Tombstones > 0 {
+			l += fmt.Sprintf("; %d deletes held, %s", o.Tombstones, h(o.TombstoneBytes))
+		}
+		l += ")"
 	}
 	if o.VersionRemoval == state.VersionRemovalAllowed {
 		l += "; its credential can remove versions"
