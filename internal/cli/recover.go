@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/state"
@@ -391,7 +393,8 @@ func printOverflow(w io.Writer, targets []manifest.Overflow) {
 		}
 		fmt.Fprintln(w)
 		if o.AccessKey != "" || o.SecretKey != "" {
-			fmt.Fprintf(w, "    access key: %s\n    secret key: %s\n", o.AccessKey, o.SecretKey)
+			an, sn := overflow.EnvNames(cmp.Or(o.EnvPrefix, overflow.DefaultEnvPrefix(o.Name)))
+			fmt.Fprintf(w, "    access key: %s (as %s)\n    secret key: %s (as %s)\n", o.AccessKey, an, o.SecretKey, sn)
 		}
 	}
 }

@@ -942,7 +942,10 @@ upstream bucket is Q-V.
   so a rebuilt node admits the friend again; added in #29 within
   format 1, since readers ignore a field they do not know and an
   absent one reads as none), `overflow` (name, endpoint, bucket, prefix and credential,
-  S3-1; empty until #38 fills it) and `buckets` (name, sealed name,
+  S3-1, with region, `max_bytes`, `env_prefix`, retention and price
+  added in #38 within format 1; the credential is read from the
+  daemon's environment when the manifest is built, and absent while it
+  is unset) and `buckets` (name, sealed name,
   `copies`, profile, created at). Placement (REPL-12) and the buckets'
   own S3 credentials (SEC-3) are not in it. *Envelope*: `ldm1` ‖
   24-byte nonce ‖ XChaCha20-Poly1305 (`golang.org/x/crypto`) of the
@@ -1097,7 +1100,7 @@ upstream bucket is Q-V.
   push manifests). Overflow target
   credentials found in the manifest are shown once, for the user to
   put in the environment (SEC-3); they are not written to disk
-  (`printOverflow`; the list is empty until #38). The
+  (`printOverflow`, naming the variables each goes in). The
   `placement` table (D6) and the hash index are then rebuilt from the
   control API `list` of each reachable place for each sealed bucket
   (§3.7): one paged call per bucket and place, not a request per
@@ -3201,8 +3204,9 @@ upstream bucket is Q-V.
   store's local error (`TestARecoveredNodeReplacesFromTheReadThrough`:
   recover, then `peer add` and `peer remove`, with no refusal). This
   heals an object that vanished from the store outside lendisk too, as
-  a read of it would. Overflow targets (#38, #40) are not built; their
-  cases join the drained places below when they are. A failed
+  a read of it would. Overflow targets (#38) are places like friends
+  in a pass: an overflow target is never drained for being over
+  `max_bytes` (drain-back is #40), but one gone past `replace_after` is. A failed
   verification (#27) is one: see *Unverified replicas* below.
   - *Metadata first.* Each live metadata object gets a row at every
     friend with an address whose row of it is not `queued`, `acked`,
@@ -4610,14 +4614,18 @@ the handler's own reads and is never cancelled; nothing below
     and exact for the usual single bucket. `status` shows the local copy
     beside it (`RepositorySize`, the live bytes in the store).
   - *Protectable size* (`Plan.Protectable`): the largest `S` with
-    Σ min(D, quotaⱼ − m) + Σ (overflow `max_bytes` − m) ≥ c × D over the
+    Σ min(D, quotaⱼ − m) + Σ min(D, overflow `max_bytes` − m) ≥ c × D over the
     friendships with an address, each term floored at 0, `m` scaled with
     `S` at the repository's present metadata share (1% while it holds no
     data) and `D = S − m`; the feasible set is an interval from 0, so a
     bisection finds its end. The fair bound (`Plan.FairProtectable`)
     puts each friend's reported repository size in place of its quota.
-    Overflow targets are a parameter (`Plan.Overflow`), none until #38;
-    `status` lists them (`capacity.overflow`, empty).
+    Overflow targets are a parameter (`Plan.Overflow`, each target's
+    `max_bytes`, read by `capacity.Read` since #38). An overflow target
+    holds at most one copy of each object, as a friend does, so its term
+    is capped at D too (#38; it was not, which overstated the
+    protectable size once `max_bytes` passed D). `status` lists them
+    (`capacity.overflow`, §3.11).
   - *Guidance* (`Plan.Cover`). While the repository is above 90% of the
     protectable size (`capacity.AlertPercent`), the numbers aim at
     `S ÷ 0.9` (`Plan.Target`), so that setting them clears the alert
@@ -6589,12 +6597,113 @@ of the `copies`, and the estimated cost (S3-7).
   start. Each of the node's buckets is a sub-prefix
   `<prefix>/<sealed name>/` (SEC-16), with keys below it as the tool
   wrote them (S3-2).
+  *Realised (#38).* Table `overflow` (migration 40): name, endpoint
+  URL, region (empty: minio-go asks the provider), bucket, prefix
+  (default `lendisk`), `max_bytes`, `env_prefix`, retention, price per
+  GB-month, and what `overflow add` found (`versioning`: enabled,
+  suspended or off; `lifecycle`: present, created, absent or
+  unsupported; `version_removal`: allowed, denied or unknown). Names
+  are 1 to 32 of `[a-z0-9-]`, starting with a letter
+  (`overflow.CheckName`). The target's place name in `placement`,
+  `place`, `place_use` and every per-place table is `overflow:<name>`
+  (`state.OverflowPlace`), which no node ID can be. Package
+  `internal/overflow` owns the name and the credential:
+  `<env_prefix>ACCESS_KEY` and `<env_prefix>SECRET_KEY`, the prefix
+  `LENDISK_OVERFLOW_<NAME>_` (upper case, `-` as `_`) unless `--env-prefix`
+  names another; `overflow.Credential` prints, logs and marshals as
+  `[credential redacted]`, and errors name variables, never values.
+  The client is `replica.NewOverflow`: the one replica `Client` (D12)
+  with the provider's host, TLS by the URL's scheme, bucket lookup
+  auto (path style except at AWS), keys at
+  `replica.OverflowKey(prefix, sealed, key)`, and its own error
+  classification (`classifyOverflow`): a checksum mismatch is
+  `ErrRejected`, `SlowDown` or 503 `ErrBusy`, a 403 the provider
+  refusing the credential, retried and reported, never `ErrRemoved`
+  or `ErrQuota`. Its probe lists one key under the prefix (S3-5's
+  credential may do that; a friend's probe lists buckets).
+  `overflow add` checks before it writes the row
+  (`Client.CheckOverflow`): it lists under the prefix, puts a test
+  object `<prefix>/lendisk-check-<random>` with the SHA-256 checksum,
+  reads it back, reads versioning (anything but enabled is warned of),
+  removes the test object's own version to learn whether the
+  credential can remove versions (allowed is warned of, with S3-5's
+  recommendation; denied leaves the test object as a non-current
+  version for the lifecycle rule), deletes it, and reads the lifecycle
+  rules: with no enabled rule expiring non-current versions under the
+  prefix it offers one, and creates it, added to the bucket's rules
+  as `lendisk-<name>` with the retention in whole days, when given
+  `--lifecycle`. Any failure of the credential leaves no row, and the
+  provider's message is passed through `Credential.Redact`. `serve`
+  refuses to start while any target's variables are unset
+  (`checkOverflowCredentials`, before anything starts); a target added
+  while the daemon runs is built at the worker's next friendship read,
+  and one whose variables that daemon lacks is retrying with the
+  reason, alerted as `overflow_unreachable`. *Decision (#38):* the
+  credential comes from those two variables only. restic and Kopia
+  walk minio-go's chain (static keys, `AWS_*` variables, shared files,
+  instance roles), and rclone does too with `env_auth`; a chain here
+  could pick up a credential meant for another program or bucket, so
+  lendisk names the variables per target and reads nothing else.
 - **S3-3** Uploads carry a SHA-256 request checksum, the object's on a
   single PUT and each part's on multipart (§3.4), plus lendisk's
   SHA-256 as metadata. Garage verifies both (Q-Y.2); a provider that
   refuses them is set per target to send none, and the sample
   downloads of VER-2 carry the check there. Large objects use
   multipart with the resume of §3.4.
+  *Realised (#38):* the same calls as a friend's (`Client.Put`,
+  `Create`/`PutPart`/`Complete`): `x-amz-checksum-sha256` with
+  `UNSIGNED-PAYLOAD` on a PUT, `x-amz-checksum-algorithm: SHA256` at
+  create and each part's SHA-256 in an unsigned trailer, and the parts'
+  checksums at complete; versitygw and Garage both refuse a body that
+  does not match (`TestOverflowPutsUnderThePrefixWithAVerifiedChecksum`,
+  `TestScenarioOverflowAtAnExternalProvider`). *Decision:* SHA-256, not
+  Content-MD5. restic and Kopia send Content-MD5 (minio-go's
+  `SendContentMd5`) and rclone sends Content-MD5 per part with the
+  whole object's MD5 as metadata; lendisk already has each object's
+  SHA-256 from capture (EP-3), takes each part's as it streams, and
+  sends the same checksum to friends, so one path covers both. The
+  per-target switch to send none is not built: no provider tried
+  refuses it.
+- **Placement** (#38, D6 step 3, `state/overflow.go`). `poolPlaces`
+  returns the targets after the friends, with `max_bytes` as quota.
+  `choose` (capture) and the re-placement pass's choose take friends
+  first by D6's rule, and only for the copies still missing a target
+  by most free bytes: `max_bytes` less use, less the bucket's metadata
+  it lacks, so a target never passes `max_bytes` (S3-7). A target
+  chosen for a data copy is first given every live metadata object of
+  the bucket it lacks (`placeMetadata`), in the same transaction and
+  ahead of the data in its FIFO, at their own sequences, so the
+  barrier still sends each only after the data written before it.
+  From then on each metadata put of the bucket goes there too
+  (`overflowHolding`: a target with a queued or acknowledged data put
+  of the bucket), and each delete of a key it holds or was sent. A
+  target counts in `PoolSize`, the pool fingerprint (adding one runs a
+  re-placement pass, which places copies that were below `copies`),
+  `BelowCopies`, `Replacing` and the offsite holders (#20 review). It
+  is never a target of re-routing; as a source it is a friend's like.
+  Deletes go straight to the provider: client-side tombstones for an
+  unversioned bucket (S3-4) are #39.
+- **Alerts and status** (#38, S3-7). `overflow_receiving` while a
+  target holds or has queued a live data copy (it costs money);
+  `overflow_high` at 90% of `max_bytes` and `overflow_full` at 100%,
+  each replacing the other and held like the quota alerts;
+  `overflow_unreachable` after the same thresholds as a friend's.
+  `status` lists each target in `places` (kind `overflow`, its name as
+  `place`), and in `capacity.overflow`: `max_bytes`, use, percent, the
+  live data objects and bytes it is one of the copies of, endpoint,
+  bucket, prefix, `env_prefix`, what `overflow add` found, and the
+  monthly cost estimate (use in GB of 10⁹ bytes times
+  `--price-per-gb`, two decimals, no currency) when a price was given;
+  never the credential. A target without versioning is labelled
+  "retention: client-side" (S3-4's label; the tombstones are #39).
+- **Testing** (#38). Unit and CLI tests run versitygw's posix backend
+  in the test process as the provider (`overflow/overflowtest`; once
+  per process, so a CLI test holds the gateway with `serving` and runs
+  its nodes as daemon processes). CI's `overflow` job runs scenario
+  12's first half (`TestScenarioOverflowAtAnExternalProvider`) against
+  a Garage container (`.github/garage.sh`, the image pinned at
+  v2.5.0); the test skips without its `LENDISK_TEST_OVERFLOW_*`
+  variables.
 - **S3-4** Buckets without versioning get lendisk-side tombstones: the
   delete is recorded locally and issued after the window; `status`
   labels the target "retention: client-side". Drain-back deletes go
@@ -6649,7 +6758,7 @@ and every place also holds the metadata `m` (about 1% of `S`). With
 `D = S − m`, quotas `qⱼ` and overflow room `Oₖ`, the pool holds `S` at
 `c` copies only if
 
-    Σⱼ min(D, qⱼ − m) + Σₖ (Oₖ − m) ≥ c × D
+    Σⱼ min(D, qⱼ − m) + Σₖ min(D, Oₖ − m) ≥ c × D
 
 and the protectable size (LEND-7) is the largest `S` that satisfies it
 (each term floored at 0: a friend too small for the metadata holds no
@@ -6684,9 +6793,10 @@ Worked examples, `c = 2`:
 3. **E with 380 GB among the same four** (scenario 12). Fair quotas
    cap each friendship at 100 GB: with `m` ≈ 4 GB, 4 × 96 = 384 GB of
    data room, so `D` ≤ 192 and the protectable size is just under 200
-   GB. An overflow target at `max_bytes` 450 GB adds 446: 384 + 446 =
-   830 ≥ 2 × 376, so every data object has one copy at a friend and the
-   other at a friend or the target. At about $6 per TB-month that is
+   GB. An overflow target at `max_bytes` 450 GB adds min(376, 446): 384 +
+   376 = 760 ≥ 2 × 376, so every data object can have one copy at a
+   friend and the other at a friend or the target (whether D6's choice
+   reaches that placement is Q-AD). At about $6 per TB-month that is
    under $3 a month. A fifth friend with 400 GB of their own, at a 400
    GB quota, empties the target: 384 + min(376, 396) = 760 ≥ 752.
 
@@ -7032,6 +7142,23 @@ design and disappear with it.
   friend one number it could already estimate from what it holds of
   the bucket's metadata. REQUIREMENTS.md v0.10 lists it in SEC-2; it is
   rounded to 1 GB (§3.5).
+- **Q-AD (open, #38)** D6's choice and scenario 12. Friends of equal
+  quotas fill at the same rate, each data object going to `copies` of
+  them while they have room, so once they are full every later object
+  finds no friend with room and gets a single copy, at the overflow
+  target: below `copies`. Scenario 12 (four friends at 100 GB, 380 GB
+  to back up, a 450 GB target) wants every object at two places, one a
+  friend, which §4 shows is feasible (each object at one friend and the
+  target) but D6 does not reach, at capture or by re-placement (moving
+  a friend's second copy to the target frees nothing at the friend for
+  the retention window, RET-1). #38 builds D6 as written and tests it
+  where fewer than `copies` friends have room (`TestScenarioOverflow`:
+  one large friend and one small). Options: while the pool's friends
+  cannot hold `copies` × the repository (`Plan`), place at most
+  `copies − 1` copies of a new data object at friends and the rest at
+  a target; or reserve friend room for first copies. Either changes
+  REPL-12's "only for copies that no friend has room for", so it is
+  the user's call.
 - **Q-AC (gate, open)** Drain-back deletes at overflow targets (§3.11,
   S3-5). Check per tier-1 provider (B2, Wasabi, Hetzner, R2) whether a
   credential can allow delete markers but not version removal, and

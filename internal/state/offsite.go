@@ -33,9 +33,10 @@ import (
 // until the key is written back or deleted.
 //
 // Only places in the pool hold copies: friends with an address that do
-// not refuse this node and are not gone past replace_after (REPL-12,
-// REPL-13). An acknowledgement at a removed or gone friend is not
-// counted; re-placement (#26) restores the copy elsewhere.
+// not refuse this node and are not gone past replace_after, and overflow
+// targets not gone past it (REPL-12, REPL-13, #38). An acknowledgement
+// at a removed or gone friend is not counted; re-placement (#26)
+// restores the copy elsewhere.
 //
 // w is valid when every put at or below it passes; the watermark is
 // the highest valid w up to the bucket's latest done write. So the
@@ -218,7 +219,8 @@ func (db *DB) Offsite(ctx context.Context, bucket string, target int64) (Offsite
 
 // holders are the places that count as holding copies, as JSON for
 // json_each: friends with an address that do not refuse this node and
-// are not gone past replace_after (PoolSize's rule).
+// are not gone past replace_after, and overflow targets not gone past
+// it (PoolSize's rule).
 func (db *DB) holders(ctx context.Context) (string, error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {

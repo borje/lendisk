@@ -230,7 +230,7 @@ func (db *DB) Replacing(ctx context.Context) (map[string]ReplacingStat, error) {
 		count(*) FILTER (WHERE p.state = 'dropping')
 		FROM placement p JOIN queue q ON q.seq = p.seq
 		WHERE (p.state = 'dropping' OR p.state = 'queued' AND p.replaced_at IS NOT NULL)
-		AND p.place IN (SELECT peer_key FROM friendship)
+		AND p.place IN (SELECT peer_key FROM friendship UNION ALL `+overflowPlaces+`)
 		GROUP BY p.bucket`)
 	if err != nil {
 		return nil, err
@@ -273,6 +273,10 @@ type replacer struct {
 	// failed a challenge (VER-1, #27): drained of its data copies, as a
 	// removed friend is, for that bucket alone.
 	unverified map[string]bool
+	// metaPlaces are where the bucket in hand's metadata goes: every
+	// friend with an address, and each overflow target holding data of
+	// it (REPL-12).
+	metaPlaces []string
 }
 
 // Replace runs one re-placement pass over every bucket (REPL-13, file
@@ -303,7 +307,9 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 		f := &rfriend{poolPlace: p, reachable: !p.unreachable(db, m.now)}
 		f.drainAll = p.cond == ConditionRemoved || p.gone(db, m.now)
 		f.candidate = p.quota > 0 && !f.drainAll && !p.full()
-		if !f.drainAll {
+		// An overflow target above max_bytes is not drained: its
+		// copies move back to friends only by drain-back (#40).
+		if !f.drainAll && !p.overflow {
 			if f.drain, err = db.overQuota(ctx, p); err != nil {
 				return st, err
 			}
@@ -513,15 +519,31 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 	if m.unverified, err = unverifiedAt(ctx, m.db, bucket); err != nil {
 		return st, err
 	}
-	// Metadata missing at a friend with an address (REPL-12).
-	meta, err := column(ctx, m.db, `SELECT DISTINCT q.seq FROM queue q, friendship f
+	// Metadata missing at a friend with an address, or at an overflow
+	// target holding data of the bucket (REPL-12).
+	m.metaPlaces = nil
+	for _, f := range m.order {
+		if !f.overflow {
+			m.metaPlaces = append(m.metaPlaces, f.peer)
+		}
+	}
+	held, err := overflowHolding(ctx, m.db, bucket)
+	if err != nil {
+		return st, err
+	}
+	m.metaPlaces = append(m.metaPlaces, held...)
+	list, err := json.Marshal(m.metaPlaces)
+	if err != nil {
+		return st, err
+	}
+	meta, err := column(ctx, m.db, `SELECT DISTINCT q.seq FROM queue q, json_each(?2) f
 		WHERE q.bucket = ?1 AND q.class IN ('metadata', 'snapshot') AND q.op = 'put' AND q.state = 'done'
-		AND q.immutable IS NULL AND `+liveQ+` AND coalesce(f.address, '') != ''
-		AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.place = f.peer_key AND p.seq = q.seq
+		AND q.immutable IS NULL AND `+liveQ+`
+		AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.place = f.value AND p.seq = q.seq
 			AND p.state IN ('queued', 'acked', 'refused', 'dropping'))
 		AND NOT EXISTS (SELECT 1 FROM placement r WHERE r.seq = q.seq AND r.state = 'refused'
 			AND r.cause IN ('store', 'oversize'))
-		ORDER BY q.seq`, bucket)
+		ORDER BY q.seq`, bucket, string(list))
 	if err != nil {
 		return st, err
 	}
@@ -798,7 +820,7 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 		f    *rfriend
 		free int64
 	}
-	var cs []cand
+	var cs, over []cand
 	for _, f := range m.order {
 		if !f.candidate || f.drain[o.seq] || m.unverified[f.peer] {
 			continue
@@ -809,6 +831,15 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 		meta, err := m.unsentAt(ctx, bucket, f.peer)
 		if err != nil {
 			return nil, err
+		}
+		if f.overflow {
+			// D6 step 3: by free bytes, its missing metadata going
+			// there with the copy (write); never past max_bytes (S3-7).
+			free := capped(f.quota) - capped(max(f.use, 0)) - capped(f.taken) - capped(meta)
+			if free >= capped(need) {
+				over = append(over, cand{f, free})
+			}
+			continue
 		}
 		if meta > 0 {
 			continue
@@ -827,6 +858,14 @@ func (m *replacer) choose(ctx context.Context, bucket string, o robj, at map[str
 		}
 		return byFraction(a.f.peer, a.free, capped(a.f.quota), b.f.peer, b.free, capped(b.f.quota))
 	})
+	// Overflow targets only for the copies no friend has room for.
+	slices.SortFunc(over, func(a, b cand) int {
+		if c := cmp.Compare(b.free, a.free); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.f.peer, b.f.peer)
+	})
+	cs = append(cs, over...)
 	var out []string
 	for _, c := range cs[:min(n, len(cs))] {
 		out = append(out, c.f.peer)
@@ -903,6 +942,22 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 			}
 		}
 		for _, op := range ops {
+			if f := m.friends[op.place]; f != nil && f.overflow && !meta && op.kind == opPlace {
+				// The bucket's metadata goes to an overflow target with
+				// its first data copy there, ahead of it (REPL-12).
+				k := [2]string{bucket, op.place}
+				bytes, err := m.unsentAt(ctx, bucket, op.place)
+				if err != nil {
+					return st, err
+				}
+				placed, err := placeMetadata(ctx, ptx, bucket, op.place, now)
+				if err != nil {
+					return st, err
+				}
+				st.Placed += placed
+				f.taken = capped(f.taken + bytes)
+				m.unsent[k] = 0
+			}
 			n, err := m.write(ctx, ptx, seq, op, o.rows, now)
 			if err != nil {
 				return st, err
@@ -923,22 +978,23 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 	return st, tx.Commit()
 }
 
-// metadataOps places metadata object o at every friend with an address
+// metadataOps places metadata object o at every friend with an address,
+// and every overflow target holding data of the bucket (metaPlaces),
 // whose row of it does not hold, refuse or delete it (REPL-12).
 func (m *replacer) metadataOps(o robj) []rop {
 	if storeRefused(o.rows) {
 		return nil
 	}
 	var ops []rop
-	for _, f := range m.order {
+	for _, place := range m.metaPlaces {
 		has := false
 		for _, r := range o.rows {
-			if r.place == f.peer && (r.holds() || r.state == PlacementRefused || r.state == PlacementDropping) {
+			if r.place == place && (r.holds() || r.state == PlacementRefused || r.state == PlacementDropping) {
 				has = true
 			}
 		}
 		if !has {
-			ops = append(ops, rop{kind: opPlace, place: f.peer})
+			ops = append(ops, rop{kind: opPlace, place: place})
 		}
 	}
 	return ops

@@ -368,7 +368,7 @@ func TestStaleNamesWhatChangedSinceTheSheetWasPrinted(t *testing.T) {
 	}
 	print := func() {
 		t.Helper()
-		s, err := Build(ctx, db, id, false)
+		s, err := Build(ctx, db, id, false, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

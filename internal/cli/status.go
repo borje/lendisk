@@ -340,8 +340,8 @@ type StatusAlert struct {
 // StatusPlace is one place in the pool and its replication FIFO
 // (REPL-1, REPL-4, REPL-11).
 type StatusPlace struct {
-	Place string `json:"place"` // the friend's node ID
-	Kind  string `json:"kind"`  // friend
+	Place string `json:"place"` // the friend's node ID, or the overflow target's name
+	Kind  string `json:"kind"`  // friend or overflow
 	// Removed is true for a former friend (PEER-5, #25): its copies no
 	// longer count, and nothing more is sent there.
 	Removed bool `json:"removed,omitempty"`
@@ -435,6 +435,15 @@ func places(ctx context.Context, db *state.DB, now time.Time) ([]StatusPlace, er
 		names = append(names, f.Peer)
 		seen[f.Peer] = true
 	}
+	// Overflow targets beside the friends (S3-1).
+	targets, err := db.Overflows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, o := range targets {
+		names = append(names, o.Place())
+		seen[o.Place()] = true
+	}
 	var rest []string
 	for p := range stats {
 		if !seen[p] {
@@ -445,7 +454,11 @@ func places(ctx context.Context, db *state.DB, now time.Time) ([]StatusPlace, er
 	out := []StatusPlace{}
 	for _, p := range append(names, rest...) {
 		st, c := stats[p], conds[p]
-		sp := StatusPlace{Place: p, Kind: "friend", Removed: !seen[p], State: c.Condition, Detail: c.Detail,
+		kind, place := "friend", p
+		if name, ok := state.OverflowName(p); ok {
+			kind, place = "overflow", name
+		}
+		sp := StatusPlace{Place: place, Kind: kind, Removed: !seen[p], State: c.Condition, Detail: c.Detail,
 			Queue:      StatusQueue{Objects: st.Queued, Bytes: st.QueuedBytes},
 			LagSeconds: int64(st.Lag / time.Second), Refused: st.Refused, Dropping: st.Dropping}
 		if !c.LastOK.IsZero() {

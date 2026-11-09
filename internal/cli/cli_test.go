@@ -63,6 +63,9 @@ type node struct {
 	// lending cap (#24); zero is 1 PiB, so tests that lend 80G run on a
 	// small disk.
 	lendSpace uint64
+	// env, when set, is the environment every command reads overflow
+	// credentials from (app.env); unset variables are absent.
+	env map[string]string
 }
 
 func newNode(t *testing.T) *node {
@@ -87,6 +90,7 @@ func (n *node) run(stdin string, phrase string, args ...string) (int, string, st
 		redeemTransport: n.redeemTransport, beforeFriendship: n.beforeFriendship,
 		afterFetch: n.afterFetch, listBudget: n.listBudget, sleep: n.sleep,
 		lendStatfs: func(string) (store.Space, error) { return store.Space{Total: cmp.Or(n.lendSpace, 1<<50)}, nil },
+		env:        func(k string) (string, bool) { v, ok := n.env[k]; return v, ok },
 	}
 	args = append(args, "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0")
 	code := a.run(args)

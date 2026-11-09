@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/borje/lendisk/internal/capacity"
@@ -40,8 +41,7 @@ type StatusCapacity struct {
 	Coverable bool  `json:"coverable"`
 	// Friends is each friendship's quota and use both ways.
 	Friends []StatusCapacityFriend `json:"friends"`
-	// Overflow is each overflow target's room and use (S3-7); none until
-	// overflow targets exist.
+	// Overflow is each overflow target's room, use and cost (S3-7).
 	Overflow []StatusCapacityOverflow `json:"overflow"`
 	// Lent is the quota lent to all friends, LentUsed what they store
 	// here; Received the quota they lend this node (the same, as every
@@ -80,7 +80,88 @@ type StatusCapacityFriend struct {
 type StatusCapacityOverflow struct {
 	Name     string `json:"name"`
 	MaxBytes int64  `json:"max_bytes"`
-	Use      int64  `json:"use"`
+	// Use is what it holds or will hold, metadata included, as the
+	// provider counts bytes (objects at their size plus
+	// state.ObjectOverhead).
+	Use int64 `json:"use"`
+	// Endpoint, Bucket and Prefix are where it is; keys go under
+	// <prefix>/<sealed name>/ (S3-2). Never the credential (SEC-3).
+	Endpoint string `json:"endpoint"`
+	Bucket   string `json:"bucket"`
+	Prefix   string `json:"prefix"`
+	// DataObjects and DataBytes are the live data objects for which it
+	// is one of the copies.
+	DataObjects int64 `json:"data_objects"`
+	DataBytes   int64 `json:"data_bytes"`
+	// Percent is Use of MaxBytes; at 100 no new copies go there (S3-7).
+	Percent int64 `json:"percent"`
+	// PricePerGB and MonthlyCost are the user's price per GB (10^9
+	// bytes) and month and the estimate for Use; absent without a price.
+	PricePerGB  float64 `json:"price_per_gb,omitempty"`
+	MonthlyCost float64 `json:"monthly_cost,omitempty"`
+	// Versioning, Lifecycle and VersionRemoval are what overflow add
+	// found (S3-4, S3-5).
+	Versioning     string `json:"versioning"`
+	Lifecycle      string `json:"lifecycle"`
+	VersionRemoval string `json:"version_removal"`
+	// EnvPrefix names the credential's variables: <env_prefix>ACCESS_KEY
+	// and <env_prefix>SECRET_KEY.
+	EnvPrefix string `json:"env_prefix"`
+}
+
+// overflowStatus reads each overflow target's room, use and cost (S3-7).
+func overflowStatus(ctx context.Context, db *state.DB) ([]StatusCapacityOverflow, error) {
+	targets, err := db.Overflows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	holds, err := db.OverflowHolds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []StatusCapacityOverflow{}
+	for _, o := range targets {
+		h := holds[o.Name]
+		so := StatusCapacityOverflow{Name: o.Name, MaxBytes: o.MaxBytes, Use: h.Use, Endpoint: o.Endpoint, Bucket: o.Bucket,
+			Prefix: o.Prefix, DataObjects: h.DataObjects, DataBytes: h.DataBytes, PricePerGB: o.PricePerGB,
+			Versioning: o.Versioning, Lifecycle: o.Lifecycle, VersionRemoval: o.VersionRemoval, EnvPrefix: o.EnvPrefix}
+		if o.MaxBytes > 0 {
+			so.Percent = h.Use * 100 / o.MaxBytes
+		}
+		if o.PricePerGB > 0 {
+			so.MonthlyCost = math.Round(float64(h.Use)/1e9*o.PricePerGB*100) / 100
+		}
+		out = append(out, so)
+	}
+	return out, nil
+}
+
+// overflowLine is one overflow target in status's capacity lines.
+func overflowLine(o StatusCapacityOverflow) string {
+	h := capacity.Human
+	l := fmt.Sprintf("    %s: holds %s of %s (%d%%), %s (%s) for which it is one of the copies", o.Name, h(o.Use), h(o.MaxBytes),
+		o.Percent, countObjects(o.DataObjects), h(o.DataBytes))
+	if o.PricePerGB > 0 {
+		l += fmt.Sprintf("; about %.2f a month at %g per GB", o.MonthlyCost, o.PricePerGB)
+	}
+	l += fmt.Sprintf("; versioning %s", o.Versioning)
+	if o.Versioning != state.VersioningEnabled {
+		l += " (retention: client-side)"
+	}
+	if o.VersionRemoval == state.VersionRemovalAllowed {
+		l += "; its credential can remove versions"
+	}
+	if o.Percent >= 100 {
+		l += "; full: no new copies go there"
+	}
+	return l
+}
+
+func countObjects(n int64) string {
+	if n == 1 {
+		return "1 data object"
+	}
+	return fmt.Sprintf("%d data objects", n)
 }
 
 // capacityStatus reads capacity planning at now.
@@ -105,6 +186,9 @@ func (a *app) capacityStatus(ctx context.Context, db *state.DB, defaultCopies in
 		Protectable: plan.Protectable(), FairProtectable: plan.FairProtectable(), Alerting: plan.Alerting(),
 		Friends: []StatusCapacityFriend{}, Overflow: []StatusCapacityOverflow{}}
 	c.Deficit = max(c.RepositorySize-c.Protectable, 0)
+	if c.Overflow, err = overflowStatus(ctx, db); err != nil {
+		return nil, err
+	}
 	cover, ok := plan.Cover()
 	c.Coverable = ok
 	low := func(since time.Time) string {
@@ -184,8 +268,11 @@ func capacityLines(c *StatusCapacity, role string) []string {
 		if len(c.Overflow) == 0 {
 			out = append(out, "  Overflow targets: none")
 		}
+		if len(c.Overflow) > 0 {
+			out = append(out, fmt.Sprintf("  Overflow targets: %d, for the copies no friend has room for", len(c.Overflow)))
+		}
 		for _, o := range c.Overflow {
-			out = append(out, fmt.Sprintf("    %s: %s of %s", o.Name, h(o.Use), h(o.MaxBytes)))
+			out = append(out, overflowLine(o))
 		}
 	}
 	return out

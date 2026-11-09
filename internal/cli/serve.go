@@ -21,6 +21,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/metrics"
+	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/pace"
 	"github.com/borje/lendisk/internal/profile"
 	"github.com/borje/lendisk/internal/quota"
@@ -110,7 +111,12 @@ func (a *app) serveCmd() *cobra.Command {
 			}
 			// The node manifest (ID-4), pushed to every friend; in both
 			// profiles, since a lender-only node is rebuilt from it too.
-			push := &manifest.Pusher{DB: db, Self: id, Now: a.clock, Random: a.random, Log: log}
+			// Overflow targets' credentials are in the environment, or
+			// the daemon does not start (SEC-3, S3-1).
+			if err := checkOverflowCredentials(ctx, db, a.getenv()); err != nil {
+				return err
+			}
+			push := &manifest.Pusher{DB: db, Self: id, Now: a.clock, Random: a.random, Log: log, Getenv: a.getenv()}
 			// Ending friendships (PEER-5, SEC-15, #25): revoked, told and
 			// purged by the farewell, kicked by a friend's remove call.
 			fw := &farewell{DB: db, Log: log, Now: a.clock}
@@ -287,6 +293,16 @@ func (a *app) serveCmd() *cobra.Command {
 				// (REPL-9): it reads the store and lendisk.db only.
 				w = &replica.Worker{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Log: log,
 					Alerted: alerts.Check, Now: a.clock, Full: xch.Due, Fill: gw.Fill, Pace: pacer, Metrics: counters}
+				// Overflow targets (#38), each with the credential the
+				// daemon's environment holds now (SEC-3).
+				getenv := a.getenv()
+				w.ConnectOverflow = func(o state.Overflow) (replica.Replica, error) {
+					cred, err := overflow.Lookup(getenv, o.EnvPrefix)
+					if err != nil {
+						return nil, err
+					}
+					return replica.NewOverflow(o, cred, id.SealedName, w.Client)
+				}
 				if a.tuneReplication != nil {
 					a.tuneReplication(w)
 				}
