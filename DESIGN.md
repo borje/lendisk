@@ -2702,6 +2702,7 @@ upstream bucket is Q-V.
   | Put acknowledged after its delete was placed (#85) | S, then its tomb, until the purge | S: the put keeps S, its delete takes −S more, +S in `place_freed` |
   | Delete refused | the object, live | S: the delete leaves both counts |
   | Copy marked `dropping`, then `drained` (#26) | the copy, then its tomb, until the purge | S: out of `place_use`, +S in `place_freed` (`place_freed_dropping`) |
+  | Tomb undeleted (RET-3, #32) | unchanged: the tomb, live again | 2S until the answer: the restored put's acknowledged S, and the S its delete left in `place_freed` |
   | A `drained` copy placed there again (re-placement) | the tomb and the new copy | the new S queued, plus the S still in `place_freed` |
   | The bucket at the place | 4 KiB | 0 until an answer counts it |
   | A quota answer | its count, `lent` | `lent` plus the place's queued puts, split so that `place_freed` holds its deletes |
@@ -4381,15 +4382,117 @@ the handler's own reads and is never cancelled; nothing below
   nothing is lost, and a later delete starts a new window
   (`TestCompletingAnOldUploadRevivesTheObject`).
 - **RET-3** `undelete` for a friend is the control API `undelete`
-  (bucket, since): the lender moves each tomb copy deleted since that
-  time back to its key and drops the row; `list` shows beforehand what
-  that would restore. For an overflow target that versions, the
+  (bucket, since; §3.7 NET-7, #32): the lender moves each tomb copy
+  deleted since that time back to its key and drops the row; `list`
+  shows beforehand what that would restore. For an overflow target that versions, the
   borrower does not remove the delete marker, since S3-5's credential
   cannot remove versions: it copies the last version before the marker
   onto the same key (`CopyObject` with the source version id), which
   makes it current again and leaves the marker to the lifecycle rule.
   Elsewhere it clears the borrower's own client-side tombstones
-  (S3-4).
+  (S3-4). Overflow targets are not built yet (#36); the friends' side
+  is (#32):
+  - *The command.* `lendisk undelete <bucket> [--since <time>]
+    [--rewrites] [--yes]` (`internal/cli/undelete.go`) asks the daemon
+    through `lendisk.db` (table `undelete_request`, schema 34:
+    `state.DB.RequestUndelete`), as `verify` does (VER-3): only the
+    daemon dials with the node's keys (§3.7, #69). `--since` is an RFC
+    3339 time, a date (local midnight) or how long ago (`36h`, `7d`);
+    without it, every tomb in the window. The daemon's runner
+    (`internal/undelete`, polled every second) first reads every
+    friend's `list` of the bucket and writes a preview: the
+    tombstoned keys whose `tombstoned_at` is at or after since, each
+    once however many friends hold it, their bytes, the snapshot keys
+    among them (named, up to 50) and the count per friend. The command
+    prints it and asks; no, or an interrupt, drops the request
+    (`CancelUndelete`), and nothing was asked of any friend. Yes
+    (`ConfirmUndelete`) has the runner ask every friend with an
+    address, page by page, and record what each restored; the command
+    prints per friend what came back and what was left, and exits 1
+    if a friend was not reached (undelete is safe to repeat). Every
+    friend is asked, not only those placement names: after an
+    attacker's prune placement no longer says who holds the bucket's
+    tombs; a friend holding none answers `NoSuchBucket` or restores
+    nothing.
+  - *The lender (`gateway.Gateway.Undelete`, `undelete.go`).* For the
+    caller's own bucket (`lent_bucket`; another sealed name is
+    `NoSuchBucket`, PEER-8), up to a page of keys after `after` with a
+    kept tombstone deleted at or after since (`state.UndeleteKeys`),
+    each under its key's lock and the borrower's publication lock:
+    *which version* — the key's newest delete tomb since then: the
+    version it held when it was last deleted. With `rewrites`, a
+    rewrite's tomb (#74; multipart rewrites' too, #23) counts as well,
+    and the key comes back as it was at since: its oldest tomb, of
+    either kind, deleted at or after since. *Never over a live
+    object* — a key live with other bytes is skipped and reported with
+    both hashes (`conflict`), one live with the chosen bytes is
+    reported `live`; its tombs stay for their window, so no version is
+    lost (RET-1). To roll a live rewritable key back, delete it first
+    and undelete with `--rewrites`. *The revival* is the re-put's
+    (`revive`): the row pending, the tomb hard-linked back (never over
+    an object), the tomb unlinked, the row dropped, so `settleTombs`
+    settles a crash midway as for a re-put. *Quota:* a tomb counts
+    until purged (LEND-1), so a revival moves its count from tomb to
+    live unchanged (`TestUndeleteRestoresTheTombsDeletedSince`).
+  - *The borrower (`state.DB.RecordRestored`).* What a friend restored
+    is checked as recovery checks a list (key, size, hash, a
+    hash-named key's name; rejected entries are logged and counted),
+    classified by the bucket's profile (local-only keys are not
+    recorded), and joins the index in one transaction per page: a key
+    whose latest done write is a delete, or that has none (a recovered
+    node's key every friend listed tombstoned), gains a done put of
+    the version, created now, with an acknowledged placement row at
+    that friend (size plus `ObjectOverhead`); a second friend
+    restoring the same version adds its acknowledgement (a `queued`,
+    `refused`, `dropped` or `abandoned` row of that version there
+    becomes `acked`; one re-placement is `dropping` keeps its course).
+    The local store is not refilled: the row's `queue.local` is NULL,
+    so the read-through fetches each object when it is first read
+    (ID-6, EP-10) and the store reconciler does not take its absence
+    for a delete (§3.3 EP-14). The offsite watermark counts the rows as
+    any acknowledged put (REPL-11): restored at `copies` friends, the
+    bucket is offsite again with no byte sent; at fewer, re-placement
+    (#26) fills the missing copies through the read-through
+    (`TestRestoredObjectsJoinTheIndex`). *Decision: the local version
+    wins (EP-11).* A key whose latest done write is a put of another
+    version (this node wrote it again since, or holds a change EP-11
+    held back) keeps it: the local store is the user's, and its version
+    is the newer; the friend's restored copy is reported (`kept`) and
+    not counted. A key with a write in flight (a pending row) is left
+    to that write. The borrower's count of the friend is high by the
+    restored bytes until its next quota answer (§3.4 *What each side
+    counts*).
+  - *Scenario 4* (`TestScenarioRansomwareIsUndone`, real daemons,
+    restic): A at two copies over B and C; the attacker's `restic
+    forget --prune` of both snapshots replicates as tombs at both; A
+    is wiped and recovered from B; restic sees no snapshot; an
+    undelete declined changes nothing; one accepted brings every
+    object back at both friends, `restic snapshots` lists both,
+    `restic check --read-data` passes through the read-through, the
+    latest snapshot restores exactly, and `status --wait` says the
+    bucket is offsite at two copies. *Scenario 9*
+    (`TestScenarioKopiaRestoresAfterMaintenanceAndRecovery`): a Kopia
+    bucket offsite at two copies; full maintenance after a snapshot
+    delete tombs its deleted packs and indexes at both friends; after
+    recovery the latest snapshot restores through the read-through;
+    an undelete then brings back every deleted blob (the rewrites'
+    tombs of `kopia.maintenance` stay: not asked) and Kopia still
+    verifies and restores.
+  - *Precedent (#32).* S3 versioning undeletes by removing the delete
+    marker, which makes the newest version before it current again;
+    older versions stay as they were. Backblaze B2 has no unhide call:
+    a hidden file is unhidden by deleting its hide marker
+    (`b2_delete_file_version`), the same way, and a file uploaded again
+    after the hide is simply the newest version. restic's advice after a
+    ransomware prune is to restore from a copy the attacker could not
+    reach and keep `forget --prune` away from the backup credentials
+    (append-only rest-server, object lock); it has no undelete of its
+    own, since a pruned pack is gone. So: the newest delete tomb, as
+    the delete marker's removal (the version before the prune); never
+    over a live object, as S3 never removes a version that is current;
+    a rewrite's replaced version only when asked, as S3 keeps
+    noncurrent versions out of the way until a copy names one; and the
+    friend's tomb-keeping is the copy the attacker could not reach.
 - **VER-1** The challenge is a control API call (#27; §3.7 NET-7):
   the borrower sends the bucket's sealed name, an object key, a byte
   range and a fresh 32-byte nonce; the lender reads the range through
@@ -4732,7 +4835,29 @@ the handler's own reads and is never cancelled; nothing below
   makes the sealed name the caller's; a lender that lost its database
   serves no list until both are back (§3.1 ID-4). It is what `recover` (ID-5),
   `import` (REPL-8) and `undelete` previews read, so none of them
-  needs a request per object. The borrower replicates to a friend with
+  needs a request per object. `undelete` is served (#32, §3.6 RET-3):
+  `POST /_lendisk/undelete` with `{"bucket": <sealed>, "since":
+  <unix seconds, 0 for every tomb in the window>, "rewrites", "after",
+  "limit"}`, answered `{"restored": [{"key", "size", "sha256",
+  "tombstoned_at"}], "skipped": [{"key", "sha256", "live",
+  "reason"}], "next"}`: at most a page (`gateway.MaxListPage`) of the
+  keys with tombs since then after `after`, each restored or skipped
+  (`conflict`, `live`). Open to the `peer` role only and keyed by the
+  resolved caller, like `list`; another's or an unknown sealed name is
+  `404` with `NoSuchBucket`; a negative since, a page over 1000 or no
+  bucket `400`; a gateway still starting `503` with `Retry-After: 5`.
+  *Rate limit (LEND-5, #32):* per friend one undelete runs at a time
+  (a second is `503`), and a token bucket of keys looked at
+  (`Server.UndeleteBurst`, 2,000, refilled at `UndeleteRate`, 100 a
+  second; `control.Default…`) admits a call only while not in debt;
+  the call then takes the keys it restored or skipped, at least
+  `UndeleteCallCost` (10), so a page may overdraw once and the friend
+  waits, `503` with `Retry-After`; other friends are unaffected
+  (`TestUndeleteIsPacedPerFriend`). The borrower's runner waits out a
+  `503` as long as it asks. 6,000 keys, a 100 GB restic repository's
+  packs, take under a minute; a hostile friend makes the lender walk
+  at most 100 tombstone keys a second, each a link and an unlink it
+  could cause anyway by a re-put of the same bytes. The borrower replicates to a friend with
   the same replica client it uses for overflow targets, dialling
   through tailcat as below. AC check: from an allowed peer,
   `restic -r s3:http://<lender>:9000/<bucket> snapshots` works with the
@@ -5136,7 +5261,13 @@ the handler's own reads and is never cancelled; nothing below
   tombstoned object (`404 NoSuchKey`: a tomb is no live byte), C's
   live object by C's sealed name (`404 NoSuchBucket`), the tomb's path
   and a range over `control.MaxChallengeRange` (`400`), and a `GET`
-  (`405`); its pacing is `TestChallengesArePacedPerFriend`'s.
+  (`405`); its pacing is `TestChallengesArePacedPerFriend`'s. The
+  undelete's (#32) are an empty body and a page over 1000 keys
+  (`400`), C's bucket by C's sealed name (`404 NoSuchBucket`), B's
+  own since 2100 (`200`, nothing restored, so B's tombstone stays for
+  the RET-2 phase), and a `GET` (`405`); its pacing is
+  `TestUndeleteIsPacedPerFriend`'s, an invite key's `403`
+  `TestUndeleteCallRestoresTheCallersOwnTombs`'s.
   With friendships A–B and A–C, a hostile B, holding every credential
   its node holds, sends A all of them from its node ID and from its
   dial key: everything outside NET-7's list is refused and A's store is

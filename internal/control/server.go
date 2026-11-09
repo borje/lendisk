@@ -62,12 +62,19 @@ type Server struct {
 	// (DefaultWholeRate, DefaultWholeBurst).
 	ChallengeRate, ChallengeBurst           int64
 	ChallengeWholeRate, ChallengeWholeBurst int64
+	// Undeleter brings friends' tombs back for the undelete call (RET-3);
+	// nil answers it 404. UndeleteRate and UndeleteBurst pace what one
+	// friend's calls look at, in keys per second and keys (defaults
+	// DefaultUndeleteRate and DefaultUndeleteBurst).
+	Undeleter                   Undeleter
+	UndeleteRate, UndeleteBurst int64
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 	Log *slog.Logger
 
 	quotaLimits     quotaLimits
 	challengeLimits challengeLimits
+	undeleteLimits  undeleteLimits
 }
 
 func (s *Server) now() time.Time {
@@ -117,6 +124,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case ChallengePath:
 		if s.method(w, r, http.MethodPost) {
 			s.challenge(w, r, c)
+		}
+	case UndeletePath:
+		if s.method(w, r, http.MethodPost) {
+			s.undelete(w, r, c)
 		}
 	case RemovePath:
 		if s.method(w, r, http.MethodPost) {

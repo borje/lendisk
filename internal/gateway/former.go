@@ -13,6 +13,10 @@ import (
 // errNotServing: the gateway has not built its lending layer yet.
 var errNotServing = errors.New("the gateway is not serving yet; trying again later")
 
+// ErrNotServing is errNotServing for callers outside the package: the
+// gateway has not started yet, and the call may be tried again soon.
+var ErrNotServing = errNotServing
+
 // PurgeFormer deletes what former friend peer stored on this node, at the
 // end of the friendship's retention window (PEER-5, #25): each of its
 // lent buckets, with its tombs and unfinished uploads, from the store.

@@ -169,3 +169,12 @@ func ceilUnix(t time.Time) int64 {
 	}
 	return s
 }
+
+// UndeleteKeys returns up to limit keys of peer's bucket sealed after the
+// key after, in key order, that have a kept tombstone deleted at or after
+// since: a delete's, or with rewrites a rewrite's too (RET-3, #32).
+func (db *DB) UndeleteKeys(ctx context.Context, peer, sealed string, since time.Time, rewrites bool, after string, limit int) ([]string, error) {
+	return column(ctx, db, `SELECT DISTINCT key FROM tombstone
+		WHERE peer_key = ? AND sealed = ? AND key > ? AND pending = 0 AND deleted_at >= ? AND (? OR rewrite IS NULL OR rewrite = 0)
+		ORDER BY key LIMIT ?`, peer, sealed, after, since.Unix(), rewrites, limit)
+}

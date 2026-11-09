@@ -113,7 +113,16 @@ func controlAttacks(own, other string) []attack {
 		{name: "quota out of range", method: "POST", target: control.QuotaPath,
 			body: []byte(`{"number":4611686018427387905,"use":-1,"repository_size":1}`)},
 		{name: "quota by GET", method: "GET", target: control.QuotaPath},
-		{name: "undelete", method: "POST", target: control.Prefix + "undelete", body: []byte("{}")},
+		// RET-3 (#32): undelete reaches the caller's own bucket only, and
+		// a time to come brings nothing back: B's tombstone stays for the
+		// RET-2 phase after.
+		{name: "undelete", method: "POST", target: control.UndeletePath, body: []byte("{}")},
+		{name: "undelete own, from 2100", method: "POST", target: control.UndeletePath,
+			body: fmt.Appendf(nil, `{"bucket":%q,"since":4102444800}`, own)},
+		{name: "undelete another's", method: "POST", target: control.UndeletePath, body: fmt.Appendf(nil, `{"bucket":%q}`, other)},
+		{name: "undelete a huge page", method: "POST", target: control.UndeletePath,
+			body: fmt.Appendf(nil, `{"bucket":%q,"limit":%d}`, own, gateway.MaxListPage+1)},
+		{name: "undelete by GET", method: "GET", target: control.UndeletePath},
 		{name: "an unknown call", method: "GET", target: control.Prefix + "admin"},
 		// Last: from a friend it ends the friendship (PEER-5, #25).
 		{name: "remove", method: "POST", target: control.RemovePath, body: []byte("{}")},
