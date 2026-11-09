@@ -177,6 +177,20 @@ func (f *Friend) Head(ctx context.Context, bucket, key string) (string, bool, er
 	return strings.ToLower(info.Metadata.Get("X-Amz-Meta-" + MetaSHA256)), true, nil
 }
 
+// Probe asks the friend for this node's bucket list (GET /, which a
+// lender answers from its mapping table, PEER-8): the reachability
+// probe (#65), one small request signed like every other, so it also
+// tells a friend that refuses this node (ErrRemoved). It moves no
+// object and is bounded by the stall timeout.
+func (f *Friend) Probe(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, f.stall)
+	defer cancel()
+	if _, err := f.core.ListBuckets(ctx); err != nil {
+		return classify(fmt.Errorf("probing the friend: %w", err))
+	}
+	return nil
+}
+
 // Delete removes the key from the sealed bucket. A key or bucket the
 // friend does not have is already deleted.
 func (f *Friend) Delete(ctx context.Context, bucket, key string) error {

@@ -250,7 +250,7 @@ func (db *DB) QuotaFailed(ctx context.Context, peer, why string, now time.Time) 
 // as room again at once rather than after it next acknowledges a row.
 // LastOK is untouched. Any other condition stands.
 func (db *DB) ResumePlace(ctx context.Context, place string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `UPDATE place SET condition = 'ok', detail = NULL, since = ?
+	_, err := db.ExecContext(ctx, `UPDATE place SET condition = 'ok', detail = NULL, since = ?, failing_since = NULL
 		WHERE place = ? AND condition = 'quota'`, now.Unix(), place)
 	return err
 }

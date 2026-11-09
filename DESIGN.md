@@ -1658,7 +1658,9 @@ upstream bucket is Q-V.
   to run `lendisk peer remove <friend>` if it did
   (`TestAFriendThatKeepsRefusingIsAlerted`). A `removed` place keeps
   being asked as long as rows wait there: metadata goes to every friend
-  and is never re-routed, so a node that still backs up keeps asking.
+  and is never re-routed, so a node that still backs up keeps asking;
+  and while nothing waits, the reachability probe asks it every 15
+  minutes (§3.4, #65), each refusal refreshing `refused_at`.
   *Why not end it:* `since` changes only with the condition, and a
   `removed` place's data rows are re-routed away, so one stray 403 (an
   IAM lookup error, a stale session) could freeze the condition and,
@@ -2395,13 +2397,73 @@ upstream bucket is Q-V.
   one lost disk loses every offsite copy)" above the places
   (`pool: {"friends": N, "single_friend": true|false}` in
   `status --json`).
-  *Reachability* until the probe (#65) is the place's condition: a
-  friend is unreachable once it has been `retrying` or `removed` for
+  *Reachability* is the place's condition, which replication and the
+  reachability probe (below, #65) keep: a friend is unreachable once
+  it is `retrying` or `removed` and has not answered `ok` for
   `replication.reroute_after` (1 hour; a shorter failure is a blip),
   and gone once, in addition, `replication.replace_after` (7 days) has
-  passed since its last acknowledgement (`last_ok`, or the failure's
-  start if it never answered). An unreachable friend with room is still
-  chosen when the reachable ones are not enough; a gone one is not.
+  passed since its last answer (`last_ok`, or the failure's start if
+  it never answered). An unreachable friend with room is still chosen
+  when the reachable ones are not enough; a gone one is not.
+  *Away is a run of failing answers, not one condition (#65, from the
+  #21 review).* `place.since` restarts at every change of condition,
+  so a friend alternating between network errors and `507`s was never
+  `retrying` or `quota` for an hour on end, and never counted as away:
+  it held the delete and metadata barriers and its unsent data for
+  ever. `place.failing_since` (migration 32) is the start of the run
+  of failing answers (`retrying`, `quota`, `removed`): kept as the
+  condition changes among them, and through `store` (this node's
+  failure, not the friend's answer), cleared by `ok`
+  (`state.SetPlaceCondition`; `ResetPlaceCondition` and `ResumePlace`
+  clear it too). Unreachable, full for long (*Reroute*, below) and
+  gone count from it, the current condition still saying which: a
+  friend `retrying` now after an hour of `507`s and network errors is
+  unreachable, one answering `507` now is full for long
+  (`TestAwaySurvivesAlternatingNetworkErrorsAnd507s`). NULL reads as
+  `since`: rows from before the migration, and a previous release's
+  writes, which do not keep it. *Decision:* a column rather than
+  "no `last_ok` for the hour", because the probe advances `last_ok` of
+  a full friend that answers it (it is reachable), which must still
+  become full for long.
+  *The reachability probe (OPS-2, D6, #65).* Replication alone learns
+  a friend's reachability only when something is sent there, so an
+  idle friend (nothing queued, paused backups) could be gone for weeks
+  unjudged. Each sender therefore probes its place when it has nothing
+  to send (its FIFO empty, its head held at the barrier, or the
+  schedule closed) and nothing reached the place for
+  `Worker.ProbeEvery` (`replica.DefaultProbeEvery`, 15 minutes) since
+  its last send or probe, and at once when the sender starts idle,
+  which is what the alert service's first pass a minute after start
+  reads. The probe is `replica.Prober`: for a friend `Friend.Probe`, one
+  `ListBuckets` (`GET /`, NET-7's list, which the lender answers from
+  its mapping table, PEER-8) over the sender's own client, so the
+  tunnel's one client per friend (#52, #69) carries it, signed like any
+  request, bounded by the stall timeout; a refusal of this node is
+  `ErrRemoved` (`TestProbeAsksForTheBucketListThroughTheTunnel`). It runs on the sender's
+  goroutine, so never beside one of its sends, and carries no object,
+  so it is not held to the schedule (REPL-7) or the rate limits. Its
+  outcome is recorded like a send's (`TestAnIdleFriendIsProbedAtMostEveryInterval`,
+  `TestNoProbeWhileASendIsInFlight`, `TestAFriendWaitingAtTheBarrierIsProbed`):
+  an answer is a sign of life, not an acknowledgement
+  (`state.ProbeAnswered`, `TestAProbeAnswerRefreshesLastOKButKeepsFullAndStore`):
+  `last_ok` advances, `retrying` and
+  `removed` become `ok`, while `quota` stands (the probe stores
+  nothing, and its run of failing answers goes on) and so does
+  `store`; a refusal of this node is `removed` (with `refused_at`, so
+  #83's `friend_refuses` keeps judging an idle friend); any other
+  failure is `retrying`, whether or not anything is queued, except
+  that a `store` wait stands (`TestAFailedProbeLeavesAWaitOnTheStore`).
+  *Decision: the quota call is not a probe.* It reaches the control
+  API, not the S3 surface replication needs, hourly, from another
+  package; keeping reachability with the sender keeps one writer of
+  each place's condition, and a probe costs one small request per idle
+  friend each 15 minutes. A friend whose client cannot even be built
+  (`Worker.Connect` fails: a malformed node ID, a secret that cannot
+  be derived) has no sender; the worker records it `retrying` with the
+  reason, once per run, and builds it again each pass, so it is judged
+  unreachable and alerted like a friend that does not answer rather
+  than counting as answering for ever
+  (`TestAFriendWhoseClientCannotBeBuiltIsRetrying`).
   *The borrower's count* (`place_use`, schema 12) is the sum over a
   place's `queued` and `acked` rows of `placement.size`: a put's bytes
   plus `state.ObjectOverhead` (4 KiB, the lender's per-object overhead,
@@ -2599,13 +2661,15 @@ upstream bucket is Q-V.
   also heals them.
   Table `place` keeps each place's last answer:
   `condition` (`ok`, `retrying`, `quota`, `removed`, and `store` while
-  it waits because this node's store cannot be read), `detail`, `since`
-  and `last_ok`, D6's last-reachable time. A sender whose FIFO is empty,
+  it waits because this node's store cannot be read), `detail`, `since`,
+  `failing_since` (the start of its run of failing answers, #65) and
+  `last_ok`, D6's last-reachable time: its last acknowledgement or
+  answered probe. A sender whose FIFO is empty,
   including at daemon start, sets `store` back to `ok` without touching
   `last_ok` (`state.ResetPlaceCondition`): the rows it waited on went
   for another reason than its answer, such as a refusal for the store.
   `retrying`, `quota` and `removed` are the place's own last answer and
-  stand until it answers again, at its next row (#61). A friend
+  stand until it answers again, at its next row or probe (#61, #65). A friend
   added after a row was placed gets no copy of it until re-placement
   (REPL-13 below, #26), which sends it the bucket's metadata first.
 - **REPL-1, the metadata barrier.** A metadata row at sequence `m` is
@@ -2699,8 +2763,8 @@ upstream bucket is Q-V.
   its friend, and the lag shows in `status`. *Decision (#19,
   review):* the row is dropped instead of waiting (state `dropped`:
   out of the FIFO, not counted in `place_use`) when its friend is gone
-  past `replace_after`, or has answered `507` for
-  `replication.reroute_after` and the row holds a metadata barrier
+  past `replace_after`, or answers `507` with no `ok` for
+  `replication.reroute_after` (`failing_since`, #65) and the row holds a metadata barrier
   (`Held`'s rule): a full friend would refuse it, and while queued it
   would hold every place's metadata and the full friend's later
   deletes for as long as the friend stays full. A shorter `507` is
@@ -2785,7 +2849,9 @@ upstream bucket is Q-V.
     *Decision (#21 review): a friend that is away does not hold
     deletes.* Metadata queued at a friend unreachable for
     `replication.reroute_after`, or full (`507`) for that long, is not
-    waited for, as `Reroute` does not wait for it either: otherwise one
+    waited for (both counted from `failing_since`, so a friend
+    alternating between the two is away too, #65), as `Reroute` does
+    not wait for it either: otherwise one
     friend away for days would hold every other friend's deletes, and,
     since FIFOs are strict, every row behind them, new backups
     included. The cost is the AC while it is away: its replica keeps
@@ -4673,14 +4739,21 @@ the handler's own reads and is never cancelled; nothing below
     both hold: its place's condition is `retrying` (a network error)
     and `now − since ≥ alert.Service.MinRetrying` (1 hour), and
     `now − last_ok ≥ alerts.unreachable_after` (24h), using `since`
-    when `last_ok` is unset (it never answered). A friend that went off
-    at t0, tried next by a backup at t0+20h, is alerted at t0+24h; one
-    tried next at t0+23h30m is alerted at t0+24h30m, when it has been
-    retrying for the hour. The hour keeps a nightly backup that meets a one-minute
-    blip 24h after the last answer from alerting at once, since
-    reachability is learned only from replication attempts. So a friend
-    with nothing queued is not judged until the periodic reachability
-    probe (#65), which may let the hour be revisited;
+    when `last_ok` is unset (it never answered). Since the
+    reachability probe (§3.4, #65), a friend with nothing queued is
+    judged too: while this node runs, its last answer is at most a probe
+    interval (15 minutes) old, so a friend that went off at t0 is
+    retrying from its next probe and alerted at about t0+24h, whether or
+    not anything waits for it
+    (`TestAnIdleFriendThatGoesAwayIsAlertedAtThreshold`,
+    `TestAnIdleFriendIsProbedAndAlertedOnlyOnceAway`); one answering
+    its probes never is. *Decision (#65): the hour stays.* The probe
+    keeps `last_ok` fresh only while this node runs: a node switched
+    off for longer than `unreachable_after` starts with every friend's
+    last answer that old, and a one-minute blip at its first probe
+    would alert at the first pass. The hour asks for four failed probes
+    in a row (or an hour of failed sends) first, and costs an idle
+    friend's alert nothing but that hour;
   - `store_unreadable`, no subject: a place waits with condition
     `store` (§3.4 *Local errors*);
   - `objects_not_replicated`, subject the bucket: objects refused

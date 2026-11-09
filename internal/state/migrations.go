@@ -661,4 +661,17 @@ var migrations = []Migration{
 		-- completion. NULL for an upload of a new object.
 		ALTER TABLE lent_upload ADD COLUMN replaces TEXT;`,
 	},
+	{
+		Version: 32, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Since when a place has not answered ok (#65, from the #21
+		-- review): the start of its run of failing answers (retrying,
+		-- quota, removed), kept as the condition changes among them and
+		-- through a wait on this node's store, cleared by ok. A friend
+		-- alternating between network errors and 507s is then away once
+		-- the run lasts replication.reroute_after, though since restarts
+		-- at each change. Unix seconds; NULL reads as since (rows from
+		-- before this migration, and the previous release's writes).
+		ALTER TABLE place ADD COLUMN failing_since INTEGER;`,
+	},
 }

@@ -71,6 +71,14 @@ type Replica interface {
 	Head(ctx context.Context, bucket, key string) (sha256 string, ok bool, err error)
 }
 
+// Prober is a place the worker can ask, cheaply, whether it answers
+// (OPS-2, D6, #65): Friend is one. The worker probes a place only while
+// its sender is idle, so never beside a send. Probe stores nothing; a
+// place that refuses this node as no friend answers ErrRemoved.
+type Prober interface {
+	Probe(ctx context.Context) error
+}
+
 // Multipart is a place that takes an object in parts (REPL-6, #23):
 // minio-go's low-level multipart calls (Q-Y.1). Friend is one. Each
 // part carries its own SHA-256; the place verifies the whole object

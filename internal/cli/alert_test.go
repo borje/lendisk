@@ -88,9 +88,13 @@ func TestUnreachableFriendAlertedThroughHookWebhookAndStatus(t *testing.T) {
 		t.Fatalf("the webhook's secret is in the log:\n%s", logs)
 	}
 
+	// "B" is no node ID, so the worker cannot build its client and
+	// records that as the reason it is retrying (#65); the message
+	// carries the condition's latest detail, either one.
 	st := n.status()
 	if len(st.Alerts) != 1 || st.Alerts[0].Kind != alert.KindFriendUnreachable || st.Alerts[0].Subject != "B" ||
-		!strings.Contains(st.Alerts[0].Message, "dial tcB: no route") || st.Alerts[0].RaisedAt != m.RaisedAt {
+		!strings.Contains(st.Alerts[0].Message, "dial tcB: no route") && !strings.Contains(st.Alerts[0].Message, "cannot build the friend's client") ||
+		st.Alerts[0].RaisedAt != m.RaisedAt {
 		t.Fatalf("status alerts %+v", st.Alerts)
 	}
 	_, text, _ := n.run("", "", "status")
