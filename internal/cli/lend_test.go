@@ -224,7 +224,10 @@ func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
 		if err == nil {
 			break
 		}
-		if !errors.Is(err, replica.ErrBusy) {
+		// A busy answer can arrive as a reset on a loaded machine (the
+		// tunnel leg's early-answer race, #109); the worker retries
+		// both alike, so the test does too.
+		if !errors.Is(err, replica.ErrBusy) && !strings.Contains(err.Error(), "connection reset") {
 			t.Fatalf("the next write after the abandoned one: %v\n%s", err, stop())
 		}
 		if time.Since(start) > 10*time.Second {
