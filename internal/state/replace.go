@@ -93,15 +93,32 @@ type ReplaceStats struct {
 	Cancelled  int64 // unsent surplus copies cancelled
 	Below      int64 // live data objects still below copies
 	BelowBytes int64 // their bytes
-	Skipped    int64 // copies left alone as taken or being sent, which may land: a later pass looks again
+	// BelowSmallest is the size of the smallest of them (when Below > 0):
+	// the pass records it, and the pool fingerprint asks whether a place
+	// has room for it (#106).
+	BelowSmallest int64
+	Skipped       int64 // copies left alone as taken or being sent, which may land: a later pass looks again
 }
 
 func (s *ReplaceStats) add(o ReplaceStats) {
 	s.Placed += o.Placed
 	s.Dropping += o.Dropping
 	s.Cancelled += o.Cancelled
-	s.Below += o.Below
-	s.BelowBytes += o.BelowBytes
+	s.addBelow(o.Below, o.BelowBytes, o.BelowSmallest)
+}
+
+// below counts one object of size still below copies.
+func (s *ReplaceStats) below(size int64) { s.addBelow(1, size, size) }
+
+func (s *ReplaceStats) addBelow(objects, bytes, smallest int64) {
+	if objects <= 0 {
+		return
+	}
+	if s.Below == 0 || smallest < s.BelowSmallest {
+		s.BelowSmallest = smallest
+	}
+	s.Below += objects
+	s.BelowBytes += bytes
 }
 
 // lockBucket takes bucket's lock, which the placer and re-placement
@@ -159,51 +176,121 @@ func (db *DB) SetCopies(ctx context.Context, bucket string, copies int) error {
 // with an address, its quota, whether it refuses this node, is gone
 // past replace_after, counts more than its quota, or is full by its last
 // answer (paused for quota, LEND-2: no room until it acknowledges again
-// or the quota rises); each bucket's copies; and each replica marked
-// unverified (VER-1, #27). The worker runs a pass whenever it changes
-// (#26), and Offsite counts no object short of places as stuck while it
-// differs from the pool the last pass answered (passDue).
+// or the quota rises); whether it has room for the smallest object the
+// last pass left below copies (#106: a quota answer replaces this
+// node's count of its use there, place_use, and can give room); each
+// bucket's copies; and each replica marked unverified (VER-1, #27). The
+// worker runs a pass whenever it changes (#26), and Offsite counts no
+// object short of places as stuck while it differs from the pool the
+// last pass answered (passDue).
+//
+// Room is fingerprinted coarsely, as that one yes or no per place: use
+// moves with every capture, and a pass per capture would be waste.
 func (db *DB) PoolFingerprint(ctx context.Context) (string, error) {
-	ps, err := poolPlaces(ctx, db)
+	var smallest sql.NullInt64
+	err := db.QueryRowContext(ctx, `SELECT short_min FROM replace_pass WHERE id = 1`).Scan(&smallest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	v, err := db.readPool(ctx, smallest.Valid)
 	if err != nil {
 		return "", err
 	}
-	now := db.now()
-	var b strings.Builder
-	for _, p := range ps {
-		fmt.Fprintf(&b, "%s %d %t %t %t %t", p.peer, p.quota, p.cond == ConditionRemoved, p.gone(db, now),
-			capped(p.use) > capped(p.quota), p.full())
-		if p.removing {
-			b.WriteString(" removing") // #96
-		}
-		b.WriteString(";")
+	return v.fingerprint(db, smallest, nil), nil
+}
+
+// poolView is the pool as PoolFingerprint reads it.
+type poolView struct {
+	places []poolPlace
+	now    time.Time
+	live   int64  // the live metadata, read when room is asked about
+	rest   string // each bucket's copies and each replica marked unverified
+}
+
+// readPool reads the pool; withLive reads the live metadata too, which
+// room depends on.
+func (db *DB) readPool(ctx context.Context, withLive bool) (poolView, error) {
+	v := poolView{now: db.now()}
+	var err error
+	if v.places, err = poolPlaces(ctx, db); err != nil {
+		return v, err
 	}
+	if withLive {
+		if v.live, err = liveMetadata(ctx, db); err != nil {
+			return v, err
+		}
+	}
+	var b strings.Builder
 	rows, err := db.QueryContext(ctx, `SELECT name, copies FROM buckets ORDER BY name`)
 	if err != nil {
-		return "", err
+		return v, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var name string
 		var copies int
 		if err := rows.Scan(&name, &copies); err != nil {
-			return "", err
+			return v, err
 		}
 		fmt.Fprintf(&b, "|%s %d", name, copies)
 	}
 	if err := rows.Err(); err != nil {
-		return "", err
+		return v, err
 	}
 	rows.Close()
 	marks, err := column(ctx, db, `SELECT place || ' ' || bucket FROM replica_check
 		WHERE unverified_at IS NOT NULL ORDER BY place, bucket`)
 	if err != nil {
-		return "", err
+		return v, err
 	}
 	for _, m := range marks {
 		fmt.Fprintf(&b, "|unverified %s", m)
 	}
-	return b.String(), nil
+	v.rest = b.String()
+	return v, nil
+}
+
+// fingerprint renders the pool, asking each place whether it has room
+// for an object of smallest bytes (when valid): the pass's rule
+// (replacer.choose), for a place that may take a copy at all. Only a
+// yes is written, so a pool with no room reads as before #106. With
+// after (a pass's record: v as it began, after as it ended), a place
+// has room only if it had it in both: room the pass took is no room
+// now, and room that came during the pass is no room it answered.
+func (v poolView) fingerprint(db *DB, smallest sql.NullInt64, after *poolView) string {
+	var b strings.Builder
+	var roomAfter map[string]bool
+	if after != nil && smallest.Valid {
+		roomAfter = map[string]bool{}
+		for _, p := range after.places {
+			roomAfter[p.peer] = after.room(db, p, smallest.Int64+ObjectOverhead)
+		}
+	}
+	for _, p := range v.places {
+		fmt.Fprintf(&b, "%s %d %t %t %t %t", p.peer, p.quota, p.cond == ConditionRemoved, p.gone(db, v.now),
+			capped(p.use) > capped(p.quota), p.full())
+		if p.removing {
+			b.WriteString(" removing") // #96
+		}
+		if smallest.Valid && v.room(db, p, smallest.Int64+ObjectOverhead) && (after == nil || roomAfter[p.peer]) {
+			b.WriteString(" room") // #106
+		}
+		b.WriteString(";")
+	}
+	b.WriteString(v.rest)
+	return b.String()
+}
+
+// room reports whether place p may take a copy that counts need bytes:
+// a candidate (rfriend.candidate) with free room for it.
+func (v poolView) room(db *DB, p poolPlace, need int64) bool {
+	if p.quota <= 0 || p.cond == ConditionRemoved || p.gone(db, v.now) || p.removing || p.full() {
+		return false
+	}
+	if p.overflow {
+		return capped(p.quota)-capped(max(p.use, 0)) >= capped(need)
+	}
+	return fits(freeRoom(p.quota, p.use, 0, v.live), need)
 }
 
 // BelowSince is a bucket's record of live data objects below copies
@@ -326,8 +413,11 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 	var st ReplaceStats
 	// The pool this pass answers, read before the places it decides on:
 	// a change during the pass leaves the record behind it, so the next
-	// pass is still due.
-	pool, err := db.PoolFingerprint(ctx)
+	// pass is still due. Its room is asked about the smallest object
+	// this pass leaves below copies (#106), and must last to its end, so
+	// neither a pass that changed nothing nor one that took the room is
+	// due again.
+	pool, err := db.readPool(ctx, true)
 	if err != nil {
 		return st, err
 	}
@@ -409,9 +499,17 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 	// cut short by its context answered nothing past where it stopped:
 	// the pass stays due.
 	if ctx.Err() == nil {
-		if _, err := db.ExecContext(ctx, `INSERT INTO replace_pass (id, pool, done_at) VALUES (1, ?, ?)
-			ON CONFLICT (id) DO UPDATE SET pool = excluded.pool, done_at = excluded.done_at`,
-			pool, db.now().Unix()); err != nil {
+		var smallest sql.NullInt64
+		if st.Below > 0 {
+			smallest = sql.NullInt64{Int64: st.BelowSmallest, Valid: true}
+		}
+		end, err := db.readPool(ctx, true)
+		if err == nil {
+			_, err = db.ExecContext(ctx, `INSERT INTO replace_pass (id, pool, done_at, short_min) VALUES (1, ?, ?, ?)
+				ON CONFLICT (id) DO UPDATE SET pool = excluded.pool, done_at = excluded.done_at, short_min = excluded.short_min`,
+				pool.fingerprint(db, smallest, &end), db.now().Unix(), smallest)
+		}
+		if err != nil {
 			errs = append(errs, fmt.Errorf("recording the re-placement pass: %w", err))
 		}
 	}
@@ -644,12 +742,12 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 	case m.drainBack:
 		rounds = append(rounds, drainRound)
 	}
-	var below, belowBytes int64
+	var below ReplaceStats // the last round's objects below copies
 	for _, r := range rounds {
 		m.moves, m.drains = r == moveRound, r == drainRound
-		s, b, bb, err := m.dataRound(ctx, bucket, copies)
+		s, b, err := m.dataRound(ctx, bucket, copies)
 		st.add(s)
-		below, belowBytes = b, bb
+		below = b
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -658,7 +756,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 		}
 	}
 	m.moves, m.drains = false, false
-	st.Below, st.BelowBytes = below, belowBytes
+	st.Below, st.BelowBytes, st.BelowSmallest = below.Below, below.BelowBytes, below.BelowSmallest
 	if ctx.Err() == nil {
 		s, err := m.dropIdleMetadata(ctx, bucket)
 		st.add(s)
@@ -667,7 +765,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 		}
 	}
 	if ctx.Err() == nil {
-		if err := m.recordBelow(ctx, bucket, below, belowBytes); err != nil {
+		if err := m.recordBelow(ctx, bucket, below.Below, below.BelowBytes); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -678,7 +776,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 // asks for them, in batches; it returns what it did and the objects
 // still below copies after it. A failed batch's error is returned with
 // the rest done.
-func (m *replacer) dataRound(ctx context.Context, bucket string, copies int) (ReplaceStats, int64, int64, error) {
+func (m *replacer) dataRound(ctx context.Context, bucket string, copies int) (ReplaceStats, ReplaceStats, error) {
 	var st ReplaceStats
 	var errs []error
 	type job struct {
@@ -687,11 +785,11 @@ func (m *replacer) dataRound(ctx context.Context, bucket string, copies int) (Re
 	}
 	var after int64
 	var work []job
-	var below, belowBytes int64
+	var below ReplaceStats // Below, BelowBytes and BelowSmallest alone
 	for ctx.Err() == nil {
 		objs, err := m.page(ctx, bucket, after)
 		if err != nil {
-			return st, below, belowBytes, errors.Join(append(errs, err)...)
+			return st, below, errors.Join(append(errs, err)...)
 		}
 		if len(objs) == 0 {
 			break
@@ -700,14 +798,13 @@ func (m *replacer) dataRound(ctx context.Context, bucket string, copies int) (Re
 			after = o.seq
 			ops, short, left, err := m.decide(ctx, bucket, o, copies, false)
 			if err != nil {
-				return st, below, belowBytes, errors.Join(append(errs, err)...)
+				return st, below, errors.Join(append(errs, err)...)
 			}
 			switch {
 			case len(ops) > 0 || m.dropShort(o, copies):
 				work = append(work, job{o.seq, o.size, short}) // its batch counts what it leaves
 			case short:
-				below++
-				belowBytes += o.size
+				below.below(o.size)
 			}
 			if len(ops) == 0 {
 				m.skipped += left
@@ -727,18 +824,16 @@ func (m *replacer) dataRound(ctx context.Context, bucket string, copies int) (Re
 			// stay so (below_copies is recorded all the same).
 			for _, j := range work[:n] {
 				if j.short {
-					below++
-					belowBytes += j.size
+					below.below(j.size)
 				}
 			}
 		} else {
 			st.add(s)
-			below += s.Below
-			belowBytes += s.BelowBytes
+			below.addBelow(s.Below, s.BelowBytes, s.BelowSmallest)
 		}
 		work = work[n:]
 	}
-	return st, below, belowBytes, errors.Join(errs...)
+	return st, below, errors.Join(errs...)
 }
 
 // page reads up to replacePage live data objects of bucket after
@@ -1261,8 +1356,7 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 			}
 			m.skipped += left
 			if short = below; below {
-				st.Below++
-				st.BelowBytes += size
+				st.below(size)
 			}
 		}
 		for _, op := range ops {
@@ -1283,8 +1377,7 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 				if capped(max(use, 0))+capped(bytes)+capped(size+ObjectOverhead) > capped(f.quota) {
 					if !short {
 						short = true
-						st.Below++
-						st.BelowBytes += size
+						st.below(size)
 					}
 					continue
 				}
