@@ -1,6 +1,6 @@
 # lendisk — requirements
 
-Status: draft v0.11.6, 2026-11-10. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.11.7, 2026-11-10. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
@@ -26,7 +26,9 @@ in format version 2 or later only (COMPAT-1); v0.11.5 places each data
 object of a bucket with `copies` ≥ 2 at one friend fewer and an
 overflow target while friends cannot hold `copies` of the repository
 (REPL-12); v0.11.6 says the first handshake between two nodes needs a
-relay, after which a direct path needs none (NET-2, NET-3). The design
+relay, after which a direct path needs none (NET-2, NET-3); v0.11.7
+says how scenario 10's forward refuses `restic prune`: at its first
+write, before any delete. The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -1237,9 +1239,12 @@ current design (component behaviour, API assumptions) are in DESIGN.md
     commands that copy each
     replica's keys into a local directory; after both, `restic -r
     <directory> snapshots` lists A's snapshots, with no lendisk
-    replication code in the path. B's daemon refuses `restic prune`'s
-    attempt, through the forward, to remove tombstoned data (RET-2) and
-    refuses every operation outside the NET-7 list (SEC-9).
+    replication code in the path. Through the forward, B's daemon
+    refuses `restic prune` at its first write, the lock file, since a
+    write without its SHA-256 is refused (LEND-4), so prune removes
+    nothing; a delete sent through the forward leaves a tombstone with
+    the bytes, which no request can purge (RET-2); and B refuses every
+    operation outside the NET-7 list (SEC-9).
 11. **Backup from another machine.** A runs on a NAS. The user sets
     `endpoint.listen` to the NAS's LAN address and adds bucket `laptop
     --profile restic`; `bucket add` prints the lines for that address,
