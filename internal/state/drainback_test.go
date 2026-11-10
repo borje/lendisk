@@ -355,3 +355,71 @@ func TestARefusedHeldDeleteIsKeptCountedAndTriedAgainDaily(t *testing.T) {
 		t.Fatalf("not tried again after a day: %+v", ts)
 	}
 }
+
+// REPL-13, S3-7 (#98): status says whether drain-back runs: active
+// while the friends hold the largest the repository was in the window,
+// off while placement is split, and otherwise waiting, with the moment
+// it could start if the repository stays as it is. No target, no
+// answer. Asking records nothing.
+func TestDrainStatusSaysWhetherDrainBackRunsAndWhenItCould(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("A", 10)
+	p.friend("B", 10)
+	drain := func() DrainStatus {
+		t.Helper()
+		s, ok, err := p.db.OverflowDrainStatus(ctx)
+		if err != nil || !ok {
+			t.Fatalf("drain status %+v, %v, %v", s, ok, err)
+		}
+		return s
+	}
+	if s, ok, err := p.db.OverflowDrainStatus(ctx); err != nil || ok {
+		t.Fatalf("without a target: %+v, %v, %v", s, ok, err)
+	}
+	p.overflow("b2", 100)
+	p.bucket("r", 2)
+	p.put("r", "index/1", "metadata", 0.1)
+	for i := range 9 {
+		p.put("r", fmt.Sprintf("data/%02d", i), "data", 1)
+	}
+	if s := drain(); s.State != DrainActive || !s.From.IsZero() {
+		t.Fatalf("friends hold the repository: %+v", s)
+	}
+	for i := range 2 {
+		p.put("r", fmt.Sprintf("data/x%d", i), "data", 1)
+	}
+	if s := drain(); s.State != DrainSplit {
+		t.Fatalf("grown past the friends: %+v", s)
+	}
+	for i := range 2 {
+		p.del("r", fmt.Sprintf("data/x%d", i), "data")
+	}
+	peaks := func() (s string) {
+		t.Helper()
+		if err := p.db.QueryRow(`SELECT count(*) || '/' || coalesce(sum(data), 0) FROM repository_peak`).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	before := peaks()
+	from := time.Unix(peakDay(p.now)*86400, 0).Add(DrainWindow)
+	if s := drain(); s.State != DrainWaiting || !s.From.Equal(from) {
+		t.Fatalf("pruned below it today: %+v, want waiting until %s", s, from)
+	}
+	p.now = from.Add(-time.Second)
+	if s := drain(); s.State != DrainWaiting || !s.From.Equal(from) {
+		t.Fatalf("a second before: %+v", s)
+	}
+	p.now = from
+	if s := drain(); s.State != DrainActive {
+		t.Fatalf("at %s: %+v", from, s)
+	}
+	if after := peaks(); after != before {
+		t.Fatalf("asking recorded the repository: %s, then %s", before, after)
+	}
+	// The pass agrees.
+	if ok, err := p.db.overflowDrain(ctx); err != nil || !ok {
+		t.Fatalf("the pass's drain-back %v, %v", ok, err)
+	}
+}

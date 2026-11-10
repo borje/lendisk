@@ -96,7 +96,7 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq restic
       - name: RustFS
         run: .github/rustfs.sh lendisk-ci-rustfs >> "$GITHUB_ENV"
-      - run: go test -race -timeout 5m -run 'TestAVersionedProviderUndeletesByCopyingTheVersionBeforeTheMarker|TestOverflowAddCreatesTheLifecycleRuleAtAProvider' -v ./internal/replica
+      - run: go test -race -timeout 5m -run 'TestAVersionedProviderUndeletesByCopyingTheVersionBeforeTheMarker|TestOverflowAddCreatesTheLifecycleRuleAtAProvider|TestACredentialThatMayNotDeleteKeepsTheObjectAtAProvider' -v ./internal/replica
       - run: go test -race -timeout 15m -run 'TestScenarioOverflowRetentionAtAVersionedProvider' -v ./internal/cli
       - name: stop RustFS
         if: always()

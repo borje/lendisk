@@ -43,6 +43,9 @@ type StatusCapacity struct {
 	// the repository and an overflow target exists: each data object then
 	// goes to Copies − 1 friends and one overflow target (REPL-12).
 	OverflowSplit bool `json:"overflow_split"`
+	// OverflowDrain is whether copies at overflow targets move back to
+	// friends (REPL-13, #98); absent without an overflow target in use.
+	OverflowDrain *StatusOverflowDrain `json:"overflow_drain,omitempty"`
 	// Friends is each friendship's quota and use both ways.
 	Friends []StatusCapacityFriend `json:"friends"`
 	// Overflow is each overflow target's room, use and cost (S3-7).
@@ -55,6 +58,20 @@ type StatusCapacity struct {
 	LentUsed       int64 `json:"lent_used"`
 	Received       int64 `json:"received"`
 	ReceivedUnused int64 `json:"received_unused"`
+}
+
+// StatusOverflowDrain is drain-back in capacity planning (REPL-13,
+// #98).
+type StatusOverflowDrain struct {
+	// State is "active" (the friends hold the largest the repository was
+	// in the last 30 days: copies at targets move back as they have
+	// room), "waiting" (they hold it as it is now, not that largest) or
+	// "split" (off: placement is split).
+	State string `json:"state"`
+	// From, while waiting, is when drain-back could start at the
+	// earliest if the repository stays as it is and no quota changes
+	// (RFC 3339, UTC).
+	From string `json:"from,omitempty"`
 }
 
 // StatusCapacityFriend is one friendship in capacity planning.
@@ -136,6 +153,12 @@ type StatusCapacityOverflow struct {
 	// is tried again daily. Absent when none.
 	DeleteDenied      int64 `json:"delete_denied,omitempty"`
 	DeleteDeniedBytes int64 `json:"delete_denied_bytes,omitempty"`
+	// DeleteDeniedPastWindow and DeleteDeniedPastWindowBytes are those
+	// of DeleteDenied that are the user's deletes made longer ago than
+	// the target's retention window: held past it because the
+	// credential may not delete them (#98). Absent when none.
+	DeleteDeniedPastWindow      int64 `json:"delete_denied_past_window,omitempty"`
+	DeleteDeniedPastWindowBytes int64 `json:"delete_denied_past_window_bytes,omitempty"`
 	// Removing is when `overflow remove` began removing the target
 	// (RFC 3339, UTC), and KeepData whether its copies are left there;
 	// absent for a target in use (#96). It is listed until its row
@@ -178,6 +201,7 @@ func overflowStatus(ctx context.Context, db *state.DB) ([]StatusCapacityOverflow
 			so.Tombstones, so.TombstoneBytes, so.TombstoneNextDue = t.Tombs, t.Bytes, rfc3339(t.NextDue)
 		}
 		so.DeleteDenied, so.DeleteDeniedBytes = t.Denied, t.DeniedBytes
+		so.DeleteDeniedPastWindow, so.DeleteDeniedPastWindowBytes = t.DeniedPastWindow, t.DeniedPastWindowBytes
 		if o.MaxBytes > 0 {
 			so.Percent = h.Use * 100 / o.MaxBytes
 		}
@@ -214,6 +238,11 @@ func overflowLine(o StatusCapacityOverflow) string {
 		// S3-5 (#40): a credential without delete permission.
 		l += fmt.Sprintf("; %d copies kept, %s: its credential may not delete them (tried again daily)",
 			o.DeleteDenied, h(o.DeleteDeniedBytes))
+		if o.DeleteDeniedPastWindow > 0 {
+			// #98: the user's deletes outlive the retention window.
+			l += fmt.Sprintf(", %d of them deleted objects, %s, held past the retention window because the credential may not delete them",
+				o.DeleteDeniedPastWindow, h(o.DeleteDeniedPastWindowBytes))
+		}
 	}
 	if o.VersionRemoval == state.VersionRemovalAllowed {
 		l += "; its credential can remove versions"
@@ -227,6 +256,23 @@ func overflowLine(o StatusCapacityOverflow) string {
 		l += "; full: no new copies go there"
 	}
 	return l
+}
+
+// drainLine is drain-back in status's capacity lines (#98); "" without
+// an overflow target.
+func drainLine(d *StatusOverflowDrain) string {
+	if d == nil {
+		return ""
+	}
+	switch d.State {
+	case state.DrainActive:
+		return "  drain-back: active, copies at overflow targets move back to friends as they have room"
+	case state.DrainWaiting:
+		return fmt.Sprintf("  drain-back: waiting, the friends cannot hold the largest the repository was in the last %d days; it starts at %s at the earliest if the repository stays this size",
+			int(state.DrainWindow/(24*time.Hour)), d.From)
+	default:
+		return "  drain-back: off while placement is split"
+	}
 }
 
 func countObjects(n int64) string {
@@ -263,6 +309,11 @@ func (a *app) capacityStatus(ctx context.Context, db *state.DB, defaultCopies in
 	}
 	cover, ok := plan.Cover()
 	c.Coverable, c.OverflowSplit = ok, plan.Split()
+	if d, ok, err := db.OverflowDrainStatus(ctx); err != nil {
+		return nil, err
+	} else if ok {
+		c.OverflowDrain = &StatusOverflowDrain{State: d.State, From: rfc3339(d.From)}
+	}
 	low := func(since time.Time) string {
 		if since.IsZero() || now.Sub(since) < LowUseFor {
 			return ""
@@ -346,6 +397,9 @@ func capacityLines(c *StatusCapacity, role string) []string {
 				l = fmt.Sprintf("  Overflow targets: %d; friends cannot hold %d copies of the repository, so each object goes to %s and an overflow target",
 					len(c.Overflow), c.Copies, plural(int64(c.Copies-1), "friend", "friends"))
 			}
+			out = append(out, l)
+		}
+		if l := drainLine(c.OverflowDrain); l != "" {
 			out = append(out, l)
 		}
 		for _, o := range c.Overflow {

@@ -328,14 +328,22 @@ func (db *DB) overflowDrain(ctx context.Context) (bool, error) {
 	if err := recordPeak(ctx, db, u, now); err != nil {
 		return false, err
 	}
-	var peak RepositoryUse
-	if err := db.QueryRowContext(ctx, `SELECT coalesce(max(data), 0), coalesce(max(metadata), 0), coalesce(max(copies), 0)
-		FROM repository_peak WHERE day > ? AND day <= ?`, peakDay(now.Add(-DrainWindow)), peakDay(now)).Scan(&peak.Data, &peak.Metadata, &peak.Copies); err != nil {
-		return false, err
-	}
-	ps, err := poolPlaces(ctx, db)
+	from, err := drainFrom(ctx, db, u, now)
+	return from.IsZero(), err
+}
+
+// drainFrom is when drain-back could run at the earliest, the
+// repository staying u and the friends' quotas as they are now: zero
+// when it may run at now (overflowDrain's test). Each day of
+// repository_peak in the window, u counted as today's, from the newest
+// back, adds its largest data, metadata and copies to what the friends
+// must hold; the first day that takes it past what they hold
+// (FriendsHold, which only gets harder as each grows) must leave the
+// window first, which it does DrainWindow after that day began.
+func drainFrom(ctx context.Context, q querier, u RepositoryUse, now time.Time) (time.Time, error) {
+	ps, err := poolPlaces(ctx, q)
 	if err != nil {
-		return false, err
+		return time.Time{}, err
 	}
 	var quotas []int64
 	for _, p := range ps {
@@ -343,7 +351,82 @@ func (db *DB) overflowDrain(ctx context.Context) (bool, error) {
 			quotas = append(quotas, p.quota)
 		}
 	}
-	return FriendsHold(peak.Data, peak.Metadata, cmp.Or(peak.Copies, DefaultCopies), quotas), nil
+	today := peakDay(now)
+	rows, err := q.QueryContext(ctx, `SELECT day, data, metadata, copies FROM repository_peak WHERE day > ? AND day <= ?
+		ORDER BY day DESC`, peakDay(now.Add(-DrainWindow)), today)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer rows.Close()
+	peak := u
+	holds := func(day int64) (time.Time, bool) {
+		if FriendsHold(peak.Data, peak.Metadata, cmp.Or(peak.Copies, DefaultCopies), quotas) {
+			return time.Time{}, true
+		}
+		return time.Unix(day*86400, 0).Add(DrainWindow), false
+	}
+	if from, ok := holds(today); !ok {
+		return from, nil
+	}
+	for rows.Next() {
+		var day int64
+		var d RepositoryUse
+		if err := rows.Scan(&day, &d.Data, &d.Metadata, &d.Copies); err != nil {
+			return time.Time{}, err
+		}
+		peak = RepositoryUse{Data: max(peak.Data, d.Data), Metadata: max(peak.Metadata, d.Metadata), Copies: max(peak.Copies, d.Copies)}
+		if from, ok := holds(day); !ok {
+			return from, nil
+		}
+	}
+	return time.Time{}, rows.Err()
+}
+
+// Drain-back states for status (#98).
+const (
+	DrainActive  = "active"  // copies at targets move back to friends as they have room
+	DrainWaiting = "waiting" // for the window's largest repository to leave it
+	DrainSplit   = "split"   // off: placement is split
+)
+
+// DrainStatus is whether drain-back runs (REPL-13, #98): State is
+// DrainActive, DrainWaiting or DrainSplit; From, while waiting, is when
+// it could run at the earliest if the repository stays as it is now and
+// no quota changes.
+type DrainStatus struct {
+	State string
+	From  time.Time
+}
+
+// readOnly hides a querier's ExecContext, so overflowSplit records no
+// sample of the repository through it.
+type readOnly struct{ querier }
+
+// OverflowDrainStatus reports whether drain-back runs, as the next
+// re-placement pass would decide it (overflowSplit, overflowDrain),
+// without recording the repository; ok is false without an overflow
+// target in use.
+func (db *DB) OverflowDrainStatus(ctx context.Context) (s DrainStatus, ok bool, err error) {
+	var targets int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM overflow WHERE removing_at IS NULL`).Scan(&targets); err != nil || targets == 0 {
+		return s, false, err
+	}
+	split, err := db.overflowSplit(ctx, readOnly{db})
+	if err != nil || split {
+		return DrainStatus{State: DrainSplit}, true, err
+	}
+	u, err := repositoryUse(ctx, db)
+	if err != nil {
+		return s, false, err
+	}
+	from, err := drainFrom(ctx, db, u, db.now())
+	if err != nil {
+		return s, false, err
+	}
+	if from.IsZero() {
+		return DrainStatus{State: DrainActive}, true, nil
+	}
+	return DrainStatus{State: DrainWaiting, From: from}, true, nil
 }
 
 // peakDay is t's day in repository_peak: days since the Unix epoch.

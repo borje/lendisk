@@ -418,3 +418,58 @@ func TestAVersionedTargetsMetadataGoesAfterTheWindow(t *testing.T) {
 	idx := p.put("r", "index/2", "metadata", 0.1)
 	p.wantPlaces("index/2", idx, "B")
 }
+
+// S3-5, RET-3 (#98): a user delete the target refused for want of
+// permission keeps the object there after its retention window, the
+// daily retry notwithstanding; status counts those apart. At a
+// client-side target the delete is refused at the window's end, so it
+// counts at once; at a versioned one, refused at once, it counts once
+// the window has passed since the delete, retries or not.
+func TestADeniedUserDeleteHeldPastItsWindowIsCounted(t *testing.T) {
+	ctx := context.Background()
+	holds := func(p *pool) TombHold {
+		t.Helper()
+		h, err := p.db.OverflowTombHolds(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h["garage"]
+	}
+	p, target, _ := tombPool(t, t.TempDir())
+	del := p.del("r", "data/1", "data")
+	if _, err := p.db.HoldOverflowDelete(ctx, target, del, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.ack(target, del)
+	if h := holds(p); h.DeniedPastWindow != 0 {
+		t.Fatalf("a held delete inside its window: %+v", h)
+	}
+	p.now = p.now.Add(24 * time.Hour)
+	if err := p.db.DenyOverflowDelete(ctx, target, del, p.now); err != nil {
+		t.Fatal(err)
+	}
+	if h := holds(p); h.Denied != 1 || h.DeniedPastWindow != 1 || h.DeniedPastWindowBytes != h.DeniedBytes || h.DeniedBytes <= 0 {
+		t.Fatalf("client-side, refused at the window's end: %+v", h)
+	}
+
+	p, target, _ = targetPool(t, t.TempDir(), VersioningEnabled)
+	del = p.del("r", "data/1", "data")
+	if err := p.db.DenyOverflowDelete(ctx, target, del, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.ack(target, del)
+	if h := holds(p); h.Denied != 1 || h.DeniedPastWindow != 0 {
+		t.Fatalf("versioned, refused at once: %+v", h)
+	}
+	p.now = p.now.Add(24*time.Hour - time.Second)
+	if err := p.db.DenyOverflowDelete(ctx, target, del, p.now); err != nil { // the daily retry
+		t.Fatal(err)
+	}
+	if h := holds(p); h.DeniedPastWindow != 0 {
+		t.Fatalf("a second before the window ends: %+v", h)
+	}
+	p.now = p.now.Add(time.Second)
+	if h := holds(p); h.Denied != 1 || h.DeniedPastWindow != 1 || h.DeniedPastWindowBytes != h.DeniedBytes {
+		t.Fatalf("versioned, the window passed: %+v", h)
+	}
+}

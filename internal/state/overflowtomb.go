@@ -29,7 +29,8 @@ import (
 //   - A claim holds a key: the worker sends no held delete of a key an
 //     undelete claimed, and an undelete claims no key the worker holds,
 //     and restores only keys whose newest tomb is still inside the
-//     window.
+//     window or was refused for want of permission (the object is
+//     still there, #98).
 
 // tombClaim is how long a claim on a tomb holds: one older died with
 // its process, and the tomb is free again.
@@ -238,9 +239,12 @@ func (db *DB) DropOverflowTomb(ctx context.Context, place string, seq int64) err
 // undeletable selects place's tombs t of bucket an undelete may restore:
 // the newest tomb of its key, a delete of the key (not a copy
 // re-placement drained, which the index holds elsewhere), made at or
-// after :since and inside its window at :now (not due).
+// after :since and inside its window at :now (not due), or refused for
+// want of permission, which leaves the object at the target whenever
+// its retry is due: at a versioned target too, which then holds no
+// marker for it (#98).
 const undeletable = `FROM overflow_tomb t WHERE t.place = :place AND t.bucket = :bucket AND t.drained IS NULL
-	AND t.deleted_at >= :since AND t.due_at > :now
+	AND t.deleted_at >= :since AND (t.due_at > :now OR t.denied_at IS NOT NULL)
 	AND t.seq = (SELECT max(n.seq) FROM overflow_tomb n WHERE n.place = t.place AND n.bucket = t.bucket AND n.key = t.key)`
 
 func undeletableArgs(place, bucket string, since, now time.Time) []any {
@@ -315,15 +319,24 @@ type TombHold struct {
 	// target refused to delete (DenyOverflowDelete).
 	Denied      int64
 	DeniedBytes int64
+	// DeniedPastWindow and DeniedPastWindowBytes are those of Denied
+	// that are the user's deletes, not drained copies, made longer ago
+	// than the target's retention window: the target still holds what
+	// RET-3 lets go, since its credential may not delete it (#98).
+	DeniedPastWindow      int64
+	DeniedPastWindowBytes int64
 }
 
 // OverflowTombHolds returns each overflow target's tombstones that has
-// any, by name.
+// any, by name, at the database's clock.
 func (db *DB) OverflowTombHolds(ctx context.Context) (map[string]TombHold, error) {
+	const past = `denied_at IS NOT NULL AND drained IS NULL AND deleted_at + coalesce((SELECT o.retention FROM overflow o
+		WHERE '` + OverflowPrefix + `' || o.name = place), 0) <= ?1`
 	rows, err := db.QueryContext(ctx, `SELECT place, count(*) FILTER (WHERE denied_at IS NULL),
 		coalesce(sum(size) FILTER (WHERE denied_at IS NULL), 0), min(due_at) FILTER (WHERE denied_at IS NULL),
-		count(*) FILTER (WHERE denied_at IS NOT NULL), coalesce(sum(size) FILTER (WHERE denied_at IS NOT NULL), 0)
-		FROM overflow_tomb GROUP BY place`)
+		count(*) FILTER (WHERE denied_at IS NOT NULL), coalesce(sum(size) FILTER (WHERE denied_at IS NOT NULL), 0),
+		count(*) FILTER (WHERE `+past+`), coalesce(sum(size) FILTER (WHERE `+past+`), 0)
+		FROM overflow_tomb GROUP BY place`, db.now().Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +346,8 @@ func (db *DB) OverflowTombHolds(ctx context.Context) (map[string]TombHold, error
 		var place string
 		var h TombHold
 		var due sql.NullInt64
-		if err := rows.Scan(&place, &h.Tombs, &h.Bytes, &due, &h.Denied, &h.DeniedBytes); err != nil {
+		if err := rows.Scan(&place, &h.Tombs, &h.Bytes, &due, &h.Denied, &h.DeniedBytes, &h.DeniedPastWindow,
+			&h.DeniedPastWindowBytes); err != nil {
 			return nil, err
 		}
 		if due.Valid {
