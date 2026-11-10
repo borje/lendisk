@@ -107,6 +107,72 @@ func TestNewestManifestWinsAcrossLenders(t *testing.T) {
 	}
 }
 
+// ID-5 (#107): a lender that refuses the dial or resets the connection,
+// as one restarting its daemon does, is asked again for a bounded time
+// before recovery moves on: B refuses twice, resets once, and then
+// serves; C, which B names, refuses throughout and is given up within
+// DefaultRetryFor, and D, named after it, is still asked; E's other
+// failure is not asked again.
+func TestARefusingLenderIsAskedAgainForABoundedTime(t *testing.T) {
+	src := &transporttest.Source{D: transporttest.Start(t)}
+	b, c, d, e := newLender(t, src), newLender(t, src), newLender(t, src), newLender(t, src)
+	refusedErr := errors.New(`Get "http://lendisk/_lendisk/manifest": connect tcp [fd7a::1]:9000: connection was refused`)
+	resetErr := errors.New("read tcp [fd7a::2]:4242->[fd7a::1]:9000: connection reset by peer")
+	asked := map[string]int{}
+	fetch := func(_ context.Context, addr string) (*manifest.Manifest, error) {
+		asked[addr]++
+		switch addr {
+		case b.addr:
+			if asked[addr] <= 2 {
+				return nil, refusedErr
+			} else if asked[addr] == 3 {
+				return nil, resetErr
+			}
+			return &manifest.Manifest{Seq: 5, Content: manifest.Content{Friends: []manifest.Friend{friendOf(c), friendOf(d), friendOf(e)}}}, nil
+		case c.addr:
+			return nil, refusedErr
+		case d.addr:
+			return &manifest.Manifest{Seq: 6}, nil
+		}
+		return nil, errors.New("no manifest")
+	}
+	now := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	var slept []time.Duration
+	f := &Fetcher{Fetch: fetch, Now: func() time.Time { return now },
+		Sleep: func(_ context.Context, d time.Duration) error { slept = append(slept, d); now = now.Add(d); return nil }}
+	m, tried, err := f.Newest(t.Context(), b.addr)
+	if err != nil || m.Seq != 6 {
+		t.Fatalf("newest: %+v %v; want D's version 6", m, err)
+	}
+	if asked[b.addr] != 4 || asked[d.addr] != 1 || asked[e.addr] != 1 {
+		t.Fatalf("asked %v; want B 4 times, D and E once", asked)
+	}
+	var total time.Duration
+	for _, d := range slept {
+		total += d
+	}
+	// B: 1+2+4 s. C: 1+2+4+8+8 s, 23 s: one more 8 s wait would pass 30 s.
+	if want := 7*time.Second + 23*time.Second; total != want {
+		t.Fatalf("waited %v in all (%v); want %v", total, slept, want)
+	}
+	if asked[c.addr] != 6 {
+		t.Fatalf("asked C %d times; want 6 within %v", asked[c.addr], DefaultRetryFor)
+	}
+	for _, fd := range tried {
+		if fd.Peer == c.id.NodeID() && fd.Err != refusedErr {
+			t.Fatalf("C: %+v; want its refusal reported", fd)
+		}
+	}
+	// A context ended between tries ends them.
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	f.Sleep = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	asked = map[string]int{}
+	if _, _, err := f.Newest(ctx, c.addr); err != refusedErr || asked[c.addr] != 1 {
+		t.Fatalf("with the context ended: %v, asked %v", err, asked)
+	}
+}
+
 // ID-5 (#29): restoring from the manifest gives every friendship back
 // with its terms and the key the friend dials this node with, which the
 // tunnel admits again as that friend; the address's region; a version

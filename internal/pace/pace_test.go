@@ -339,6 +339,46 @@ func TestALendWaitIsCreditedOnlyUpToTheBodysFairShare(t *testing.T) {
 	}
 }
 
+// LEND-5 (#107): an abandoned body still under way (its handler waits
+// on the store, so it reads nothing, and its done is not yet called)
+// counts among the borrower's bodies, which raises an honest body's
+// fair share and never lowers it: each of the honest body's waits at
+// the limit is credited whole, beside it and once it is done. So the
+// floor rate and the stall bound see none of the lender's pacing.
+func TestAnHonestBodyBesideAnAbandonedOneIsCreditedItsWholeWait(t *testing.T) {
+	c := newClock()
+	p := paced(c, Settings{Lend: map[string]Rates{"B": {Down: Burst}}}) // a burst a second
+	_, doneAbandoned := p.LendIn(t.Context(), "B", zeros(1<<20), nil)
+	var waits []time.Duration
+	honest, doneHonest := p.LendIn(t.Context(), "B", zeros(8*Burst), func(d time.Duration) { waits = append(waits, d) })
+	defer doneHonest()
+	buf := make([]byte, Burst)
+	for i := range 4 {
+		if i == 2 {
+			doneAbandoned() // the abandoned body ends mid-way
+		}
+		start := c.now()
+		if _, err := io.ReadFull(honest, buf); err != nil {
+			t.Fatal(err)
+		}
+		slept := c.now().Sub(start)
+		if i == 0 {
+			continue // the burst: no wait
+		}
+		if slept != time.Second {
+			t.Fatalf("read %d waited %v; want 1 s at a burst a second", i, slept)
+		}
+	}
+	if len(waits) != 3 {
+		t.Fatalf("credited %v; want 3 waits", waits)
+	}
+	for i, d := range waits {
+		if d != time.Second {
+			t.Fatalf("wait %d was credited %v of its 1 s; want all of it", i+1, d)
+		}
+	}
+}
+
 // #87: a friend's limiter made on its first transfer has the rates of
 // the last Set, though the Set raced with that transfer's start: the
 // settings are read where the limiter is made. Racy by nature; before
