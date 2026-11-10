@@ -8,8 +8,16 @@ permissions:
   contents: read
 
 jobs:
+  # Split in two: internal/cli alone takes most of a runner, and sharing
+  # one with every other package made both slow enough that
+  # time-sensitive tests timed out (CI 2026-11-10: cli 27 min of the
+  # 30 min bound, every package 1.7x slower).
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [cli, rest]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -46,8 +54,15 @@ jobs:
           sudo install -m 0755 duplicacy /usr/local/bin/duplicacy
           rclone version | head -1; aws --version; duplicacy 2>&1 | grep -A1 VERSION
       - run: go vet ./...
-      - run: go test -race -timeout 30m ./...
+        if: matrix.part == 'rest'
+      - name: go test (internal/cli)
+        if: matrix.part == 'cli'
+        run: go test -race -timeout 40m ./internal/cli
+      - name: go test (every other package)
+        if: matrix.part == 'rest'
+        run: go test -race -timeout 30m $(go list ./... | grep -v '/internal/cli$')
       - name: SEC-11 test build (admission admits everyone; the middleware alone refuses)
+        if: matrix.part == 'cli'
         run: go test -race -tags admitall -run TestMiddlewareAloneRefusesStranger ./internal/cli
 
   # Scenario 12's first half against a real S3 provider (S3-1 to S3-3,

@@ -16,12 +16,12 @@ import (
 // client-side tombstones for the target's window).
 func TestScenarioOverflowRetentionVersioned(t *testing.T) {
 	serving(t, 2)
-	scenarioOverflowRetention(t, overflowtest.Start(t, "offsite", true), "backups/lendisk", true, 8*time.Second)
+	scenarioOverflowRetention(t, overflowtest.Start(t, "offsite", true), "backups/lendisk", true, providerWindow)
 }
 
 func TestScenarioOverflowRetentionUnversioned(t *testing.T) {
 	serving(t, 2)
-	scenarioOverflowRetention(t, overflowtest.Start(t, "offsite", false), "backups/lendisk", false, 8*time.Second)
+	scenarioOverflowRetention(t, overflowtest.Start(t, "offsite", false), "backups/lendisk", false, providerWindow)
 }
 
 // The same against providers running elsewhere (DESIGN §3.11's tiers):
@@ -41,8 +41,9 @@ func TestScenarioOverflowRetentionAtAnUnversionedProvider(t *testing.T) {
 	scenarioOverflowRetention(t, srv, fmt.Sprintf("ci/%d", time.Now().UnixNano()), false, providerWindow)
 }
 
-// providerWindow is the retention window of the tests against providers
-// running elsewhere.
+// providerWindow is the retention window of every retention scenario:
+// long enough that a slow or loaded runner checks the target before the
+// held deletes come due (an 8 s window ran out on CI, 2026-11-10).
 const providerWindow = 30 * time.Second
 
 // providerFromEnv connects to the provider the variables with prefix
