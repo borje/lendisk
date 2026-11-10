@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"strconv"
 	"strings"
@@ -101,7 +102,7 @@ checksums and weekly by a downloaded sample (VER-2).`,
 	set.Flags().StringVar(&sf.fullCycle, "full-cycle", "", "download every object held there once in this many days, such as 90 or 90d (VER-1a); 0 or off for none, the default")
 	cmd.AddCommand(set)
 
-	var keep bool
+	var keep, force, yes bool
 	remove := &cobra.Command{
 		Use:   "remove <name>",
 		Short: "Remove an overflow target once its copies are held elsewhere",
@@ -121,13 +122,29 @@ or target is added, or a quota raised.
 With --keep-data the copies are left at the target and nothing more is
 deleted there (deletes it holds for the retention window are dropped
 unsent): the target is dropped as soon as its data is held elsewhere.
-Given again with --keep-data, a removal under way stops deleting.`,
+Given again with --keep-data, a removal under way stops deleting.
+
+--force drops the target at once, deleting nothing more there: for a
+removal that cannot finish, its credential revoked or no longer in the
+daemon's environment (` + "`lendisk serve`" + ` refuses to start without it). If
+the target holds copies objects still need (they are not yet held by
+enough friends or other targets), it lists them and asks before
+dropping it; --yes answers for you. What is left there is listed: lendisk
+no longer manages it.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if force {
+				return a.runOverflowForce(cmd.Context(), args[0], yes)
+			}
+			if yes {
+				return usageError{errors.New("--yes goes with --force")}
+			}
 			return a.runOverflowRemove(cmd.Context(), args[0], keep)
 		},
 	}
 	remove.Flags().BoolVar(&keep, "keep-data", false, "leave the copies at the target, deleting nothing there")
+	remove.Flags().BoolVar(&force, "force", false, "drop the target now, deleting nothing more there, when its removal cannot finish (credential revoked)")
+	remove.Flags().BoolVarP(&yes, "yes", "y", false, "with --force: do not ask before losing copies objects still need")
 	cmd.AddCommand(remove)
 	return cmd
 }
@@ -346,6 +363,10 @@ func (a *app) runOverflowRemove(ctx context.Context, name string, keep bool) err
 	default:
 		fmt.Fprintln(w, "  Its copies there are then deleted as delete markers, which its lifecycle rule expires.")
 	}
+	if left, err := db.OverflowLeftAt(ctx, name); err == nil && left.Abandoned > 0 {
+		fmt.Fprintf(w, "  %s sent there lost their answer and may have landed (%s): nothing deletes them there, and they stay when it is dropped.\n",
+			uploads(left.Abandoned), formatSize(left.AbandonedBytes))
+	}
 	fmt.Fprintln(w, "  The target is dropped once nothing is left there; `lendisk status` shows it until then.")
 	if plan, err := capacity.Read(ctx, db, state.DefaultCopies); err == nil && plan.Size() > 0 && plan.Protectable() < plan.Size() {
 		fmt.Fprintf(w, "  ! Without it the pool protects %s of the repository's %s: the copies that find no room stay at the target until you add a friend or target, or a quota is raised.\n",
@@ -353,6 +374,86 @@ func (a *app) runOverflowRemove(ctx context.Context, name string, keep bool) err
 	}
 	fmt.Fprintln(w, "Keep `lendisk serve` running, with the target's credential in its environment: the daemon does the moving.")
 	return nil
+}
+
+// uploads counts n uploads.
+func uploads(n int64) string {
+	if n == 1 {
+		return "1 upload"
+	}
+	return fmt.Sprintf("%d uploads", n)
+}
+
+// runOverflowForce drops target name at once (#102), after the user
+// confirmed any copies objects still need that go with it (I3).
+func (a *app) runOverflowForce(ctx context.Context, name string, yes bool) error {
+	_, db, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	o, err := db.GetOverflow(ctx, name)
+	if errors.Is(err, state.ErrNotFound) {
+		return noTarget(name)
+	} else if err != nil {
+		return err
+	}
+	w := a.out
+	loss, left, err := db.ForceRemoveOverflow(ctx, name, false, a.now())
+	if errors.Is(err, state.ErrWouldLose) {
+		printLoss(w, name, loss)
+		if !yes {
+			fmt.Fprint(w, "Drop it anyway, losing those copies? [y/N]: ")
+			line, err := a.readLine()
+			if ans := strings.ToLower(line); err != nil || ans != "y" && ans != "yes" {
+				return fmt.Errorf("not confirmed; overflow target %s was not dropped", name)
+			}
+		}
+		loss, left, err = db.ForceRemoveOverflow(ctx, name, true, a.now())
+	}
+	if errors.Is(err, state.ErrNotFound) {
+		return noTarget(name)
+	} else if err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "Overflow target %s dropped (--force): nothing more is sent to it or deleted there.\n", name)
+	if loss.Objects > 0 {
+		fmt.Fprintf(w, "  Data objects left with fewer copies than their bucket's copies: %d; the daemon places new ones as the pool has room.\n",
+			loss.Objects)
+	}
+	if !left.Empty() {
+		fmt.Fprintf(w, "  It may still hold what lendisk no longer manages, under %s/%s/ (the provider bills it until you delete it there):\n",
+			o.Bucket, o.Prefix)
+		if left.Copies > 0 {
+			fmt.Fprintf(w, "    %d objects lendisk put there and never deleted (%s)\n", left.Copies, formatSize(left.CopyBytes))
+		}
+		if left.Deletes > 0 {
+			fmt.Fprintf(w, "    %d objects deleted or moved, whose deletes there were held or refused and not sent (%s)\n",
+				left.Deletes, formatSize(left.DeleteBytes))
+		}
+		if left.Abandoned > 0 {
+			fmt.Fprintf(w, "    %s whose answer was lost, which may have landed (%s)\n", uploads(left.Abandoned), formatSize(left.AbandonedBytes))
+		}
+	}
+	fmt.Fprintf(w, "If `lendisk serve` refused to start without its credential, it starts now; a running daemon stops sending there at its next look at the targets.\n")
+	return nil
+}
+
+// printLoss shows what dropping target name now would take from the
+// objects (#102).
+func printLoss(w io.Writer, name string, l state.Loss) {
+	fmt.Fprintf(w, "! Overflow target %s holds copies objects still need: %s (%s) not yet held by enough friends or other targets.\n",
+		name, countObjects(l.Objects), formatSize(l.Bytes))
+	if l.Unprotected > 0 {
+		fmt.Fprintf(w, "! %d of them would have no copy offsite at all, only the one in this node's store.\n", l.Unprotected)
+	}
+	for _, k := range l.Keys {
+		fmt.Fprintf(w, "    %s\n", k)
+	}
+	if more := l.Objects - int64(len(l.Keys)); more > 0 {
+		fmt.Fprintf(w, "    and %d more\n", more)
+	}
+	fmt.Fprintln(w, "  Dropping it loses those copies; without --force, the daemon keeps them until each is held elsewhere.")
 }
 
 type overflowFlags struct {
@@ -476,6 +577,11 @@ func checkOverflowCredentials(ctx context.Context, db *state.DB, getenv overflow
 	}
 	for _, o := range targets {
 		if _, err := overflow.Lookup(getenv, o.EnvPrefix); err != nil {
+			if o.Removing() {
+				// #102: a removal that cannot finish without it.
+				return fmt.Errorf("overflow target %s, being removed: %w; or, if the credential is gone for good, drop the target with `lendisk overflow remove --force %s`",
+					o.Name, err, o.Name)
+			}
 			return fmt.Errorf("overflow target %s: %w", o.Name, err)
 		}
 	}

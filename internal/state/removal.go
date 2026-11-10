@@ -21,8 +21,10 @@ import (
 //   - Reroute's moves and drops of unsent data;
 //   - RemoveOverflow's unsent puts at the target being removed;
 //   - removeFriendship's unsent rows and ForgetFormerFriend's rows
-//     (exceptFriendRemoved), and dropOverflow's rows of a target removed
-//     with keep_data (exceptKeepData).
+//     (exceptFriendRemoved), dropOverflow's rows of a target removed
+//     with keep_data (exceptKeepData), and ForceRemoveOverflow's: each
+//     live data copy asked first, and the rows forgotten (exceptForced)
+//     only once none is refused or the user accepted the loss (#102).
 //
 // A dropping copy is asked about again before its delete is sent
 // (checkDrop, #104): from StartPlacement, in the transaction that takes
@@ -72,12 +74,13 @@ import (
 //     their reason: the user lowering `copies` (I1 counts the copies
 //     set now: SetCopies is the user's decision), `overflow remove
 //     --keep-data` (the target's rows are forgotten with its data left
-//     there, exceptKeepData) and a friendship ended, by the user or by
-//     the friend (byPeer, exceptFriendRemoved). Nothing else bypasses
-//     I1.
+//     there, exceptKeepData), `overflow remove --force` with the loss
+//     it prints confirmed (exceptForced, #102) and a friendship ended,
+//     by the user or by the friend (byPeer, exceptFriendRemoved).
+//     Nothing else bypasses I1.
 //
 // The calls that name an exception (removeFriendship, ForgetFormerFriend,
-// dropOverflow), and those for unsent data rows (applyReroute,
+// dropOverflow, ForceRemoveOverflow), and those for unsent data rows (applyReroute,
 // RemoveOverflow), always return true. They record the decision, and
 // enforce nothing: removing an unsent copy never lowers the count I1
 // keeps, and neither does removing a copy at a former friend or at a
@@ -89,6 +92,7 @@ import (
 const (
 	exceptFriendRemoved = "a friendship ended, by the user or by the friend"
 	exceptKeepData      = "an overflow target removed with --keep-data"
+	exceptForced        = "an overflow target removed with --force, its loss confirmed by the user"
 )
 
 // removal is one copy a path asks to remove: row seq of bucket at

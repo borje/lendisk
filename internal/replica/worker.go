@@ -478,10 +478,16 @@ func (w *Worker) reroute(ctx context.Context) {
 // depends on any more (#96, state.FinishOverflowRemovals); their
 // senders stop at the next read of the targets.
 func (w *Worker) finishRemovals(ctx context.Context) {
-	names, err := w.DB.FinishOverflowRemovals(ctx)
-	for _, n := range names {
+	done, err := w.DB.FinishOverflowRemovals(ctx)
+	for _, r := range done {
 		w.Log.Info("replication: overflow target removed: its copies are held elsewhere and nothing is left there to delete",
-			"place", state.OverflowPlace(n))
+			"place", state.OverflowPlace(r.Name))
+		if l := r.Left; l.Abandoned > 0 {
+			// #102: uploads whose answer was lost may have landed there;
+			// lendisk no longer deletes them, and the provider bills them.
+			w.Log.Warn("replication: the removed overflow target may still hold uploads whose answer was lost; lendisk no longer deletes them there: delete them with the provider's tools if they are not wanted",
+				"place", state.OverflowPlace(r.Name), "uploads", l.Abandoned, "bytes", l.AbandonedBytes)
+		}
 	}
 	if err != nil && ctx.Err() == nil {
 		w.Log.Error("replication: finishing the removal of overflow targets failed", "err", err)
@@ -901,6 +907,24 @@ func (w *Worker) issueTombs(ctx context.Context, place string, r Replica, log *s
 		return false, false
 	}
 	for i, t := range ts {
+		// The target may have been removed with keep_data since the
+		// claim (#102): then nothing more is sent there.
+		if ok, err := w.DB.TombToSend(ctx, place, t.Seq); err != nil || !ok {
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Error("replication: reading a held delete failed", "err", err)
+				}
+				seqs := make([]int64, 0, len(ts)-i)
+				for _, u := range ts[i:] {
+					seqs = append(seqs, u.Seq)
+				}
+				if uerr := w.DB.UnclaimOverflowTombs(context.Background(), place, seqs); uerr != nil {
+					log.Error("replication: giving back held deletes failed; they are tried again within the hour", "err", uerr)
+				}
+				return sent, false
+			}
+			continue
+		}
 		err := r.Delete(ctx, t.Bucket, t.Key)
 		if err == nil || errors.Is(err, ErrDeleteDenied) {
 			sent = true

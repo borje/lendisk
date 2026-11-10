@@ -170,3 +170,44 @@ func TestRecoveryListsEachOverflowTargetAndRebuildsItsPlacement(t *testing.T) {
 		t.Fatalf("%d rows placed at the target again after recovery", queued)
 	}
 }
+
+// #102: the manifest carries a target's removal, since when and with
+// keep_data, so a node recovered during the removal goes on removing
+// it: no new copy goes there, rather than the target coming back into
+// use. A target in use stays in use.
+func TestRecoveryDuringARemovalKeepsTheTargetBeingRemoved(t *testing.T) {
+	ctx := t.Context()
+	self := newID(t)
+	old := openDB(t)
+	since := time.Unix(1_800_000_000, 0)
+	for _, name := range []string{"b2", "wasabi"} {
+		if err := old.AddOverflow(ctx, state.Overflow{Name: name, Endpoint: "https://s3.example", Bucket: "offsite",
+			MaxBytes: 1 << 30, EnvPrefix: overflow.DefaultEnvPrefix(name), AddedAt: since}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := old.RemoveOverflow(ctx, "b2", true, since); err != nil {
+		t.Fatal(err)
+	}
+	c, err := manifest.Build(ctx, old, self, nil)
+	if err != nil || len(c.Overflow) != 2 || c.Overflow[0].RemovingAt != since.Unix() || !c.Overflow[0].KeepData ||
+		c.Overflow[1].RemovingAt != 0 {
+		t.Fatalf("manifest %+v, %v", c.Overflow, err)
+	}
+	db := openDB(t)
+	for range 2 {
+		if _, err := Restore(ctx, db, &manifest.Manifest{Seq: 4, Content: c}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	o, err := db.GetOverflow(ctx, "b2")
+	if err != nil || !o.RemovingAt.Equal(since) || !o.KeepData {
+		t.Fatalf("restored %+v, %v: want being removed since %v, keeping its data", o, err, since)
+	}
+	if w, err := db.GetOverflow(ctx, "wasabi"); err != nil || w.Removing() {
+		t.Fatalf("restored %+v, %v: want in use", w, err)
+	}
+	if n, _ := db.PoolSize(ctx); n != 1 {
+		t.Fatalf("pool size %d after recovery, want wasabi only", n)
+	}
+}

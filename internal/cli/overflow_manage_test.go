@@ -174,6 +174,85 @@ func TestOverflowRemoveSaysWhatHappensAndStatusShowsIt(t *testing.T) {
 	}
 }
 
+// #102: a removal whose credential is gone cannot finish, and serve
+// refuses to start without it, naming --force. `overflow remove
+// --force` lists the copies objects still need that the target holds
+// and asks first: refused, nothing changes; confirmed (or --yes), the
+// target is dropped and what is left there is listed.
+func TestOverflowRemoveForceAsksBeforeLosingCopiesObjectsNeed(t *testing.T) {
+	serving(t, 0) // the provider is versitygw, in this process
+	srv := overflowtest.Start(t, "offsite", true)
+	n := newNode(t)
+	n.mustInit(t)
+	n.env = overflowEnv(srv)
+	if code, out, e := n.run("", "", "overflow", "add", "s3", "b2", "--endpoint", srv.Endpoint, "--bucket", "offsite",
+		"--max-bytes", "1G"); code != 0 {
+		t.Fatalf("overflow add: %s%s", out, e)
+	}
+	// The target holds the only offsite copy of a pack.
+	const pack, sha = "data/ab/abcdef", "ab01cd23ab01cd23ab01cd23ab01cd23ab01cd23ab01cd23ab01cd23ab01cd23"
+	db := openDB(t, n)
+	r, err := db.Exec(`INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
+		VALUES ('laptop', ?, 'put', 'data', 'done', 4, ?, 1)`, pack, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, _ := r.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
+		VALUES (?, 'overflow:b2', 'laptop', ?, 'put', 'acked', ?, 1, 4100)`, seq, pack, sha); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, e := n.run("", "", "overflow", "remove", "b2"); code != 0 {
+		t.Fatalf("overflow remove: %d %s%s", code, out, e)
+	}
+	// The credential is revoked and gone from the environment.
+	n.env = nil
+	err = checkOverflowCredentials(t.Context(), db, func(string) (string, bool) { return "", false })
+	if err == nil || !strings.Contains(err.Error(), "lendisk overflow remove --force b2") {
+		t.Fatalf("serve's credential check: %v", err)
+	}
+
+	if code, _, e := n.run("", "", "overflow", "remove", "b2", "--yes"); code != 2 || !strings.Contains(e, "--force") {
+		t.Fatalf("--yes without --force: %d %s", code, e)
+	}
+	if code, _, e := n.run("", "", "overflow", "remove", "nope", "--force"); code != 1 || !strings.Contains(e, "no overflow target nope") {
+		t.Fatalf("forcing an unknown target: %d %s", code, e)
+	}
+	code, out, e := n.run("n\n", "", "overflow", "remove", "b2", "--force")
+	if code != 1 || !strings.Contains(e, "not confirmed") {
+		t.Fatalf("force refused: %d %s%s", code, out, e)
+	}
+	for _, want := range []string{"holds copies objects still need: 1 data object", "1 of them would have no copy offsite",
+		"laptop/" + pack, "Drop it anyway"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("force does not say %q:\n%s", want, out)
+		}
+	}
+	if st := n.status(); len(st.Capacity.Overflow) != 1 {
+		t.Fatalf("a refused force dropped the target: %+v", st.Capacity.Overflow)
+	}
+
+	code, out, e = n.run("", "", "overflow", "remove", "b2", "--force", "--yes")
+	if code != 0 {
+		t.Fatalf("force --yes: %d %s%s", code, out, e)
+	}
+	for _, want := range []string{"dropped (--force)", "fewer copies than their bucket's copies: 1",
+		"1 objects lendisk put there and never deleted", "offsite/lendisk/"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("force --yes does not say %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Drop it anyway") {
+		t.Errorf("force --yes asked:\n%s", out)
+	}
+	if st := n.status(); len(st.Capacity.Overflow) != 0 {
+		t.Fatalf("the target is still listed: %+v", st.Capacity.Overflow)
+	}
+	if err := checkOverflowCredentials(t.Context(), db, func(string) (string, bool) { return "", false }); err != nil {
+		t.Fatalf("serve still refuses: %v", err)
+	}
+}
+
 // #96, scenario 12 scaled down as TestScenarioOverflowDrainsBackToANewFriend:
 // A backs up at two copies with one friend, B, too small for two copies,
 // so every data object is at B and the target (with versioning). The

@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -216,6 +217,7 @@ func runModel(t *testing.T, seed uint64, steps int) {
 		{1, m.versioning},
 		{2, m.removeTarget},
 		{2, m.finishRemovals},
+		{1, m.forceRemoveTarget},
 		{4, m.tombs},
 		{4, m.tick},
 		{1, m.startSeed},
@@ -528,11 +530,38 @@ func (m *removalModel) removeTarget() {
 	m.did("target %s removed, keep_data %t", pl.name, keep)
 }
 
-func (m *removalModel) finishRemovals() {
-	names, err := m.p.db.FinishOverflowRemovals(context.Background())
+// forceRemoveTarget is `overflow remove --force` (#102): the target is
+// dropped at once and nothing more is deleted there. Not accepted, it
+// is refused while a live copy there is one its object needs, which the
+// checks after the step hold it to (I1); accepted, it is I3's named
+// exception.
+func (m *removalModel) forceRemoveTarget() {
+	pl := m.somePlace(targets)
+	if pl == nil {
+		return
+	}
+	accept := m.pick(4) == 0
+	name, _ := OverflowName(pl.name)
+	loss, _, err := m.p.db.ForceRemoveOverflow(context.Background(), name, accept, m.p.now)
+	if errors.Is(err, ErrWouldLose) {
+		m.did("target %s not forced out: %d objects need it", pl.name, loss.Objects)
+		return
+	}
 	m.must(err)
-	for _, n := range names {
-		pl := m.byName[OverflowPlace(n)]
+	pl.out, pl.answering, pl.removing = true, false, true
+	if accept {
+		m.exempt[pl.name] = true
+	}
+	m.did("target %s forced out, loss accepted %t (%d objects)", pl.name, accept, loss.Objects)
+}
+
+func (m *removalModel) finishRemovals() {
+	done, err := m.p.db.FinishOverflowRemovals(context.Background())
+	m.must(err)
+	var names []string
+	for _, r := range done {
+		names = append(names, r.Name)
+		pl := m.byName[OverflowPlace(r.Name)]
 		pl.out, pl.answering = true, false
 		m.exempt[pl.name] = true
 	}

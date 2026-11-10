@@ -154,3 +154,62 @@ func TestHeldDeletesAtAnUnreachableTargetBackOffAndWarnOnce(t *testing.T) {
 	waitFor(t, "the held delete sent once the target answers", func() bool { return !target.holds("laptop", "data/1") })
 	waitFor(t, "the recovery logged", func() bool { return logs.records("INFO", "held deletes go to the overflow target again") == 1 })
 }
+
+// #102: a target removed with keep_data while the worker sends a batch
+// of held deletes there gets no more of them: the worker asks before
+// each (state.TombToSend), so only the delete on its way when the user
+// ran `overflow remove --keep-data` goes, and the rest stay there.
+func TestKeepDataStopsTheHeldDeletesTheWorkerIsSending(t *testing.T) {
+	fx := newFixture(t, "B")
+	target := fx.withTarget("garage", state.VersioningOff)
+	clock := &fixtureClock{now: time.Now()}
+	fx.w.Now = clock.Now
+	keys := []string{"data/1", "data/2", "data/3"}
+	for _, k := range keys {
+		fx.write("laptop", k, "pack "+k)
+	}
+	fx.run()
+	waitFor(t, "every pack at the target", func() bool {
+		for _, k := range keys {
+			if !target.holds("laptop", k) {
+				return false
+			}
+		}
+		return true
+	})
+	for _, k := range keys {
+		fx.remove("laptop", k)
+	}
+	fx.drained("overflow:garage")
+	var deletes atomic.Int64
+	target.mu.Lock()
+	target.fail = func(op, _ string) error {
+		if op == "delete" && deletes.Add(1) == 1 {
+			// The user removes the target keeping its data while this
+			// first delete is on its way.
+			if err := fx.db.RemoveOverflow(context.Background(), "garage", true, clock.Now()); err != nil {
+				t.Error(err)
+			}
+		}
+		return nil
+	}
+	target.mu.Unlock()
+	clock.add(time.Hour)
+	waitFor(t, "the held deletes settled", func() bool {
+		h, err := fx.db.OverflowTombHolds(context.Background())
+		return deletes.Load() > 0 && err == nil && h["garage"].Tombs == 0
+	})
+	time.Sleep(100 * time.Millisecond) // a few polls of the sender
+	if n := deletes.Load(); n != 1 {
+		t.Fatalf("%d deletes sent, want only the one on its way", n)
+	}
+	held := 0
+	for _, k := range keys {
+		if target.holds("laptop", k) {
+			held++
+		}
+	}
+	if held != 2 {
+		t.Fatalf("the target holds %d of the packs, want the two not yet deleted", held)
+	}
+}

@@ -118,6 +118,12 @@ type Overflow struct {
 	EnvPrefix        string  `json:"env_prefix,omitempty"`
 	RetentionSeconds int64   `json:"retention_seconds,omitempty"`
 	PricePerGB       float64 `json:"price_per_gb,omitempty"`
+	// Added with #102, absent from older manifests (format stays 1): the
+	// target is being removed, since RemovingAt (Unix seconds), and its
+	// copies left there if KeepData, so a node rebuilt during the
+	// removal goes on removing it rather than using it again.
+	RemovingAt int64 `json:"removing_at,omitempty"`
+	KeepData   bool  `json:"keep_data,omitempty"`
 }
 
 // Bucket is one of the node's own buckets with its sealed name, the
@@ -162,6 +168,9 @@ func Build(ctx context.Context, db *state.DB, self *identity.Identity, getenv ov
 	for _, o := range targets {
 		mo := Overflow{Name: o.Name, Endpoint: o.Endpoint, Bucket: o.Bucket, Prefix: o.Prefix, Region: o.Region,
 			MaxBytes: o.MaxBytes, EnvPrefix: o.EnvPrefix, RetentionSeconds: int64(o.Retention / time.Second), PricePerGB: o.PricePerGB}
+		if o.Removing() {
+			mo.RemovingAt, mo.KeepData = o.RemovingAt.Unix(), o.KeepData
+		}
 		if getenv != nil {
 			if cred, err := overflow.Lookup(getenv, o.EnvPrefix); err == nil {
 				mo.AccessKey, mo.SecretKey = cred.AccessKey, cred.SecretKey

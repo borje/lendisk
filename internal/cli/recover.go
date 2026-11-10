@@ -400,6 +400,9 @@ func printOverflow(w io.Writer, targets []manifest.Overflow) {
 		if o.Prefix != "" {
 			fmt.Fprintf(w, ", prefix %s", o.Prefix)
 		}
+		if o.RemovingAt > 0 {
+			fmt.Fprint(w, "; being removed: its copies go elsewhere, as before")
+		}
 		fmt.Fprintln(w)
 		if o.AccessKey != "" || o.SecretKey != "" {
 			an, sn := overflow.EnvNames(cmp.Or(o.EnvPrefix, overflow.DefaultEnvPrefix(o.Name)))
