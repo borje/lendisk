@@ -31,6 +31,51 @@ func TestRecoverWarnsOfLendersNotHeard(t *testing.T) {
 	}
 }
 
+// #72: a recovered list whose keys could not be decided again is shown
+// in status, with its failure, until it settles.
+func TestStatusShowsARecoveredListThatFailedToSettle(t *testing.T) {
+	parallel(t, 0)
+	n := newNode(t)
+	n.mustInit(t)
+	n.addBucket(t, "laptop", "restic")
+	db := openDB(t, n)
+	ctx := t.Context()
+	for _, f := range []string{"B", "C"} {
+		if err := db.AddFriendship(ctx, state.Friendship{Peer: f, Address: "tc" + f, OwnNumber: 1 << 30, PeerNumber: 1 << 30}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.AddRelists(ctx, []string{"B", "C"}, []string{"laptop"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordListed(ctx, "B", "laptop", []state.Listed{{Key: "config", Size: 1, SHA256: "hb", Class: "metadata"}},
+		1, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER fail BEFORE UPDATE ON recovered_key BEGIN SELECT RAISE(FAIL, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SettleFinished(ctx); err == nil {
+		t.Fatal("settling did not fail")
+	}
+	if fs := n.status().Recovery.SettleFailed; len(fs) != 1 || fs[0].Place != "B" || fs[0].Bucket != "laptop" ||
+		!strings.Contains(fs[0].Error, "boom") || fs[0].Failures != 1 || fs[0].TriedAt == "" {
+		t.Fatalf("settle_failed %+v", fs)
+	}
+	if _, out, _ := n.run("", "", "status"); !strings.Contains(out, "could not be decided yet") {
+		t.Fatalf("status text:\n%s", out)
+	}
+	if _, err := db.Exec(`DROP TRIGGER fail`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SettleFinished(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if fs := n.status().Recovery.SettleFailed; len(fs) != 0 {
+		t.Fatalf("settled, still shown: %+v", fs)
+	}
+}
+
 // #29 review (user decision 2026-11-07): status shows a recovered key
 // in conflict with what each place listed, and `bucket resolve` picks a
 // place's version; a key only one place lists is marked unverified in a

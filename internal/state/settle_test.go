@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -143,5 +144,110 @@ func TestSettlingPastItsBudgetStillFinishes(t *testing.T) {
 		if v := verdict(t, db, "laptop", k); v.Verdict != VerdictSingle {
 			t.Fatalf("%s: %+v", k, v)
 		}
+	}
+}
+
+// #72: a list whose settling fails is recorded and skipped: the lists
+// after it still settle, and it is tried again each round until it
+// settles.
+func TestAListThatFailsToSettleBlocksNoOther(t *testing.T) {
+	ctx := context.Background()
+	db := recoveringWith(t, "B", "C")
+	if err := db.AddRelists(ctx, []string{"B", "C"}, []string{"work"}); err != nil {
+		t.Fatal(err)
+	}
+	for b, key := range map[string]string{"laptop": "index/bad", "work": "index/9"} {
+		if _, err := db.RecordListed(ctx, "B", b, []Listed{{Key: key, Size: 1, SHA256: "h", Class: "metadata"}}, 1, "", true); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.RecordListed(ctx, "C", b, nil, 0, "", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`CREATE TRIGGER fail BEFORE UPDATE ON recovered_key WHEN NEW.key = 'index/bad'
+		BEGIN SELECT RAISE(FAIL, 'boom'); END`); err != nil {
+		t.Fatal(err)
+	}
+	for round := int64(1); round <= 2; round++ {
+		err := db.SettleFinished(ctx)
+		if err == nil || !strings.Contains(err.Error(), "boom") {
+			t.Fatalf("round %d: the failure is not reported: %v", round, err)
+		}
+		// The laptop lists, B's the first of all, fail; the work lists
+		// after them settle.
+		if v := verdict(t, db, "work", "index/9"); v.Verdict != VerdictConflict {
+			t.Fatalf("round %d: a later list did not settle: %+v", round, v)
+		}
+		fs, err := db.SettleFailed(ctx)
+		if err != nil || len(fs) != 2 {
+			t.Fatalf("round %d: failed %+v %v", round, fs, err)
+		}
+		for _, f := range fs {
+			if f.Bucket != "laptop" || !strings.Contains(f.SettleError, "boom") || f.SettleFailures != round {
+				t.Fatalf("round %d: failed %+v", round, fs)
+			}
+		}
+		if n, _ := db.Unsettled(ctx); n != 2 {
+			t.Fatalf("round %d: %d unsettled", round, n)
+		}
+	}
+	if _, err := db.Exec(`DROP TRIGGER fail`); err != nil {
+		t.Fatal(err)
+	}
+	settle(t, db)
+	if v := verdict(t, db, "laptop", "index/bad"); v.Verdict != VerdictConflict {
+		t.Fatalf("retried list: %+v", v)
+	}
+	if fs, err := db.SettleFailed(ctx); err != nil || len(fs) != 0 {
+		t.Fatalf("failures left %+v %v", fs, err)
+	}
+}
+
+// #72: a finished list's lone-metadata settling records its progress
+// with each batch, so rounds whose budget ends after one batch still
+// finish it, each resuming where the last stopped.
+func TestLoneMetadataSettlingResumesAfterItsBudget(t *testing.T) {
+	batch, pauseFor := SettleBatch, SettlePause
+	// Every round's budget ends in the pause after its first batch.
+	SettleBatch, SettlePause = 2, time.Hour
+	t.Cleanup(func() { SettleBatch, SettlePause = batch, pauseFor })
+	ctx := context.Background()
+	db := recoveringWith(t, "B", "C")
+	var lone []Listed
+	for i := 0; i < 10; i++ {
+		lone = append(lone, Listed{Key: fmt.Sprintf("index/%02d", i), Size: 1, SHA256: "h", Class: "metadata"})
+	}
+	if _, err := db.RecordListed(ctx, "B", "laptop", lone, len(lone), "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordListed(ctx, "C", "laptop", nil, 0, "", true); err != nil {
+		t.Fatal(err)
+	}
+	conflicts := func() int {
+		cs, err := db.Conflicts(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(cs)
+	}
+	rounds := 0
+	for ; rounds < 15; rounds++ {
+		if n, _ := db.Unsettled(ctx); n == 0 {
+			break
+		}
+		round, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		err := db.SettleFinished(round)
+		cancel()
+		if rounds == 0 && (err == nil || conflicts() != 2) {
+			t.Fatalf("the first round decided %d keys: %v", conflicts(), err)
+		}
+	}
+	// Two lists ended in the bucket, five batches each, and a round
+	// that marks the last settled.
+	if n, _ := db.Unsettled(ctx); n != 0 || rounds > 11 {
+		t.Fatalf("%d lists unsettled after %d rounds", n, rounds)
+	}
+	if c := conflicts(); c != len(lone) {
+		t.Fatalf("%d of %d lone keys decided", c, len(lone))
 	}
 }

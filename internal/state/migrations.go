@@ -1069,4 +1069,19 @@ var migrations = []Migration{
 		-- seconds; NULL: none, its replicas keep VER-2's sampling alone.
 		ALTER TABLE overflow ADD COLUMN full_cycle INTEGER;`,
 	},
+	{
+		Version: 50, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Settling an ended list (#72): settle_after is the last lone
+		-- metadata key a finished list's settling decided, committed with
+		-- each batch, so settling resumes after it (NULL: from the
+		-- start). A list whose settling failed keeps the failure
+		-- (settle_error, settle_tried_at in unix seconds, settle_failures
+		-- in a row) and is tried again next round; the lists after it
+		-- settle meanwhile. All NULL once it settles.
+		ALTER TABLE relist ADD COLUMN settle_after TEXT;
+		ALTER TABLE relist ADD COLUMN settle_error TEXT;
+		ALTER TABLE relist ADD COLUMN settle_tried_at INTEGER;
+		ALTER TABLE relist ADD COLUMN settle_failures INTEGER;`,
+	},
 }

@@ -1265,8 +1265,8 @@ upstream bucket is Q-V.
   so a friend added after recovery (no row) is no evidence. A page's
   keys are decided in its own transaction: a page holds at most 1,000
   keys (`gateway.MaxListPage`), and a longer one fails the list, in the
-  control client and in the lister alike. What an ended list affects
-  beyond its pages (an abandoned list's keys, a finished list's lone
+  control client and in the lister alike, before the caps count it
+  (#72). What an ended list affects beyond its pages (an abandoned list's keys, a finished list's lone
   metadata keys) is decided afterwards by `state.SettleFinished`, which
   the lister runs at the start and the end of every round, in write
   transactions of 2,000 keys or 250 ms (`state.SettleBudget`),
@@ -1280,7 +1280,17 @@ upstream bucket is Q-V.
   statement once (`preparedTx`): the same dozen statements run for
   every key, and compiling them each time cost most of a batch.
   `settled` marks a
-  list's settling finished. Settling is bounded by the round's budget
+  list's settling finished. Each batch commits its progress with it: an
+  abandoned list's dropped entries are gone, and a finished list's
+  lone-metadata pass records the last key it decided (`settle_after`,
+  migration 50), so a pass longer than a round's budget resumes after
+  it rather than starting again (#72). A list whose settling fails is
+  recorded (`settle_error`, `settle_tried_at`, `settle_failures`,
+  cleared when it settles), skipped so the lists after it still
+  settle, logged, shown in `status` (`recovery.settle_failed`), and
+  tried again next round; a failing batch of keys whose write ended
+  is skipped the same way and stays `writing`, so counted unsettled.
+  Settling is bounded by the round's budget
   like the listing: what it does not finish (or a crash, a shutdown or
   a busy database interrupts) is left, and the daemon's lister counts
   every ended list not yet settled as pending (`state.Unsettled`), so
