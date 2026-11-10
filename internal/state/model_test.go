@@ -31,7 +31,10 @@ import (
 //     data of its bucket: a live copy, a delete it has queued but not
 //     sent, a held tomb, a denied delete, or a delete marker inside its
 //     window (the model's own view, not holdsLiveData's);
-//   - every acknowledged copy of a live object is one the model sent.
+//   - every acknowledged copy of a live object is one the model sent;
+//   - liveness, after the steps (settle, #108): made quiescent with
+//     friends holding everything, the pool empties every target within
+//     settleRounds rounds.
 //
 // The steps are what the model can see happen: a put row's state
 // changes are logged by triggers on placement (model_change), and the
@@ -113,6 +116,9 @@ type removalModel struct {
 	// exempt: places whose rows the step removes as a named exception
 	// (I3), not by the removal rule.
 	exempt map[string]bool
+	// calm: no send fails and no delete is refused (settle's liveness
+	// phase).
+	calm bool
 }
 
 func TestRemovalModel(t *testing.T) {
@@ -244,6 +250,7 @@ func runModel(t *testing.T, seed uint64, steps int) {
 			return
 		}
 	}
+	m.settle()
 	if os.Getenv("LENDISK_MODEL_LOG") != "" {
 		t.Log(strings.Join(m.log, "\n"))
 	}
@@ -778,7 +785,7 @@ func (m *removalModel) sendTo(pl *mplace, n int) int {
 		if p.State == PlacementDropping {
 			m.checkSend(pl, p)
 		}
-		if m.pick(10) == 0 {
+		if !m.calm && m.pick(10) == 0 {
 			m.must(m.p.db.SetPlaceCondition(ctx, pl.name, ConditionRetrying, "blip", m.p.now))
 			m.did("%s: %d %s failed", pl.name, p.Seq, p.Op)
 			return took
@@ -786,6 +793,14 @@ func (m *removalModel) sendTo(pl *mplace, n int) int {
 		sha := ""
 		if p.Op == OpPut {
 			sha = p.SHA256
+			if pl.target {
+				// The put replaces the key's current version there: the
+				// one it overwrites is nothing lendisk deletes or
+				// undeletes there any more.
+				pl.held = slices.DeleteFunc(pl.held, func(v *mver) bool {
+					return v.kind == mLive && v.bucket == p.Bucket && v.key == p.Key
+				})
+			}
 			pl.held = append(pl.held, &mver{seq: p.Seq, bucket: p.Bucket, key: p.Key, data: p.Class == "data", kind: mLive})
 			m.did("%s: %d put %s", pl.name, p.Seq, p.Key)
 		} else {
@@ -830,7 +845,7 @@ func (m *removalModel) deleted(pl *mplace, p Placement) {
 	case held:
 		set(mTomb, p.Seq, time.Time{})
 		m.did("%d delete %s held as a tomb", p.Seq, p.Key)
-	case m.pick(8) == 0:
+	case !m.calm && m.pick(8) == 0:
 		m.must(m.p.db.DenyOverflowDelete(ctx, pl.name, p.Seq, m.p.now))
 		set(mDenied, p.Seq, time.Time{})
 		m.did("%d delete %s denied", p.Seq, p.Key)
@@ -845,9 +860,15 @@ func (m *removalModel) deleted(pl *mplace, p Placement) {
 
 // tombs issues or refuses each target's due tombs (replica.issueTombs).
 func (m *removalModel) tombs() {
-	ctx := context.Background()
 	m.p.now = m.p.now.Add(time.Duration(m.pick(6*60)) * time.Minute)
 	m.did("tombs at %s", m.p.now.UTC().Format("01-02 15:04"))
+	m.issueTombs()
+}
+
+// issueTombs issues or refuses each answering target's tombs due now
+// (replica.issueTombs).
+func (m *removalModel) issueTombs() {
+	ctx := context.Background()
 	for _, pl := range m.inPool(targets) {
 		if !pl.answering {
 			continue
@@ -855,7 +876,7 @@ func (m *removalModel) tombs() {
 		ts, err := m.p.db.DueOverflowTombs(ctx, pl.name, m.p.now, 100)
 		m.must(err)
 		for _, tb := range ts {
-			if m.pick(5) == 0 {
+			if !m.calm && m.pick(5) == 0 {
 				m.must(m.p.db.DenyOverflowDelete(ctx, pl.name, tb.Seq, m.p.now))
 				for _, v := range pl.held {
 					if v.tomb == tb.Seq && (v.kind == mTomb || v.kind == mDrainTomb || v.kind == mDenied) {
@@ -995,6 +1016,109 @@ func (m *removalModel) undelete() {
 		c.pl.held = append(c.pl.held, &mver{seq: seq, bucket: c.k.bucket, key: c.k.key, data: true, kind: mLive})
 	}
 	m.did("undelete of %s/%s from %s: %+v", c.k.bucket, c.k.key, c.pl.name, res)
+}
+
+// Liveness (#108).
+
+// settleRounds bounds the rounds settle gives the pool to empty its
+// targets: a round per day is past the targets' retention (three days)
+// and a denied delete's retry (one) after four, and drain-back, the
+// metadata drops behind it and the tombs behind those take a round
+// each.
+const settleRounds = 8
+
+// settle checks liveness once the random steps are done (#108): the
+// pool is made quiescent, with friends holding everything (every place
+// in the pool answers, refuses nothing, is not gone, its replicas
+// verified; no seed pending; at least as many friends as any bucket's
+// copies, each with room for the whole repository), and from here no
+// send fails and no delete is refused. Then at most settleRounds rounds
+// of what a daemon does run, each a day after the last: a pass, every
+// FIFO sent until it is empty or held, the tombs due issued, the
+// removals finished. Each round is checked as a step is (I1, I2). After
+// them every target still in the pool holds nothing: no key whose
+// latest row there is a put, no delete still to send, no tomb, no use
+// counted (what status shows), and nothing the model believes it holds
+// but versions behind delete markers.
+func (m *removalModel) settle() {
+	ctx := context.Background()
+	m.calm = true
+	m.step++
+	m.what, m.exempt = "settle:", map[string]bool{}
+	for len(m.inPool(friends)) < 3 {
+		m.addFriendOf(1000)
+	}
+	for _, pl := range m.inPool(friends) {
+		_, err := m.p.db.Exec(`UPDATE friendship SET own_number = ?1, peer_number = ?1 WHERE peer_key = ?2`,
+			1000*unit, pl.name)
+		m.must(err)
+	}
+	for {
+		before := m.what
+		m.confirmSeed()
+		if strings.HasSuffix(m.what, "no seed pending") {
+			break
+		}
+		if m.what == before {
+			m.fail("confirming a seed changed nothing")
+		}
+	}
+	m.log = append(m.log, fmt.Sprintf("%d %s: %s", m.step, m.p.now.UTC().Format("01-02 15:04"), m.what))
+	m.check()
+	for round := 1; round <= settleRounds; round++ {
+		m.step++
+		m.what, m.exempt = fmt.Sprintf("settle round %d:", round), map[string]bool{}
+		m.p.now = m.p.now.Add(25 * time.Hour)
+		for _, pl := range m.inPool(nil) {
+			m.must(m.p.db.SetPlaceCondition(ctx, pl.name, ConditionOK, "", m.p.now))
+			pl.answering, pl.refuses = true, false
+			for _, b := range m.buckets {
+				m.must(m.p.db.RecordVerified(ctx, pl.name, b, true, m.p.now))
+			}
+		}
+		m.replace()
+		for sweep := 0; sweep < 100; sweep++ {
+			took := 0
+			for _, pl := range m.inPool(func(pl *mplace) bool { return pl.answering }) {
+				took += m.sendTo(pl, 1000)
+			}
+			if took == 0 {
+				break
+			}
+		}
+		m.issueTombs()
+		m.finishRemovals()
+		m.log = append(m.log, fmt.Sprintf("%d %s: %s", m.step, m.p.now.UTC().Format("01-02 15:04"), m.what))
+		m.check()
+		if m.t.Failed() {
+			return
+		}
+	}
+	for _, pl := range m.inPool(targets) {
+		// What it holds or will: each key whose latest row there is a
+		// put not deleted, and each delete still to send.
+		var rows, tombs int
+		m.must(m.p.db.QueryRow(`SELECT count(*) FROM placement p WHERE p.place = ?
+			AND (p.op = 'put' AND p.state IN ('queued', 'acked', 'dropping') AND NOT EXISTS (SELECT 1 FROM placement l
+				WHERE l.place = p.place AND l.bucket = p.bucket AND l.key = p.key AND l.seq > p.seq)
+			OR p.op = 'delete' AND p.state = 'queued')`, pl.name).Scan(&rows))
+		m.must(m.p.db.QueryRow(`SELECT count(*) FROM overflow_tomb WHERE place = ?`, pl.name).Scan(&tombs))
+		var held []string
+		for _, v := range pl.held {
+			if v.kind != mMarker && v.kind != mDrainMarker {
+				held = append(held, fmt.Sprintf("%s/%s (%d) kind %d", v.bucket, v.key, v.seq, v.kind))
+			}
+		}
+		use := m.p.use(pl.name)
+		if rows != 0 || tombs != 0 || use != 0 || len(held) != 0 {
+			all, err := column(ctx, m.p.db, `SELECT p.bucket || '/' || p.key || ' (' || p.seq || ') ' || q.class || ' ' || p.op || ' ' || p.state
+				FROM placement p JOIN queue q ON q.seq = p.seq
+				WHERE p.place = ? AND p.state IN ('queued', 'acked', 'dropping') ORDER BY p.seq`, pl.name)
+			m.must(err)
+			m.fail("liveness: %s not empty after %d quiescent rounds: %d rows, %d tombs, use %d, holding %v\n%s",
+				pl.name, settleRounds, rows, tombs, use, held, strings.Join(all, "\n"))
+		}
+	}
 }
 
 // The checks.

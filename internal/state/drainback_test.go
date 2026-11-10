@@ -127,6 +127,36 @@ func TestDrainBackEmptiesTheTargetOnceAFriendJoins(t *testing.T) {
 	}
 }
 
+// REPL-13, S3-7 (#108, found by TestRemovalModel's liveness check): a
+// metadata key written again while the target held data of its bucket
+// has two acknowledged rows there, the version the later put overwrote
+// and the later one. Drain-back deletes the later one, which takes the
+// key off the target; the overwritten one goes with it, so the target
+// is empty in status too, not counted holding it and priced for it for
+// good.
+func TestDrainBackLeavesNoOverwrittenMetadataCountedAtTheTarget(t *testing.T) {
+	p, o, _ := scenario12(t)
+	first := p.rowsAt(o)[0]
+	p.rewrite("r", "index/1", "metadata", 0.2)
+	p.settled()
+	if n := p.rowsIn(o, PlacementAcked); n != 17 {
+		t.Fatalf("%d rows acknowledged at the target, want 15 data copies and two versions of index/1", n)
+	}
+	p.friend("F", 40)
+	p.settled()
+	if n := p.rowsIn(o, PlacementAcked) + p.rowsIn(o, PlacementQueued) + p.rowsIn(o, PlacementDropping); n != 0 {
+		t.Fatalf("%d rows still held at the target after drain-back (%v), want none", n, p.rowsAt(o))
+	}
+	p.wantState(o, first, PlacementDrained)
+	holds, err := p.db.OverflowHolds(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h := holds["b2"]; h.Use != 0 {
+		t.Fatalf("the target counts %d bytes after drain-back, want 0", h.Use)
+	}
+}
+
 // REPL-13, #38 review's guard (mayRemove, I1): a drain-back copy
 // acknowledged at a friend does not delete the copy at the target while
 // the object would be left with fewer than copies acknowledged copies at

@@ -68,7 +68,12 @@ func TestScenarioOverflowDrainsBackToANewFriend(t *testing.T) {
 	}
 	fID := fn.identity().NodeID().String()
 	f.friends[fID] = fp
-	within(t, 3*time.Minute, "the target empty in status", func() bool {
+	// status reads the places and the capacity one after the other, not
+	// as one snapshot: a pass that marks the target's metadata dropping
+	// between the two reads shows the target empty while those deletes
+	// are still to be sent (#108). So the provider, which holds no key
+	// once they are, is asked as well.
+	within(t, 3*time.Minute, "the target empty in status and at the provider", func() bool {
 		st := f.an.status()
 		if len(st.Capacity.Overflow) != 1 {
 			return false
@@ -79,12 +84,22 @@ func TestScenarioOverflowDrainsBackToANewFriend(t *testing.T) {
 				return false // deletes still to send
 			}
 		}
-		return o.DataObjects == 0 && o.Use == 0 && o.DeleteDenied == 0
+		if o.DataObjects != 0 || o.Use != 0 || o.DeleteDenied != 0 {
+			return false
+		}
+		left, err := srv.Keys(t.Context(), prefix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(left) != 0 {
+			t.Logf("status shows the target empty, but it still holds %v", overflowtest.SortedKeys(left))
+		}
+		return len(left) == 0
 	})
 	f.drain()
 	f.an.drained("b2", 90*time.Second)
 	if keys, err := srv.Keys(t.Context(), prefix); err != nil || len(keys) != 0 {
-		t.Fatalf("the target still holds %v (%v)", overflowtest.SortedKeys(keys), err)
+		t.Fatalf("the target holds %v again (%v)", overflowtest.SortedKeys(keys), err)
 	}
 	_, text, _ := f.an.run("", "", "status")
 	if !strings.Contains(text, "b2: holds 0 B") {

@@ -3524,7 +3524,15 @@ upstream bucket is Q-V.
     return), reintroduced alone, fails it. I1 is also checked as a
     `dropping` copy's delete is sent and as it turns `drained` (#104):
     without `checkDrop`, each of CI's seeds fails it (seed 6 at step
-    490, 8 at 1337, 5 at 1956).
+    490, 8 at 1337, 5 at 1956). After the steps it checks liveness
+    (#108): the pool made quiescent, with friends holding everything
+    and no send failing or delete refused from then on, at most eight
+    rounds a day apart (a pass, every FIFO sent, the tombs due issued,
+    removals finished) leave every target in the pool empty: no key
+    whose latest row there is a put, no delete to send, no tomb, no use
+    counted, and nothing the model believes it holds but versions behind
+    delete markers. Without #108's fix for overwritten metadata, seed 6
+    fails it.
   - *Dropping, only after the replacement.* An acknowledged copy at a
     drained place is marked `dropping` when its replacement is
     acknowledged, in the transaction that records the acknowledgement
@@ -7836,10 +7844,17 @@ of the `copies`, and the estimated cost (S3-7).
   a target holds, has queued and is deleting no copy of a live data
   object of a bucket, its copies of the bucket's metadata are dropped
   too (`dropIdleMetadata`, end of each bucket's pass: acknowledged ones
-  marked dropping, unsent ones cancelled), so the target holds nothing
-  and `status` shows it empty
+  marked dropping, unsent ones cancelled; an acknowledged version a
+  later put of its key there overwrote is drained once that later row
+  is dropping or drained, as its delete takes the key off the target,
+  #108), so the target holds nothing and `status` shows it empty
   (`TestDrainBackEmptiesTheTargetOnceAFriendJoins`,
-  `TestScenarioOverflowDrainsBackToANewFriend`). Every delete at the
+  `TestDrainBackLeavesNoOverwrittenMetadataCountedAtTheTarget`,
+  `TestScenarioOverflowDrainsBackToANewFriend`). `status` reads the
+  places and the capacity one after the other, not as one snapshot, so
+  a pass marking the metadata dropping between the two reads can show
+  the target empty while those deletes are still to be sent; the
+  scenario asks the provider too (#108). Every delete at the
   target, drained data and metadata alike, goes the
   retention-preserving way (*Retention and undelete* below). A
   metadata row still dropping when the target is chosen again for a
