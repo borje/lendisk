@@ -3349,6 +3349,10 @@ upstream bucket is Q-V.
     sending lock, so neither decides about an object while the other
     does, and no capture waits behind a pass for long. A batch that
     fails is rolled back and the pass goes on, returning the errors;
+    what it counted in memory is rolled back with it (the room it took
+    at each place, the metadata it marked sent, the copies it left), so
+    a later batch or bucket in the same pass can use that room (#91,
+    `TestAFailedBatchGivesItsRoomBackForTheRestOfThePass`);
     what is below copies is recorded all the same, and the worker runs
     the pass again at its next re-routing tick rather than an hour later
     (`TestBelowCopiesIsRecordedWhenABatchFails`,
