@@ -1561,6 +1561,21 @@ func (m *replacer) dropIdleMetadata(ctx context.Context, bucket string) (Replace
 				st.Cancelled += n
 			}
 		}
+		// A version the target's later put of its key overwrote is no
+		// copy removeCopy asks about (a row of a version no longer live,
+		// removal.go): it marks only the place's latest row of a key, and
+		// the delete of that row takes the key off the target. Once that
+		// delete is on its way or done, the older row goes with it, or it
+		// would stay acknowledged and counted in the target's use, and the
+		// target never empty, for good (#108).
+		if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementDrained+`'
+			WHERE place = ?1 AND bucket = ?2 AND op = 'put' AND state = 'acked'
+			AND seq IN (SELECT q.seq FROM queue q WHERE q.bucket = ?2 AND q.class IN ('metadata', 'snapshot'))
+			AND EXISTS (SELECT 1 FROM placement l WHERE l.place = placement.place AND l.bucket = placement.bucket
+				AND l.key = placement.key AND l.seq > placement.seq AND l.op = 'put'
+				AND l.state IN ('`+PlacementDropping+`', '`+PlacementDrained+`'))`, t, bucket); err != nil {
+			return st, err
+		}
 	}
 	return st, tx.Commit()
 }
