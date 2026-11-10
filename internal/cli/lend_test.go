@@ -129,7 +129,19 @@ func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
 	// would take it many seconds.
 	var mu sync.Mutex
 	last := int64(-1)
+	// On the first data/next it admits, A's store pauses 2 s before its
+	// last 64 KiB: by then B has written every byte of the body, and
+	// waits for the answer for longer than f's stall timeout. That is
+	// what a tunnel holding the body does on a loaded runner: the
+	// borrower's write of 3 MiB returned at once into gVisor's send
+	// buffer, and its last 2 MiB reached A over seconds, so f's 1 s
+	// wait for the response's headers ended a write A was taking (CI at
+	// 15b6d65). The pause makes that happen on every run.
+	var paused sync.Once
 	a.beforeRead = func(key string, read int64) {
+		if key == "data/next" && read+64<<10 >= 3<<20 {
+			paused.Do(func() { time.Sleep(2 * time.Second) })
+		}
 		if key != "data/big" || read < 1<<20 {
 			return
 		}
@@ -168,14 +180,27 @@ func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { dl.Close() })
+	// f abandons the big send after 1 s without progress. Its stall
+	// timeout is also its wait for a response's headers, which starts
+	// once the body is written into the tunnel, not once it reached A,
+	// so the writes after it go through patient, which waits as long as
+	// a replica client does (§3.4).
 	f, err := replica.NewFriend(bID, aKey, aAddr, dl.Dial, replica.Options{DialTimeout: 20 * time.Second, StallTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	patient, err := replica.NewFriend(bID, aKey, aAddr, dl.Dial, replica.Options{DialTimeout: 20 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
 	put := func(key string, body []byte) error {
 		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 		defer cancel()
-		return f.Put(ctx, replica.Object{Bucket: "laptop", Key: key, Size: int64(len(body)), SHA256: sha256Hex(body),
+		c := patient
+		if key == "data/big" {
+			c = f
+		}
+		return c.Put(ctx, replica.Object{Bucket: "laptop", Key: key, Size: int64(len(body)), SHA256: sha256Hex(body),
 			Body: bytes.NewReader(body)})
 	}
 	big := make([]byte, 64<<20)
@@ -192,7 +217,9 @@ func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
 	}
 	resumed()
 	start := time.Now()
+	var admitted time.Duration // when the write that A took was sent
 	for {
+		admitted = time.Since(start)
 		err := put("data/next", next)
 		if err == nil {
 			break
@@ -206,7 +233,7 @@ func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 	mu.Lock()
-	t.Logf("released %v after A's store read again, at byte %d", time.Since(start), last)
+	t.Logf("released within %v after A's store read again, at byte %d", admitted, last)
 	mu.Unlock()
 	if got := lentObjects(t, a, bID, "laptop"); len(got) != 1 || got["data/next"] == "" {
 		t.Fatalf("A holds %v; want data/next alone", got)
