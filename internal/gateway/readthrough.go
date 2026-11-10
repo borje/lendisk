@@ -11,6 +11,7 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -56,6 +57,42 @@ var (
 		Description: "lendisk: this object is not in the local store yet and no friend holding it could serve it now; " +
 			"try again when one is reachable (lendisk status shows the friends)"}
 )
+
+// FetchBound is the most time one fetch from a place may take once the
+// place has answered (#73): Base, plus the object's size at Rate bytes a
+// second. The stall watchdog (replica.Options.StallTimeout) ends a body
+// that stops; this ends one that trickles, which would otherwise hold
+// the key's lock and the reader for as long as the friend likes.
+type FetchBound struct {
+	Base time.Duration // zero is DefaultFetchBase
+	Rate int64         // bytes a second; zero is DefaultFetchRate
+}
+
+const (
+	// DefaultFetchBase is the friend client's stall timeout: a fetch is
+	// given at least as long as it may go without a byte.
+	DefaultFetchBase = 2 * time.Minute
+	// DefaultFetchRate is the lender's floor rate for a request body
+	// (bridge.DefaultFloorRate, 8 KiB/s, LEND-2), half the pace.MinRate
+	// a download limit keeps each fetch above: a 16 MiB restic pack is
+	// given 2 minutes plus about 34.
+	DefaultFetchRate = 8 << 10
+)
+
+// of is the bound for an object of size bytes.
+func (b FetchBound) of(size int64) time.Duration {
+	base, rate := b.Base, b.Rate
+	if base <= 0 {
+		base = DefaultFetchBase
+	}
+	if rate <= 0 {
+		rate = DefaultFetchRate
+	}
+	return base + time.Duration(float64(size)/float64(rate)*float64(time.Second))
+}
+
+// emptySHA256 is the SHA-256 of no bytes.
+const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 // errKeyConflict refuses a recovered key whose friends hold different
 // versions, none of which counts (ID-5, state.KeyConflict).
@@ -195,6 +232,14 @@ func (d *Decorator) readThrough(ctx context.Context, bucketp, keyp *string) erro
 // one takes its place (VER-5). The caller holds the key's lock. It
 // returns errNotFetched when no place could serve it, or errInternal.
 func (d *Decorator) fetchAny(ctx context.Context, bucket, key string, src state.Source) error {
+	if src.Size == 0 && src.SHA256 != emptySHA256 {
+		// No bytes of size 0 have that hash, so no place can serve the
+		// version, and the store would commit an empty object before
+		// the hash could refuse it (#73).
+		d.Log.Error("read-through: the index records an empty object with the hash of other bytes; nothing is fetched",
+			"bucket", bucket, "key", key, "sha256", src.SHA256)
+		return errNotFetched
+	}
 	for _, p := range d.fetchOrder(src.Places) {
 		start := time.Now()
 		err := d.fetchFrom(ctx, p, bucket, key, src)
@@ -240,12 +285,23 @@ func (e storeError) Unwrap() error { return e.err }
 // fetchFrom streams key from place into the store, verified as it
 // passes: bytes that are not the recorded version (too many, too few, or
 // another hash) fail the read before the store commits the object.
+//
+// Once the place has answered, the body has d.FetchBound to arrive in
+// (#73); the wait for a fetch slot, the dial and the response headers
+// have bounds of their own. The store writes under ctx, so a fetch ended
+// for its time is the place's failure, not the store's.
 func (d *Decorator) fetchFrom(ctx context.Context, place, bucket, key string, src state.Source) error {
-	body, err := d.Fetch.Fetch(ctx, place, bucket, key)
+	fctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	body, err := d.Fetch.Fetch(fctx, place, bucket, key)
 	if err != nil {
 		return err
 	}
 	defer body.Close()
+	bound := d.FetchBound.of(src.Size)
+	var late atomic.Bool
+	timer := time.AfterFunc(bound, func() { late.Store(true); cancel() })
+	defer timer.Stop()
 	v := &verifying{r: body, h: sha256.New(), size: src.Size, want: src.SHA256}
 	size := src.Size
 	_, err = d.Backend.PutObject(ctx, s3response.PutObjectInput{Bucket: &bucket, Key: &key, Body: v, ContentLength: &size})
@@ -255,8 +311,12 @@ func (d *Decorator) fetchFrom(ctx context.Context, place, bucket, key string, sr
 			d.removeFetched(bucket, key)
 		}
 		return v.err
+	case v.readErr != nil && late.Load():
+		return fmt.Errorf("the fetch took longer than %v, its bound for %d bytes: %w", bound, src.Size, v.readErr)
 	case v.readErr != nil:
 		return v.readErr
+	case err != nil && late.Load():
+		return fmt.Errorf("the fetch took longer than %v, its bound for %d bytes: %w", bound, src.Size, err)
 	case err != nil:
 		return storeError{err}
 	}
@@ -427,6 +487,22 @@ func (d *Decorator) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input
 	slices.SortFunc(local, func(a, b listItem) int { return cmp.Compare(a.name, b.name) })
 	merged := mergeItems(local, idx)
 	truncated := res.IsTruncated != nil && *res.IsTruncated
+	if truncated {
+		// The store's next page starts after its last name: index keys
+		// past it wait for that page, or the store's keys between would
+		// be skipped by the continuation token (#73).
+		cut := deref(res.NextContinuationToken)
+		if len(local) > 0 {
+			cut = local[len(local)-1].name
+		}
+		if cut != "" {
+			n, _ := slices.BinarySearchFunc(merged, cut, func(it listItem, c string) int { return cmp.Compare(it.name, c) })
+			if n < len(merged) && merged[n].name == cut {
+				n++
+			}
+			merged = merged[:n]
+		}
+	}
 	if len(merged) > limit {
 		merged, truncated = merged[:limit], true
 	}
@@ -440,8 +516,10 @@ func (d *Decorator) ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input
 	}
 	n := int32(len(merged))
 	res.KeyCount, res.IsTruncated = &n, &truncated
-	res.NextContinuationToken = nil
-	if truncated {
+	switch {
+	case !truncated:
+		res.NextContinuationToken = nil
+	case len(merged) > 0: // else the store's own token stands
 		last := merged[len(merged)-1].name
 		res.NextContinuationToken = &last
 	}

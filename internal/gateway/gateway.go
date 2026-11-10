@@ -109,6 +109,9 @@ type Gateway struct {
 	// Fetch opens objects at friends for the read-through (EP-10, ID-6);
 	// nil serves only what the store holds.
 	Fetch Fetcher
+	// FetchBound bounds each read-through fetch's time (#73); zero is
+	// the default.
+	FetchBound FetchBound
 
 	// AfterStore is the decorator's crash-window hook. Tests only.
 	AfterStore func()
@@ -327,7 +330,7 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 // anything is served (EP-3).
 func (g *Gateway) decorator(ctx context.Context, be *Store) (*Decorator, error) {
 	d := &Decorator{Backend: be, Uploads: be, DB: g.DB, Profiles: g.Profiles, Log: g.Log, AfterStore: g.AfterStore,
-		Fetch: g.Fetch, ctx: ctx, beforeHash: g.BeforeHash, Now: g.Clock}
+		Fetch: g.Fetch, FetchBound: g.FetchBound, ctx: ctx, beforeHash: g.BeforeHash, Now: g.Clock}
 	if d.Profiles == nil {
 		set, err := profile.Load("")
 		if err != nil {
