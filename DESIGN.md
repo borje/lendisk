@@ -7303,6 +7303,19 @@ of the `copies`, and the estimated cost (S3-7).
   stay). A drain-back copy already sent when the split returns lands
   all the same, and the split then moves that object's copy to the
   target once more: one move back, not a cycle.
+  *Status (#98).* `capacity.overflow_drain` (absent without a target in
+  use) has `state`: `active`, `split` (off while placement is split)
+  or `waiting`, with `from`, the earliest moment drain-back could run
+  if the repository stays as it is and no quota changes; the text adds
+  a "drain-back:" line under the overflow targets.
+  `state.OverflowDrainStatus` decides it as the next pass would
+  (`overflowSplit`, then `drainFrom`, which `overflowDrain` uses too)
+  but records no sample: going back from today, each day's largest is
+  added to what the friends must hold, and the first day that takes it
+  past `FriendsHold` leaves the window `DrainWindow` after that day
+  began, which is `from`
+  (`TestDrainStatusSaysWhetherDrainBackRunsAndWhenItCould`,
+  `TestStatusSaysWhetherDrainBackRuns`).
 - **Drain-back** (#40, REPL-13, scenario 12). The re-placement pass
   (§3.4) of a bucket not split, while drain-back runs, takes a last
   round (`dataRound`, after the round that places missing copies, so a
@@ -7425,7 +7438,8 @@ of the `copies`, and the estimated cost (S3-7).
   (`.github/rustfs.sh`, `rustfs/rustfs:1.0.3`, a bucket with
   versioning made through the AWS CLI; `LENDISK_TEST_OVERFLOW_VERSIONED_*`)
   running `TestAVersionedProviderUndeletesByCopyingTheVersionBeforeTheMarker`,
-  `TestOverflowAddCreatesTheLifecycleRuleAtAProvider` (#96) and
+  `TestOverflowAddCreatesTheLifecycleRuleAtAProvider` (#96),
+  `TestACredentialThatMayNotDeleteKeepsTheObjectAtAProvider` (#98) and
   `TestScenarioOverflowRetentionAtAVersionedProvider`. Both scripts
   mask the generated access and secret key (`::add-mask::`, on stderr
   since stdout goes to `$GITHUB_ENV`) before anything else is logged
@@ -7569,7 +7583,8 @@ of the `copies`, and the estimated cost (S3-7).
     `TestAnUnversionedTargetGetsItsDeleteOnlyAfterTheWindow`).
     `undelete` first drops superseded tombs, then takes each key whose
     newest tomb is a delete (not a drain) made at or after `since` and
-    still inside its window, and claims every tomb of that key, drained
+    still inside its window or refused for want of permission (S3-5,
+    #98), and claims every tomb of that key, drained
     and due ones included (`ClaimOverflowTombs`). The newest tomb says
     which version the target holds: a HEAD checks the target still
     holds it, and it is recorded (`RecordRestored`); the tombs that
@@ -7657,6 +7672,37 @@ of the `copies`, and the estimated cost (S3-7).
   `TestARefusedHeldDeleteIsKeptCountedAndTriedAgainDaily`,
   `TestAnOverflowDeleteRefusedForPermissionIsDeleteDenied`,
   `TestStatusCountsCopiesTheTargetMayNotDelete`).
+  *Follow-ups (#98).* Each daily retry sets a denied tomb due a day
+  later, so a refused user delete outlives its retention window: the
+  object is still there, which is harmless, and `status` says so.
+  `delete_denied_past_window` and `delete_denied_past_window_bytes`
+  (`state.TombHold.DeniedPastWindow`) count the denied tombs that are
+  user deletes, not drained copies, made longer ago than the target's
+  `--retention`; the text line adds "N of them deleted objects, size,
+  held past the retention window because the credential may not
+  delete them" (`TestADeniedUserDeleteHeldPastItsWindowIsCounted`,
+  `TestStatusCountsDeletesHeldPastTheWindowForWantOfPermission`). At a
+  versioned target a refused user delete leaves no marker, so the
+  provider's marker listing never shows it, while the index holds the
+  key deleted. Undelete takes it as a held delete instead: a denied
+  tomb is undeletable whenever its retry is due (`undeletable`:
+  inside the window, or `denied_at` set), at both kinds of target, so
+  the key, checked with a HEAD, is recorded as present with no copy
+  made, and the refused delete is no longer retried
+  (`TestUndeleteTakesAKeyWhoseDeleteTheTargetRefusedAsPresent`).
+  *Decision:* treat it as present rather than only report it. The tomb
+  already holds the key's version and the undelete path for held
+  deletes already checks and records it, so one condition covers it;
+  a status line alone would leave the user no way to get the key back.
+  End to end at a provider, `TestACredentialThatMayNotDeleteKeepsTheObjectAtAProvider`
+  (CI's `overflow-versioned` job, RustFS 1.0.3) puts a bucket policy
+  denying `s3:DeleteObject` under the run's prefix: the worker's
+  delete gets the provider's own 403, the object stays live there and
+  is counted denied, and after the policy is lifted the daily retry
+  deletes it. RustFS evaluates bucket policies for every credential,
+  its root one included. Garage cannot run it: it has no policies, and
+  a key's bucket permission is read, write or owner, write including
+  delete.
 - **S3-6** Stored checksums are read with `StatObject` (the ETag,
   where it is an MD5 of a single-part object) and compared where the
   type matches; sample downloads (VER-2) are the check everywhere.

@@ -1,7 +1,10 @@
 package cli
 
 import (
+	"encoding/json"
+	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -136,5 +139,102 @@ func TestStatusCountsCopiesTheTargetMayNotDelete(t *testing.T) {
 	}
 	if l := overflowLine(o); !strings.Contains(l, "2 copies kept, 4.0 MiB: its credential may not delete them") {
 		t.Fatalf("status line: %s", l)
+	}
+}
+
+// S3-5, RET-3 (#98): of the copies kept, the user's deletes made longer
+// ago than the retention window are counted apart, in status --json and
+// its text line; drained copies and deletes inside the window are not.
+func TestStatusCountsDeletesHeldPastTheWindowForWantOfPermission(t *testing.T) {
+	parallel(t, 0)
+	db, err := state.Open(t.Context(), t.TempDir(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	now := time.Now()
+	if err := db.AddOverflow(t.Context(), state.Overflow{Name: "g", Endpoint: "https://s3.example", Bucket: "offsite",
+		MaxBytes: 1 << 30, EnvPrefix: "X_", Retention: time.Hour, Versioning: state.VersioningOff, AddedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range []struct {
+		size    int64
+		drained any
+		deleted time.Time
+	}{
+		{3 << 20, nil, now.Add(-2 * time.Hour)},    // a user delete past the window
+		{1 << 20, nil, now.Add(-30 * time.Minute)}, // inside it
+		{5 << 20, 1, now.Add(-2 * time.Hour)},      // a drained copy
+	} {
+		if _, err := db.Exec(`INSERT INTO overflow_tomb (place, seq, bucket, key, size, drained, deleted_at, due_at, denied_at)
+			VALUES ('overflow:g', ?, 'laptop', ?, ?, ?, ?, ?, ?)`, i+1, fmt.Sprintf("data/%d", i), r.size, r.drained,
+			r.deleted.Unix(), now.Add(time.Hour).Unix(), now.Unix()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := overflowStatus(t.Context(), db)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("%+v %v", got, err)
+	}
+	o := got[0]
+	if o.DeleteDenied != 3 || o.DeleteDeniedPastWindow != 1 || o.DeleteDeniedPastWindowBytes != 3<<20 {
+		t.Fatalf("status %+v", o)
+	}
+	b, _ := json.Marshal(o)
+	if !strings.Contains(string(b), `"delete_denied_past_window":1,"delete_denied_past_window_bytes":3145728`) {
+		t.Fatalf("json %s", b)
+	}
+	if l := overflowLine(o); !strings.Contains(l, "1 of them deleted objects, 3.0 MiB, held past the retention window because the credential may not delete them") {
+		t.Fatalf("status line: %s", l)
+	}
+}
+
+// REPL-13 (#98): status says whether drain-back runs, in
+// capacity.overflow_drain and a text line: absent without a target,
+// active while the friends hold the repository's window, off while
+// placement is split, waiting with the earliest start otherwise.
+func TestStatusSaysWhetherDrainBackRuns(t *testing.T) {
+	parallel(t, 0)
+	if drainLine(nil) != "" {
+		t.Fatal("a drain-back line without a target")
+	}
+	from := "2026-12-10T00:00:00Z"
+	for _, c := range []struct {
+		d    StatusOverflowDrain
+		json string
+		line string
+	}{
+		{StatusOverflowDrain{State: state.DrainActive}, `{"state":"active"}`, "drain-back: active"},
+		{StatusOverflowDrain{State: state.DrainSplit}, `{"state":"split"}`, "drain-back: off while placement is split"},
+		{StatusOverflowDrain{State: state.DrainWaiting, From: from}, `{"state":"waiting","from":"` + from + `"}`,
+			"drain-back: waiting, the friends cannot hold the largest the repository was in the last 30 days; it starts at " + from},
+	} {
+		if b, _ := json.Marshal(c.d); string(b) != c.json {
+			t.Errorf("json %s, want %s", b, c.json)
+		}
+		if l := drainLine(&c.d); !strings.Contains(l, c.line) {
+			t.Errorf("line %q, want %q", l, c.line)
+		}
+	}
+	db, err := state.Open(t.Context(), t.TempDir(), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	a := &app{}
+	c, err := a.capacityStatus(t.Context(), db, 2, time.Now())
+	if err != nil || c.OverflowDrain != nil {
+		t.Fatalf("without a target: %+v, %v", c, err)
+	}
+	if err := db.AddOverflow(t.Context(), state.Overflow{Name: "g", Endpoint: "https://s3.example", Bucket: "offsite",
+		MaxBytes: 1 << 30, EnvPrefix: "X_", Retention: time.Hour, AddedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	c, err = a.capacityStatus(t.Context(), db, 2, time.Now())
+	if err != nil || c.OverflowDrain == nil || c.OverflowDrain.State != state.DrainActive {
+		t.Fatalf("an empty repository with a target: %+v, %v", c.OverflowDrain, err)
+	}
+	if !slices.ContainsFunc(capacityLines(c, "owner"), func(l string) bool { return strings.Contains(l, "drain-back: active") }) {
+		t.Fatalf("lines %q", capacityLines(c, "owner"))
 	}
 }
