@@ -29,6 +29,11 @@ import (
 //     since the time and inside the window, checks the target still
 //     holds each with the bytes deleted, records it, and drops the
 //     held deletes that record supersedes; the rest are given back.
+//   - A target whose versioning changed since it was added (#97) may
+//     hold both: the markers of deletes sent while it had versioning
+//     (state.MarkerDeleted judges each key by when its delete was
+//     acknowledged) and the deletes held while it had none. Each key
+//     comes back the way its last delete was made.
 //
 // A copy re-placement drained or moved away from the target (REPL-13)
 // is no delete of the user's and is left as it is: a versioned target's
@@ -93,9 +98,11 @@ func (r *Runner) targetCandidates(ctx context.Context, tg target, q state.Undele
 		if c.tomb != nil {
 			return true, nil // held deletes are deletes of the key, never drained copies
 		}
-		return r.DB.PlaceDeleted(ctx, tg.o.Place(), q.Bucket, c.obj.Key)
+		// The user's delete, sent as a marker: not a drained copy's, nor
+		// one held as a tomb (#97).
+		return r.DB.MarkerDeleted(ctx, tg.o.Place(), q.Bucket, c.obj.Key)
 	}
-	if !tg.o.ClientSide() {
+	if tg.o.Markers() {
 		ds, err := tg.t.ListDeleted(ctx, q.Bucket, since)
 		if err != nil {
 			return nil, err
@@ -108,8 +115,17 @@ func (r *Runner) targetCandidates(ctx context.Context, tg target, q state.Undele
 				out = append(out, c)
 			}
 		}
-		return out, nil
 	}
+	// Held deletes: a target without versioning's, or one with it now
+	// that held them before (#97).
+	tombs, err := r.tombCandidates(ctx, tg, q, since, claim, keep)
+	return append(out, tombs...), err
+}
+
+// tombCandidates is targetCandidates' held deletes of tg.
+func (r *Runner) tombCandidates(ctx context.Context, tg target, q state.UndeleteRequest, since time.Time, claim bool,
+	keep func(candidate) (bool, error)) ([]candidate, error) {
+	var out []candidate
 	var ts []state.OverflowTomb
 	var err error
 	if claim {
@@ -231,7 +247,7 @@ func (r *Runner) undeleteTarget(ctx context.Context, tg target, q state.Undelete
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			if !tg.o.ClientSide() {
+			if c.tomb == nil {
 				// A put of the key queued or in flight there is a newer
 				// version: copying the old one over it could undo it
 				// (#39 review). It is kept, as a friend's newer version is.
@@ -248,7 +264,7 @@ func (r *Runner) undeleteTarget(ctx context.Context, tg target, q state.Undelete
 				}
 			}
 			why := ""
-			if tg.o.ClientSide() {
+			if c.tomb != nil {
 				// Still held there with the bytes deleted?
 				st, ok, err := tg.t.Stat(ctx, q.Bucket, c.obj.Key)
 				switch {
@@ -291,11 +307,13 @@ func (r *Runner) undeleteTarget(ctx context.Context, tg target, q state.Undelete
 
 // adoptTarget adopts, at a versioned target, the copies a run made whose
 // record was lost: keys live there that the index holds deleted with
-// that delete acknowledged there (state.AdoptCandidates). An
-// unversioned target holds every deleted key live until its window
-// ends, so nothing is adopted there.
+// that delete acknowledged there as a marker (state.AdoptCandidates,
+// state.MarkerDeleted). A target without versioning holds every deleted
+// key live until its window ends, so nothing is adopted there, nor a key
+// whose delete a target held as a tomb before or after a change of
+// versioning (#97).
 func (r *Runner) adoptTarget(ctx context.Context, tg target, q state.UndeleteRequest, prof *profile.Profile) (int, error) {
-	if tg.err != nil || tg.o.ClientSide() {
+	if tg.err != nil || !tg.o.Markers() {
 		return 0, nil
 	}
 	live, err := tg.t.ListLive(ctx, q.Bucket)
@@ -308,6 +326,13 @@ func (r *Runner) adoptTarget(ctx context.Context, tg target, q state.UndeleteReq
 	}
 	var objs []state.Restored
 	for _, k := range keys {
+		// A key the target holds under a delete held as a tomb (since a
+		// suspension, #97) is no copy made: only a marker's is.
+		if ok, err := r.DB.MarkerDeleted(ctx, tg.o.Place(), q.Bucket, k); err != nil {
+			return 0, err
+		} else if !ok {
+			continue
+		}
 		st, ok, err := tg.t.Stat(ctx, q.Bucket, k)
 		if err != nil {
 			return 0, err

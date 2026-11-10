@@ -1006,4 +1006,25 @@ var migrations = []Migration{
 			PRIMARY KEY (borrower, sealed)
 		);`,
 	},
+	{
+		Version: 46, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Overflow targets' versioning, read again daily (S3-4, #97).
+		-- versioning_checked_at: Unix seconds of the last read that got an
+		-- answer; NULL before the first (overflow add's read, at added_at).
+		ALTER TABLE overflow ADD COLUMN versioning_checked_at INTEGER;
+		-- Each change a read found: the target's versioning was previous
+		-- before at (Unix seconds) and versioning from then on, so a delete
+		-- acknowledged there at t was sent as a delete marker exactly when
+		-- the versioning at t was enabled. A target with no row has had its
+		-- overflow.versioning since it was added.
+		CREATE TABLE overflow_versioning (
+			id         INTEGER PRIMARY KEY,
+			name       TEXT NOT NULL,
+			at         INTEGER NOT NULL,
+			previous   TEXT NOT NULL,
+			versioning TEXT NOT NULL
+		);
+		CREATE INDEX overflow_versioning_name ON overflow_versioning (name, at);`,
+	},
 }

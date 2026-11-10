@@ -36,8 +36,9 @@ import (
 const tombClaim = time.Hour
 
 // ClientSide reports whether the target's retention is lendisk's own
-// (S3-4): it has no versioning, so deletes are held as client-side
-// tombstones for its retention window.
+// (S3-4): it has no versioning as last read (overflow add, then daily:
+// RecordOverflowVersioning, #97), so deletes from now on are held as
+// client-side tombstones for its retention window.
 func (o Overflow) ClientSide() bool { return o.Versioning != VersioningEnabled }
 
 // Retention labels for status (S3-4).

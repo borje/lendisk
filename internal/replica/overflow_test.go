@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/minio/minio-go/v7"
 
 	"github.com/borje/lendisk/internal/overflow"
@@ -161,6 +162,37 @@ func TestCheckOverflowWarnsWhenVersioningIsOff(t *testing.T) {
 		!strings.Contains(notes, "retention: client-side") || strings.Contains(notes, "final") {
 		t.Fatalf("check %+v", ch)
 	}
+}
+
+// S3-4 (#97): the daily read of a target's versioning answers what the
+// provider has now: enabled, suspended after the user suspends it, off
+// at a bucket that never had it; a wrong credential is no answer.
+func TestTheTargetsVersioningIsReadAsItIsNow(t *testing.T) {
+	ctx := t.Context()
+	t.Run("versioned", func(t *testing.T) {
+		s := startS3(t, true)
+		c, _ := overflowClient(t, s, s.Secret)
+		if v, err := c.Versioning(ctx); err != nil || v != state.VersioningEnabled {
+			t.Fatalf("versioning %q, %v", v, err)
+		}
+		if err := s.SetVersioning(ctx, types.BucketVersioningStatusSuspended); err != nil {
+			t.Fatal(err)
+		}
+		if v, err := c.Versioning(ctx); err != nil || v != state.VersioningSuspended {
+			t.Fatalf("after a suspension: versioning %q, %v", v, err)
+		}
+		bad, _ := overflowClient(t, s, "wrong-secret-0123456789")
+		if v, err := bad.Versioning(ctx); err == nil {
+			t.Fatalf("a wrong credential read versioning %q", v)
+		}
+	})
+	t.Run("unversioned", func(t *testing.T) {
+		s := startS3(t, false)
+		c, _ := overflowClient(t, s, s.Secret)
+		if v, err := c.Versioning(ctx); err != nil || v != state.VersioningOff {
+			t.Fatalf("versioning %q, %v", v, err)
+		}
+	})
 }
 
 // S3-1: a wrong credential fails the check, and a put with it is the

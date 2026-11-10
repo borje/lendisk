@@ -104,10 +104,18 @@ type StatusCapacityOverflow struct {
 	PricePerGB  float64 `json:"price_per_gb,omitempty"`
 	MonthlyCost float64 `json:"monthly_cost,omitempty"`
 	// Versioning, Lifecycle and VersionRemoval are what overflow add
-	// found (S3-4, S3-5).
+	// found (S3-4, S3-5); Versioning is read again daily since #97.
 	Versioning     string `json:"versioning"`
 	Lifecycle      string `json:"lifecycle"`
 	VersionRemoval string `json:"version_removal"`
+	// VersioningChecked is when the daily read of versioning last got an
+	// answer (RFC 3339, UTC); absent before the first (#97).
+	VersioningChecked string `json:"versioning_checked,omitempty"`
+	// VersioningChanged is when a read found Versioning changed last,
+	// and VersioningBefore what it was until then; absent when it never
+	// changed (#97).
+	VersioningChanged string `json:"versioning_changed,omitempty"`
+	VersioningBefore  string `json:"versioning_before,omitempty"`
 	// EnvPrefix names the credential's variables: <env_prefix>ACCESS_KEY
 	// and <env_prefix>SECRET_KEY.
 	EnvPrefix string `json:"env_prefix"`
@@ -144,13 +152,20 @@ func overflowStatus(ctx context.Context, db *state.DB) ([]StatusCapacityOverflow
 	if err != nil {
 		return nil, err
 	}
+	changes, err := db.LastVersioningChanges(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := []StatusCapacityOverflow{}
 	for _, o := range targets {
 		h := holds[o.Name]
 		so := StatusCapacityOverflow{Name: o.Name, MaxBytes: o.MaxBytes, Use: h.Use, Endpoint: o.Endpoint, Bucket: o.Bucket,
 			Prefix: o.Prefix, DataObjects: h.DataObjects, DataBytes: h.DataBytes, PricePerGB: o.PricePerGB,
 			Versioning: o.Versioning, Lifecycle: o.Lifecycle, VersionRemoval: o.VersionRemoval, EnvPrefix: o.EnvPrefix,
-			Retention: o.RetentionMode()}
+			Retention: o.RetentionMode(), VersioningChecked: rfc3339(o.VersioningCheckedAt)}
+		if ch, ok := changes[o.Name]; ok {
+			so.VersioningChanged, so.VersioningBefore = rfc3339(ch.At), ch.Previous
+		}
 		t := tombs[o.Name]
 		if t.Tombs > 0 {
 			so.Tombstones, so.TombstoneBytes, so.TombstoneNextDue = t.Tombs, t.Bytes, rfc3339(t.NextDue)
@@ -176,6 +191,9 @@ func overflowLine(o StatusCapacityOverflow) string {
 		l += fmt.Sprintf("; about %.2f a month at %g per GB", o.MonthlyCost, o.PricePerGB)
 	}
 	l += fmt.Sprintf("; versioning %s", o.Versioning)
+	if o.VersioningChanged != "" {
+		l += fmt.Sprintf(" since %s (was %s)", o.VersioningChanged, o.VersioningBefore)
+	}
 	if o.Retention == state.RetentionClientSide {
 		// S3-4: lendisk holds each delete for the window; this guards
 		// against mistakes, not a compromised node.

@@ -581,8 +581,9 @@ type StatusBucket struct {
 	// format version 1, which lendisk does not support (COMPAT-1, #79):
 	// writes are accepted and replicated as before. Absent otherwise.
 	KopiaFormat1 *StatusKopiaFormat1 `json:"kopia_format1,omitempty"`
-	// Replicas are the friends that hold the bucket's objects, each with
-	// its verification (VER-1, VER-4, #27).
+	// Replicas are the places that hold the bucket's objects, each with
+	// its verification (VER-1, VER-4, #27): friends, and since #39 the
+	// overflow targets, whose peer is overflow:<name> (S3-6).
 	Replicas []StatusReplica `json:"replicas"`
 	// Reconciled is what the store reconciler found reached or left the
 	// store outside the endpoint (EP-14, #8).
@@ -607,9 +608,12 @@ type StatusReconciled struct {
 	LastPass    string `json:"last_pass,omitempty"` // RFC 3339, UTC; absent before the first
 }
 
-// StatusReplica is one friend's replica of a bucket and when it was last
+// StatusReplica is one place's replica of a bucket and when it was last
 // verified (VER-4). Times are RFC 3339, UTC, absent when never.
 type StatusReplica struct {
+	// Peer is the friend's node ID, or overflow:<name> for an overflow
+	// target (#39), checked by the provider's stored checksums and a
+	// downloaded sample rather than challenges (S3-6).
 	Peer string `json:"peer"`
 	// LastVerified is the last challenge it passed; LastFull the last
 	// `lendisk verify --full` it passed.

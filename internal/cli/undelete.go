@@ -41,7 +41,10 @@ downloaded: the local store reads each object from a friend the first
 time it is read, as after recover.
 
 --since takes a time (2026-11-07T14:00:00Z, or a date, 2026-11-07, at
-midnight local time) or how long ago (36h, 7d).
+midnight local time) or how long ago (36h, 7d). A delete counts from when
+the friend or overflow target took it, which is when replication sent it:
+no delete made after --since is missed, and one made shortly before it
+comes back too if a friend was offline and took it later.
 
 Of a key deleted more than once since then, the version it held when it
 was last deleted comes back. A key written again since, with other bytes,

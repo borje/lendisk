@@ -211,6 +211,14 @@ const (
 	// credential, it is unset in the daemon's environment, or the
 	// network fails). Subject: the target's name.
 	KindOverflowUnreachable = "overflow_unreachable"
+	// KindOverflowVersioning: the daily read of an overflow target's
+	// versioning found it suspended or off after it was enabled (S3-4,
+	// #97): deletes there are held as client-side tombstones from then
+	// on, which guard against mistakes, not a compromised node. Subject:
+	// the target's name. A change, not a condition the user must fix: it
+	// stays raised VersioningAlertFor after the change was found, or
+	// until versioning is enabled again.
+	KindOverflowVersioning = "overflow_versioning"
 	// KindSeedStale: a seed from a disk (REPL-8) has had nothing
 	// confirmed by the friend's list for state.SeedStaleAfter since the
 	// export (#95): the disk is lost or not imported, and the friend's
@@ -222,6 +230,10 @@ const (
 
 // OverflowHighPercent is where KindOverflowHigh is raised (S3-7).
 const OverflowHighPercent = 90
+
+// VersioningAlertFor is how long KindOverflowVersioning stays raised
+// after the change was found (#97).
+const VersioningAlertFor = 7 * 24 * time.Hour
 
 // DefaultUncheckedAfter is Service.UncheckedAfter when zero.
 const DefaultUncheckedAfter = 3 * 24 * time.Hour
@@ -309,7 +321,8 @@ var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotR
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindFriendRefuses, KindPurgeSoon,
 	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
 	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot, KindRecoverySheetStale,
-	KindProtectable, KindOverflowReceiving, KindOverflowHigh, KindOverflowFull, KindOverflowUnreachable, KindSeedStale}
+	KindProtectable, KindOverflowReceiving, KindOverflowHigh, KindOverflowFull, KindOverflowUnreachable, KindSeedStale,
+	KindOverflowVersioning}
 
 // Kinds are the alert kinds the evaluator owns, for the metrics that
 // count pending alerts by kind (OPS-4).
@@ -885,10 +898,22 @@ func (s *Service) overflowConditions(ctx context.Context, conds map[string]state
 	if err != nil {
 		return nil, err
 	}
+	changes, err := s.DB.LastVersioningChanges(ctx)
+	if err != nil {
+		return nil, err
+	}
 	var out []state.Alert
 	after := orDefault(s.UnreachableAfter, 24*time.Hour)
 	minRetrying := orDefault(s.MinRetrying, time.Hour)
 	for _, o := range targets {
+		if ch, ok := changes[o.Name]; ok && ch.Previous == state.VersioningEnabled && ch.Versioning != state.VersioningEnabled &&
+			now.Sub(ch.At) < VersioningAlertFor {
+			msg := fmt.Sprintf("overflow target %s: versioning on bucket %s is %s since %s (it was enabled): deletes there are held as client-side tombstones from now on (retention: client-side), "+
+				"which guard against mistakes, not a compromised node; deletes sent before stay as delete markers for the lifecycle rule. "+
+				"Enable versioning on the bucket again to have the provider keep deleted copies",
+				o.Name, o.Bucket, ch.Versioning, ch.At.UTC().Format(time.RFC3339))
+			out = append(out, alertOf(KindOverflowVersioning, o.Name, msg))
+		}
 		h := holds[o.Name]
 		if h.DataObjects > 0 {
 			msg := fmt.Sprintf("overflow target %s is receiving copies that no friend has room for: %s (%s) of this node's data are there, %s of its %s in all; "+
