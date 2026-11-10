@@ -956,8 +956,16 @@ func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(st
 	// Drops go in one statement per place: a full friend may drop
 	// thousands of rows in a pass.
 	drops := map[string][]int64{}
+	now := db.now()
 	for _, op := range ops {
 		if sending != nil && sending(op.from, op.seq) {
+			continue
+		}
+		// An unsent data row: the removal rule allows it (I1), and asks
+		// nothing of the database.
+		if ok, _, err := db.mayRemove(ctx, tx, removal{seq: op.seq, place: op.from, class: "data"}, now); err != nil {
+			return 0, 0, err
+		} else if !ok {
 			continue
 		}
 		if op.to == "" {

@@ -74,7 +74,7 @@ func (db *DB) RemoveFriendship(ctx context.Context, peer string, byPeer bool, no
 		return FormerFriend{}, err
 	}
 	defer tx.Rollback()
-	ff, err := removeFriendship(ctx, tx, peer, byPeer, now)
+	ff, err := db.removeFriendship(ctx, tx, peer, byPeer, now)
 	if err != nil {
 		return FormerFriend{}, err
 	}
@@ -82,7 +82,7 @@ func (db *DB) RemoveFriendship(ctx context.Context, peer string, byPeer bool, no
 }
 
 // removeFriendship is RemoveFriendship inside tx.
-func removeFriendship(ctx context.Context, tx *sql.Tx, peer string, byPeer bool, now time.Time) (FormerFriend, error) {
+func (db *DB) removeFriendship(ctx context.Context, tx *sql.Tx, peer string, byPeer bool, now time.Time) (FormerFriend, error) {
 	f, err := scanFriendship(tx.QueryRowContext(ctx, `SELECT `+friendshipCols+` FROM friendship WHERE peer_key = ?`, peer))
 	if err != nil {
 		return FormerFriend{}, err
@@ -110,6 +110,11 @@ func removeFriendship(ctx context.Context, tx *sql.Tx, peer string, byPeer bool,
 	// Its replicas' verification ends with it (#27 review): befriended
 	// again, it starts unchecked, not unverified.
 	if _, err := tx.ExecContext(ctx, `DELETE FROM replica_check WHERE place = ?`, peer); err != nil {
+		return FormerFriend{}, err
+	}
+	// Its unsent rows leave its FIFO: a friend removed by the user (I3,
+	// removal.go); its copies are re-placed (REPL-13).
+	if _, _, err := db.mayRemove(ctx, tx, removal{place: peer, except: exceptFriendRemoved}, now); err != nil {
 		return FormerFriend{}, err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementAbandoned+`'
@@ -186,6 +191,11 @@ func (db *DB) ForgetFormerFriend(ctx context.Context, peer string) error {
 	}
 	if !former {
 		return nil
+	}
+	// Its rows go with its replica, purged: a friend removed by the user
+	// (I3, removal.go).
+	if _, _, err := db.mayRemove(ctx, tx, removal{place: peer, except: exceptFriendRemoved}, db.now()); err != nil {
+		return err
 	}
 	for _, q := range []string{
 		`DELETE FROM placement WHERE place = ?`,
