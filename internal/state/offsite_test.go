@@ -327,6 +327,55 @@ func TestAPauseForQuotaEndingMakesAPassDue(t *testing.T) {
 	}
 }
 
+// REPL-11, LEND-2 (#106): a friend's quota answer replaces this node's
+// count of its use there, and can give room a pass found none for: an
+// answer that counted a send crossing it, then the next answer without
+// it. The object the pass left short waits for the pass that answer
+// makes due rather than showing as stuck; an answer that still leaves
+// no room for it changes nothing.
+func TestAQuotaAnswerGivingRoomMakesAPassDue(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.bucket("laptop", 2)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	answer := func(lent float64) {
+		t.Helper()
+		if _, err := p.db.QuotaAnswered(ctx, "C", 10*unit, p.now,
+			QuotaAnswer{Number: 10 * unit, Lent: int64(lent * float64(unit))}, p.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first := p.put("laptop", "data/1", "data", 4)
+	p.ackAll(first)
+	answer(9) // C counts a send that crossed the answer
+	seq := p.put("laptop", "data/2", "data", 2)
+	p.ackAll(seq)
+	if got := p.places(seq); !slices.Equal(got, []string{"B"}) {
+		t.Fatalf("data/2 placed at %v, want B alone", got)
+	}
+	if s := p.replace(); s.Placed != 0 || s.Below != 1 {
+		t.Fatalf("a pass with no room at C: %+v", s)
+	}
+	if o := p.offsite("laptop", seq); o.Stuck.Unplaced != 1 {
+		t.Fatalf("with no room at C and the pass done: %+v", o)
+	}
+	answer(8.5) // room at C, but not for data/2
+	if o := p.offsite("laptop", seq); o.Stuck.Unplaced != 1 {
+		t.Fatalf("with C still short of room for data/2: %+v", o)
+	}
+	answer(4) // C's count without the crossing send
+	if o := p.offsite("laptop", seq); o.Stuck.Objects != 0 || o.Waiting.Objects != 1 {
+		t.Fatalf("with room at C after its answer: %+v", o)
+	}
+	if s := p.replace(); s.Placed != 1 || s.Below != 0 {
+		t.Fatalf("the pass after the answer: %+v", s)
+	}
+	if due, err := p.db.passDue(ctx); err != nil || due {
+		t.Fatalf("after the pass that placed it: due %t, %v", due, err)
+	}
+}
+
 // REPL-11, OPS-2 (#90): a pass that ends with an error on one bucket
 // still answers the pool. Objects short of places, in the bucket that
 // failed and in a bucket with no room, show as stuck rather than

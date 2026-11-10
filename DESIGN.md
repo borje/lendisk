@@ -3286,8 +3286,9 @@ upstream bucket is Q-V.
   whether it refuses this node, is gone past `replace_after`, counts
   more than its quota or is paused for quota (its last answer a 507:
   no room until it acknowledges again or the quota rises,
-  `ResumePlace`), each bucket's `copies`, and each replica marked
-  unverified (#27); read every five
+  `ResumePlace`) and whether it has room for the smallest object the
+  last pass left below copies (#106, below), each bucket's `copies`,
+  and each replica marked unverified (#27); read every five
   polls, so a friend added, removed (`peer remove` or its remove call,
   §3.2), gone, back, paused for quota or resumed, or a quota or
   `copies` changed starts a pass within seconds, whichever process
@@ -4398,6 +4399,33 @@ upstream bucket is Q-V.
     (`TestAnObjectWithoutRoomWaitsForThePassAQuotaRaiseIsDue`,
     `TestAPauseForQuotaEndingMakesAPassDue`). With the daemon stopped
     no pass runs, and such objects wait with it.
+    *Decision (#106): the fingerprint asks each place whether it has
+    room for the smallest object the last pass left below copies.* A
+    friend's room is its quota less this node's count of its use there
+    (`place_use`), and a quota answer replaces that count with the
+    lender's (§3.5): an answer that counted a send crossing it, then
+    the next one without it, gives room no quota, pause or condition
+    in the fingerprint shows, so a pass that found none became final
+    and `status --wait` exited 4 for an object the next pass placed.
+    The pass records the size of the smallest object it left below
+    copies (`replace_pass.short_min`, schema 51, NULL when none), and
+    the fingerprint marks each place that may take a copy (quota above
+    0, not removed, gone, being removed or paused for quota) and has
+    room for it by the pass's rule (`room`): friends by `freeRoom` with
+    the metadata reserve, targets by `max_bytes`. Only the yes is
+    written, and the coarse flag, rather than use itself, keeps the
+    fingerprint still as captures move use. The pass records the pool
+    it read at its start, rendered with the smallest object it leaves
+    short and with room marked only where the place had it at the
+    pass's start and still has it at its end: room the pass took is no
+    room now, and room that came during the pass (an answer mid-pass)
+    is none it answered, so the next look finds the pool changed. A
+    pass that changed nothing is not due again, and a place with room
+    for that object the pass did not use (its metadata missing, its
+    replica unverified) carries the mark in both and is no change
+    (`TestAQuotaAnswerGivingRoomMakesAPassDue`). An object
+    larger than the smallest that gains room while the smallest
+    already had it is not seen until the hourly pass.
   - *a pending put* (#20 review), any data or metadata put whose queue
     row is not done yet, has no placement at all; a completed multipart
     upload is even answered before its row is hashed and done (§3.3,

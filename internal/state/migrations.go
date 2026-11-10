@@ -1084,4 +1084,13 @@ var migrations = []Migration{
 		ALTER TABLE relist ADD COLUMN settle_tried_at INTEGER;
 		ALTER TABLE relist ADD COLUMN settle_failures INTEGER;`,
 	},
+	{
+		Version: 51, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The size of the smallest live data object the last re-placement
+		-- pass left below copies (#106), NULL when it left none: the pool
+		-- fingerprint asks whether each place has room for it, so a quota
+		-- answer that gives room makes a pass due.
+		ALTER TABLE replace_pass ADD COLUMN short_min INTEGER;`,
+	},
 }
