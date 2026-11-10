@@ -954,7 +954,11 @@ upstream bucket is Q-V.
   format 1, since readers ignore a field they do not know and an
   absent one reads as none), `overflow` (name, endpoint, bucket, prefix and credential,
   S3-1, with region, `max_bytes`, `env_prefix`, retention and price
-  added in #38 within format 1; the credential is read from the
+  added in #38 within format 1, and `removing_at` and `keep_data` in
+  #102, so a node recovered during `overflow remove` restores the
+  target as being removed and goes on removing it rather than using it
+  again, `TestRecoveryDuringARemovalKeepsTheTargetBeingRemoved`; the
+  credential is read from the
   daemon's environment when the manifest is built, and absent while it
   is unset) and `buckets` (name, sealed name,
   `copies`, profile, created at). Placement (REPL-12) and the buckets'
@@ -3352,8 +3356,10 @@ upstream bucket is Q-V.
     paths: `AckPlacement` (the copy a re-placed one replaces), `decide`'s
     surplus, drain, split-move and drain-back drops and cancels,
     `dropIdleMetadata`, `Reroute`'s moves and drops, `RemoveOverflow`'s
-    unsent puts, and, as named exceptions, `removeFriendship`,
-    `ForgetFormerFriend` and `dropOverflow`. Not removals of a copy: a
+    unsent puts, `ForceRemoveOverflow`'s live data copies (#102), and,
+    as named exceptions, `removeFriendship`, `ForgetFormerFriend`,
+    `dropOverflow` and `ForceRemoveOverflow` once the user accepted the
+    loss. Not removals of a copy: a
     row of a version no longer live (`CancelPlacement` of a superseded
     put, `placeTx` cancelling a deleted key's unsent puts), a delete's
     or a seed's acknowledgement, and the metadata barrier (`Held`),
@@ -3377,11 +3383,13 @@ upstream bucket is Q-V.
     - **I3:** the removals that go below `copies` are named exceptions
       with their reason: the user lowering `copies` (I1 counts the
       copies set now), `overflow remove --keep-data` (the target's rows
-      are forgotten with its data left there, `exceptKeepData`) and a
+      are forgotten with its data left there, `exceptKeepData`),
+      `overflow remove --force` with the loss it prints confirmed
+      (`exceptForced`, #102) and a
       friendship ended, by the user or by the friend (`byPeer`,
       `exceptFriendRemoved`). Nothing else bypasses I1. The calls that
       name an exception (`removeFriendship`, `ForgetFormerFriend`,
-      `dropOverflow`) and those for unsent data rows (`applyReroute`,
+      `dropOverflow`, `ForceRemoveOverflow`) and those for unsent data rows (`applyReroute`,
       `RemoveOverflow`) always return true: they record the decision
       and enforce nothing, as removing an unsent copy, or one at a
       former friend or a target being removed (not intact places),
@@ -7434,6 +7442,44 @@ of the `copies`, and the estimated cost (S3-7).
   (`TestRemovingATargetPlacesItsCopiesElsewhereBeforeDeletingThem`,
   `TestRemovingATargetKeepingItsDataSendsNoDelete`,
   `TestScenarioOverflowRemoveMovesItsCopiesThenDropsTheTarget`).
+  *Follow-ups (#102).* `--keep-data` forgets only the held deletes no
+  one claims; a batch the worker claimed is left to it, and
+  `issueTombs` asks `TombToSend` before each delete, which forgets the
+  tomb once the target is kept, so at most the delete already on its
+  way goes; `DueOverflowTombs` claims none at a kept target, and
+  `FinishOverflowRemovals` first forgets the kept targets' tombs whose
+  claim was given back or went stale
+  (`TestKeepDataStopsTheHeldDeletesTheWorkerIsSending`,
+  `TestKeepDataStopsHeldDeletesTheWorkerClaimed`). A put a sender took
+  and then gave up (`abandoned`) may have landed, and nothing deletes
+  it there: it does not hold the removal, and is reported as left
+  behind, by `overflow remove` (`OverflowLeftAt`) and in the worker's
+  warning as the row goes (`FinishOverflowRemovals` returns each
+  target's `LeftBehind`: the latest row of a key there that may have
+  reached it, an unsent row not counting;
+  `TestAPutAbandonedAtARemovedTargetIsReportedLeftBehind`).
+  *Decision:* reported, not deleted: a delete needs its own row in the
+  target's FIFO, and a delete by key could take a later version.
+  `overflow remove --force [--yes]` ends a removal whose credential is
+  revoked or gone, which otherwise never finishes (its deletes cannot be
+  sent) and keeps `serve` from starting (`checkOverflowCredentials`
+  names `--force` for a target being removed):
+  `ForceRemoveOverflow` marks it removing and asks the removal rule
+  about each live data copy there (I1); if any is refused, it changes
+  nothing and returns the `Loss` (objects, bytes, those with no other
+  intact copy, up to ten keys), which the command prints before asking
+  `[y/N]` (`--yes` answers); accepted, the row and every per-place row
+  go at once as I3's `exceptForced`, and the command lists what is left
+  there under the bucket and prefix (copies never deleted, held or
+  refused deletes, abandoned puts), as lendisk no longer manages it.
+  With no copy refused it goes without asking
+  (`TestAForcedRemovalRefusesWhileTheTargetHoldsCopiesObjectsNeed`,
+  `TestAForcedRemovalOfATargetWhoseCopiesAreHeldElsewhereNeedsNoConsent`,
+  `TestOverflowRemoveForceAsksBeforeLosingCopiesObjectsNeed`;
+  `TestRemovalModel` forces targets out, with and without consent).
+  *Decision:* `--force`, not finishing a `keep_data` target gone past
+  `replace_after` on its own: dropping copies the daemon cannot reach
+  is the user's call, made once, with the loss shown.
   Every error the
   overflow client returns has the credential's keys taken out of its
   message (`replica.redacted`; Garage's 403 names the access key), so

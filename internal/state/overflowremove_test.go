@@ -18,11 +18,20 @@ func (p *pool) removeOverflow(name string, keepData bool) {
 
 func (p *pool) finishRemovals() []string {
 	p.t.Helper()
-	names, err := p.db.FinishOverflowRemovals(context.Background())
+	var names []string
+	for _, r := range p.finishRemovalsLeft() {
+		names = append(names, r.Name)
+	}
+	return names
+}
+
+func (p *pool) finishRemovalsLeft() []RemovedTarget {
+	p.t.Helper()
+	done, err := p.db.FinishOverflowRemovals(context.Background())
 	if err != nil {
 		p.t.Fatal(err)
 	}
-	return names
+	return done
 }
 
 // holdDrops holds every dropping or queued delete row at target as the

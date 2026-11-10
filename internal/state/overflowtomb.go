@@ -21,7 +21,8 @@ import (
 //
 // Rules a caller must keep:
 //   - A tomb is issued (the delete sent) only after DueOverflowTombs
-//     returned it, which claims it, and is dropped only after the
+//     returned it, which claims it, and TombToSend, asked just before
+//     the send, still allows it (#102); it is dropped only after the
 //     delete was acknowledged (DropOverflowTomb).
 //   - A tomb whose key the target holds again (an acknowledged put of
 //     it at or after the tomb's row: a re-put, or an undelete's record)
@@ -217,14 +218,16 @@ const keyClaimed = `EXISTS (SELECT 1 FROM overflow_tomb c WHERE c.place = t.plac
 
 // DueOverflowTombs drops place's superseded tombs, then claims and
 // returns up to limit of those due at now (their window ended), oldest
-// first, whose key no one holds a live claim on. The caller sends each
-// delete and then drops the tomb.
+// first, whose key no one holds a live claim on; none at a target
+// removed with keep_data (#102). The caller asks TombToSend before it
+// sends each delete, and then drops the tomb.
 func (db *DB) DueOverflowTombs(ctx context.Context, place string, now time.Time, limit int) ([]OverflowTomb, error) {
 	if _, err := db.DropSupersededTombs(ctx, place); err != nil {
 		return nil, err
 	}
 	return scanOTombs(db.QueryContext(ctx, `UPDATE overflow_tomb SET claimed_at = :now
-		WHERE place = :place AND seq IN (SELECT t.seq FROM overflow_tomb t WHERE t.place = :place AND t.due_at <= :now
+		WHERE place = :place AND NOT `+keptTarget(":place")+`
+			AND seq IN (SELECT t.seq FROM overflow_tomb t WHERE t.place = :place AND t.due_at <= :now
 			AND NOT `+keyClaimed+` ORDER BY t.due_at, t.seq LIMIT :limit)
 		RETURNING `+oTombCols, sql.Named("place", place), sql.Named("now", now.Unix()),
 		sql.Named("stale", now.Add(-tombClaim).Unix()), sql.Named("limit", limit)))
