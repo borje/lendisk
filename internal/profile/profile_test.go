@@ -80,6 +80,11 @@ func TestKopiaClassifiesKeys(t *testing.T) {
 	if p.HashNamed("p" + strings.Repeat("ab", 32)) {
 		t.Error("a kopia blob is not named by its SHA-256")
 	}
+	// #78: Kopia reads the union of its metadata blobs; restic's lone
+	// config or key stays a conflict in recovery.
+	if !p.UnionMetadata || set.Get("restic").UnionMetadata || set.Get("generic").UnionMetadata {
+		t.Error("only kopia reads the union of its metadata")
+	}
 }
 
 // EP-7: generic has no snapshot, metadata or local-only keys, and is
