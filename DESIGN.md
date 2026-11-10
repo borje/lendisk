@@ -5395,16 +5395,26 @@ the handler's own reads and is never cancelled; nothing below
 - **NET-5** Relays are DERP servers. The node's relay set
   (`transport.RelaySet`) is the project's DERP map, shipped in the
   binary (`transport/projectrelays.json`, empty while the project runs
-  no relay), unless `relays.map_url` (a DERP map URL, Tailscale's JSON
-  format) or `[[relays.list]]` (self-hosted relays, `host`, `port`,
+  no relay), unless `relays.map_url` (an https URL of a DERP map,
+  Tailscale's JSON format; plain http is refused, #42 review M2) or
+  `[[relays.list]]` (self-hosted relays, `host`, `port`,
   `stun_port`, `cert`) is set: either replaces it, both are used
   together, the list's regions numbered from 900 after the map's.
-  `relays.tailscale_bootstrap` (default true) adds the hosted map
-  tailcat publishes (Tailscale's relays) as a last resort: its regions
-  never take an ID of the node's own, and the address's region is
-  picked from them only when none of the own regions answers a latency
-  probe (`RelaySet.Pick`). Set false, the node depends on no third
-  party's relay. Fetched maps are kept in `lendisk.db` (`node`
+  The map's host is fully trusted: it chooses every relay the node
+  uses and the certificate pins they are checked by, so it can send
+  the node's traffic metadata to any relay it likes; a user who does
+  not trust a host lists relays instead. `relays.tailscale_bootstrap`
+  adds the hosted map tailcat publishes (Tailscale's relays) as a last
+  resort: its regions never take an ID of the node's own, and the
+  address's region is picked from them only when none of the own
+  regions answers a latency probe (`RelaySet.Pick`). It is tri-state
+  (`config.Relays.Bootstrap`, #42 review M1): `true` or `false` as
+  set; unset, the hosted relays are used only while `relays.map_url`
+  and `relays.list` are both empty. A user who names relays of their
+  own has decided which relays may see their traffic (NET-5a), so the
+  hosted map is then neither fetched nor part of the policy set unless
+  they set `true`. Whether a node with no relays configured uses them
+  by default is an open question to the user; for now it does. Fetched maps are kept in `lendisk.db` (`node`
   `relays.map:<url>`, `transport.StoreMapCache`), so a node restarted
   while a map's host is down still knows its set. Precedent: Syncthing
   ships a default relay pool URL that any list replaces; Tailscale's
@@ -5427,8 +5437,21 @@ the handler's own reads and is never cancelled; nothing below
   refuses one that does not, before a client is built or the relay
   dialled, with `transport.ErrRelayNotAllowed` naming the relay and the
   two ways to allow it; `peer add` refuses an invite the same way. An
-  address shares a relay with the set when one of its nodes is a node
-  of a set region (relay identity, below). An address naming a hosted
+  address's relay is a set region when one of its nodes, in the order
+  tailcat dials them, is a node of that region by the host name, IP or
+  port it gives literally; no name of the address is resolved, since a
+  name the friend chose can resolve anywhere at dial time (DNS
+  rebinding). The address is then not dialled as given: it is
+  re-encoded with the friend's keys and that set region's own nodes, so
+  the host names, IPs, ports and certificate pins tailcat uses all come
+  from the user's set (#42 review H1). Otherwise a node naming a set
+  host with an IP or pin of its own, or a region listing a foreign node
+  before a set node, would reach the friend's relay
+  (`TestHintRefusedSetHostWithForeignIPAndPinDialsTheSet`,
+  `TestHintRefusedMixedRegionDialsOnlyTheSetNode`,
+  `TestHintRefusedNameResolvingToASetIPIsRefused`). With hints
+  accepted the address is dialled as it is, and its names are resolved
+  to tell aliases of one server apart. An address naming a hosted
   region by ID only is resolved by tailcat against Tailscale's map, so
   it is a peer hint. The set's map is read at most every 5 minutes, a
   failure remembered for a minute, and a relay found outside it is
@@ -5726,7 +5749,9 @@ the handler's own reads and is never cancelled; nothing below
   region of the set are one relay. tailcat strips region IDs, codes and
   node names from an address, so the region is known only from the
   set; a dialler with none (a test's) knows relays by their servers.
-  The names are resolved at the dial, within 2 s, and an address's
+  With peer hints accepted the names are resolved at the dial, within
+  2 s (with them refused the set region's own nodes are dialled and
+  nothing is resolved, NET-5a), and an address's
   relay is reused for 10 minutes (#60 review, #42). An address naming
   a hosted region by ID only gives that ID. Two addresses are one relay
   when those sets share a server or a region, whatever the node order,

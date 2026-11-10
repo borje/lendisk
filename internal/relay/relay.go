@@ -125,6 +125,11 @@ func Run(ctx context.Context, c Config, ready func(Entry)) error {
 	if err := os.MkdirAll(c.Dir, 0o700); err != nil {
 		return err
 	}
+	// MkdirAll leaves an existing directory's mode alone; it holds the
+	// relay's keys.
+	if err := os.Chmod(c.Dir, 0o700); err != nil {
+		return fmt.Errorf("making %s private: %w", c.Dir, err)
+	}
 	tlsConf, pin, err := c.tlsConfig()
 	if err != nil {
 		return err
@@ -266,7 +271,12 @@ func (c Config) selfSigned() (tls.Certificate, error) {
 // writePrivate writes b to path at 0600 from the first byte.
 func writePrivate(path string, b []byte) error {
 	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// A leftover .tmp keeps its mode through O_CREATE; remove it so the
+	// key is 0600 from the first byte.
+	if err := os.Remove(tmp); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}

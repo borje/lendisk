@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"slices"
@@ -203,11 +204,6 @@ var ErrRelayNotAllowed = errors.New("the friend's relay is not one of this node'
 // them. Two addresses are one relay when their keys overlap.
 type relay []string
 
-// inSet reports whether r shares a region with the node's relay set.
-func (r relay) inSet() bool {
-	return slices.ContainsFunc(r, func(k string) bool { return strings.HasPrefix(k, "region:") })
-}
-
 // derpPort is a node's DERP port: its own, or the scheme's default,
 // which is what derphttp dials (443 over HTTPS, 3340 over plain HTTP
 // with TS_DEBUG_USE_DERP_HTTP).
@@ -330,8 +326,9 @@ type relays struct {
 }
 
 type cachedRelay struct {
-	r  relay
-	at time.Time
+	r    relay
+	dial string // the address to dial (see relayFor)
+	at   time.Time
 }
 
 // How long the relay set's map is reused before it is read again, and
@@ -371,59 +368,104 @@ func defaultLookup(ctx context.Context, host string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
 
-// relayFor is the relay of addr, refused with ErrRelayNotAllowed when a
-// relay set is given, acceptHints is false and the address's relay is
-// not in it (NET-5a).
-func (p *relays) relayFor(ctx context.Context, addr string, ci tailcat.ConnInfo) (relay, error) {
+// relayFor is the relay of addr and the address to dial it by. With a
+// relay set and peer hints refused (NET-5a), the address's relay must
+// be a region of the set, matched by the host names, IPs and ports the
+// address gives literally (no name is resolved: a name the friend
+// chose could resolve anywhere at dial time), and the address dialled
+// is re-encoded with that set region's own nodes: host names, IPs,
+// ports and certificate pins all come from the user's set, never from
+// the friend's address, so a node naming a set host with another IP or
+// pin, or a region mixing a set node with others, reaches only the
+// set's relay. Otherwise ErrRelayNotAllowed. With hints accepted, or
+// no set, addr is dialled as it is and its host names are resolved, so
+// aliases of one server are one relay.
+func (p *relays) relayFor(ctx context.Context, addr string, ci tailcat.ConnInfo) (relay, string, error) {
 	p.mu.Lock()
 	set, accept, lookup := p.set, p.acceptHints, p.lookup
 	if c, ok := p.cache[addr]; ok && p.now().Sub(c.at) < relayTTL {
 		p.mu.Unlock()
-		return c.r, nil
+		return c.r, c.dial, nil
 	}
 	p.mu.Unlock()
-	rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
-	defer cancel()
-	resolve := func(host string) []netip.Addr {
-		if lookup == nil {
-			return nil
-		}
-		as, _ := lookup(rctx, host) // a name that does not resolve keeps its host key
-		return as
-	}
 	var r relay
-	// A relay outside the set as last read is checked against the set
-	// read afresh before it is refused: the set may have grown.
-	for _, fresh := range []bool{false, true} {
+	dial := addr
+	if set != nil && !accept {
+		// A relay outside the set as last read is checked against the
+		// set read afresh before it is refused: the set may have grown.
+		var region *tailcfg.DERPRegion
+		for _, fresh := range []bool{false, true} {
+			known, err := p.setMap(ctx, set, fresh)
+			if err != nil {
+				return nil, "", fmt.Errorf("reading this node's relays to check the friend's: %w", err)
+			}
+			if region = setRegionOf(ci, known); region != nil {
+				break
+			}
+			if fresh {
+				return nil, "", fmt.Errorf("%w: it is %s; add it to relays.list or relays.map_url, or set relays.accept_peer_hints = true to use the relay a friend's address names (NET-5a)",
+					ErrRelayNotAllowed, describeRelay(ci))
+			}
+		}
+		own := tailcat.ConnInfo{ServerPublic: ci.ServerPublic, ServerDiscoPublic: ci.ServerDiscoPublic,
+			PresharedKey: ci.PresharedKey, Region: []*tailcfg.DERPRegion{region}}
+		dial = string(own.Addr())
+		r = relayOf(own, &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{region.RegionID: region}}, nil)
+	} else {
 		var known *tailcfg.DERPMap
 		if set != nil {
-			m, err := p.setMap(ctx, set, fresh)
-			switch {
-			case err == nil:
-				known = m
-			case !accept:
-				return nil, fmt.Errorf("reading this node's relays to check the friend's: %w", err)
+			// The set only tells meshed regions apart here; without
+			// it the relay is known by its servers alone.
+			known, _ = p.setMap(ctx, set, false)
+		}
+		rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
+		defer cancel()
+		r = relayOf(ci, known, func(host string) []netip.Addr {
+			if lookup == nil {
+				return nil
 			}
-			// With peer hints accepted, the set only tells meshed
-			// regions apart; without it the relay is known by its
-			// servers alone.
-		}
-		r = relayOf(ci, known, resolve)
-		if set == nil || accept || r.inSet() {
-			break
-		}
-		if fresh {
-			return nil, fmt.Errorf("%w: it is %s; add it to relays.list or relays.map_url, or set relays.accept_peer_hints = true to use the relay a friend's address names (NET-5a)",
-				ErrRelayNotAllowed, describeRelay(ci))
-		}
+			as, _ := lookup(rctx, host) // a name that does not resolve keeps its host key
+			return as
+		})
 	}
 	p.mu.Lock()
 	if p.cache == nil || len(p.cache) > 1024 {
 		p.cache = map[string]cachedRelay{}
 	}
-	p.cache[addr] = cachedRelay{r: r, at: p.now()}
+	p.cache[addr] = cachedRelay{r: r, dial: dial, at: p.now()}
 	p.mu.Unlock()
-	return r, nil
+	return r, dial, nil
+}
+
+// setRegionOf is the region of known that the address's relay is: the
+// region holding the first of the address's nodes, in the order
+// tailcat dials them, that is a node of known by the host name, IP and
+// port it gives literally; nil if none is.
+func setRegionOf(ci tailcat.ConnInfo, known *tailcfg.DERPMap) *tailcfg.DERPRegion {
+	if known == nil {
+		return nil
+	}
+	ids := slices.Sorted(maps.Keys(known.Regions))
+	for _, reg := range ci.Region {
+		for _, n := range reg.Nodes {
+			if n.STUNOnly {
+				continue
+			}
+			keys := nodeKeys(n, nil)
+			for _, id := range ids {
+				sr := known.Regions[id]
+				if sr == nil {
+					continue
+				}
+				for _, sn := range sr.Nodes {
+					if !sn.STUNOnly && slices.ContainsFunc(nodeKeys(sn, nil), func(k string) bool { return slices.Contains(keys, k) }) {
+						return sr
+					}
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // describeRelay names an address's relay for a message.

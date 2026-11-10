@@ -153,9 +153,9 @@ if none exists.
 | `endpoint.listen` | none | S3 endpoints for other machines on your LAN, opt-in and repeatable: `address` or `interface` + `port`, `tls` = `generate` (default), `files` (with `cert`, `key`) or `off`. `lendisk endpoint cert` prints the generated certificate's fingerprint |
 | `tunnel.region` | nearest | the relay region in this node's address; changing it changes the address |
 | `tunnel.port` | `0` (any) | UDP port for direct paths, for a port forward; a friend gives `<your IP>:<port>` to `lendisk peer address` |
-| `relays.map_url` | none | a DERP map URL whose relays replace the project's relay map |
+| `relays.map_url` | none | an https URL of a DERP map whose relays replace the project's relay map; its host chooses your relays |
 | `relays.list` | none | self-hosted relays, repeatable, each the entry `lendisk relay` logs (`host=…,port=…,stun_port=…,cert=sha256-raw:…`); replaces the project's relay map |
-| `relays.tailscale_bootstrap` | `true` | also use Tailscale's hosted relays, as a last resort; `false` depends on no third-party relay |
+| `relays.tailscale_bootstrap` | auto | also use Tailscale's hosted relays, as a last resort; unset, only while `relays.map_url` and `relays.list` are empty, so with relays of your own you depend on no third-party relay unless you set `true` |
 | `relays.accept_peer_hints` | `false` | dial a friend through the relay its address names even when it is not one of yours (a relay sees both IP addresses) |
 | `relay.hostname`, `relay.listen`, `relay.stun_port`, `relay.tls` | none, `:443`, `3478`, `self-signed` | for `lendisk relay`, a relay on your own VPS: `tls` is `self-signed` (pinned by the entry), `letsencrypt` or `files` (`relay.cert`, `relay.key`) |
 | `replication.copies` | `2` | how many friends hold each object of a bucket created without `--copies`; with 1, losing one friend loses data, and `bucket add` and `status` say so |

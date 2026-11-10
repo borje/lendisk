@@ -192,7 +192,11 @@ func (k *pathKeeper) run(ctx context.Context) {
 			p, err := k.Tr.PathInfo(pctx, id)
 			cancel()
 			if err != nil {
-				continue // not dialled yet, or no answer: the last record stands
+				// Not dialled yet, or no answer: the last record stands,
+				// and the friend is probed again after a relayed one's
+				// wait, not at every tick (#42 review L4).
+				last[f.Peer] = seen{at: time.Now(), path: ""}
+				continue
 			}
 			path := "relayed"
 			if p.Direct {

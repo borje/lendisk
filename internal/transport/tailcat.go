@@ -376,11 +376,13 @@ func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (
 	if got := nodeIDOf(ci.ServerPublic.NodePublic); got != peer {
 		return nil, fmt.Errorf("address belongs to node %s, not %s", got, peer)
 	}
-	relay, err := t.relays.relayFor(ctx, addr, ci)
+	// With peer hints refused, the address dialled is the friend's key
+	// at the set's own relay, never the address's relay data (NET-5a).
+	relay, dialAddr, err := t.relays.relayFor(ctx, addr, ci)
 	if err != nil {
 		return nil, err
 	}
-	c, err := t.clientFor(ctx, peer, relay, addr)
+	c, err := t.clientFor(ctx, peer, relay, dialAddr)
 	if err != nil {
 		return nil, err
 	}

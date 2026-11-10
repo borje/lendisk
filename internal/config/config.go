@@ -200,14 +200,27 @@ type Tunnel struct {
 // Relays is the [relays] section: the relays this node uses (NET-5,
 // NET-5a). map_url and list each replace the project's relay map.
 type Relays struct {
-	MapURL string `toml:"map_url" help:"URL of a DERP map (JSON, as Tailscale publishes one) whose relays replace the project's relay map (NET-5); with relays.list, both are used; empty for none"`
+	MapURL string `toml:"map_url" help:"https URL of a DERP map (JSON, as Tailscale publishes one) whose relays replace the project's relay map (NET-5); with relays.list, both are used; empty for none"`
 	// List is [[relays.list]]: self-hosted relays, as `lendisk relay`
 	// prints them.
 	List []RelayEntry `toml:"list" help:"self-hosted relays (lendisk relay) that replace the project's relay map (NET-5), repeatable, as the relay prints its entry: 'host=relay.example.org,port=443,stun_port=3478,cert=sha256-raw:<hex>'; port 0 is 443, stun_port 0 is 3478 and -1 none, cert pins a self-signed certificate"`
-	// TailscaleBootstrap adds the hosted relays as a last resort.
-	TailscaleBootstrap Switch `toml:"tailscale_bootstrap" default:"true" help:"also use Tailscale's hosted relays, as a last resort when none of this node's own relays answers (NET-5): true or false; set false to depend on no relay run by a third party"`
+	// TailscaleBootstrap adds the hosted relays as a last resort; unset
+	// is auto (see Relays.Bootstrap).
+	TailscaleBootstrap Switch `toml:"tailscale_bootstrap" help:"also use Tailscale's hosted relays, as a last resort when none of this node's own relays answers (NET-5): true or false; unset, they are used only while relays.map_url and relays.list are both empty, so a node with relays of its own depends on no relay run by a third party"`
 	// AcceptPeerHints lets a friend's address choose the relay (NET-5a).
 	AcceptPeerHints Switch `toml:"accept_peer_hints" default:"false" help:"dial a friend through the relay its address names even when that relay is not one of this node's relays (NET-5a): true or false. A relay sees both nodes' IP addresses and how much they send"`
+}
+
+// Bootstrap reports whether Tailscale's hosted relays join the relay
+// set (NET-5, NET-5a): as relays.tailscale_bootstrap says, or, unset,
+// only while the node has no relays of its own (no map_url, no list):
+// which relays may see a node's traffic is the user's decision, so a
+// user who names relays gets those alone unless they ask for more.
+func (r Relays) Bootstrap() bool {
+	if strings.TrimSpace(string(r.TailscaleBootstrap)) == "" {
+		return r.MapURL == "" && len(r.List) == 0
+	}
+	return r.TailscaleBootstrap.On()
 }
 
 // RelayEntry is one [[relays.list]] entry: a DERP server.
@@ -551,8 +564,10 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("tunnel.port = %q: want a UDP port from 1 to 65535, or 0 for any", c.Tunnel.Port))
 	}
 	if u := c.Relays.MapURL; u != "" {
-		if p, err := url.Parse(u); err != nil || (p.Scheme != "http" && p.Scheme != "https") || p.Host == "" {
-			errs = append(errs, fmt.Errorf("relays.map_url = %q: want an http:// or https:// URL of a DERP map", u))
+		// The map's host chooses every relay the node uses: only
+		// over TLS (#42 review M2).
+		if p, err := url.Parse(u); err != nil || p.Scheme != "https" || p.Host == "" {
+			errs = append(errs, fmt.Errorf("relays.map_url = %q: want an https:// URL of a DERP map; its host chooses this node's relays, so plain http is refused", u))
 		}
 	}
 	for i, e := range c.Relays.List {
@@ -564,6 +579,9 @@ func (c *Config) Validate() error {
 		key string
 		v   Switch
 	}{{"relays.tailscale_bootstrap", c.Relays.TailscaleBootstrap}, {"relays.accept_peer_hints", c.Relays.AcceptPeerHints}} {
+		if s.key == "relays.tailscale_bootstrap" && strings.TrimSpace(string(s.v)) == "" {
+			continue // auto
+		}
 		if err := s.v.check(); err != nil {
 			errs = append(errs, fmt.Errorf("%s = %w", s.key, err))
 		}

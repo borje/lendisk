@@ -20,16 +20,18 @@ type fakePaths struct {
 	relayedFor int
 	dialled    identity.NodeID
 
-	mu    sync.Mutex
-	calls int
+	mu     sync.Mutex
+	calls  int
+	misses int // probes of a friend not dialled
 }
 
 func (f *fakePaths) PathInfo(_ context.Context, peer identity.NodeID) (transport.Path, error) {
-	if peer != f.dialled {
-		return transport.Path{}, errors.New("not dialled")
-	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if peer != f.dialled {
+		f.misses++
+		return transport.Path{}, errors.New("not dialled")
+	}
 	f.calls++
 	if f.calls <= f.relayedFor {
 		return transport.Path{Relay: "relay.example:443"}, nil
@@ -47,7 +49,8 @@ func (f *fakePaths) probes() int {
 // ping also trying for a direct path, and records each answer: relayed
 // with its relay, then direct with the endpoint once a ping comes back
 // direct. A direct friend is pinged far less often, and a friend not
-// dialled is left alone.
+// dialled gets no path and is asked again only after a relayed
+// friend's wait, not at every tick (#42 review L4).
 func TestPathKeeperRetriesWhileRelayed(t *testing.T) {
 	parallel(t, 0)
 	db, err := state.Open(t.Context(), t.TempDir(), slog.New(slog.DiscardHandler))
@@ -74,6 +77,7 @@ func TestPathKeeperRetriesWhileRelayed(t *testing.T) {
 		}
 	}
 	tr := &fakePaths{relayedFor: 3, dialled: ids[0]}
+	start := time.Now()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
@@ -98,5 +102,11 @@ func TestPathKeeperRetriesWhileRelayed(t *testing.T) {
 	}
 	if f, err := db.GetFriendship(t.Context(), ids[1].String()); err != nil || f.Path != "" || !f.PathAt.IsZero() {
 		t.Fatalf("a friend not dialled got a path: %+v %v", f, err)
+	}
+	tr.mu.Lock()
+	misses := tr.misses
+	tr.mu.Unlock()
+	if most := int(time.Since(start)/(30*time.Millisecond)) + 2; misses > most {
+		t.Fatalf("a friend not dialled was probed %d times in %v; at most %d with a 30ms wait", misses, time.Since(start), most)
 	}
 }

@@ -47,12 +47,12 @@ type backend struct {
 
 func backendOf(owner any) (backend, error) {
 	v := reflect.ValueOf(owner)
-	if v.Kind() != reflect.Pointer || v.IsNil() {
+	if v.Kind() != reflect.Pointer || v.IsNil() || v.Elem().Kind() != reflect.Struct {
 		return backend{}, errInternals
 	}
 	lb := v.Elem().FieldByName("lb")
-	if !lb.IsValid() || lb.Kind() != reflect.Pointer || lb.IsNil() {
-		return backend{}, errInternals
+	if !lb.IsValid() || lb.Kind() != reflect.Pointer || lb.IsNil() || lb.Elem().Kind() != reflect.Struct {
+		return backend{}, errInternals // FieldByName panics on a non-struct
 	}
 	be := lb.Elem()
 	b := backend{sys: field[tsd.System](be, "sys"), nm: field[*netmap.NetworkMap](be, "nm"), mu: field[sync.Mutex](be, "mu")}

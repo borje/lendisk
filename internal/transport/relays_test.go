@@ -17,10 +17,10 @@ import (
 	"github.com/borje/lendisk/internal/transport/transporttest"
 )
 
-// maps serves DERP maps by URL to a RelaySet, counting fetches.
-type maps map[string]*tailcfg.DERPMap
+// servedMaps serves DERP maps by URL to a RelaySet, counting fetches.
+type servedMaps map[string]*tailcfg.DERPMap
 
-func (m maps) set(s *RelaySet) *RelaySet {
+func (m servedMaps) set(s *RelaySet) *RelaySet {
 	s.fetch = func(_ context.Context, url string) (*tailcfg.DERPMap, error) {
 		if dm, ok := m[url]; ok {
 			return dm, nil
@@ -47,7 +47,7 @@ func oneRegion(id tailcfg.DERPRegionID, host string) *tailcfg.DERPRegion {
 // map, together their union; the hosted relays come in only with
 // relays.tailscale_bootstrap, and never over an ID of the node's own.
 func TestRelaySetReplacesTheProjectMap(t *testing.T) {
-	served := maps{
+	served := servedMaps{
 		"https://relays.example/map.json": {Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
 			901: oneRegion(901, "a.relays.example"), 902: oneRegion(902, "b.relays.example")}},
 		bootstrapURL: {Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
@@ -103,7 +103,7 @@ func TestPickPrefersOwnRelaysOverTheBootstrap(t *testing.T) {
 	hostedNode := *hosted.Region.Nodes[0]
 	hostedRegion.RegionID, hostedNode.RegionID, hostedNode.Name = 1, 1, "1a"
 	hostedRegion.Nodes = []*tailcfg.DERPNode{&hostedNode}
-	served := maps{bootstrapURL: {Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: &hostedRegion}}}
+	served := servedMaps{bootstrapURL: {Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{1: &hostedRegion}}}
 	list := []RelayServer{{Host: "127.0.0.1", Port: own.Region.Nodes[0].DERPPort, STUNPort: own.Region.Nodes[0].STUNPort}}
 	s := served.set(&RelaySet{List: list, Bootstrap: true})
 	m, err := s.DERPMap(t.Context())

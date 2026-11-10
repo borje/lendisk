@@ -125,6 +125,29 @@ func TestSelfHostedRelayCarriesATunnel(t *testing.T) {
 	}
 }
 
+// #42 review L5: an existing relay directory open to others is made
+// private, and a leftover temporary key file open to others is not
+// reused, so the key is 0600 from its first byte.
+func TestRelayKeepsItsDirectoryPrivate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "relay")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "relay.key.tmp"), []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, dir)
+	if fi, err := os.Stat(dir); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("relay dir: %v %v", fi, err)
+	}
+	if fi, err := os.Stat(filepath.Join(dir, "relay.key")); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("relay key: %v %v", fi, err)
+	}
+}
+
 // NET-5 (#42): a relay with a setting it cannot serve refuses to start
 // and says which.
 func TestRelayRefusesBadSettings(t *testing.T) {

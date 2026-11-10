@@ -617,7 +617,7 @@ func TestRelaysSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.Relays.MapURL != "" || len(l.Relays.List) != 0 || !l.Relays.TailscaleBootstrap.On() || l.Relays.AcceptPeerHints.On() || l.Tunnel.Port.Int() != 0 {
+	if l.Relays.MapURL != "" || len(l.Relays.List) != 0 || l.Relays.TailscaleBootstrap != "" || !l.Relays.Bootstrap() || l.Relays.AcceptPeerHints.On() || l.Tunnel.Port.Int() != 0 {
 		t.Fatalf("defaults: %+v, tunnel %+v", l.Relays, l.Tunnel)
 	}
 	pin := "sha256-raw:" + strings.Repeat("ab", 32)
@@ -643,7 +643,7 @@ stun_port = -1
 	if err != nil {
 		t.Fatal(err)
 	}
-	if l.Relays.MapURL != "https://relays.example/derpmap.json" || l.Relays.TailscaleBootstrap.On() || !l.Relays.AcceptPeerHints.On() || l.Tunnel.Port.Int() != 41641 {
+	if l.Relays.MapURL != "https://relays.example/derpmap.json" || l.Relays.Bootstrap() || !l.Relays.AcceptPeerHints.On() || l.Tunnel.Port.Int() != 41641 {
 		t.Fatalf("from the file: %+v", l.Relays)
 	}
 	want := []RelayEntry{{Host: "relay.example.org", Cert: pin}, {Host: "192.0.2.7", Port: 8443, STUNPort: -1}}
@@ -656,6 +656,7 @@ stun_port = -1
 	}
 	for _, bad := range [][]string{
 		{"--relays-map-url", "ftp://relays.example/map.json"},
+		{"--relays-map-url", "http://relays.example/map.json"},
 		{"--relays-list", "port=443"},
 		{"--relays-list", "host=relay.example,port=70000"},
 		{"--relays-list", "host=relay.example,stun_port=-2"},
@@ -668,6 +669,32 @@ stun_port = -1
 	} {
 		if _, err := load(t, append([]string{"--config", none}, bad...), nil); err == nil {
 			t.Errorf("%v was accepted", bad)
+		}
+	}
+}
+
+// #42 review M1, NET-5a: relays.tailscale_bootstrap unset is auto: the
+// hosted relays join the set only while the node names no relays of
+// its own; naming some leaves them out unless the user asks for them.
+func TestTailscaleBootstrapIsAutoUnlessSet(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	pin := "host=relay.example.org"
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{nil, true},
+		{[]string{"--relays-list", pin}, false},
+		{[]string{"--relays-map-url", "https://relays.example/map.json"}, false},
+		{[]string{"--relays-list", pin, "--relays-tailscale-bootstrap", "true"}, true},
+		{[]string{"--relays-tailscale-bootstrap", "false"}, false},
+	} {
+		l, err := load(t, append([]string{"--config", none}, tc.args...), nil)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.args, err)
+		}
+		if got := l.Relays.Bootstrap(); got != tc.want {
+			t.Errorf("%v: bootstrap %v, want %v", tc.args, got, tc.want)
 		}
 	}
 }

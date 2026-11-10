@@ -28,7 +28,7 @@ func (a *app) relays(cfg *config.Loaded, st transport.NodeStore) transport.Regio
 	if a.regions != nil {
 		return a.regions
 	}
-	set := &transport.RelaySet{MapURL: cfg.Relays.MapURL, Bootstrap: cfg.Relays.TailscaleBootstrap.On()}
+	set := &transport.RelaySet{MapURL: cfg.Relays.MapURL, Bootstrap: cfg.Relays.Bootstrap()}
 	if st != nil {
 		set.Cache = transport.StoreMapCache{Store: st}
 	}

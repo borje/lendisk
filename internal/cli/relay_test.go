@@ -103,11 +103,12 @@ func TestRelayCommandReportsItsEntry(t *testing.T) {
 // NET-5 AC, with a single self-hosted relay (#42): two nodes whose only
 // relay is a `lendisk relay`, listed by its entry with the hosted
 // relays off, choose it for their addresses and become friends through
-// it. relays.list replaces the project's map.
+// it. relays.list replaces the project's map, and with it the hosted
+// relays are left out unless asked for (#42 review M1).
 func TestFriendsThroughASelfHostedRelayOnly(t *testing.T) {
 	serving(t, 1)
 	entry := runRelay(t, newNode(t))
-	only := []string{"--relays-list", entry, "--relays-tailscale-bootstrap", "false"}
+	only := []string{"--relays-list", entry}
 	an, bn := newNode(t), newNode(t)
 	for _, n := range []*node{an, bn} {
 		n.regions = nil // the relay set the flags name, not a test source
