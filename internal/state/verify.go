@@ -40,6 +40,10 @@ type ReplicaCheck struct {
 	// HeldSince is the first acknowledgement the friend still holds of
 	// the bucket; zero when it holds none.
 	HeldSince time.Time
+	// AllCheckedAt is when every object the replica holds was last
+	// checked whole without a failure: the rolling full check's last
+	// completed pass (VER-1a, #105), or FullAt if later.
+	AllCheckedAt time.Time
 }
 
 // LastPassOrHeld is when the replica last passed a challenge, or, if
@@ -65,15 +69,21 @@ func timeOf(n sql.NullInt64) time.Time {
 
 // RecordVerified records a passed check of place's replica of bucket at
 // now: it is due again a day later. A full check also clears the
-// unverified mark (VER-3: the user checked every object); a ranged one
-// leaves it, and leaves the time it last passed as it was, so an
-// unverified replica never looks freshly verified (#39 review).
+// unverified mark (VER-3: the user checked every object) and counts as
+// a completed full cycle, the rolling pass starting over (VER-1a); a
+// ranged one leaves it, and leaves the time it last passed as it was,
+// so an unverified replica never looks freshly verified (#39 review).
 func (db *DB) RecordVerified(ctx context.Context, place, bucket string, full bool, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO replica_check (place, bucket, checked_at, verified_at, full_at)
-		VALUES (?1, ?2, ?3, ?3, CASE WHEN ?4 THEN ?3 END)
+	_, err := db.ExecContext(ctx, `INSERT INTO replica_check (place, bucket, checked_at, verified_at, full_at, cycle_full_at)
+		VALUES (?1, ?2, ?3, ?3, CASE WHEN ?4 THEN ?3 END, CASE WHEN ?4 THEN ?3 END)
 		ON CONFLICT (place, bucket) DO UPDATE SET checked_at = ?3,
 			verified_at = CASE WHEN ?4 OR unverified_at IS NULL THEN ?3 ELSE verified_at END,
 			full_at = CASE WHEN ?4 THEN ?3 ELSE full_at END,
+			cycle_full_at = CASE WHEN ?4 THEN ?3 ELSE cycle_full_at END,
+			cycle_after = CASE WHEN ?4 THEN NULL ELSE cycle_after END,
+			cycle_started_at = CASE WHEN ?4 THEN NULL ELSE cycle_started_at END,
+			cycle_checked = CASE WHEN ?4 THEN NULL ELSE cycle_checked END,
+			cycle_skipped = CASE WHEN ?4 THEN NULL ELSE cycle_skipped END,
 			unverified_at = CASE WHEN ?4 THEN NULL ELSE unverified_at END,
 			detail = CASE WHEN ?4 THEN NULL ELSE detail END,
 			error = NULL, error_at = NULL`, place, bucket, now.Unix(), full)
@@ -83,12 +93,15 @@ func (db *DB) RecordVerified(ctx context.Context, place, bucket string, full boo
 // RecordUnverified records a failed challenge of place's replica of
 // bucket at now (VER-1): the replica is marked unverified, which
 // re-placement reads (PoolFingerprint changes), and the alert service
-// raises KindReplicaUnverified. An earlier mark keeps its time.
+// raises KindReplicaUnverified. An earlier mark keeps its time. The
+// rolling full check's pass ends unfinished (VER-1a): once a full check
+// clears the mark, a new pass starts.
 func (db *DB) RecordUnverified(ctx context.Context, place, bucket, detail string, now time.Time) error {
 	_, err := db.ExecContext(ctx, `INSERT INTO replica_check (place, bucket, checked_at, unverified_at, detail)
 		VALUES (?1, ?2, ?3, ?3, ?4)
 		ON CONFLICT (place, bucket) DO UPDATE SET checked_at = ?3,
-			unverified_at = coalesce(unverified_at, ?3), detail = ?4, error = NULL, error_at = NULL`,
+			unverified_at = coalesce(unverified_at, ?3), detail = ?4, error = NULL, error_at = NULL,
+			cycle_after = NULL, cycle_started_at = NULL, cycle_checked = NULL, cycle_skipped = NULL`,
 		place, bucket, now.Unix(), detail)
 	return err
 }
@@ -116,7 +129,7 @@ const heldSince = `(SELECT min(h.acked_at) FROM placement h
 // then friend; a replica never checked has zero times.
 func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name, c.checked_at, c.verified_at, c.full_at,
-		c.unverified_at, coalesce(c.detail, ''), coalesce(c.error, ''), c.error_at, `+heldSince+`
+		max(coalesce(c.cycle_full_at, 0), coalesce(c.full_at, 0)), c.unverified_at, coalesce(c.detail, ''), coalesce(c.error, ''), c.error_at, `+heldSince+`
 		FROM `+replicaPlaces+` f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
 		WHERE c.place IS NOT NULL OR coalesce(f.address, '') != '' AND EXISTS (SELECT 1 FROM placement p
@@ -129,13 +142,16 @@ func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 	var out []ReplicaCheck
 	for rows.Next() {
 		var c ReplicaCheck
-		var checked, verified, full, unverified, errAt, held sql.NullInt64
-		if err := rows.Scan(&c.Place, &c.Bucket, &checked, &verified, &full, &unverified, &c.Detail, &c.Error, &errAt,
+		var checked, verified, full, all, unverified, errAt, held sql.NullInt64
+		if err := rows.Scan(&c.Place, &c.Bucket, &checked, &verified, &full, &all, &unverified, &c.Detail, &c.Error, &errAt,
 			&held); err != nil {
 			return nil, err
 		}
 		c.CheckedAt, c.VerifiedAt, c.FullAt = timeOf(checked), timeOf(verified), timeOf(full)
 		c.UnverifiedAt, c.ErrorAt, c.HeldSince = timeOf(unverified), timeOf(errAt), timeOf(held)
+		if all.Int64 > 0 {
+			c.AllCheckedAt = timeOf(all)
+		}
 		out = append(out, c)
 	}
 	return out, rows.Err()

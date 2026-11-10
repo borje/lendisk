@@ -5390,6 +5390,86 @@ the handler's own reads and is never cancelled; nothing below
     Like Storj, only a definite answer counts. Unlike it, the scope is
     the one bucket's replica: the friend's other replicas answer their
     own challenges, and the friendship stays.
+- **VER-1a** The rolling full check (#105, `verify/cycle.go`,
+  `state/fullcycle.go`): besides the daily sample, every replica at a
+  friend is walked in write order (`queue.seq`), a slice a day, each
+  object of the slice challenged whole as `verify --full` challenges it
+  (`Whole`, the HMAC over every byte, nothing crossing the tunnel), so
+  that every challengeable object is challenged once a cycle:
+  `verify.full_cycle`, 30 days by default (`verify.DefaultFullCycle`;
+  `1d` to `365d`, days or a Go duration, `config.ParseCycle`).
+  - *Slices.* A slice is due a day (`Verifier.Every`) after the
+    replica's last (`replica_check.cycle_at`, schema 49;
+    `state.DB.DueCycles`, run after the daily challenges in each pass)
+    under the daily challenge's rules: a place with an address that
+    acknowledged objects of the bucket, not unverified, no error within
+    the hour, and waiting while the replica's FIFO has rows `queued` or
+    `dropping` until more than `state.Overdue` past due. Its size is
+    what the pass has left after the cursor (`ChallengeableAfter`) over
+    the slices left before the cycle ends, rounded up, so the pass ends
+    within its cycle whatever is written meanwhile, and the last slice
+    takes all that is left; the next pass starts a day after one ends.
+    Each object is paced as in a full check: the lender's whole-object
+    budget (`control.DefaultWholeRate`, 4 MiB/s, burst 32 MiB) is waited
+    out up to 5 minutes plus the largest object's debt at
+    `verify.DefaultWholeRate`. At the lender's rate, a 1 TB replica's
+    daily slice of 33 GB is read in under 2.5 hours, of a budget kept
+    apart from the ranged challenges, so it never stalls a daily one; as
+    with `--full`, the verifier runs one slice at a time, and a long one
+    holds up the next replica's until it ends.
+  - *Cursor.* `replica_check.cycle_after` is the sequence of the last
+    object the pass decided (passed or skipped), with `cycle_started_at`
+    and the pass's `cycle_checked` and `cycle_skipped`. It is saved
+    after every slice, after one that got no answer (keeping what it
+    decided) and when the daemon stops mid-slice, so a restart goes on
+    where the pass stopped (`TestTheFullCycleCoversEveryObjectOnceACycle`,
+    a second `Verifier` on the same database). An object written after
+    the pass began has a higher sequence, and joins it where the cursor
+    reaches it; an object acknowledged at the friend later with a lower
+    sequence (a re-placed copy) waits for the next pass.
+  - *Verdicts* are VER-1's, through the same code (`checker`, shared
+    with `Check`): a failed proof, read again with `StillChallengeable`,
+    marks the replica unverified, alerts and starts re-placement, and
+    ends the pass unfinished (`RecordUnverified` clears the cursor); no
+    answer is recorded in `replica_check.error` and the slice goes on
+    an hour later from its cursor; an object whose local copy is gone or
+    no longer matches its capture hash is skipped and counted
+    (`TestAFullCycleSliceFollowsTheChallengeVerdicts`). A pass that
+    reaches the end having checked anything is recorded complete
+    (`cycle_full_at`, `CompleteCycle`); one that only skipped is ended
+    unrecorded (`EndCycle`). A `verify --full` that passes counts as a
+    completed pass and starts the next from the beginning
+    (`RecordVerified` with full). A small loss is found within a cycle:
+    one object of 100, lost just after the pass read it, is found when
+    the next pass reaches it, 10 days later on a 10-day cycle
+    (`TestASmallLossIsFoundWithinOneCycle`, the injected clock).
+  - *Overflow targets* keep VER-2's sample and the daily stored
+    checksums; a full cycle there downloads each object (through
+    `Pace.Fetch`, REPL-7's download limit) and costs egress, so it is
+    opt-in per target: `lendisk overflow set <name> --full-cycle <days>`
+    (`overflow.full_cycle`, seconds, schema 49; `0` or `off` for none,
+    the default; `status --json` `capacity.overflow[].full_cycle_seconds`).
+    `DueCycles` lists a target's replicas only while it has one, with
+    its own cycle (`TestATargetsFullCycleIsOptIn`,
+    `TestATargetsFullCycleIsOptInAndDownloads`).
+  - *Decision: a rolling full pass beside the random sample (#105).*
+    Eight random objects a day catch a large loss within a day, but a
+    friend holding 100,000 objects that loses 50 to a bad sector is
+    caught with about 0.4% probability a day, so for months the borrower
+    believes it has `copies` copies of those objects and has one fewer.
+    Precedent: ZFS and Btrfs scrub the whole pool periodically (monthly
+    is the common default: `zfs-scrub-monthly@.timer`,
+    `btrfs-scrub@.timer`); Tahoe-LAFS's deep-check (`tahoe deep-check
+    --verify`) reads every share of every file, run on a schedule;
+    `restic check --read-data-subset n/t` reads the n-th of t slices, so
+    rotating n reads every pack once per t runs. Random spot checks
+    find big losses fast; a rolling full pass bounds how long any
+    single loss can hide. lendisk does both, as a scrub plus audits
+    would: the slice reads at the friend, as the challenge does, so the
+    pass costs the friend's disk time and the borrower's own reads of
+    its copy, and nothing on the tunnel but 32 bytes per object. The
+    order is the write order, as restic's slices are by pack ID, so the
+    cursor is one number and new objects join without a rescan.
 - **VER-3** `lendisk verify <bucket> --peer <id> [--full]`
   (`internal/cli/verify.go`) asks the daemon through `lendisk.db`
   (table `verify_request`, schema 29: `state.DB.RequestVerify`), polls
@@ -5429,6 +5509,10 @@ the handler's own reads and is never cancelled; nothing below
   or "! UNVERIFIED at <friend> since <time>: <what failed>"; `status
   --json` adds `buckets[].replicas[]` with `peer`, `last_verified`,
   `last_full`, `unverified`, `unverified_since`, `detail` and `error`.
+  Since #105 a verified line ends ", every object checked whole
+  <time>", and the JSON adds `last_full_at`: the last completed pass of
+  the rolling full check (VER-1a) or the last passing `--full`,
+  whichever is later (`ReplicaCheck.AllCheckedAt`).
   Since #39 the list includes overflow targets, `peer` being
   `overflow:<name>` where a friend's is its node ID (§3.11 S3-6).
   `peer list` shows it per friend (§3.2 PEER-4).
@@ -5629,8 +5713,9 @@ the handler's own reads and is never cancelled; nothing below
     the borrower's bytes and their hash, nothing more). The friend learns it without a new call: its
     daily challenge (VER-1, §3.6) samples eight objects of the replica,
     so a rotten one fails a proof within about n/8 days for a replica of
-    n objects, at once with `lendisk verify --full`, and one failed
-    proof re-places the whole replica; meanwhile the read-through and
+    n objects and within the rolling full check's cycle at most (VER-1a,
+    30 days by default), at once with `lendisk verify --full`, and one
+    failed proof re-places the whole replica; meanwhile the read-through and
     re-placement verify every byte they read from it and try the next
     holder (§3.3 EP-10). A notice would be a new peer-protocol call and
     the lender's unverifiable word, and would add no repair the
@@ -7932,7 +8017,10 @@ of the `copies`, and the estimated cost (S3-7).
   nothing at any provider (`TestATargetIsCheckedDailyByTheProvidersStoredChecksums`,
   `TestTheSampleDownloadsAShareOfTheTargetsBytesAWeek`,
   `TestASampleThatDoesNotMatchTheIndexAlerts`,
-  `TestAFullCheckOfATargetDownloadsEveryObject`).
+  `TestAFullCheckOfATargetDownloadsEveryObject`). A target given
+  `overflow set --full-cycle <days>` also has the rolling full check
+  (VER-1a, §3.6): every object it holds downloaded and hashed once a
+  cycle, a slice a day; off by default, for the egress it costs.
 
 ## 4. Capacity planning
 

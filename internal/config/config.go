@@ -65,9 +65,16 @@ type Config struct {
 	Replication Replication `toml:"replication"`
 	// Lending is [lending]: what this node lends its friends (LEND-1).
 	Lending Lending `toml:"lending"`
+	// Verify is [verify]: how this node checks what friends hold (VER-1a).
+	Verify Verify `toml:"verify"`
 	// Metrics is [metrics]: the Prometheus endpoint (OPS-4).
 	Metrics Metrics `toml:"metrics"`
 	Log     Log     `toml:"log"`
+}
+
+// Verify is the [verify] section (VER-1a, #105).
+type Verify struct {
+	FullCycle string `toml:"full_cycle" default:"30d" help:"how long the rolling full check takes to challenge every object a friend holds of this node's buckets whole, a slice a day besides the daily random challenge (VER-1a), so a small silent loss is found within it: days such as 30d, or hours such as 36h; from 1d to 365d"`
 }
 
 // Metrics is the [metrics] section (OPS-4, #43).
@@ -503,6 +510,38 @@ func (c *Config) OverflowSample() float64 {
 	return v
 }
 
+// MaxFullCycle bounds verify.full_cycle (VER-1a).
+const MaxFullCycle = 365 * 24 * time.Hour
+
+// ParseCycle reads a full check's cycle (VER-1a): days such as "30d", or
+// a Go duration such as "36h". Zero is an error.
+func ParseCycle(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	var d time.Duration
+	if n, ok := strings.CutSuffix(s, "d"); ok {
+		v, err := strconv.ParseUint(n, 10, 16)
+		if err != nil {
+			return 0, fmt.Errorf("%q: want days such as 30d, or hours such as 36h", s)
+		}
+		d = time.Duration(v) * 24 * time.Hour
+	} else {
+		var err error
+		if d, err = time.ParseDuration(s); err != nil {
+			return 0, fmt.Errorf("%q: want days such as 30d, or hours such as 36h", s)
+		}
+	}
+	if d < 24*time.Hour || d > MaxFullCycle {
+		return 0, fmt.Errorf("%q: want from 1d to 365d: the check runs a slice a day", s)
+	}
+	return d, nil
+}
+
+// FullCycle is verify.full_cycle, which Validate checked.
+func (c *Config) FullCycle() time.Duration {
+	d, _ := ParseCycle(c.Verify.FullCycle)
+	return d
+}
+
 // UnreachableAfter is alerts.unreachable_after, which Validate checked.
 func (c *Config) UnreachableAfter() time.Duration {
 	d, _ := time.ParseDuration(c.Alerts.UnreachableAfter)
@@ -582,6 +621,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	errs = append(errs, c.checkPacing()...)
+	if _, err := ParseCycle(c.Verify.FullCycle); err != nil {
+		errs = append(errs, fmt.Errorf("verify.full_cycle: %w", err))
+	}
 	if m := strings.TrimSpace(c.Lending.MaxTotal); m != "" {
 		if v, err := ParseSize(m); err != nil || v == 0 || v > 1<<62 {
 			errs = append(errs, fmt.Errorf("lending.max_total = %q: want a size above zero such as 240G, or empty for no cap", c.Lending.MaxTotal))

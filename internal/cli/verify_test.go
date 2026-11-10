@@ -90,12 +90,14 @@ func TestVerifyOnDemandAndStatus(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "5 objects") {
 		t.Fatalf("verify --full: %d %s%s", code, out, e)
 	}
+	// A passing full check is a completed full cycle (VER-1a, #105):
+	// status shows it per replica, in text and JSON.
 	r := replicaOf(t, an, "laptop", bKey)
-	if r.LastVerified == "" || r.LastFull == "" || r.Unverified {
+	if r.LastVerified == "" || r.LastFull == "" || r.LastFullAt != r.LastFull || r.Unverified {
 		t.Fatalf("replica %+v", r)
 	}
 	_, text, _ := an.run("", "", "status")
-	if !strings.Contains(text, "verified at "+bKey[:8]) {
+	if !strings.Contains(text, "verified at "+bKey[:8]) || !strings.Contains(text, "every object checked whole "+r.LastFullAt) {
 		t.Fatalf("status:\n%s", text)
 	}
 	if p := an.peerOf(bKey); p.LastVerified == nil {

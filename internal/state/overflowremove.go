@@ -110,7 +110,7 @@ func (db *DB) forgetSplit() {
 	db.splitMu.Unlock()
 }
 
-// UpdateOverflow writes o's endpoint, region and max_bytes, and what a
+// UpdateOverflow writes o's endpoint, region, max_bytes and full cycle, and what a
 // new check found (lifecycle, version_removal), to the target of its
 // name (#96), in one transaction with the versioning that check read
 // at now, recorded as RecordOverflowVersioning records it ("": no
@@ -123,8 +123,13 @@ func (db *DB) UpdateOverflow(ctx context.Context, o Overflow, versioning string,
 		return nil, err
 	}
 	defer tx.Rollback()
+	var cycle any
+	if o.FullCycle > 0 {
+		cycle = int64(o.FullCycle / time.Second)
+	}
 	r, err := tx.ExecContext(ctx, `UPDATE overflow SET endpoint = ?, region = ?, max_bytes = ?, lifecycle = ?,
-		version_removal = ? WHERE name = ?`, o.Endpoint, o.Region, o.MaxBytes, o.Lifecycle, o.VersionRemoval, o.Name)
+		version_removal = ?, full_cycle = ? WHERE name = ?`, o.Endpoint, o.Region, o.MaxBytes, o.Lifecycle, o.VersionRemoval,
+		cycle, o.Name)
 	if err != nil {
 		return nil, err
 	}

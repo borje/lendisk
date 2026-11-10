@@ -1,6 +1,6 @@
 # lendisk — requirements
 
-Status: draft v0.11.7, 2026-11-10. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.11.8, 2026-11-10. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
@@ -28,9 +28,10 @@ overflow target while friends cannot hold `copies` of the repository
 (REPL-12); v0.11.6 says the first handshake between two nodes needs a
 relay, after which a direct path needs none (NET-2, NET-3); v0.11.7
 says how scenario 10's forward refuses `restic prune`: at its first
-write, before any delete. The design
-decisions that were §3 of that document, and the implementation detail
-that was mixed into its §4, live in DESIGN.md.
+write, before any delete; v0.11.8 has every object at a friend
+challenged whole at least once a cycle, 30 days by default (VER-1a).
+The design decisions that were §3 of that document, and the
+implementation detail that was mixed into its §4, live in DESIGN.md.
 
 ## 0. How to read this document
 
@@ -766,6 +767,14 @@ double the surface for no change in the core problem.
   fresh nonce; the lender's answer is checked against the local copy. A
   failed challenge raises an alert, marks the replica unverified and
   starts re-placement of its copies (REPL-13).
+- **VER-1a** Besides VER-1's daily sample, the borrower's daemon shall
+  challenge every object placed at a friend whole (the proof covering
+  all its bytes) at least once per cycle, configurable and 30 days by
+  default, so that a loss too small for the daily sample to catch is
+  found within one cycle; the outcome of each challenge is as VER-1's.
+  `lendisk status` shall show, per replica, when its last cycle
+  completed. For an overflow target, where each check is a download
+  that costs the user, the same full cycle is opt-in per target.
 - **VER-2** For a place that cannot answer a challenge (an overflow
   target, S3-6), verification shall instead download a random sample of
   objects (default 0.1% of bytes per week, configurable) and check their
@@ -1280,6 +1289,7 @@ current design (component behaviour, API assumptions) are in DESIGN.md
 
 ## 8. Changes
 
+- **v0.11.8 (2026-11-10)** VER-1a: every object at a friend is challenged whole at least once a cycle (30 days by default), so a small silent loss that VER-1's daily sample of eight objects would miss for months is found within the cycle; opt-in per overflow target (#105). Decided by the user.
 - **v0.11.5 (2026-11-09)** REPL-12: for a bucket with `copies` ≥ 2, while friends cannot hold `copies` of the repository, each data object goes to `copies − 1` friends and one overflow target, so scenario 12's equal friends do not fill with second copies (#38, DESIGN Q-AD). Decided by the user.
 - **v0.11.4 (2026-11-08)** Kopia format version 1 (repositories made by
   Kopia 0.8 or earlier and never upgraded) is not supported (#79). Its
