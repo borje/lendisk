@@ -2,7 +2,12 @@ package replica
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,4 +96,61 @@ func TestAVersionedTargetGetsItsDeleteAtOnce(t *testing.T) {
 	waitFor(t, "data/1 at the target", func() bool { return target.holds("laptop", "data/1") })
 	fx.remove("laptop", "data/1")
 	waitFor(t, "the delete at the target", func() bool { return !target.holds("laptop", "data/1") })
+}
+
+// records returns how many log records at level have a message
+// containing msg.
+func (l *logBuffer) records(level, msg string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, line := range strings.Split(l.b.String(), "\n") {
+		var r map[string]any
+		if json.Unmarshal([]byte(line), &r) == nil && r["level"] == level && strings.Contains(fmt.Sprint(r["msg"]), msg) {
+			n++
+		}
+	}
+	return n
+}
+
+// S3-4 (#97): while an overflow target is unreachable and deletes are
+// due there, the sender tries them with backoff, not every poll (each
+// attempt holds the target's FIFO for one timeout), and warns once, not
+// at every try; once the target answers it says so and sends them.
+func TestHeldDeletesAtAnUnreachableTargetBackOffAndWarnOnce(t *testing.T) {
+	fx := newFixture(t, "B")
+	target := fx.withTarget("garage", state.VersioningOff)
+	clock := &fixtureClock{now: time.Now()}
+	fx.w.Now = clock.Now
+	fx.w.MinBackoff, fx.w.MaxBackoff = 100*time.Millisecond, 400*time.Millisecond
+	logs := fx.logTo()
+	fx.write("laptop", "data/1", "pack one")
+	fx.run()
+	waitFor(t, "data/1 at the target", func() bool { return target.holds("laptop", "data/1") })
+	fx.remove("laptop", "data/1")
+	fx.drained("overflow:garage")
+	var tries atomic.Int64
+	var down atomic.Bool
+	down.Store(true)
+	target.mu.Lock()
+	target.fail = func(op, _ string) error {
+		if op == "delete" && down.Load() {
+			tries.Add(1)
+			return errors.New("dial tcp: connection refused")
+		}
+		return nil
+	}
+	target.mu.Unlock()
+	clock.add(time.Hour)
+	waitFor(t, "a first try of the held delete", func() bool { return tries.Load() > 0 })
+	time.Sleep(time.Second) // 100 polls of the sender
+	if n := tries.Load(); n > 8 {
+		t.Fatalf("the held delete was tried %d times in a second: no backoff", n)
+	}
+	if n := logs.records("WARN", "sending a held delete"); n != 1 {
+		t.Fatalf("warned %d times while the target stayed unreachable, want once", n)
+	}
+	down.Store(false)
+	waitFor(t, "the held delete sent once the target answers", func() bool { return !target.holds("laptop", "data/1") })
+	waitFor(t, "the recovery logged", func() bool { return logs.records("INFO", "held deletes go to the overflow target again") == 1 })
 }

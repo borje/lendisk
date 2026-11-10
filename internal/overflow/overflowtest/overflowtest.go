@@ -99,6 +99,14 @@ func Start(t *testing.T, bucket string, versioning bool) *Server {
 	return s
 }
 
+// SetVersioning sets the bucket's versioning to status (Enabled or
+// Suspended), as a user at the provider's console would.
+func (s *Server) SetVersioning(ctx context.Context, status types.BucketVersioningStatus) error {
+	_, err := s.client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{Bucket: aws.String(s.Bucket),
+		VersioningConfiguration: &types.VersioningConfiguration{Status: status}})
+	return err
+}
+
 // Connect is a Server for a bucket at a provider running elsewhere,
 // such as a Garage or RustFS container in CI (DESIGN §3.11): the bucket
 // must exist, and the credential must be able to read and list it.

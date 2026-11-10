@@ -5217,6 +5217,8 @@ the handler's own reads and is never cancelled; nothing below
   or "! UNVERIFIED at <friend> since <time>: <what failed>"; `status
   --json` adds `buckets[].replicas[]` with `peer`, `last_verified`,
   `last_full`, `unverified`, `unverified_since`, `detail` and `error`.
+  Since #39 the list includes overflow targets, `peer` being
+  `overflow:<name>` where a friend's is its node ID (§3.11 S3-6).
   `peer list` shows it per friend (§3.2 PEER-4).
 - *Scenario 5* (`TestScenarioBadLender`, real daemons, restic, A's
   injected clock): scenario 1's circle, every replica verified; B
@@ -6229,7 +6231,16 @@ the handler's own reads and is never cancelled; nothing below
     says when the hold ends (`SeedExpiry` after the export), to import
     the disk, or to send by the network now with `lendisk export
     --cancel <bucket> --for <friend>`. Cleared by the first
-    confirmation or the seed's end (`TestAStaleSeedRaisesAlert`).
+    confirmation or the seed's end (`TestAStaleSeedRaisesAlert`);
+  - `overflow_versioning`, subject the target: the daily read found an
+    overflow target's versioning suspended or off after it had been
+    enabled (§3.11 S3-4, #97). The message says since when, that
+    deletes there are held as client-side tombstones from then on and
+    guard against mistakes, not a compromised node, and to enable
+    versioning again. Held for `alert.VersioningAlertFor` (7 days)
+    after the change, or until versioning is enabled again
+    (`TestASuspendedVersioningIsAlertedForAWeek`). The overflow
+    targets' other alerts are in §3.11 *Alerts and status*.
   The four quota alerts (`quota_high`, `quota_exhausted`,
   `lent_over_quota`, `protectable_size`) have hysteresis (#24 review;
   the last since #37, as a repository near the line crosses it with
@@ -7046,7 +7057,7 @@ of the `copies`, and the estimated cost (S3-7).
   URL, region (empty: minio-go asks the provider), bucket, prefix
   (default `lendisk`), `max_bytes`, `env_prefix`, retention, price per
   GB-month, and what `overflow add` found (`versioning`: enabled,
-  suspended or off; `lifecycle`: present, created, absent or
+  suspended or off, read again daily since #97; `lifecycle`: present, created, absent or
   unsupported; `version_removal`: allowed, denied or unknown). Names
   are 1 to 32 of `[a-z0-9-]`, starting with a letter
   (`overflow.CheckName`). The target's place name in `placement`,
@@ -7308,7 +7319,17 @@ of the `copies`, and the estimated cost (S3-7).
   size)", and `overflow add` warns that its retention is client-side
   and guards against mistakes, not a compromised node. The replicas at
   a target are listed with the friends' (VER-4) and alerted the same
-  way (`replica_unverified`, `replica_unchecked`).
+  way (`replica_unverified`, `replica_unchecked`): `status --json`'s
+  `buckets[].replicas[]` has an entry per target holding the bucket,
+  its `peer` `overflow:<name>`, beside the friends' node IDs, so a
+  consumer that took every peer for a friend must tell them apart by
+  that prefix. Since #97 `versioning` is the daily read's, with
+  `versioning_checked` (the last read that got an answer),
+  `versioning_changed` and `versioning_before` (the last change, when
+  there was one; the text line says "versioning suspended since <time>
+  (was enabled)"), and `overflow_versioning` is alerted for a week
+  after versioning was found suspended or off at a target that had it
+  (*Versioning re-read* under S3-4).
 - **Testing** (#38). Unit and CLI tests run versitygw's posix backend
   in the test process as the provider (`overflow/overflowtest`; once
   per process, so a CLI test holds the gateway with `serving` and runs
@@ -7333,16 +7354,70 @@ of the `copies`, and the estimated cost (S3-7).
   *Retention and undelete, realised (#39).* A target is client-side
   when `overflow add` found versioning anything but enabled
   (`state.Overflow.ClientSide`; *suspended* counts, as a delete there
-  removes the null version). Versioning is read only at `overflow
-  add`: enabling it later changes nothing until the target is added
-  again (no command re-reads it yet).
+  removes the null version), and it is judged by the versioning as last
+  read, which the verifier reads again daily (*Versioning re-read*
+  below): a change applies to the deletes made from then on.
+  - *Versioning re-read, realised (#97).* A user can suspend or
+    enable versioning at the provider at any time after `overflow
+    add`, and a delete sent to a suspended bucket is final for an
+    object put since. So each verification pass reads the versioning
+    (`Client.Versioning`: `GetBucketVersioning`; a provider without
+    the call, `NotImplemented`, is off) of every target whose last
+    answer, or `overflow add`'s read at `added_at`, is a day old
+    (`verify.Verifier.Every`), alongside its daily replica check, and
+    records it (`state.RecordOverflowVersioning`:
+    `overflow.versioning_checked_at`, migration 46). A read that gets
+    no answer decides nothing and is tried again after an hour
+    (`Retry`, kept in memory). A change updates `overflow.versioning`
+    and adds a row to `overflow_versioning` (name, at, previous,
+    versioning), so the target's retention follows it from then on:
+    enabled to suspended or off holds every later delete as a tomb,
+    logs an alert and raises `overflow_versioning` for a week
+    (`alert.VersioningAlertFor`; cleared at once if versioning is
+    enabled again): a change the user may have meant, so it is said
+    rather than held until "fixed"; off to enabled sends later deletes
+    as markers, and the tombs already held stay held, sent when due
+    and undeletable meanwhile (`TestVersioningEnabledLaterKeepsTheTombsAlreadyHeld`).
+    What was done before a change stays as it was. A delete
+    acknowledged while the target had versioning (`versionedAt`: the
+    previous versioning of the first change after the acknowledgement,
+    else the current; in the second of a change either counts) is a
+    marker: it keeps the bucket's metadata at the target for its
+    window (`holdsLiveData`) and undelete brings it back from the
+    provider, whatever the versioning now
+    (`TestMarkersSentBeforeASuspensionStillCount`). Undelete at a
+    target that has or had versioning (`Overflow.Markers`) lists its
+    markers and also its held deletes, judging each key by its last
+    delete (`state.MarkerDeleted`: acknowledged as a marker, with no
+    tomb row for it); adoption of lost records takes only keys whose
+    last delete was a marker, never a key the target still holds
+    under a held delete (`TestUndeleteAfterASuspensionBringsBackMarkersAndHeldDeletes`,
+    `TestAHeldDeleteBeforeSinceIsNotAdoptedAfterASuspension`,
+    `TestUndeleteAfterVersioningIsEnabledBringsBackBoth`,
+    `TestATargetsVersioningIsReadAgainDailyAndASuspensionAlerts`,
+    `TestTheTargetsVersioningIsReadAsItIsNow`). *Decision:* daily,
+    with the verification pass, because that is the cadence a target
+    is already contacted at for its stored checksums, and a read costs
+    one request. The cost of the lag: an object put after a
+    suspension and deleted before the next read is gone at once
+    (objects put while versioning was enabled keep their version, as
+    a suspended bucket's delete adds a null marker over it); at most a
+    day of such deletes, and the alert says what happened.
   - *Versioned target.* The worker sends the delete (a drain's too) as
     a plain `DeleteObject`: a delete marker, left to the lifecycle
     rule. `undelete` lists the bucket's versions under
     `<prefix>/<sealed name>/` (`Client.ListDeleted`), gathered by key,
     since a provider need not list a key's versions together (RustFS
-    1.0.3 lists every delete marker of a page before its versions);
-    each key's versions are ordered newest first (at equal times the
+    1.0.3 lists every delete marker of a page before its versions).
+    *Memory (#97):* gathering by key holds every version under the
+    bucket's prefix in memory at once, live ones included, as
+    `minio.ObjectInfo` values of roughly 1 KB each with the key: a
+    repository of 1 TB in restic's 16 MiB packs is some 65,000 keys,
+    so 70–150 MB for one or two versions a key while an undelete or
+    its preview runs, which matters on a 1 GB board. Accepted for v1:
+    undelete is rare and the user's own request; listing by key in
+    pages would need the provider to list a key's versions together,
+    which RustFS does not. Each key's versions are ordered newest first (at equal times the
     current one, `IsLatest`, then the provider's list order, which S3
     defines as newest first). A key whose newest is a delete marker
     made at or after `since` comes back as the version just before it,
@@ -7375,7 +7450,15 @@ of the `copies`, and the estimated cost (S3-7).
     (`TestAVanishedRowsDeleteIsNotSentAtOnce`). The target's own sender, at
     most once a poll and only while the schedule is open, claims the
     tombs due (`DueOverflowTombs`) and sends each delete, then drops
-    the tomb; a failed delete gives back its claim and the rest's. A
+    the tomb; a failed delete gives back its claim and the rest's.
+    While the target does not answer, the next look waits with
+    backoff, from the worker's `MinBackoff` (1 s) doubling to its
+    `MaxBackoff` (5 minutes), instead of
+    a poll, since each try holds the target's FIFO for one timeout;
+    only the first failure in a row warns, the rest log at debug
+    level, and the first delete answered after them is logged, as for
+    a failed probe (#97,
+    `TestHeldDeletesAtAnUnreachableTargetBackOffAndWarnOnce`). A
     tomb whose key the target holds again (an acknowledged put of the
     key there at or after the tomb's row: written again, or an
     undelete's record) is dropped unsent (`DropSupersededTombs`), so
@@ -7427,6 +7510,26 @@ of the `copies`, and the estimated cost (S3-7).
     holds deletes rather than moving objects aside: a move is a copy
     and a delete at the provider, doubling the bytes for the window,
     where a held delete costs a row.
+  - *Decision (#97): a delete counts from when the place took it.* A
+    held delete's `deleted_at` is when the worker would have sent it,
+    not when the node captured it, so when a target lagged `undelete
+    --since` also brings back deletes made shortly before since that
+    reached it after. Kept, and the same for friends and targets of
+    both kinds: a friend's tomb is dated by its lender when the delete
+    arrives (RET-1), and a versioned target's marker by the provider
+    when it applies the delete, which is how every precedent dates a
+    delete (S3 and B2 date a marker or hide at the request; rclone's
+    `--backup-dir` moves a file when the sync runs; Kopia's
+    `--point-in-time` reads the provider's version times). Neither a
+    marker nor the lender's tomb can carry the capture time without
+    a protocol change, so recording it for held deletes alone would
+    make `--since` mean two things. And the place's time errs on the
+    safe side: a delete is sent after it is made, so no delete made at
+    or after since is missed; the extra ones are deletes that reached
+    a place late, which the preview lists (snapshots named) before
+    anything is restored, and the window, counted from the same time,
+    is never shorter than the retention after the place took the
+    delete. `undelete --help` says so.
 - **S3-5** Drain-back has to delete at the target, so the recommended
   credential may create delete markers (`s3:DeleteObject` without a
   version id) and read earlier versions (`s3:GetObjectVersion`, for

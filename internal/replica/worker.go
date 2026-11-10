@@ -614,11 +614,25 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 	}
 	_, target := state.OverflowName(place)
 	var tombsAt time.Time // the last look for held deletes due (real time)
+	// Held deletes due at a target that does not answer are tried again
+	// with backoff, from minB to maxB, not every poll: each try holds
+	// the FIFO for one timeout. Only the first failure in a row warns,
+	// as for a failed probe (#97).
+	tombWait, tombFailed := poll, false
 	for ctx.Err() == nil {
 		w.done(place) // the previous row's outcome is recorded
-		if target && time.Since(tombsAt) >= poll && w.Pace.Open() {
+		if target && time.Since(tombsAt) >= tombWait && w.Pace.Open() {
 			tombsAt = time.Now()
-			w.issueTombs(ctx, place, r, log)
+			switch sent, failed := w.issueTombs(ctx, place, r, log, tombFailed); {
+			case ctx.Err() != nil:
+			case failed && tombFailed:
+				tombWait = min(2*tombWait, maxB)
+			case failed:
+				tombWait, tombFailed = minB, true
+			case sent && tombFailed:
+				log.Info("replication: held deletes go to the overflow target again")
+				tombWait, tombFailed = poll, false
+			}
 		}
 		p, ok, err := w.next(ctx, place)
 		if err != nil {
@@ -860,17 +874,22 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 // target's own sender, so never beside a put of the same key. A tomb
 // whose key the target holds again is dropped unsent. A delete that
 // fails gives back its claim and the rest's, to be tried at the next
-// look.
-func (w *Worker) issueTombs(ctx context.Context, place string, r Replica, log *slog.Logger) {
+// look. sent is whether the target answered a delete; failed whether one
+// got no answer, which is warned of unless failing (the last look's
+// failed too: logged at debug level, #97).
+func (w *Worker) issueTombs(ctx context.Context, place string, r Replica, log *slog.Logger, failing bool) (sent, failed bool) {
 	ts, err := w.DB.DueOverflowTombs(ctx, place, w.now(), 64)
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Error("replication: reading the held deletes due failed", "err", err)
 		}
-		return
+		return false, false
 	}
 	for i, t := range ts {
 		err := r.Delete(ctx, t.Bucket, t.Key)
+		if err == nil || errors.Is(err, ErrDeleteDenied) {
+			sent = true
+		}
 		if errors.Is(err, ErrDeleteDenied) {
 			// S3-5 (#40): kept, counted, and tried again daily.
 			if derr := w.DB.DenyOverflowDelete(context.Background(), place, t.Seq, w.now()); derr != nil {
@@ -889,10 +908,14 @@ func (w *Worker) issueTombs(ctx context.Context, place string, r Replica, log *s
 				log.Error("replication: giving back held deletes failed; they are tried again within the hour", "err", uerr)
 			}
 			if ctx.Err() == nil {
-				log.Warn("replication: sending a held delete after its retention window failed; trying again",
+				level := slog.LevelWarn
+				if failing {
+					level = slog.LevelDebug
+				}
+				log.Log(ctx, level, "replication: sending a held delete after its retention window failed; trying again with backoff",
 					"bucket", t.Bucket, "key", t.Key, "err", err)
 			}
-			return
+			return sent, true
 		}
 		if err := w.DB.DropOverflowTomb(context.Background(), place, t.Seq); err != nil {
 			log.Error("replication: recording a held delete as sent failed", "bucket", t.Bucket, "key", t.Key, "err", err)
@@ -900,6 +923,7 @@ func (w *Worker) issueTombs(ctx context.Context, place string, r Replica, log *s
 		log.Debug("replication: a held delete was sent after the target's retention window (S3-4)",
 			"bucket", t.Bucket, "key", t.Key, "deleted_at", t.DeletedAt)
 	}
+	return sent, false
 }
 
 // waitingOnStore reports whether place's recorded condition is

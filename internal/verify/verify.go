@@ -137,6 +137,10 @@ type Verifier struct {
 
 	once sync.Once
 	kick chan struct{}
+	// tried is when each overflow target's versioning read last got no
+	// answer (versioning.go).
+	triedMu sync.Mutex
+	tried   map[string]time.Time
 }
 
 func or[T int | int64 | time.Duration](v, def T) T {
@@ -220,6 +224,7 @@ func (v *Verifier) pass(ctx context.Context) {
 		}
 	}
 	v.sampleTargets(ctx)
+	v.recheckVersioning(ctx)
 }
 
 // Check challenges place's replica of bucket now, ranged (VER-1) or full

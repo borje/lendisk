@@ -2,6 +2,7 @@ package verify
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/md5"
 	"crypto/rand"
@@ -31,7 +32,31 @@ type provider struct {
 	multi    map[string]bool   // stored in parts
 	got      int64             // bytes served by Get
 	stats    int
+	// versioning is what Versioning answers ("" is enabled);
+	// versioningErr, if set, is its error instead. versioningReads
+	// counts the reads.
+	versioning      string
+	versioningErr   error
+	versioningReads int
 }
+
+func (p *provider) Versioning(context.Context) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.versioningReads++
+	if p.versioningErr != nil {
+		return "", p.versioningErr
+	}
+	return cmp.Or(p.versioning, state.VersioningEnabled), nil
+}
+
+func (p *provider) setVersioning(v string, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.versioning, p.versioningErr = v, err
+}
+
+func (p *provider) reads() int { p.mu.Lock(); defer p.mu.Unlock(); return p.versioningReads }
 
 func (p *provider) Get(_ context.Context, _, key string) (io.ReadCloser, error) {
 	p.mu.Lock()

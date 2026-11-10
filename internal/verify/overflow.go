@@ -54,6 +54,9 @@ const (
 type Target interface {
 	Get(ctx context.Context, bucket, key string) (io.ReadCloser, error)
 	Stat(ctx context.Context, bucket, key string) (replica.ObjectStat, bool, error)
+	// Versioning reads the bucket's versioning as state.Versioning…
+	// (versioning.go).
+	Versioning(ctx context.Context) (string, error)
 }
 
 // target builds place's client.

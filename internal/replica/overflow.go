@@ -151,6 +151,28 @@ func (f *Client) probeOverflow(ctx context.Context) error {
 	return nil
 }
 
+// Versioning reads an overflow target's bucket versioning as
+// state.Versioning… (S3-4, #97): the verifier's daily read. A provider
+// without the call (NotImplemented) has none, which is off; any other
+// error is no answer and decides nothing.
+func (f *Client) Versioning(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, f.stall)
+	defer cancel()
+	v, err := f.core.GetBucketVersioning(ctx, f.root.bucket)
+	var er minio.ErrorResponse
+	switch {
+	case errors.As(err, &er) && (er.Code == "NotImplemented" || er.StatusCode == http.StatusNotImplemented):
+		return state.VersioningOff, nil
+	case err != nil:
+		return "", f.classify(fmt.Errorf("reading the overflow target's versioning: %w", err))
+	case v.Enabled():
+		return state.VersioningEnabled, nil
+	case v.Suspended():
+		return state.VersioningSuspended, nil
+	}
+	return state.VersioningOff, nil
+}
+
 // listOne lists at most one key of bucket under prefix.
 func (f *Client) listOne(ctx context.Context, bucket, prefix string) error {
 	ctx, cancel := context.WithCancel(ctx)

@@ -79,26 +79,47 @@ type Overflow struct {
 	Retention time.Duration // the window its lifecycle rule keeps versions for (S3-4)
 	// PricePerGB is the price per GB (10^9 bytes) and month for the cost
 	// estimate (S3-7); 0 when not given.
-	PricePerGB     float64
+	PricePerGB float64
+	// Versioning is the target's versioning as last read: by overflow
+	// add, then daily (RecordOverflowVersioning, #97).
 	Versioning     string // Versioning…
 	Lifecycle      string // Lifecycle…
 	VersionRemoval string // VersionRemoval…
 	AddedAt        time.Time
+	// VersioningCheckedAt is when the daily read last got an answer;
+	// zero before the first, which overflow add's read at AddedAt stands
+	// for (#97).
+	VersioningCheckedAt time.Time
+	// WasVersioned is set when a read found versioning changed from or
+	// to enabled: the target may hold delete markers lendisk sent while
+	// it had versioning, whatever it has now (#97).
+	WasVersioned bool
 }
+
+// Markers reports whether the target may hold delete markers of
+// lendisk's deletes: it has versioning now, or had it at some time
+// (#97).
+func (o Overflow) Markers() bool { return o.Versioning == VersioningEnabled || o.WasVersioned }
 
 // Place is the target's place name.
 func (o Overflow) Place() string { return OverflowPlace(o.Name) }
 
 const overflowCols = `name, endpoint, region, bucket, prefix, max_bytes, env_prefix, retention,
-	coalesce(price_per_gb, 0), versioning, lifecycle, version_removal, added_at`
+	coalesce(price_per_gb, 0), versioning, lifecycle, version_removal, added_at, versioning_checked_at,
+	EXISTS (SELECT 1 FROM overflow_versioning c WHERE c.name = overflow.name
+		AND '` + VersioningEnabled + `' IN (c.previous, c.versioning))`
 
 func scanOverflow(s interface{ Scan(...any) error }) (Overflow, error) {
 	var o Overflow
 	var retention, added int64
+	var checked sql.NullInt64
 	err := s.Scan(&o.Name, &o.Endpoint, &o.Region, &o.Bucket, &o.Prefix, &o.MaxBytes, &o.EnvPrefix, &retention,
-		&o.PricePerGB, &o.Versioning, &o.Lifecycle, &o.VersionRemoval, &added)
+		&o.PricePerGB, &o.Versioning, &o.Lifecycle, &o.VersionRemoval, &added, &checked, &o.WasVersioned)
 	o.Retention = time.Duration(retention) * time.Second
 	o.AddedAt = time.Unix(added, 0)
+	if checked.Valid {
+		o.VersioningCheckedAt = time.Unix(checked.Int64, 0)
+	}
 	return o, err
 }
 
@@ -126,7 +147,9 @@ func (db *DB) AddOverflow(ctx context.Context, o Overflow) error {
 	} else if n == 0 {
 		return ErrExists
 	}
-	return nil
+	// A target of the name added before has no history here (#97).
+	_, err = db.ExecContext(ctx, `DELETE FROM overflow_versioning WHERE name = ?`, o.Name)
+	return err
 }
 
 // Overflows lists the overflow targets by name.
@@ -368,10 +391,10 @@ func overflowHolding(ctx context.Context, q querier, bucket string, now int64) (
 // is deleting a copy of a live data object (the key's latest done
 // write), or it still holds a deleted one that an undelete brings back
 // there (S3-4, RET-3): a delete of the key held there as a client-side
-// tomb or refused for want of permission (S3-5), or, at a versioned
-// target, sent there as a delete marker that the target acknowledged
-// less than its retention before now (its lifecycle rule keeps the
-// version that long). Then the bucket's metadata goes there
+// tomb or refused for want of permission (S3-5), or sent there as a
+// delete marker, while the target had versioning (versionedAt, #97),
+// that the target acknowledged less than its retention before now (its
+// lifecycle rule keeps the version that long). Then the bucket's metadata goes there
 // (overflowHolding, REPL-12), and otherwise it is dropped there
 // (dropIdleMetadata, #40). One condition for both, at the same now, so
 // the two never place and drop the same metadata in turn (#40 review).
@@ -397,7 +420,8 @@ func holdsLiveData(place, bucket, now string) string {
 	OR EXISTS (SELECT 1 FROM placement t JOIN queue tq ON tq.seq = t.seq
 		JOIN overflow o ON '` + OverflowPrefix + `' || o.name = t.place
 		WHERE t.place = ` + place + ` AND t.bucket = ` + bucket + ` AND tq.class = 'data'
-		AND o.versioning = '` + VersioningEnabled + `' AND t.op = 'delete' AND t.state = 'acked'
+		AND ` + versionedAt("o.name", "t.acked_at", "o.versioning") + `
+		AND t.op = 'delete' AND t.state = 'acked'
 		AND t.acked_at + o.retention > ` + now + ` AND ` + heldBefore + `))`
 }
 
