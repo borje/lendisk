@@ -300,9 +300,16 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 	if got := ackedAt(t, fresh, cKey, "laptop"); !maps.Equal(got, want) {
 		t.Fatalf("held at C %v, want %v", got, want)
 	}
-	// The target's list rebuilt its placement: the pack is held there.
-	if got := ackedAt(t, fresh, "overflow:spill", "laptop"); len(got) != 1 || got[pack] != want[pack] {
-		t.Fatalf("held at the overflow target %v, want %s", got, pack)
+	// The target's list rebuilt its placement: the pack was recorded as
+	// held there. B and C hold every object at copies 2, so the target's
+	// is a surplus copy, and re-placement may already be dropping it
+	// (surplus goes from overflow targets first, #96): any of those
+	// states shows the list was read.
+	var state, sha string
+	if err := openDB(t, fresh).QueryRow(`SELECT state, coalesce(sha256, '') FROM placement
+		WHERE place = 'overflow:spill' AND bucket = 'laptop' AND key = ?`, pack).Scan(&state, &sha); err != nil ||
+		sha != want[pack] || (state != "acked" && state != "dropping" && state != "drained") {
+		t.Fatalf("the pack at the overflow target: %q %q %v, want acked, dropping or drained with %s", state, sha, err, want[pack])
 	}
 	if st := fresh.status(); st.Buckets[0].BelowCopies.Objects != 0 {
 		t.Fatalf("below copies after both lists: %+v", st.Buckets[0])
