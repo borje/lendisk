@@ -132,7 +132,9 @@ func TestEmptiedBucketHeldUntilTheUserAllowsDeletes(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "up to 5") {
 		t.Fatalf("allow: exit %d: %s%s", code, out, e)
 	}
-	r = n.reconciledOf(t, "laptop", func(r StatusReconciled) bool { return r.Deletes == 5 })
+	// The pass enqueues the deletes before it records that nothing is
+	// held any more: wait for both.
+	r = n.reconciledOf(t, "laptop", func(r StatusReconciled) bool { return r.Deletes == 5 && r.HeldDeletes == 0 })
 	if r.HeldDeletes != 0 {
 		t.Fatalf("still held after the allowed pass: %+v", r)
 	}
