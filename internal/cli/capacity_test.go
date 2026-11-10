@@ -3,7 +3,6 @@ package cli
 import (
 	"os"
 	"regexp"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -55,7 +54,6 @@ func TestStatusShowsCapacityAndTheNumbersThatCoverADeficit(t *testing.T) {
 	// use there is the friends' count alone.
 	captureDirect(t, n, "laptop", map[string]int64{"index/1": 300 << 10, "data/1": 30 << 20, "data/2": 30 << 20})
 	ids := befriendDirect(t, n, 50<<20, 2)
-	slices.Sort(ids) // made in one second: listed by node ID
 	db := openDB(t, n)
 	now := time.Now()
 	for i, id := range ids {
@@ -90,21 +88,32 @@ func TestStatusShowsCapacityAndTheNumbersThatCoverADeficit(t *testing.T) {
 	if len(c.Friends) != 2 {
 		t.Fatalf("friends %+v", c.Friends)
 	}
-	for i, f := range c.Friends {
-		if f.Peer != ids[i] || f.Quota != 50<<20 || f.UseThere != 45<<20 || f.RepositorySize == nil || *f.RepositorySize != int64(i+1)<<30 {
+	// status lists friends by when the friendship was made, then by node
+	// ID: the two may straddle a second, so look each up by its ID.
+	at := map[string]int{}
+	for i, id := range ids {
+		at[id] = i
+	}
+	byID := map[string]StatusCapacityFriend{}
+	for _, f := range c.Friends {
+		byID[f.Peer] = f
+	}
+	for _, f := range c.Friends {
+		i, ok := at[f.Peer]
+		if !ok || f.Quota != 50<<20 || f.UseThere != 45<<20 || f.RepositorySize == nil || *f.RepositorySize != int64(i+1)<<30 {
 			t.Errorf("friend %d: %+v", i, f)
 		}
 		if f.Cover < 60<<20 || f.Cover > 80<<20 || f.Cover%(1<<20) != 0 {
 			t.Errorf("friend %d: cover %d, want a whole MiB in 60..80", i, f.Cover)
 		}
 	}
-	if c.Friends[0].UseHere != 5<<20 || c.Friends[1].UseHere != 0 {
-		t.Errorf("use here %d, %d", c.Friends[0].UseHere, c.Friends[1].UseHere)
+	if byID[ids[0]].UseHere != 5<<20 || byID[ids[1]].UseHere != 0 {
+		t.Errorf("use here %d, %d", byID[ids[0]].UseHere, byID[ids[1]].UseHere)
 	}
 
 	_, text, _ := n.run("", "", "status")
 	for _, want := range []string{"protectable", "paused for quota", "with fair quotas", "lendisk peer quota", "Overflow targets: none",
-		ids[0] + ": " + formatSize(c.Friends[0].Cover) + " (now 50M)", ids[1] + ": " + formatSize(c.Friends[1].Cover) + " (now 50M)"} {
+		ids[0] + ": " + formatSize(byID[ids[0]].Cover) + " (now 50M)", ids[1] + ": " + formatSize(byID[ids[1]].Cover) + " (now 50M)"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("status lacks %q:\n%s", want, text)
 		}
