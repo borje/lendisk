@@ -1143,6 +1143,11 @@ upstream bucket is Q-V.
   (`TestMetadataOnlyATargetListsIsNotLive`). A data key a target alone
   lists counts as a single source, as a friend's: restic and Kopia
   ignore an unreferenced pack, and the next prune deletes it again.
+  The cost: if every friend's replica of a bucket is lost and only an
+  overflow target survives, `recover` brings back its data but not its
+  metadata. The repository is then restored straight from the
+  provider (S3-2: the target's keys are in the tool's own layout, so
+  `restic -r s3:…` opens it), not through lendisk.
   The
   `placement` table (D6) and the hash index are then rebuilt from the
   control API `list` of each reachable place for each sealed bucket
