@@ -4837,19 +4837,33 @@ the handler's own reads and is never cancelled; nothing below
   (`TestABusyAnswerBeforeALargeBodyIsReadReachesTheBorrower`,
   `TestAQuotaAnswerBeforeALargeBodyIsReadReachesTheBorrower`; the test
   above sends 3 MiB). seed's `answered` does the same on the import
-  path (#36), where no bridge stands between. The tunnel leg has the
-  same race (#107): net/http closes a connection whose request body
-  is unread 500 ms after the answer, and gVisor resets a connection
-  closed with unread data, so a borrower still writing the body, slow
-  to read the answer on a loaded machine, got `connection reset by
-  peer` in place of busy (Go's client returns whichever of the write
-  error and the answer it sees first). It is rare and costs only a
-  retry: the worker retries a network failure as it does busy. Open: a
-  lingering close (read and discard after the answer until the
-  borrower closes, bounded) removes the reset in a loopback test, but
-  over the tunnel it made the #93 test fail 2 runs in 15 under load
-  (borrower dials hanging until their timeout), against none of 15
-  without it, for reasons not yet found; it is not in. Once
+  path (#36), where no bridge stands between. The tunnel leg had the
+  same race (#107, #109): net/http closes a connection whose request
+  body is unread 500 ms after the answer (`rstAvoidanceDelay` in
+  `closeWriteAndWait`), and gVisor resets a connection closed with
+  unread data, so a borrower still writing the body, slow to read the
+  answer on a loaded machine, got `connection reset by peer` in place
+  of busy or full: Go's client returns the write's error as soon as it
+  sees it, though the answer is already in its receive buffer, which
+  gVisor keeps readable after a reset. The borrower's replica client
+  therefore holds that write's error the way the bridge does toward
+  `gw.sock`: its tunnel connections (`replica.answerFirst`) hold a
+  write that failed on a reset until the transport closes the
+  connection, which it does once it has read the answer, or found
+  none, and for the client's stall timeout at the most
+  (`TestABorrowerThatReadsTheEarlyAnswerLateStillGetsIt`, reading the
+  answer 1.5 s late through the bridge;
+  `TestABusyAnswerOutlivesTheResetOfTheWriteItRefused`,
+  `TestAResetWithoutAnAnswerFailsAtOnce`). The #93 test no longer
+  accepts a reset among the busy answers. *Rejected:* a lingering
+  close on the lender (nginx's `lingering_close`: half-close, then read
+  and discard what the borrower still sends until it closes, bounded
+  by `lingering_time` and `lingering_timeout`). It removes the reset
+  too, but over the tunnel it makes the borrower's next dials time out
+  far more often (#109, measured under `GOMAXPROCS=2` and eight busy
+  loops: the #93 test passed 6 runs in 20 with it, 19 in 20 without;
+  §3.7 "A borrower's dials that time out"). The client-side hold adds
+  no traffic after the answer. Once
   they have stored, the retry is answered 507 if it no longer
   fits. The check reads the counter under the same lock that admits the
   write. A completion is checked against the floor alone, for the size
@@ -6199,7 +6213,8 @@ the handler's own reads and is never cancelled; nothing below
   proxy per request on every listener, loopback included (Q-L). An
   answer the gateway gives before it has read the body (a refusal,
   §3.5 LEND-2) is relayed, not lost to the failed write of the rest
-  (#100).
+  (#100); the tunnel then resets the connection, and the borrower's
+  replica client still reads the answer (`replica.answerFirst`, #109).
 - **NET-7** The gate admits exactly these S3 operations from a
   borrower's account: `PutObject`, `CreateMultipartUpload`,
   `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`,
@@ -6477,6 +6492,31 @@ the handler's own reads and is never cancelled; nothing below
   function, so
   replication traffic enters the tunnel from inside the process. No
   listener is opened on the borrower's side for replication.
+- **A borrower's dials that time out (#109, open).** Under load a
+  borrower's tailcat client can lose every new dial to a friend until
+  the client is replaced, while its open connections carry on: the
+  #93 test's 20 s dial timeout (CI at 78326b6, and the lingering close
+  tried in #107). Measured with debug logging in tailscale's netstack:
+  a TCP segment with the borrower's own address as its source and the
+  lender's tunnel address and port as its destination arrives at the
+  borrower from its WireGuard peer, the lender (where it comes from on
+  the lender is not found: not from the lender's gVisor stack). No
+  endpoint takes it, and tailscale's netstack, which registers a
+  packet's foreign destination on its NIC for subnet routing before
+  its forwarder declines the packet (`wrapTCPProtocolHandler`), never
+  removes that address again (only an accepted connection does). The
+  borrower now owns the lender's address: it answers the stray
+  segment with a reset from it, and its next SYNs to the lender leave
+  from it, which the lender's WireGuard drops ("disallowed source
+  address"), so the dial waits out its timeout. The transport's check
+  of a client whose dial failed replaces it once its connections have
+  been quiet for `quietFor` (§3.7 "A restarted friend"), so the stall
+  lasts a dial timeout or two after the transfers in flight end. Under
+  `GOMAXPROCS=2` and eight busy loops the #93 test met it in about 1
+  run in 20; traffic after an answer (a lingering close on the lender)
+  made it most runs. Fixing it means replacing a client whose dials
+  find no SYN-ACK sooner, or tailscale releasing the address; neither
+  is in.
 - **NET-7b** `peer forward` opens a listener on the loopback address
   the user names, for as long as the command runs, and copies each
   accepted connection into a tailcat dial to the friend's tunnel port,

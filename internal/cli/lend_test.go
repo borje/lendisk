@@ -175,7 +175,10 @@ func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
 		t.Fatal(err)
 	}
 	bID := b.identity()
-	dl, err := transport.NewDialer(bID, slog.New(slog.DiscardHandler))
+	// B dials A with its dial key for A, as B's daemon does (#69): its
+	// own key is the one A's daemon dials B's server with meanwhile
+	// (its reachability probe, its quota push).
+	dl, err := transport.NewFriendDialer(bID, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,10 +227,10 @@ func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
 		if err == nil {
 			break
 		}
-		// A busy answer can arrive as a reset on a loaded machine (the
-		// tunnel leg's early-answer race, #109); the worker retries
-		// both alike, so the test does too.
-		if !errors.Is(err, replica.ErrBusy) && !strings.Contains(err.Error(), "connection reset") {
+		// Every answer but the last is busy, never a reset: B's client
+		// reads A's early answer however late, though A then resets the
+		// connection (#109).
+		if !errors.Is(err, replica.ErrBusy) {
 			t.Fatalf("the next write after the abandoned one: %v\n%s", err, stop())
 		}
 		if time.Since(start) > 10*time.Second {
