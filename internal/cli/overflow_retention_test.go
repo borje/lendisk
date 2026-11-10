@@ -16,28 +16,34 @@ import (
 // client-side tombstones for the target's window).
 func TestScenarioOverflowRetentionVersioned(t *testing.T) {
 	serving(t, 2)
-	scenarioOverflowRetention(t, overflowtest.Start(t, "offsite", true), "backups/lendisk", true)
+	scenarioOverflowRetention(t, overflowtest.Start(t, "offsite", true), "backups/lendisk", true, 8*time.Second)
 }
 
 func TestScenarioOverflowRetentionUnversioned(t *testing.T) {
 	serving(t, 2)
-	scenarioOverflowRetention(t, overflowtest.Start(t, "offsite", false), "backups/lendisk", false)
+	scenarioOverflowRetention(t, overflowtest.Start(t, "offsite", false), "backups/lendisk", false, 8*time.Second)
 }
 
 // The same against providers running elsewhere (DESIGN §3.11's tiers):
 // CI runs RustFS with a versioned bucket (.github/rustfs.sh, the
 // LENDISK_TEST_OVERFLOW_VERSIONED_* variables) and Garage without
 // versioning (.github/garage.sh, LENDISK_TEST_OVERFLOW_*); each test
-// skips without its variables.
+// skips without its variables. Their window is longer: a prune and the
+// drains after it take several seconds on a CI runner, and the held
+// deletes must not come due before the test has looked (#40).
 func TestScenarioOverflowRetentionAtAVersionedProvider(t *testing.T) {
 	srv := providerFromEnv(t, "LENDISK_TEST_OVERFLOW_VERSIONED_", ".github/rustfs.sh")
-	scenarioOverflowRetention(t, srv, fmt.Sprintf("ci/%d", time.Now().UnixNano()), true)
+	scenarioOverflowRetention(t, srv, fmt.Sprintf("ci/%d", time.Now().UnixNano()), true, providerWindow)
 }
 
 func TestScenarioOverflowRetentionAtAnUnversionedProvider(t *testing.T) {
 	srv := providerFromEnv(t, "LENDISK_TEST_OVERFLOW_", ".github/garage.sh")
-	scenarioOverflowRetention(t, srv, fmt.Sprintf("ci/%d", time.Now().UnixNano()), false)
+	scenarioOverflowRetention(t, srv, fmt.Sprintf("ci/%d", time.Now().UnixNano()), false, providerWindow)
 }
+
+// providerWindow is the retention window of the tests against providers
+// running elsewhere.
+const providerWindow = 30 * time.Second
 
 // providerFromEnv connects to the provider the variables with prefix
 // name, or skips.
@@ -61,14 +67,14 @@ func providerFromEnv(t *testing.T, prefix, script string) *overflowtest.Server {
 // held, and status says "retention: client-side". `lendisk undelete`
 // brings the snapshot back at B and the target, and restic opens it.
 // At the unversioned target the deletes it cancelled are never sent,
-// past the window; a second prune's are sent once the window (8 s
-// here) has passed.
-func scenarioOverflowRetention(t *testing.T, srv *overflowtest.Server, root string, versioned bool) {
+// past the window; a second prune's are sent once the window has
+// passed.
+func scenarioOverflowRetention(t *testing.T, srv *overflowtest.Server, root string, versioned bool, window time.Duration) {
 	env := overflowEnv(srv)
 	f := newCircleWith(t, 2, "200M", nil, append(envList(env), envReplaceEvery+"=2s")...)
 	f.an.env = env
 	code, out, errOut := f.an.run("", "", "overflow", "add", "s3", "b2", "--endpoint", srv.Endpoint, "--bucket", srv.Bucket,
-		"--prefix", root, "--region", srv.Region, "--max-bytes", "200M", "--retention", "8s")
+		"--prefix", root, "--region", srv.Region, "--max-bytes", "200M", "--retention", window.String())
 	if code != 0 {
 		t.Fatalf("overflow add: %s%s", out, errOut)
 	}
@@ -171,7 +177,7 @@ func scenarioOverflowRetention(t *testing.T, srv *overflowtest.Server, root stri
 	}
 	{
 		// The cancelled deletes are never sent, past their window.
-		time.Sleep(10 * time.Second)
+		time.Sleep(window + 2*time.Second)
 		if back, err := srv.Keys(t.Context(), prefix); err != nil || len(back) != len(before) {
 			t.Fatalf("after the window: %d keys of %d (%v)", len(back), len(before), err)
 		}
@@ -182,7 +188,7 @@ func scenarioOverflowRetention(t *testing.T, srv *overflowtest.Server, root stri
 		if now, _ := srv.Keys(t.Context(), prefix); len(now) != len(before) {
 			t.Fatalf("deletes sent before the window ended: %d of %d keys left", len(now), len(before))
 		}
-		within(t, 90*time.Second, "the held deletes sent after the window", func() bool {
+		within(t, window+90*time.Second, "the held deletes sent after the window", func() bool {
 			now, err := srv.Keys(t.Context(), prefix)
 			return err == nil && len(dataKeys(now)) == 0 && f.an.status().Capacity.Overflow[0].Tombstones == 0
 		})

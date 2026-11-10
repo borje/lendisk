@@ -73,7 +73,9 @@ type OverflowTomb struct {
 // false for any other place, which is sent the delete. The row is a
 // queued delete of a key, or a copy re-placement drops (dropping):
 // drain-back deletes go the same way (S3-4). Holding again is harmless.
-// The caller then acknowledges the row as for a sent delete.
+// A row gone since its sender took it is held as nothing: such a target
+// is never sent a delete outside a tomb. The caller then acknowledges
+// the row as for a sent delete.
 func (db *DB) HoldOverflowDelete(ctx context.Context, place string, seq int64, now time.Time) (held bool, err error) {
 	name, ok := OverflowName(place)
 	if !ok {
@@ -125,7 +127,10 @@ func (db *DB) insertTomb(ctx context.Context, place string, seq int64, now, due 
 	err := db.QueryRowContext(ctx, `SELECT bucket, key, op, state, coalesce(size, 0), sha256 FROM placement
 		WHERE place = ? AND seq = ?`, place, seq).Scan(&bucket, &key, &op, &st, &size, &sha)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		// The row went since its sender took it (the place removed or
+		// rebuilt): nothing to hold, and its delete is never sent at
+		// once to a target that keeps nothing a delete removes (S3-4).
+		return true, nil
 	}
 	if err != nil {
 		return false, err

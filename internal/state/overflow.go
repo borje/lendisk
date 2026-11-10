@@ -365,17 +365,30 @@ func overflowHolding(ctx context.Context, q querier, bucket string) ([]string, e
 }
 
 // holdsLiveData is the SQL condition that the overflow target place
-// holds, has queued or is deleting a copy of a live data object (the
-// key's latest done write) of bucket: then the bucket's metadata goes
-// there (overflowHolding, REPL-12), and otherwise it is dropped there
+// holds data of bucket: it holds, has queued or is deleting a copy of a
+// live data object (the key's latest done write), or it still holds a
+// deleted one, a delete of the key held there as a client-side tomb
+// (S3-4: an undelete brings it back there, RET-3) or refused for want of
+// permission (S3-5). Then the bucket's metadata goes there
+// (overflowHolding, REPL-12), and otherwise it is dropped there
 // (dropIdleMetadata, #40). One condition for both, so the two never
-// place and drop the same metadata in turn (#40 review). place and
-// bucket are SQL expressions.
+// place and drop the same metadata in turn (#40 review). A drained
+// copy's tomb counts only when refused: drain-back moved the object to
+// a friend, and no undelete restores it at the target; nor does a
+// delete's tomb whose key the target no longer held (its copy drained
+// first). place and bucket are SQL expressions.
 func holdsLiveData(place, bucket string) string {
-	return `EXISTS (SELECT 1 FROM placement h JOIN queue hq ON hq.seq = h.seq
+	return `(EXISTS (SELECT 1 FROM placement h JOIN queue hq ON hq.seq = h.seq
 		WHERE h.place = ` + place + ` AND h.bucket = ` + bucket + ` AND h.op = 'put' AND hq.class = 'data'
 		AND h.state IN ('queued', 'acked', 'dropping')
-		AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = hq.bucket AND l.key = hq.key AND l.seq > hq.seq AND l.state = 'done'))`
+		AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = hq.bucket AND l.key = hq.key AND l.seq > hq.seq AND l.state = 'done'))
+	OR EXISTS (SELECT 1 FROM overflow_tomb t JOIN queue tq ON tq.seq = t.seq
+		WHERE t.place = ` + place + ` AND t.bucket = ` + bucket + ` AND tq.class = 'data'
+		AND (t.denied_at IS NOT NULL OR t.drained IS NULL AND EXISTS (SELECT 1 FROM placement h
+			WHERE h.place = t.place AND h.bucket = t.bucket AND h.key = t.key AND h.op = 'put'
+			AND h.state IN ('acked', 'abandoned')
+			AND h.seq = (SELECT max(x.seq) FROM placement x WHERE x.place = t.place AND x.bucket = t.bucket
+				AND x.key = t.key AND x.op = 'put' AND x.seq < t.seq)))))`
 }
 
 // placeMetadata puts every live metadata object of bucket that place

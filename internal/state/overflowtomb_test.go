@@ -242,3 +242,117 @@ func TestAnUndeleteClaimsEveryTombOfTheKey(t *testing.T) {
 		t.Fatalf("due after the claim was given back: %+v", due)
 	}
 }
+
+// metaAt is target's row of tombPool's metadata object index/1: its
+// sequence and state.
+func (p *pool) metaAt(target string) (int64, string) {
+	p.t.Helper()
+	var seq int64
+	if err := p.db.QueryRow(`SELECT seq FROM queue WHERE bucket = 'r' AND key = 'index/1'`).Scan(&seq); err != nil {
+		p.t.Fatal(err)
+	}
+	st, _ := p.rowOf(target, seq)
+	return seq, st
+}
+
+// REPL-12, S3-4, RET-3 (#40 regression): a pruned object's copy stays at
+// a target without versioning while its delete is held, and an undelete
+// brings it back there, so the bucket's metadata stays too: re-placement
+// does not delete it until the held delete is sent.
+func TestAPrunedObjectsMetadataStaysWhileItsDeleteIsHeld(t *testing.T) {
+	ctx := context.Background()
+	p, target, _ := tombPool(t, t.TempDir())
+	meta, st := p.metaAt(target)
+	if st != PlacementQueued {
+		t.Fatalf("the target's metadata row is %q, want queued with its first data", st)
+	}
+	p.ack(target, meta)
+	del := p.del("r", "data/1", "data")
+	if held, err := p.db.HoldOverflowDelete(ctx, target, del, p.now); err != nil || !held {
+		t.Fatalf("held %v, %v", held, err)
+	}
+	p.ack(target, del)
+	if s := p.replace(); s.Dropping != 0 || s.Cancelled != 0 {
+		t.Fatalf("re-placement deleted the metadata at the target while a pruned object's delete is held: %+v", s)
+	}
+	p.wantState(target, meta, PlacementAcked)
+	// The window ends and the delete is sent: the target holds no data
+	// of the bucket, and its metadata goes, that delete held in turn.
+	p.now = p.now.Add(24 * time.Hour)
+	if ts := p.due(target); len(ts) != 1 || ts[0].Seq != del {
+		t.Fatalf("due %+v", ts)
+	}
+	if err := p.db.DropOverflowTomb(ctx, target, del); err != nil {
+		t.Fatal(err)
+	}
+	if s := p.replace(); s.Dropping != 1 {
+		t.Fatalf("the metadata of an emptied target not dropped: %+v", s)
+	}
+	p.wantState(target, meta, PlacementDropping)
+}
+
+// S3-5 (#40): a copy the target refused to delete stays there, so the
+// bucket's metadata stays too.
+func TestADeniedDeleteKeepsTheMetadataAtTheTarget(t *testing.T) {
+	ctx := context.Background()
+	p, target, _ := tombPool(t, t.TempDir())
+	meta, _ := p.metaAt(target)
+	p.ack(target, meta)
+	del := p.del("r", "data/1", "data")
+	if _, err := p.db.HoldOverflowDelete(ctx, target, del, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.ack(target, del)
+	p.now = p.now.Add(24 * time.Hour)
+	if ts := p.due(target); len(ts) != 1 {
+		t.Fatalf("due %+v", ts)
+	}
+	if err := p.db.DenyOverflowDelete(ctx, target, del, p.now); err != nil {
+		t.Fatal(err)
+	}
+	if s := p.replace(); s.Dropping != 0 {
+		t.Fatalf("the metadata dropped beside a copy the target refused to delete: %+v", s)
+	}
+	p.wantState(target, meta, PlacementAcked)
+}
+
+// #40: a delete of a key whose copy drain-back already took off the
+// target holds nothing there: the target's metadata of the bucket still
+// goes.
+func TestADeleteAfterDrainBackKeepsNoMetadataAtTheTarget(t *testing.T) {
+	ctx := context.Background()
+	p, target, d := tombPool(t, t.TempDir())
+	meta, _ := p.metaAt(target)
+	p.ack(target, meta)
+	if _, err := p.db.Exec(`UPDATE placement SET state = 'dropping' WHERE place = ? AND seq = ?`, target, d); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.db.HoldOverflowDelete(ctx, target, d, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.ack(target, d)
+	del := p.del("r", "data/1", "data")
+	if p.rowState(target, del) != "" {
+		if _, err := p.db.HoldOverflowDelete(ctx, target, del, p.now); err != nil {
+			t.Fatal(err)
+		}
+		p.ack(target, del)
+	}
+	p.replace()
+	p.wantState(target, meta, PlacementDropping)
+}
+
+// S3-4: a delete at a target without versioning whose placement row is
+// gone by the time its sender holds it (the place removed meanwhile) is
+// not sent there at once: every delete at such a target goes through a
+// held tomb or nowhere.
+func TestAVanishedRowsDeleteIsNotSentAtOnce(t *testing.T) {
+	p, target, _ := tombPool(t, t.TempDir())
+	del := p.del("r", "data/1", "data")
+	if _, err := p.db.Exec(`DELETE FROM placement WHERE place = ? AND seq = ?`, target, del); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := p.db.HoldOverflowDelete(context.Background(), target, del, p.now); err != nil || !held {
+		t.Fatalf("held %v, %v: the worker would send the delete at once", held, err)
+	}
+}

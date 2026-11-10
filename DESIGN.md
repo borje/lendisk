@@ -6827,12 +6827,24 @@ of the `copies`, and the estimated cost (S3-7).
   metadata row still dropping when the target is chosen again for a
   data copy is not queued again with it; the pass after its delete
   lands puts it back, ahead of later data in the FIFO. Whether a
-  target holds data of a bucket is one condition (`holdsLiveData`: a
-  queued, acknowledged or dropping copy of a live data object) for
+  target holds data of a bucket is one condition (`holdsLiveData`) for
   sending it the bucket's metadata (`overflowHolding`) and for dropping
   it there, so an old put row of a key deleted since never makes a pass
   place what the next drops (#40 review,
-  `TestAnIdleTargetsMetadataIsNotPlacedAndDroppedOnEveryPass`). A copy
+  `TestAnIdleTargetsMetadataIsNotPlacedAndDroppedOnEveryPass`). It
+  holds data while it has a queued, acknowledged or dropping copy of a
+  live data object, or still holds a deleted one: a data key's delete
+  held there as a client-side tomb, the key's last copy there
+  acknowledged (an undelete brings it back there, RET-3), or a data
+  tomb refused for want of permission (S3-5). So a prune at an
+  unversioned target leaves the bucket's metadata there until the held
+  deletes are sent, and the undelete that restores the data finds the
+  metadata beside it (#40 regression,
+  `TestAPrunedObjectsMetadataStaysWhileItsDeleteIsHeld`,
+  `TestADeniedDeleteKeepsTheMetadataAtTheTarget`). A drained copy's
+  tomb does not count (the object moved to a friend), nor does a
+  delete's tomb of a key whose copy drained first
+  (`TestADeleteAfterDrainBackKeepsNoMetadataAtTheTarget`). A copy
   placed again at a place clears the `replaces` of the object's other
   rows naming that place, so a friend copy that once drained the
   target never counts out the target's copy the split placed there
@@ -6916,7 +6928,10 @@ of the `copies`, and the estimated cost (S3-7).
     window is the target's `--retention`, from when the delete would
     have been sent. The tomb's bytes stay in the target's use
     (triggers on the table), so `max_bytes` and the cost estimate
-    count what the provider still holds. The target's own sender, at
+    count what the provider still holds. Every delete such a target
+    is sent goes through a tomb: a row gone since its sender took it
+    is held as nothing, never sent at once
+    (`TestAVanishedRowsDeleteIsNotSentAtOnce`). The target's own sender, at
     most once a poll and only while the schedule is open, claims the
     tombs due (`DueOverflowTombs`) and sends each delete, then drops
     the tomb; a failed delete gives back its claim and the rest's. A
