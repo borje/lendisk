@@ -104,3 +104,33 @@ func TestPurgeTimeRoundedUp(t *testing.T) {
 		t.Fatalf("purge after %v, earlier than %v", ts[0].PurgeAfter, at)
 	}
 }
+
+// RET-1 (#75): a row rebuilt from the store is written kept, with its
+// purge time rounded up, and TombPaths names every tomb of one bucket
+// that has a row, pending or kept.
+func TestRestoredTombstoneIsKept(t *testing.T) {
+	ctx := context.Background()
+	db := openPeers(t)
+	at := time.Unix(1_800_000_000, 0)
+	if _, err := db.AddTombstone(ctx, Tombstone{Peer: "bob", Sealed: "sb", Key: "a", Tomb: ".lendisk/tomb/a/1",
+		SHA256: "h1", DeletedAt: at, PurgeAfter: at.Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RestoreTombstone(ctx, Tombstone{Peer: "bob", Sealed: "sb", Key: "b", Tomb: ".lendisk/tomb/b/2",
+		SHA256: "h2", ETag: "e2", Size: 7, DeletedAt: at, PurgeAfter: at.Add(time.Hour + time.Millisecond)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RestoreTombstone(ctx, Tombstone{Peer: "bob", Sealed: "other", Key: "c", Tomb: ".lendisk/tomb/c/3",
+		DeletedAt: at, PurgeAfter: at}); err != nil {
+		t.Fatal(err)
+	}
+	ts, err := db.TombstonesOf(ctx, "bob", "sb", "b")
+	if err != nil || len(ts) != 1 || ts[0].Pending || ts[0].Rewrite || ts[0].Size != 7 || ts[0].ETag != "e2" ||
+		!ts[0].PurgeAfter.Equal(at.Add(time.Hour+time.Second)) {
+		t.Fatalf("restored %+v %v", ts, err)
+	}
+	paths, err := db.TombPaths(ctx, "bob", "sb")
+	if err != nil || len(paths) != 2 || !paths[".lendisk/tomb/a/1"] || !paths[".lendisk/tomb/b/2"] {
+		t.Fatalf("paths %v %v", paths, err)
+	}
+}

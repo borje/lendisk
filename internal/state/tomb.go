@@ -59,6 +59,33 @@ func (db *DB) AddTombstone(ctx context.Context, t Tombstone) (int64, error) {
 	return res.LastInsertId()
 }
 
+// RestoreTombstone records t as kept, its bytes already in their tomb:
+// a row rebuilt from the store after lendisk.db lost it (#75). It
+// returns the row's ID.
+func (db *DB) RestoreTombstone(ctx context.Context, t Tombstone) (int64, error) {
+	res, err := db.ExecContext(ctx, `INSERT INTO tombstone (peer_key, sealed, key, tomb, sha256, etag, size, deleted_at, purge_after, rewrite, pending)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`, t.Peer, t.Sealed, t.Key, t.Tomb, t.SHA256, t.ETag, t.Size,
+		t.DeletedAt.Unix(), ceilUnix(t.PurgeAfter), nullTrue(t.Rewrite))
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// TombPaths returns the tomb path of every tombstone, pending or kept,
+// of peer's bucket sealed.
+func (db *DB) TombPaths(ctx context.Context, peer, sealed string) (map[string]bool, error) {
+	paths, err := column(ctx, db, `SELECT tomb FROM tombstone WHERE peer_key = ? AND sealed = ?`, peer, sealed)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(paths))
+	for _, p := range paths {
+		out[p] = true
+	}
+	return out, nil
+}
+
 func (db *DB) setTombPending(ctx context.Context, id int64, pending bool) error {
 	_, err := db.ExecContext(ctx, `UPDATE tombstone SET pending = ? WHERE id = ?`, pending, id)
 	return err

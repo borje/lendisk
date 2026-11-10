@@ -4895,6 +4895,11 @@ the handler's own reads and is never cancelled; nothing below
   removes the tomb directories that leaves empty, and drops the row
   and the bytes plus overhead from `lent_usage` in one transaction. A
   tomb that cannot be removed is logged and tried at the next purge.
+  The emptied directories go up to and including the bucket's
+  `.lendisk/`, after a purge or a revival alike, so a bucket whose last
+  key and last tomb are gone is empty to posix and its `DeleteBucket`
+  is not refused `BucketNotEmpty`
+  (`TestLastTombGoneLeavesNoHousekeepingDir`, #75).
   *Re-put:* a `PutObject` to a key holding no object but tombstones,
   with the hash of one of them, has its body hashed and discarded (a
   body only claiming the hash is `BadDigest`) and revives the newest
@@ -4932,6 +4937,45 @@ the handler's own reads and is never cancelled; nothing below
   bytes beside the new tomb; both are kept and counted, the list shows
   the key live, and a later delete makes a second tomb (tomb names are
   unique, never overwritten).
+  *Rows rebuilt from the store (#75):* the `tombstone` rows are the
+  lender's only record of its tombs, so a lender whose `lendisk.db` was
+  lost, or restored from an older copy, would keep tombs it never
+  purges, counts or lists. The store holds what a row needs, and
+  `Lending.rebuildTombs` (`internal/gateway/tombrebuild.go`) writes a
+  kept row (`state.DB.RestoreTombstone`) for each regular file under a
+  bucket's `.lendisk/tomb/` that no row names (`state.DB.TombPaths`),
+  holding the key's lock and the borrower's publication lock: the key
+  and delete time from the path (`<key>/<unix nanoseconds>`), the size
+  from the file, the hash (`lendisk-sha256` in posix's `user.metadata`
+  xattr) and ETag (`user.etag`) from the xattrs the rename kept, and the
+  purge time the delete time plus `gateway.Retention` of the
+  friendship as it stands then (`DefaultRetention` without one).
+  *Conservative where the store is silent:* a tomb whose name is not a
+  delete time, or names one after now (a clock set back, a file copied
+  in by hand), is taken as deleted at the rebuild, so it keeps a whole
+  window, the most it can have had left; a missing hash or ETag is
+  written empty, so the bytes are kept for the window and no put
+  revives them (the 412 still holds, since no hash matches). A
+  rewrite's tomb cannot be told from a delete's on disk and is rebuilt
+  as a delete's: its bytes are kept as long, undelete may offer it, and
+  the list no longer names it among the key's `replaced` versions.
+  The window comes from the friendship made again, which may differ
+  from the one the delete used; the delete time does not move.
+  *When:* at every start, after `settleTombs` and before anything is
+  served or reconciled, for every bucket in `lent_bucket`; and when a
+  borrower creates a bucket it has no row for (`Lending.CreateBucket`),
+  before the row is written, so no write reaches a key whose tombs have
+  no rows yet. After a lost `lendisk.db` the friend is befriended again
+  (§3.1 *Limit*), its replicator's `ensureBucket` sends `CreateBucket`,
+  posix answers `BucketAlreadyOwnedByYou` (the bucket's ACL names the
+  borrower), and the row and the tombs' rows are written then; the
+  reconcile counts them (LEND-1). `isCode` reads posix's `BucketError`
+  as well as an `APIError`; before #75 that answer was not recognised,
+  so a bucket left in the store without its row was never mapped again
+  (`TestLostTombstoneRowsRebuiltAtStartup`,
+  `TestRebuiltTombWithoutADeleteTimeKeepsAWholeWindow`,
+  `TestTombstonesRebuiltWhenTheBorrowerCreatesItsBucketAgain`). No
+  migration: the rows are the existing table's.
   A direct reader of the replica (P-5) sees the bucket as the tool left
   it after its last delete, plus `.lendisk/` and posix's `.sgwtmp/`,
   which restic ignores (`TestDirectReaderSeesTheToolsLayout` runs
