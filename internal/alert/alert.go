@@ -562,12 +562,15 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 	minRetrying := orDefault(s.MinRetrying, time.Hour)
 	for _, f := range fs {
 		c := conds[f.Peer]
-		// Busy (503 SlowDown) and nothing else for the threshold: it
-		// answers, but holds this node's copies back as surely (#92).
-		if c.Condition == state.ConditionBusy && now.Sub(c.Since) >= after {
-			msg := fmt.Sprintf("friend %s has answered only busy (503 SlowDown, asking this node to send again shortly) since %s (longer than %v); "+
+		// Busy (503 SlowDown), or silent, and never ok for the threshold
+		// since its first busy answer: it answers, but holds this node's
+		// copies back as surely (#92). A network error between busy
+		// answers does not restart the run (#93).
+		if (c.Condition == state.ConditionBusy || c.Condition == state.ConditionRetrying) &&
+			!c.BusySince.IsZero() && now.Sub(c.BusySince) >= after {
+			msg := fmt.Sprintf("friend %s has answered only busy (503 SlowDown, asking this node to send again shortly), or not at all, since %s (longer than %v); "+
 				"replication to it waits and its unsent copies go to other friends: %s",
-				f.Peer, c.Since.UTC().Format(time.RFC3339), after, c.Detail)
+				f.Peer, c.BusySince.UTC().Format(time.RFC3339), after, c.Detail)
 			out = append(out, alertOf(KindFriendUnreachable, f.Peer, msg))
 			continue
 		}

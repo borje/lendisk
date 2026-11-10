@@ -518,6 +518,11 @@ type PlaceCondition struct {
 	// is ok or it never failed (#65). Away (unreachable or full for
 	// reroute_after) is counted from it, not from Since.
 	FailingSince time.Time
+	// BusySince is its first busy answer since its last ok answer, kept
+	// through failures and probes' answers between busy ones; zero when
+	// it has not answered busy since (#93). A busy run is counted from
+	// it, not from Since.
+	BusySince time.Time
 }
 
 // SetPlaceCondition records how place answered at now. Since changes only
@@ -526,16 +531,18 @@ type PlaceCondition struct {
 // failing answer (retrying, quota, removed) after an ok, is kept while
 // the answers keep failing whatever their kind and through
 // ConditionStore (this node's failure, not the place's answer), and is
-// cleared by ok (#65).
+// cleared by ok (#65). BusySince starts with the first busy answer
+// after an ok, and only ok clears it (#93).
 func (db *DB) SetPlaceCondition(ctx context.Context, place, condition, detail string, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT INTO place (place, condition, detail, since, last_ok, refused_at, failing_since)
+	_, err := db.ExecContext(ctx, `INSERT INTO place (place, condition, detail, since, last_ok, refused_at, failing_since, busy_since)
 		VALUES (?1, ?2, ?3, ?4, CASE WHEN ?2 IN ('ok', 'busy') THEN ?4 END, CASE WHEN ?2 = 'removed' THEN ?4 END,
-			CASE WHEN ?2 IN ('retrying', 'quota', 'removed') THEN ?4 END)
+			CASE WHEN ?2 IN ('retrying', 'quota', 'removed') THEN ?4 END, CASE WHEN ?2 = 'busy' THEN ?4 END)
 		ON CONFLICT (place) DO UPDATE SET
 			since = CASE WHEN place.condition = excluded.condition THEN place.since ELSE excluded.since END,
 			condition = excluded.condition, detail = excluded.detail,
 			last_ok = coalesce(excluded.last_ok, place.last_ok),
 			refused_at = coalesce(excluded.refused_at, place.refused_at),
+			busy_since = CASE WHEN excluded.condition != 'ok' THEN coalesce(place.busy_since, excluded.busy_since) END,
 			failing_since = CASE
 				WHEN excluded.condition IN ('retrying', 'quota', 'removed') THEN coalesce(`+carriedFailing+`, excluded.since)
 				WHEN excluded.condition = 'store' THEN `+carriedFailing+`
@@ -583,8 +590,8 @@ func (db *DB) ResetPlaceCondition(ctx context.Context, place string, now time.Ti
 // PlaceConditions returns every place's last condition.
 func (db *DB) PlaceConditions(ctx context.Context) (map[string]PlaceCondition, error) {
 	rows, err := db.QueryContext(ctx, `SELECT place, condition, coalesce(detail, ''), since, last_ok, refused_at,
-		CASE WHEN condition IN ('retrying', 'quota', 'removed') THEN coalesce(failing_since, since) ELSE failing_since END
-		FROM place`)
+		CASE WHEN condition IN ('retrying', 'quota', 'removed') THEN coalesce(failing_since, since) ELSE failing_since END,
+		busy_since FROM place`)
 	if err != nil {
 		return nil, err
 	}
@@ -594,8 +601,8 @@ func (db *DB) PlaceConditions(ctx context.Context) (map[string]PlaceCondition, e
 		var place string
 		var c PlaceCondition
 		var since int64
-		var lastOK, refused, failing sql.NullInt64
-		if err := rows.Scan(&place, &c.Condition, &c.Detail, &since, &lastOK, &refused, &failing); err != nil {
+		var lastOK, refused, failing, busy sql.NullInt64
+		if err := rows.Scan(&place, &c.Condition, &c.Detail, &since, &lastOK, &refused, &failing, &busy); err != nil {
 			return nil, err
 		}
 		c.Since = time.Unix(since, 0)
@@ -607,6 +614,9 @@ func (db *DB) PlaceConditions(ctx context.Context) (map[string]PlaceCondition, e
 		}
 		if failing.Valid {
 			c.FailingSince = time.Unix(failing.Int64, 0)
+		}
+		if busy.Valid {
+			c.BusySince = time.Unix(busy.Int64, 0)
 		}
 		out[place] = c
 	}

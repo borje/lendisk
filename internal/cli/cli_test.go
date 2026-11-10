@@ -59,6 +59,9 @@ type node struct {
 	sleep func(context.Context, time.Duration) error
 	// tuneEnding, when set, is given to serveLogged's daemon.
 	tuneEnding func(*farewell)
+	// beforeRead, when set, is given to serveLogged's daemon: it runs
+	// before each read of a borrower's body (gateway.BeforeRead).
+	beforeRead func(key string, read int64)
 	// lendSpace is the store's size every command reads for the default
 	// lending cap (#24); zero is 1 PiB, so tests that lend 80G run on a
 	// small disk.

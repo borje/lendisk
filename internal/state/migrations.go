@@ -967,4 +967,15 @@ var migrations = []Migration{
 		ALTER TABLE friendship ADD COLUMN path_endpoint TEXT;
 		ALTER TABLE friendship ADD COLUMN path_at INTEGER;`,
 	},
+	{
+		Version: 44, Compat: 1, Release: "0.1",
+		SQL: `
+		-- A place's busy run (#93): its first busy answer (503 SlowDown)
+		-- since its last ok answer, kept through network errors and
+		-- probes' answers between busy ones, cleared by ok. Unix
+		-- seconds; NULL when it has not answered busy since its last ok.
+		-- A place busy now has been busy since its condition's since.
+		ALTER TABLE place ADD COLUMN busy_since INTEGER;
+		UPDATE place SET busy_since = since WHERE condition = 'busy';`,
+	},
 }

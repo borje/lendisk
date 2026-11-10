@@ -205,7 +205,7 @@ func (a *app) serveCmd() *cobra.Command {
 				a.tuneSample(sample)
 			}
 			gw := &gateway.Gateway{StoreDir: cfg.StorePath(), Socket: gateway.SocketPath(cfg.DataDir), DB: db, Self: id, Log: log,
-				Profiles: profiles, AfterStore: a.afterStore, BeforeHash: a.beforeHash, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
+				Profiles: profiles, AfterStore: a.afterStore, BeforeHash: a.beforeHash, BeforeRead: a.beforeRead, Clock: a.clock, Floor: &floor, Statfs: a.checker().Statfs,
 				Fetch: fetch, Reconcile: rec, Sample: sample}
 			tun.Undeleter.Set(gw) // the undelete call (RET-3)
 			ready := make(chan struct{})

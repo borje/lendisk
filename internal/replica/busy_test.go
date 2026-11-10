@@ -82,3 +82,46 @@ func TestABusyProbeAnswerIsASignOfLife(t *testing.T) {
 		t.Fatalf("after a busy probe: %+v", c)
 	}
 }
+
+// #93, LEND-2: a busy answer's Retry-After is how long the worker waits
+// before sending again, in place of its own backoff, and never longer
+// than max_backoff.
+func TestABusyFriendsRetryAfterIsHonouredUpToMaxBackoff(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		after            time.Duration // the friend's Retry-After
+		minB, maxB, want time.Duration // the backoff bounds; the most the retries may take
+	}{
+		{"sooner than the backoff", 20 * time.Millisecond, time.Hour, time.Hour, 10 * time.Second},
+		{"capped by max_backoff", time.Hour, 20 * time.Millisecond, 20 * time.Millisecond, 10 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newFixture(t, "B")
+			fx.w.MinBackoff, fx.w.MaxBackoff = tc.minB, tc.maxB
+			var mu sync.Mutex
+			busy := true
+			var tries atomic.Int32
+			fx.places["B"].retryAfter = tc.after
+			fx.places["B"].fail = func(op, key string) error {
+				mu.Lock()
+				defer mu.Unlock()
+				if op == "put" && busy {
+					tries.Add(1)
+					return fmt.Errorf("sending %s: %w: SlowDown", key, ErrBusy)
+				}
+				return nil
+			}
+			fx.write("laptop", "data/1", "x")
+			start := time.Now()
+			fx.run()
+			waitFor(t, "three busy answers", func() bool { return tries.Load() >= 3 })
+			if d := time.Since(start); d > tc.want {
+				t.Fatalf("three tries took %v", d)
+			}
+			mu.Lock()
+			busy = false
+			mu.Unlock()
+			fx.drained("B")
+		})
+	}
+}

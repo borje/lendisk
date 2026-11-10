@@ -450,13 +450,20 @@ type body struct {
 	// watch, if set, runs before each read; an error fails the body
 	// (Lending.watch).
 	watch func() error
+	// before, if set, runs before each read with the bytes read so far
+	// (Lending.BeforeRead). Tests only.
+	before func(read int64)
 }
 
-func (l *Lending) body(r io.Reader, limit int64) *body {
+func (l *Lending) body(key string, r io.Reader, limit int64) *body {
 	if r == nil {
 		r = eofReader{}
 	}
-	return &body{r: r, limit: limit, h: sha256.New()}
+	b := &body{r: r, limit: limit, h: sha256.New()}
+	if l.BeforeRead != nil {
+		b.before = func(read int64) { l.BeforeRead(key, read) }
+	}
+	return b
 }
 
 func (b *body) hex() string { return hex.EncodeToString(b.h.Sum(nil)) }
@@ -473,6 +480,9 @@ func (b *body) Read(p []byte) (int, error) {
 			b.failed = e
 			return 0, e
 		}
+	}
+	if b.before != nil {
+		b.before(b.n)
 	}
 	n, err := b.r.Read(p)
 	b.n += int64(n)
@@ -599,7 +609,7 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 	if in.ContentLength != nil && *in.ContentLength > 0 {
 		size = *in.ContentLength
 	}
-	b := l.body(in.Body, size)
+	b := l.body(key, in.Body, size)
 	old, has, err := l.existing(ctx, *in.Bucket, key)
 	if err != nil {
 		l.log().Error("lending: reading the stored object failed; refusing the put", "bucket", *in.Bucket, "key", key, "err", err)
@@ -936,7 +946,7 @@ func (l *Lending) uploadPartLent(ctx context.Context, peer, sealed string, in *s
 		unlock, err = l.lockUpload(ctx, u.UploadID)
 		return err
 	}
-	b := l.body(in.Body, size)
+	b := l.body(key, in.Body, size)
 	l.watch(b, peer, size)
 	b.onEOF = lockAll
 	if size == 0 {

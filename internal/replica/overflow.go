@@ -67,7 +67,7 @@ func NewOverflow(o state.Overflow, c overflow.Credential, seal func(bucket strin
 		Secure:       u.Scheme == "https",
 		Region:       o.Region,
 		BucketLookup: minio.BucketLookupAuto,
-		Transport:    tr,
+		Transport:    hinting{tr}, // a busy answer's Retry-After (#93)
 		// The worker owns retries, and no signed trailer (as a friend's).
 		MaxRetries: 1,
 	})

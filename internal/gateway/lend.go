@@ -79,6 +79,10 @@ type Lending struct {
 	// without a part before the reconcile aborts it (default
 	// DefaultAbandonAfter).
 	AbandonAfter time.Duration
+	// BeforeRead, if set, runs before each read of a borrower's put or
+	// part body, with its key and the bytes read so far: a store that
+	// stalls or reads slowly (#93). Tests only.
+	BeforeRead func(key string, read int64)
 	// Tests only: beforeComplete runs just before a borrower's upload is
 	// completed in the store; afterList when a reconcile has listed a
 	// borrower and not yet set its count; afterPartStored when a part is

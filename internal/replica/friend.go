@@ -121,7 +121,7 @@ func newFriend(access, secret string, dial func(ctx context.Context) (net.Conn, 
 		Creds:        credentials.NewStaticV4(access, secret, ""),
 		Region:       region,
 		BucketLookup: minio.BucketLookupPath,
-		Transport:    tr,
+		Transport:    hinting{tr}, // a busy answer's Retry-After (#93)
 		// minio-go retries only bodies it can seek; the worker owns
 		// retries (D12, Q-Y.1). TrailingHeaders stays off: minio-go's
 		// signed trailer is refused by versitygw and Garage (Q-Y.2).

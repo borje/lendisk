@@ -696,7 +696,8 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			}
 			continue
 		}
-		err = w.send(ctx, place, r, p)
+		sctx, retryAfter := withRetryHint(ctx) // a busy answer's Retry-After (#93)
+		err = w.send(sctx, place, r, p)
 		if ctx.Err() != nil {
 			return // stopping; the row stays queued
 		}
@@ -820,17 +821,23 @@ func (w *Worker) drain(ctx context.Context, place string, r Replica) {
 			// its writes in flight (an abandoned send's among them), or
 			// this node is at its cap of requests there. Busy, not
 			// failing: retried with backoff, never paused for quota; only
-			// a long busy stretch counts as away (state, #92).
+			// a long busy stretch counts as away (state, #92). Its
+			// Retry-After, if it sent one, replaces the backoff, capped by
+			// max_backoff (#93).
 			failing = "busy"
 			level := slog.LevelDebug
 			if prev != failing {
 				backoff = minB
 				level = slog.LevelInfo
 			}
-			log.Log(ctx, level, "replication: the friend is busy with writes in flight; retrying", append(row, "err", err, "retry_in", backoff)...)
+			wait := backoff
+			if d := retryAfter(); d > 0 {
+				wait = min(d, maxB)
+			}
+			log.Log(ctx, level, "replication: the friend is busy with writes in flight; retrying", append(row, "err", err, "retry_in", wait)...)
 			condition(state.ConditionBusy, err.Error())
 			w.Metrics.Retry(place, metrics.RetryBusy)
-			sleep(ctx, backoff)
+			sleep(ctx, wait)
 			backoff = min(2*backoff, maxB)
 		default:
 			failing = "network"

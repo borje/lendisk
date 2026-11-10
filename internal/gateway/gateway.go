@@ -97,6 +97,9 @@ type Gateway struct {
 	// BeforeHash, if set, runs before a completed multipart upload,
 	// already answered, is hashed: a slow hash. Tests only.
 	BeforeHash func()
+	// BeforeRead is Lending.BeforeRead: it runs before each read of a
+	// borrower's body. Tests only.
+	BeforeRead func(key string, read int64)
 	// ResolveEvery is how often rows a failed request left pending are
 	// settled while serving (default a minute).
 	ResolveEvery time.Duration
@@ -197,7 +200,7 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		defer func() { cancel(); <-resolved }()
 	}
 	lend := &Lending{Next: dec, DB: g.DB, Uploads: be, StoreDir: g.StoreDir, Floor: g.Floor, Statfs: g.Statfs, Log: g.Log,
-		Now: g.Clock}
+		Now: g.Clock, BeforeRead: g.BeforeRead}
 	g.lending = lend
 	g.running.Store(lend)
 	if g.lendingHook != nil {
