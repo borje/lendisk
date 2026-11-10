@@ -207,7 +207,7 @@ func (db *DB) ackPlacement(ctx context.Context, tx *sql.Tx, place string, seq in
 	if replaces.Valid && replaces.String != place {
 		// The copy it replaces goes now if the rule allows (#38 review,
 		// #96 review, #103); else a later pass drops it when it may.
-		if _, err := db.removeCopy(ctx, tx, removal{bucket: bucket, seq: seq, place: replaces.String}, db.now()); err != nil {
+		if _, err := db.removeCopy(ctx, tx, removal{bucket: bucket, seq: seq, place: replaces.String}, now); err != nil {
 			return false, err
 		}
 	}
@@ -235,15 +235,37 @@ func freeLatePut(ctx context.Context, tx *sql.Tx, place, bucket, key string, seq
 // key cancelled it (placeTx), or it was moved or refused, and it must
 // not be sent. A row taken once stays taken, as its send may have
 // landed: a later delete of the key follows it instead of cancelling it
-// (REPL-2, #21).
+// (REPL-2, #21). A dropping row's delete is asked about again first, at
+// every try (checkDrop, #104): one the removal rule now refuses is
+// acknowledged again, and ok is false.
 func (db *DB) StartPlacement(ctx context.Context, place string, seq int64, now time.Time) (ok bool, err error) {
-	r, err := db.ExecContext(ctx, `UPDATE placement SET started_at = coalesce(started_at, ?)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	var dropping bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM placement WHERE place = ? AND seq = ? AND state = ?)`,
+		place, seq, PlacementDropping).Scan(&dropping); err != nil {
+		return false, err
+	}
+	if dropping {
+		if ok, err := db.checkDrop(ctx, tx, place, seq, now); err != nil || !ok {
+			if err == nil {
+				err = tx.Commit()
+			}
+			return false, err
+		}
+	}
+	r, err := tx.ExecContext(ctx, `UPDATE placement SET started_at = coalesce(started_at, ?)
 		WHERE place = ? AND seq = ? AND state IN ('queued', 'dropping')`, now.Unix(), place, seq)
 	if err != nil {
 		return false, err
 	}
-	n, err := r.RowsAffected()
-	return n == 1, err
+	if n, err := r.RowsAffected(); err != nil || n != 1 {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 // CancelPlacement takes a queued row that will not be sent out of the

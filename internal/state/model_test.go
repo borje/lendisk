@@ -22,7 +22,9 @@ import (
 //
 //   - I1: a data copy acknowledged before the step and no longer after
 //     it (dropping, drained, gone) leaves its live object with at least
-//     `copies` acknowledged copies at intact places;
+//     `copies` acknowledged copies at intact places; so does a dropping
+//     copy's delete as it is sent and as it is acknowledged (drained,
+//     #104);
 //   - I2: no metadata object a target held or had queued is dropped or
 //     cancelled there while the target holds, or can still undelete,
 //     data of its bucket: a live copy, a delete it has queued but not
@@ -116,7 +118,10 @@ func TestRemovalModel(t *testing.T) {
 	steps := 2000
 	// Each of these seeds, on the code before #103, caught all four of
 	// the earlier removal bugs reintroduced (the mutation check in the
-	// #103 commit); one small pool (odd) and two of every size.
+	// #103 commit); one small pool (odd) and two of every size. On the
+	// code before #104, each caught a dropping copy's delete sent while
+	// it left its object short (seed 6 at step 490, 8 at 1337, 5 at
+	// 1956).
 	seeds := []uint64{5, 6, 8}
 	if s := os.Getenv("LENDISK_MODEL_STEPS"); s != "" {
 		n, err := strconv.Atoi(s)
@@ -324,7 +329,7 @@ func (m *removalModel) removeFriend() {
 	_, err := m.p.db.RemoveFriendship(context.Background(), pl.name, false, m.p.now)
 	m.must(err)
 	pl.out, pl.answering = true, false
-	m.exempt[pl.name] = true // I3: a friend removed by the user
+	m.exempt[pl.name] = true // I3: a friendship ended
 	m.did("friend %s removed", pl.name)
 }
 
@@ -741,6 +746,9 @@ func (m *removalModel) sendTo(pl *mplace, n int) int {
 		if !started {
 			continue
 		}
+		if p.State == PlacementDropping {
+			m.checkSend(pl, p)
+		}
 		if m.pick(10) == 0 {
 			m.must(m.p.db.SetPlaceCondition(ctx, pl.name, ConditionRetrying, "blip", m.p.now))
 			m.did("%s: %d %s failed", pl.name, p.Seq, p.Op)
@@ -1036,6 +1044,38 @@ func (m *removalModel) infos(seqs []int64) map[int64]rowInfo {
 	return out
 }
 
+// intactCopies counts row seq's acknowledged copies at the places
+// intact holds true.
+func (m *removalModel) intactCopies(seq int64, intact map[string]bool) int {
+	acked, err := column(context.Background(), m.p.db, `SELECT place FROM placement WHERE seq = ? AND state = 'acked'`, seq)
+	m.must(err)
+	n := 0
+	for _, a := range acked {
+		if intact[a] {
+			n++
+		}
+	}
+	return n
+}
+
+// checkSend checks I1 as the delete of pl's dropping copy p is sent
+// (#104), whether or not the send then fails: the live object keeps
+// `copies` acknowledged copies at intact places without it.
+func (m *removalModel) checkSend(pl *mplace, p Placement) {
+	m.t.Helper()
+	r := m.infos([]int64{p.Seq})[p.Seq]
+	if !r.data || !r.live {
+		return
+	}
+	bk, err := m.p.db.GetBucket(context.Background(), p.Bucket)
+	m.must(err)
+	if n := m.intactCopies(p.Seq, m.intact(p.Bucket)); n < bk.Copies {
+		m.log = append(m.log, fmt.Sprintf("%d %s: %s", m.step, m.p.now.UTC().Format("01-02 15:04"), m.what))
+		m.fail("I1: %s's delete of its copy of %s/%s (%d) sent, leaving %d acknowledged copies at intact places, copies %d",
+			pl.name, p.Bucket, p.Key, p.Seq, n, bk.Copies)
+	}
+}
+
 // intact reports, per place, whether it is intact for bucket (I1): in
 // the pool, not refusing this node, not gone past replace_after, not a
 // target being removed, its replica of the bucket not unverified.
@@ -1158,22 +1198,15 @@ func (m *removalModel) check() {
 			continue
 		}
 		switch {
-		case r.data && was == PlacementAcked:
-			// I1.
+		case r.data && (was == PlacementAcked || was == PlacementDropping && st == PlacementDrained):
+			// I1, also as a dropping copy's delete is acknowledged: it
+			// was sent in this step (#104).
 			if intact[r.bucket] == nil {
 				intact[r.bucket] = m.intact(r.bucket)
 			}
-			acked, err := column(context.Background(), m.p.db, `SELECT place FROM placement WHERE seq = ? AND state = 'acked'`, k.seq)
-			m.must(err)
-			n := 0
-			for _, a := range acked {
-				if intact[r.bucket][a] {
-					n++
-				}
-			}
-			if n < copies[r.bucket] {
-				m.fail("I1: %s's copy of %s/%s (%d) went %s, leaving %d acknowledged copies at intact places, copies %d",
-					k.place, r.bucket, r.key, k.seq, st, n, copies[r.bucket])
+			if n := m.intactCopies(k.seq, intact[r.bucket]); n < copies[r.bucket] {
+				m.fail("I1: %s's copy of %s/%s (%d) went from %s to %s, leaving %d acknowledged copies at intact places, copies %d",
+					k.place, r.bucket, r.key, k.seq, was, st, n, copies[r.bucket])
 			}
 		case !r.data && (was == PlacementAcked || was == PlacementQueued) && st != PlacementAcked && st != PlacementQueued:
 			// I2.

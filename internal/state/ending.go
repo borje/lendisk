@@ -112,8 +112,11 @@ func (db *DB) removeFriendship(ctx context.Context, tx *sql.Tx, peer string, byP
 	if _, err := tx.ExecContext(ctx, `DELETE FROM replica_check WHERE place = ?`, peer); err != nil {
 		return FormerFriend{}, err
 	}
-	// Its unsent rows leave its FIFO: a friend removed by the user (I3,
-	// removal.go); its copies are re-placed (REPL-13).
+	// Its unsent rows leave its FIFO: a friendship ended, by the user or
+	// by the friend (byPeer); its copies are re-placed (REPL-13). The
+	// call names the exception (I3, removal.go) and always returns true:
+	// removing an unsent copy never lowers the count I1 keeps. It
+	// records the decision, and enforces nothing.
 	if _, _, err := db.mayRemove(ctx, tx, removal{place: peer, except: exceptFriendRemoved}, now); err != nil {
 		return FormerFriend{}, err
 	}
@@ -192,8 +195,11 @@ func (db *DB) ForgetFormerFriend(ctx context.Context, peer string) error {
 	if !former {
 		return nil
 	}
-	// Its rows go with its replica, purged: a friend removed by the user
-	// (I3, removal.go).
+	// Its rows go with its replica, purged: a friendship ended, by the
+	// user or by the friend. The call names the exception (I3,
+	// removal.go) and always returns true: a former friend is no intact
+	// place, so removing its rows never lowers the count I1 keeps. It
+	// records the decision, and enforces nothing.
 	if _, _, err := db.mayRemove(ctx, tx, removal{place: peer, except: exceptFriendRemoved}, db.now()); err != nil {
 		return err
 	}

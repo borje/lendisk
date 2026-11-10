@@ -37,7 +37,11 @@ import (
 //     replacement (AckPlacement), or by a pass that finds the object at
 //     `copies` acknowledged good places. A dropping row is a delete in
 //     its place's FIFO, at its sequence; acknowledged, it is drained
-//     (the lender keeps a tomb for the window, RET-1);
+//     (the lender keeps a tomb for the window, RET-1). Until a sender
+//     takes it, the removal rule is asked again: by each pass, for an
+//     object it may leave short, and as it is sent (checkDrop, #104);
+//     refused, it is acknowledged again and the pass places what is
+//     missing;
 //   - surplus copies (copies lowered, or a gone friend back while its
 //     replacement waits) are cancelled while unsent, the fullest place
 //     first (an overflow target before any friend, except the last
@@ -699,7 +703,7 @@ func (m *replacer) dataRound(ctx context.Context, bucket string, copies int) (Re
 				return st, below, belowBytes, errors.Join(append(errs, err)...)
 			}
 			switch {
-			case len(ops) > 0:
+			case len(ops) > 0 || m.dropShort(o, copies):
 				work = append(work, job{o.seq, o.size, short}) // its batch counts what it leaves
 			case short:
 				below++
@@ -792,6 +796,46 @@ func (m *replacer) fullness(a, b string) int {
 	}
 	return -byFraction(a, freeRoom(fa.quota, fa.use, fa.taken, m.live), capped(fa.quota),
 		b, freeRoom(fb.quota, fb.use, fb.taken, m.live), capped(fb.quota))
+}
+
+// dropShort reports whether data object o has a dropping copy the
+// removal rule may now refuse (#104): fewer than copies acknowledged
+// copies at intact places, as I1 counts them (mayRemove).
+func (m *replacer) dropShort(o robj, copies int) bool {
+	drops, n := false, 0
+	for _, r := range o.rows {
+		f := m.friends[r.place]
+		switch {
+		case r.state == PlacementDropping:
+			drops = true
+		case r.state == PlacementAcked && f != nil && !f.drainAll && !m.unverified[r.place]:
+			n++
+		}
+	}
+	return drops && n < copies
+}
+
+// checkDrops asks the removal rule again about o's dropping copies
+// whose delete no sender holds, when the object may be short
+// (dropShort): a refused one is acknowledged again (checkDrop), in o's
+// rows too, so decide counts it and places only what is still missing.
+func (m *replacer) checkDrops(ctx context.Context, tx *preparedTx, o *robj, copies int) error {
+	if !m.dropShort(*o, copies) {
+		return nil
+	}
+	for i, r := range o.rows {
+		if r.state != PlacementDropping || m.sending != nil && m.sending(r.place, o.seq) {
+			continue
+		}
+		ok, err := m.db.checkDrop(ctx, tx, r.place, o.seq, m.now)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			o.rows[i].state = PlacementAcked
+		}
+	}
+	return nil
 }
 
 // decide is what one data object needs (file comment above): the rows
@@ -1207,6 +1251,9 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 		if meta {
 			ops = m.metadataOps(o)
 		} else {
+			if err := m.checkDrops(ctx, ptx, &o, copies); err != nil {
+				return st, err
+			}
 			var below bool
 			var left int64
 			if ops, below, left, err = m.decide(ctx, bucket, o, copies, true); err != nil {

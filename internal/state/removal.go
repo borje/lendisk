@@ -24,10 +24,25 @@ import (
 //     (exceptFriendRemoved), and dropOverflow's rows of a target removed
 //     with keep_data (exceptKeepData).
 //
+// A dropping copy is asked about again before its delete is sent
+// (checkDrop, #104): from StartPlacement, in the transaction that takes
+// the row, at every try, and by each re-placement pass for an object
+// that may have become short. A copy marked dropping passed I1 then,
+// but another holder may have been lost since; a refused drop is
+// acknowledged again and not sent, and the pass places what the object
+// lacks. A delete a sender is sending is not checked (the pass skips
+// it): it may be on its way, and a delete sent cannot be recalled. One
+// whose earlier try failed is checked again before the next: a failed
+// try most likely never reached the place (a target unreachable for
+// days is the case this is for); one that landed with its answer lost
+// leaves a copy counted that the place keeps only as a tomb, until a
+// challenge of that replica finds it missing (VER-1).
+//
 // Rules a caller must keep: a new path that drops, drains or cancels a
 // copy asks mayRemove (through removeCopy or cancelCopy where it can) in
 // the transaction that writes the change, and writes nothing it refuses;
-// a new exception to I1 is a named one here, with its reason.
+// a new exception to I1 is a named one here, with its reason. A new
+// sender of a dropping row's delete takes it through StartPlacement.
 //
 // Not removals of a copy: a row of a version no longer live (a put a
 // later write superseded, CancelPlacement; one a delete of its key
@@ -57,13 +72,22 @@ import (
 //     their reason: the user lowering `copies` (I1 counts the copies
 //     set now: SetCopies is the user's decision), `overflow remove
 //     --keep-data` (the target's rows are forgotten with its data left
-//     there, exceptKeepData) and a friend removed by the user
-//     (exceptFriendRemoved). Nothing else bypasses I1.
+//     there, exceptKeepData) and a friendship ended, by the user or by
+//     the friend (byPeer, exceptFriendRemoved). Nothing else bypasses
+//     I1.
+//
+// The calls that name an exception (removeFriendship, ForgetFormerFriend,
+// dropOverflow), and those for unsent data rows (applyReroute,
+// RemoveOverflow), always return true. They record the decision, and
+// enforce nothing: removing an unsent copy never lowers the count I1
+// keeps, and neither does removing a copy at a former friend or at a
+// target being removed, which are not intact places.
 
-// I3's named exceptions: a removal with one of these is the user's
-// decision, and mayRemove allows it without counting copies.
+// I3's named exceptions: a removal with one of these is the user's (or
+// the friend's) decision, and mayRemove allows it without counting
+// copies.
 const (
-	exceptFriendRemoved = "a friend removed by the user"
+	exceptFriendRemoved = "a friendship ended, by the user or by the friend"
 	exceptKeepData      = "an overflow target removed with --keep-data"
 )
 
@@ -222,10 +246,44 @@ func (db *DB) cancelCopy(ctx context.Context, x querierExecer, r removal, untake
 	return res.RowsAffected()
 }
 
+// checkDrop asks mayRemove again, at now, about place's dropping copy
+// of row seq before its delete is sent (#104, file comment above). ok
+// is true when the delete may go. A refused drop is acknowledged again:
+// back in place_use (the trigger), and out of place_freed, where
+// place_freed_dropping counted it when it was marked (or less, floored
+// at 0, if a quota answer reset place_freed since: the next answer
+// corrects it). A row not dropping is left as it is, and ok is false.
+func (db *DB) checkDrop(ctx context.Context, x querierExecer, place string, seq int64, now time.Time) (bool, error) {
+	var size int64
+	err := x.QueryRowContext(ctx, `SELECT coalesce(size, 0) FROM placement WHERE place = ? AND seq = ? AND state = ?`,
+		place, seq, PlacementDropping).Scan(&size)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	ok, _, err := db.mayRemove(ctx, x, removal{seq: seq, place: place, acked: true}, now)
+	if err != nil || ok {
+		return ok, err
+	}
+	if _, err := x.ExecContext(ctx, `UPDATE placement SET state = 'acked' WHERE place = ? AND seq = ? AND state = ?`,
+		place, seq, PlacementDropping); err != nil {
+		return false, err
+	}
+	if size > 0 {
+		if _, err := x.ExecContext(ctx, `UPDATE place_freed SET bytes = max(bytes - ?, 0) WHERE place = ?`,
+			size, place); err != nil {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
 // drainedAck records the acknowledgement at now of the delete of place's
 // dropping copy of row seq: the copy is drained (the lender keeps it as
 // a tomb for the window, RET-1). ok is false when the row is not
-// dropping. The removal was decided when it was marked (removeCopy).
+// dropping. The removal was decided when it was marked (removeCopy),
+// and again as its delete was taken to be sent (checkDrop).
 func drainedAck(ctx context.Context, x execer, place string, seq int64, now time.Time) (bool, error) {
 	res, err := x.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementDrained+`', acked_at = ?
 		WHERE place = ? AND seq = ? AND state = '`+PlacementDropping+`'`, now.Unix(), place, seq)

@@ -222,7 +222,10 @@ func (db *DB) dropOverflow(ctx context.Context, name string) (bool, error) {
 	place := OverflowPlace(name)
 	// Its rows left are of objects no longer live (removable), and,
 	// removed with --keep-data, its acknowledged live metadata, which
-	// stays there out of lendisk's hands (I3).
+	// stays there out of lendisk's hands. The call names the exception
+	// (I3, removal.go) and always returns true: a target being removed
+	// is no intact place, so forgetting its rows never lowers the count
+	// I1 keeps. It records the decision, and enforces nothing.
 	var keep bool
 	if err := tx.QueryRowContext(ctx, `SELECT coalesce(keep_data, 0) FROM overflow WHERE name = ?`, name).Scan(&keep); err != nil {
 		return false, err

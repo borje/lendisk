@@ -961,8 +961,10 @@ func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(st
 		if sending != nil && sending(op.from, op.seq) {
 			continue
 		}
-		// An unsent data row: the removal rule allows it (I1), and asks
-		// nothing of the database.
+		// An unsent data row: the removal rule always allows it, and
+		// asks nothing of the database: removing an unsent copy never
+		// lowers the count I1 keeps. The call records the decision, and
+		// enforces nothing.
 		if ok, _, err := db.mayRemove(ctx, tx, removal{seq: op.seq, place: op.from, class: "data"}, now); err != nil {
 			return 0, 0, err
 		} else if !ok {

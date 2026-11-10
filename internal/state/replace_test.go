@@ -710,3 +710,149 @@ func TestAGoneFriendsCopyStaysWhileItsReplacementLeavesTheObjectShort(t *testing
 	p.replace()
 	p.wantState("A", d, PlacementDropping)
 }
+
+// dropping is the place of seq's one dropping row among places, and the
+// others.
+func (p *pool) dropping(seq int64, places ...string) (string, []string) {
+	p.t.Helper()
+	var drop string
+	var others []string
+	for _, x := range places {
+		if s, _ := p.rowOf(x, seq); s == PlacementDropping {
+			if drop != "" {
+				p.t.Fatalf("both %s and %s drop %d", drop, x, seq)
+			}
+			drop = x
+		} else {
+			others = append(others, x)
+		}
+	}
+	if drop == "" {
+		p.t.Fatalf("no place among %v drops %d", places, seq)
+	}
+	return drop, others
+}
+
+// REPL-13, I1 (#104, from the #103 review): a copy marked dropping is
+// checked again before its delete is sent. Another holder lost since it
+// was marked leaves the object short, so the sender does not send it:
+// the copy is acknowledged again, and nothing is left to send there.
+func TestADroppingCopyIsNotDeletedOnceAnotherHolderIsLost(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("A", 10)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("r", 3)
+	d := p.put("r", "data/1", "data", 1)
+	p.ackQueued()
+	if err := p.db.SetCopies(ctx, "r", 2); err != nil {
+		t.Fatal(err)
+	}
+	p.replace()
+	drop, others := p.dropping(d, "A", "B", "C")
+	if err := p.db.RecordUnverified(ctx, others[0], "r", "challenge failed", p.now); err != nil {
+		t.Fatal(err)
+	}
+	next, ok, err := p.db.NextPlacement(ctx, drop)
+	if err != nil || !ok || next.Seq != d || next.Op != OpDelete {
+		t.Fatalf("%s's next row is %+v %v %v, want the delete of %d", drop, next, ok, err, d)
+	}
+	if p.start(drop, d) {
+		t.Fatalf("%s's delete of data/1 started while it leaves the object 1 intact copy of 2", drop)
+	}
+	p.wantState(drop, d, PlacementAcked)
+	if _, ok, err := p.db.NextPlacement(ctx, drop); err != nil || ok {
+		t.Fatalf("%s still has a row to send: %v %v", drop, ok, err)
+	}
+	// The pass that follows keeps it: the object has no copy to spare.
+	p.replace()
+	p.wantState(drop, d, PlacementAcked)
+}
+
+// REPL-13, I1 (#104): a delete whose earlier send failed is checked
+// again before it is tried again: the place most likely never had it.
+func TestARetriedDropIsCheckedAgain(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("A", 10)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.bucket("r", 3)
+	d := p.put("r", "data/1", "data", 1)
+	p.ackQueued()
+	if err := p.db.SetCopies(ctx, "r", 2); err != nil {
+		t.Fatal(err)
+	}
+	p.replace()
+	drop, others := p.dropping(d, "A", "B", "C")
+	if !p.start(drop, d) {
+		t.Fatalf("%s's delete did not start while the object keeps 2 copies", drop)
+	}
+	// The send failed; meanwhile another holder refuses this node.
+	p.condition(others[1], ConditionRemoved, p.now, p.now)
+	if p.start(drop, d) {
+		t.Fatalf("%s's delete was tried again while it leaves the object short", drop)
+	}
+	p.wantState(drop, d, PlacementAcked)
+}
+
+// REPL-13, I1 (#104): a re-placement pass returns a dropping copy that
+// may no longer go to acknowledged, and places what the object then
+// lacks. A's copy, gone, was dropping once C's replacement was
+// acknowledged; C's replica then failed a challenge, so A's copy stays
+// and D gets a copy in its place.
+func TestAPassKeepsARefusedDropAndPlacesItsReplacementAgain(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("A", 10)
+	p.friend("B", 10)
+	p.bucket("r", 2)
+	d := p.put("r", "data/1", "data", 1)
+	p.ackQueued()
+	p.gone("A")
+	p.friend("C", 10)
+	p.replace()
+	p.ack("C", d)
+	p.wantState("A", d, PlacementDropping)
+	if err := p.db.RecordUnverified(ctx, "C", "r", "challenge failed", p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.friend("D", 10)
+	p.replace()
+	p.wantState("A", d, PlacementAcked)
+	if s, r := p.rowOf("D", d); s != PlacementQueued || r != "A" {
+		t.Fatalf("D's row is %q replacing %q, want queued replacing A", s, r)
+	}
+	if _, ok, err := p.db.NextPlacement(ctx, "A"); err != nil || ok {
+		t.Fatalf("A still has a row to send: %v %v", ok, err)
+	}
+	// D's copy acknowledged, A's goes.
+	p.ack("D", d)
+	p.wantState("A", d, PlacementDropping)
+	if !p.start("A", d) {
+		t.Fatal("A's delete did not start once D's copy is acknowledged")
+	}
+}
+
+// REPL-13, I1 (#104): a replacement's acknowledgement
+// decides on the copy it replaces at the acknowledgement's time, not
+// the clock's when it is recorded. B was not gone yet when C answered.
+func TestAnAcknowledgementDecidesAtItsOwnTime(t *testing.T) {
+	p := newPool(t)
+	p.friend("A", 10)
+	p.friend("B", 10)
+	p.bucket("r", 2)
+	d := p.put("r", "data/1", "data", 1)
+	p.ackQueued()
+	p.gone("A")
+	p.friend("C", 10)
+	p.replace()
+	// B silent for 7.5 days by the clock: gone now, not two days ago.
+	silent := p.now.Add(-(7*24 + 12) * time.Hour)
+	p.condition("B", ConditionRetrying, silent, silent)
+	if err := p.db.AckPlacement(context.Background(), "C", d, "h", p.now.Add(-48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	p.wantState("A", d, PlacementDropping)
+}
