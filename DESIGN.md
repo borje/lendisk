@@ -3346,7 +3346,13 @@ upstream bucket is Q-V.
     drained place is marked `dropping` when its replacement is
     acknowledged, in the transaction that records the acknowledgement
     (`AckPlacement`), or by a pass that finds the object at `copies`
-    acknowledged good copies. So the object never has fewer copies than
+    acknowledged good copies. At the acknowledgement it is marked only
+    while the object keeps `copies` acknowledged copies at intact
+    places without it, the drained place's copy included (#103: with
+    another friend gone meanwhile, the gone friend's copy stays until a
+    pass drops it,
+    `TestAGoneFriendsCopyStaysWhileItsReplacementLeavesTheObjectShort`).
+    So the object never has fewer copies than
     it had, and a gone friend that returns does not count the copies
     that were moved away: the watermark's `holds` reads `dropping` and
     `drained` rows as the place's latest row of the key, and neither is
@@ -7457,6 +7463,10 @@ of the `copies`, and the estimated cost (S3-7).
   `TestAnIdleTargetsMetadataIsNotPlacedAndDroppedOnEveryPass`). It
   holds data while it has a queued, acknowledged or dropping copy of a
   live data object, or still holds a deleted one: a data key's delete
+  queued there and not sent yet, the key's last copy there
+  acknowledged (it becomes a tomb or a marker once sent, so a pass
+  between a prune and the send does not drop the metadata, #103,
+  `TestAPrunedObjectsMetadataStaysWhileItsDeleteWaitsToBeSent`), a data key's delete
   held there as a client-side tomb, the key's last copy there
   acknowledged (an undelete brings it back there, RET-3), or a data
   tomb refused for want of permission (S3-5). So a prune at an

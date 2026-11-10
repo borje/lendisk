@@ -225,13 +225,15 @@ func (db *DB) ackPlacement(ctx context.Context, tx *sql.Tx, place string, seq in
 }
 
 // keepReplaced reports whether the copy of row seq at replaced must stay
-// although its replacement was acknowledged (#38 review): replaced is
-// an intact place (in the pool, not removed, not gone past
-// replace_after, its replica of the bucket not unverified), as it is
-// when re-placement moved a copy rather than drained one, and without
-// it the object would have fewer than `copies` acknowledged copies at
-// such places. Re-placement then drops it when that is safe (decide).
-// A target being removed (#96) is kept the same way.
+// although its replacement was acknowledged (#38 review): without it
+// the object would have fewer than `copies` acknowledged copies at
+// intact places (in the pool, not removed, not gone past replace_after,
+// not a target being removed, its replica of the bucket not
+// unverified). That holds whatever replaced is: a copy moved from an
+// intact place, a target being removed (#96), or a drained place (a
+// friend gone or refusing, #103: its copy is the object's until enough
+// others are acknowledged). Re-placement then drops it when that is
+// safe (decide).
 func (db *DB) keepReplaced(ctx context.Context, tx *sql.Tx, bucket string, seq int64, replaced string) (bool, error) {
 	ps, err := poolPlaces(ctx, tx)
 	if err != nil {
@@ -243,20 +245,10 @@ func (db *DB) keepReplaced(ctx context.Context, tx *sql.Tx, bucket string, seq i
 	}
 	now := db.now()
 	intact := map[string]bool{}
-	removing := false
 	for _, p := range ps {
 		if p.cond != ConditionRemoved && !p.gone(db, now) && !p.removing && !unverified[p.peer] {
 			intact[p.peer] = true
 		}
-		if p.peer == replaced && p.removing {
-			removing = true
-		}
-	}
-	// A target being removed still holds its copy, and counts until the
-	// object has `copies` intact ones without it (#96 review): its copy
-	// goes only then, whatever happened to the others meanwhile.
-	if !intact[replaced] && !removing {
-		return false, nil // drained: it never counted
 	}
 	acked, err := column(ctx, tx, `SELECT place FROM placement WHERE seq = ? AND state = 'acked' AND place != ?`, seq, replaced)
 	if err != nil {

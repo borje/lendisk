@@ -679,3 +679,34 @@ func TestAGoneFriendsUnreadListDoesNotHoldReplacementBack(t *testing.T) {
 		t.Fatalf("D's row of data/1 is %q replacing %q, want queued replacing C", st, replaces)
 	}
 }
+
+// REPL-13, I1 (#103, found by TestRemovalModel): a gone friend's copy
+// stays at its replacement's acknowledgement while the object would be
+// left with fewer than `copies` acknowledged copies at intact places:
+// here B went too meanwhile, so only C's counts. It goes once another
+// intact copy is acknowledged.
+func TestAGoneFriendsCopyStaysWhileItsReplacementLeavesTheObjectShort(t *testing.T) {
+	p := newPool(t)
+	p.friend("A", 10)
+	p.friend("B", 10)
+	p.bucket("r", 2)
+	d := p.put("r", "data/1", "data", 1)
+	p.ackQueued()
+	p.wantPlaces("data/1", d, "A", "B")
+	p.gone("A")
+	p.friend("C", 10)
+	p.replace()
+	if s, r := p.rowOf("C", d); s != PlacementQueued || r != "A" {
+		t.Fatalf("C's row is %s replacing %q, want queued replacing A", s, r)
+	}
+	p.gone("B")
+	p.ack("C", d)
+	p.wantState("A", d, PlacementAcked)
+	p.replace()
+	p.wantState("A", d, PlacementAcked)
+	p.friend("D", 10)
+	p.replace()
+	p.ackQueued()
+	p.replace()
+	p.wantState("A", d, PlacementDropping)
+}

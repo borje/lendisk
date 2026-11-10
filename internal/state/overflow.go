@@ -483,7 +483,8 @@ func overflowHolding(ctx context.Context, q querier, bucket string, now int64) (
 // holds data of bucket at now (unix seconds): it holds, has queued or
 // is deleting a copy of a live data object (the key's latest done
 // write), or it still holds a deleted one that an undelete brings back
-// there (S3-4, RET-3): a delete of the key held there as a client-side
+// there (S3-4, RET-3): a delete of the key queued there and not sent
+// yet (#103: it is held or sent as a marker once sent), held there as a client-side
 // tomb or refused for want of permission (S3-5), or sent there as a
 // delete marker, while the target had versioning (versionedAt, #97),
 // that the target acknowledged less than its retention before now (its
@@ -507,6 +508,9 @@ func holdsLiveData(place, bucket, now string) string {
 		WHERE h.place = ` + place + ` AND h.bucket = ` + bucket + ` AND h.op = 'put' AND hq.class = 'data'
 		AND h.state IN ('queued', 'acked', 'dropping')
 		AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = hq.bucket AND l.key = hq.key AND l.seq > hq.seq AND l.state = 'done'))
+	OR EXISTS (SELECT 1 FROM placement t JOIN queue tq ON tq.seq = t.seq
+		WHERE t.place = ` + place + ` AND t.bucket = ` + bucket + ` AND tq.class = 'data'
+		AND t.op = 'delete' AND t.state = 'queued' AND ` + heldBefore + `)
 	OR EXISTS (SELECT 1 FROM overflow_tomb t JOIN queue tq ON tq.seq = t.seq
 		WHERE t.place = ` + place + ` AND t.bucket = ` + bucket + ` AND tq.class = 'data'
 		AND (t.denied_at IS NOT NULL OR t.drained IS NULL AND ` + heldBefore + `))

@@ -297,6 +297,26 @@ func TestAPrunedObjectsMetadataStaysWhileItsDeleteIsHeld(t *testing.T) {
 	p.wantState(target, meta, PlacementDropping)
 }
 
+// REPL-12, I2 (#103, found by TestRemovalModel): a pruned object's
+// delete queued at the target and not sent yet still leaves the copy
+// there, which its tomb or marker then keeps: a pass in between does
+// not drop the bucket's metadata at the target.
+func TestAPrunedObjectsMetadataStaysWhileItsDeleteWaitsToBeSent(t *testing.T) {
+	for _, v := range []string{VersioningOff, VersioningEnabled} {
+		t.Run(v, func(t *testing.T) {
+			p, target, _ := targetPool(t, t.TempDir(), v)
+			meta, _ := p.metaAt(target)
+			p.ack(target, meta)
+			del := p.del("r", "data/1", "data")
+			p.wantPlaces("delete of data/1", del, "B", target)
+			if s := p.replace(); s.Dropping != 0 || s.Cancelled != 0 {
+				t.Fatalf("re-placement deleted the metadata at the target before a pruned object's delete was sent: %+v", s)
+			}
+			p.wantState(target, meta, PlacementAcked)
+		})
+	}
+}
+
 // S3-5 (#40): a copy the target refused to delete stays there, so the
 // bucket's metadata stays too.
 func TestADeniedDeleteKeepsTheMetadataAtTheTarget(t *testing.T) {
