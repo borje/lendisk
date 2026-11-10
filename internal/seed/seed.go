@@ -10,7 +10,9 @@
 //     borrower's bucket through the friend's own running gateway, signed
 //     as the borrower, so the lender's quota, floor, hash and
 //     existing-key checks (LEND-1, LEND-2, LEND-4) apply exactly as to a
-//     put over the tunnel.
+//     put over the tunnel. Data goes before metadata, and metadata not
+//     at all once data was refused; a disk older than one imported, and
+//     a key the borrower deleted here, are refused (#95).
 //   - Confirmer, in the borrower's daemon: lists the friend's copy
 //     (NET-7 list) and acknowledges each held row the list shows with the
 //     captured hash; the rest stay queued and go by the network once the
@@ -79,7 +81,15 @@ type Object struct {
 	Key    string `json:"key"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256"` // the capture's hash (REPL-10)
+	// Class is the key's class at export (EP-7): data, metadata or
+	// snapshot. Added in #95 within format 1: a manifest without it
+	// counts every object as data.
+	Class string `json:"class,omitempty"`
 }
+
+// meta reports whether o is metadata or a snapshot (REPL-12): put only
+// after every data object (#95).
+func (o Object) meta() bool { return o.Class != "" && o.Class != "data" }
 
 // Path is where the object's file lies under the export directory.
 func (m Manifest) Path(key string) string {

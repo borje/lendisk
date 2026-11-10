@@ -422,7 +422,7 @@ func TestImportFollowsNoLinkAndOpensNoDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	dialled := false
-	im := &Importer{Self: b, Dial: func(context.Context) (net.Conn, error) {
+	im := &Importer{Self: b, DB: openDB(t), Dial: func(context.Context) (net.Conn, error) {
 		dialled = true
 		return nil, errors.New("no gateway in this test")
 	}}

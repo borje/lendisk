@@ -159,6 +159,8 @@ lendisk uses the store alone. Tables:
 | `reconcile` | the store reconciler's guard against mass deletion |
 | `undelete_request`, `undelete_key` | `lendisk undelete` runs |
 | `seed` | `lendisk export <bucket> --for <friend>`: a friend seeded from a disk, whose rows of that bucket wait until its list confirms the import |
+| `seed_skip` | the rows of a seed its export did not write, which it does not wait for |
+| `seed_import` | on a lender: the newest seeding disk of each borrower's bucket imported, so an older one is refused |
 | `alert` | raised alerts and their delivery |
 
 ## The export layout

@@ -92,11 +92,14 @@ func (e *Exporter) Export(ctx context.Context, bucket string, place identity.Nod
 	}()
 	m := Manifest{Format: Format, Borrower: e.Self.NodeID().String(), Lender: place.String(),
 		Bucket: e.Self.SealedName(bucket), Layout: layout}
+	// The rows not written: the seed does not wait for them (#95).
+	var skipped []int64
 	for _, o := range objs {
 		if err := ctx.Err(); err != nil {
 			return r, err
 		}
 		if strings.HasSuffix(o.Key, "/") || !filepath.IsLocal(filepath.FromSlash(o.Key)) {
+			skipped = append(skipped, o.Seq)
 			continue // a directory marker: no lender stores one (SEC-5)
 		}
 		written, err := copyChecked(filepath.Join(e.StoreDir, bucket, filepath.FromSlash(o.Key)),
@@ -106,9 +109,10 @@ func (e *Exporter) Export(ctx context.Context, bucket string, place identity.Nod
 		}
 		if !written {
 			r.Changed++
+			skipped = append(skipped, o.Seq)
 			continue
 		}
-		m.Objects = append(m.Objects, Object{Key: o.Key, Size: o.Size, SHA256: o.SHA256})
+		m.Objects = append(m.Objects, Object{Key: o.Key, Size: o.Size, SHA256: o.SHA256, Class: o.Class})
 		r.Objects++
 		r.Bytes += o.Size
 	}
@@ -121,7 +125,7 @@ func (e *Exporter) Export(ctx context.Context, bucket string, place identity.Nod
 	if err := writeManifest(dst, m, secret); err != nil {
 		return r, err
 	}
-	if err := e.DB.SeedWritten(ctx, place.String(), bucket, r.Objects, r.Bytes, e.now()); err != nil {
+	if err := e.DB.SeedWritten(ctx, place.String(), bucket, r.Objects, r.Bytes, skipped, e.now()); err != nil {
 		return r, err
 	}
 	ok = true

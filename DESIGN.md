@@ -3977,7 +3977,13 @@ upstream bucket is Q-V.
     object (REPL-12). The bytes are read from the store directory
     (`<store>/<bucket>/<key>`) and hashed on the way; a key whose copy
     no longer matches its capture hash (a write under way) is left out,
-    counted, for the network. Layout: one file per key at its key path,
+    counted, for the network. The rows the export does not write (that
+    key's, a directory marker's) are recorded with the seed
+    (`seed_skip`, migration 45, #95): they stay held while it is
+    pending, but it does not wait for the friend's list to show them, so
+    a seed whose disk was imported whole ends `confirmed`. Each manifest
+    object carries its `class` (data, metadata, snapshot; additive
+    within format 1, absent means data). Layout: one file per key at its key path,
     or for a `kopia` bucket Kopia's sharded layout and `.shards`
     (`export.KopiaPath`, as LEND-6's export); a directory marker is
     skipped (no lender stores one). `<dir>` must be new or empty; files
@@ -4007,14 +4013,22 @@ upstream bucket is Q-V.
     lags, as an offline friend's does; its own FIFO keeps the order,
     since it is sent nothing of the bucket until the seed ends. A failed
     export drops its row. A second
-    export of the same bucket for the same friend replaces the seed.
+    export of the same bucket for the same friend replaces the seed
+    (and restarts its 30 days). `lendisk export --cancel <bucket> --for
+    <friend>` ends a pending seed `cancelled` (#95): its rows go by the
+    network at the worker's next look (a second), as for a lost disk; a
+    disk imported anyway stores nothing twice (`putAgain`).
     Reroute (#19) still applies to a friend unreachable past
     `reroute_after`.
   - *Import* (`lendisk import <dir>`, on the lender, daemon running):
     reads and authenticates the manifest (at most `seed.MaxManifest`,
     512 MiB, some 2.5 million objects), checks the borrower is a
-    friend, then puts each object through the lender's own gateway
-    socket (`gw.sock`) with `replica.NewSeeder`: the borrower's access
+    friend, refuses a disk older than one imported before (below), then
+    puts each object through the lender's own gateway
+    socket (`gateway.LiveSocket`: `gw.sock`, or the private socket a
+    data_dir too long for a socket path moves it to, which the daemon
+    names in `run/gw.sock.path` while it serves; `daemonRunning` dials
+    the same, #95) with `replica.NewSeeder`: the borrower's access
     key and the pair secret the lender derives too, `x-amz-meta-lendisk-
     sha256` and the checksum header exactly as the worker sends them.
     So quota and floor (`reserve`), hash (`putLent`'s body check),
@@ -4039,6 +4053,29 @@ upstream bucket is Q-V.
     regular file (`seed.openPlain`), so no link is followed and no FIFO
     or device blocks or is read; a manifest key that is absolute or has
     `..` refuses the whole manifest.
+  - *Import order (#95).* Every data object goes first, in manifest
+    order, then metadata and snapshots, and those only if no data
+    object was refused: an index or snapshot names packs, and one
+    landing before its pack would show the friend's replica a
+    repository with a hole, which the network path never does
+    (REPL-12's barrier). The metadata left out is reported ("Left N
+    metadata objects for the network") and stays queued at the
+    borrower, which sends it after the refused data once the seed ends.
+    An import stopped by quota stops in the data, so no metadata lands
+    either.
+  - *Replay (#95).* An old disk imported again would bring back keys
+    the borrower has pruned since: the gateway does not refuse a put to
+    a tombstoned key, it revives it when the hash matches (§3.6, RET-2,
+    `tomb.go`). So the lender records the newest `exported_at` imported
+    per borrower and sealed bucket (`seed_import`, migration 45,
+    `state.SeedImport`, nanoseconds, the borrower's clock, compared only
+    with the same borrower's exports) and refuses an older disk whole;
+    the same disk again passes, to finish an import that stopped. And
+    an object whose key the borrower deleted here (a tombstone that is
+    not a rewrite's replaced version) is refused from any disk; if the
+    borrower still holds the key, its node sends it, which revives it
+    as a network put would. A cancelled seed's disk is not known to the
+    lender; the tombstone rule covers it.
   - *Confirm* (`seed.Confirmer`, in the borrower's daemon, `full`
     role): every minute each pending seed's friend is listed (§3.7
     `list`; a 404 `NoSuchBucket` is "nothing yet"; failures back off
@@ -4052,10 +4089,22 @@ upstream bucket is Q-V.
     listing has confirmed more for `state.SeedQuietAfter` (1 h:
     `quiet`, an import ended or stopped part way); when nothing was
     confirmed within `state.SeedExpiry` (30 days: `expired`, a disk
-    lost or never imported); or when the friend is no longer one
-    (`removed`). Then the FIFO sends what is left, in seq order.
+    lost or never imported); when the friend is no longer one
+    (`removed`); or when the user cancels it (`cancelled`). Then the
+    FIFO sends what is left, in seq order. `ConfirmSeeded` finds a
+    listed key's queued rows and acknowledges them in one transaction,
+    each only while still `queued` (`ackPlacement` with `onlyQueued`),
+    so a row re-placement abandoned meanwhile stays so (#95). A seed
+    that has confirmed nothing for `state.SeedStaleAfter` (7 days)
+    raises `seed_stale` (§3.8, #95). *Decision:* a week is a disk sent
+    by post or carried at the next weekly visit, is
+    `replace_after`'s default, and leaves three of `SeedExpiry`'s four
+    weeks to import the disk or cancel the seed; sooner would alert
+    ordinary posting, later would leave the friend's copies waiting
+    unremarked for most of the month.
   - `status` shows each pending seed with its age and when its hold
-    ends at the latest if nothing more is confirmed (text, and
+    ends at the latest if nothing more is confirmed, and the cancel
+    command (text, and
     `expires_at` in `--json`'s `seeds`, which lists every seed);
     `status --wait` that times out names each pending seed of the
     bucket and the objects it holds.
@@ -4066,8 +4115,18 @@ upstream bucket is Q-V.
     `TestOnlyRowsTheListShowsWithTheirHashAreAcknowledged`,
     `TestSeedEnds` (`internal/seed`);
     `TestScenarioSeedAFriendFromADisk` (quota stop and rerun, a damaged
-    object, a held key, confirmation, no re-upload by the worker's
-    metrics) and `TestSeedExportAndImportRefusals` (`internal/cli`).
+    object, a held key, metadata left for the network, confirmation, no
+    re-upload by the worker's metrics, cancel, an older disk refused)
+    and `TestSeedExportAndImportRefusals` (`internal/cli`). #95:
+    `TestASeedEndsConfirmedWithoutTheRowsItsExportSkipped`,
+    `TestConfirmSeededAcknowledgesOnlyRowsStillQueued`,
+    `TestCancelledSeedReleasesItsRows`, `TestAnOlderSeedingDiskIsRefused`
+    (`internal/state`); `TestImportPutsDataBeforeMetadata`,
+    `TestImportRefusesAnOlderDiskAndDeletedKeys`,
+    `TestASeedWhoseExportSkippedRowsEndsConfirmed` (`internal/seed`);
+    `TestAStaleSeedRaisesAlert` (`internal/alert`);
+    `TestLongSocketPathFallsBack` (`internal/gateway`),
+    `TestImportFindsTheSocketOfALongDataDir` (`internal/cli`).
 - **REPL-10** The hash is SHA-256, taken by the decorator from the
   write stream at capture (EP-3) and kept on the queue row; the worker
   sends it with the object as `x-amz-meta-lendisk-sha256` and stores
@@ -6068,7 +6127,14 @@ the handler's own reads and is never cancelled; nothing below
     says to add a friend or an overflow target instead. `Service.Copies`
     is `replication.copies`, the `c` of a node with no bucket
     (`TestRepositoryNearTheProtectableSizeNamesANumberPerFriendship`,
-    `TestTooFewFriendsToProtectSaysSo`).
+    `TestTooFewFriendsToProtectSaysSo`);
+  - `seed_stale`, subject `<friend>/<bucket>`: a pending seed from a
+    disk (§3.4 REPL-8) whose friend's list has confirmed nothing for
+    `state.SeedStaleAfter` (7 days) since the export (#95). The message
+    says when the hold ends (`SeedExpiry` after the export), to import
+    the disk, or to send by the network now with `lendisk export
+    --cancel <bucket> --for <friend>`. Cleared by the first
+    confirmation or the seed's end (`TestAStaleSeedRaisesAlert`).
   The four quota alerts (`quota_high`, `quota_exhausted`,
   `lent_over_quota`, `protectable_size`) have hysteresis (#24 review;
   the last since #37, as a repository near the line crosses it with

@@ -1212,6 +1212,7 @@ friend, or with no room in the pool), which status shows.`,
 				exported, _ := time.Parse(time.RFC3339, sd.ExportedAt)
 				fmt.Fprintf(a.out, "  exported %s ago; if the friend's list confirms nothing more, the rest go by the network from %s\n",
 					ageText(a.now().Sub(exported)), textTime(sd.ExpiresAt))
+				fmt.Fprintf(a.out, "  to send it by the network now instead: lendisk export --cancel %s --for %s\n", sd.Bucket, sd.Place)
 				if sd.Error != "" {
 					fmt.Fprintf(a.out, "  (last list: %s)\n", sd.Error)
 				}

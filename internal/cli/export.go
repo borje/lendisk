@@ -20,9 +20,9 @@ import (
 // #36).
 func (a *app) exportCmd() *cobra.Command {
 	var lent, forPeer string
-	var kopia bool
+	var kopia, cancel bool
 	cmd := &cobra.Command{
-		Use:   "export (<bucket> --for <friend> | --lent <stored name> [--kopia-layout]) <directory>",
+		Use:   "export (<bucket> --for <friend> | --lent <stored name> [--kopia-layout]) <directory> | --cancel <bucket> --for <friend>",
 		Short: "Write a bucket as plain files: to seed a friend from a disk, or a friend's replica held here",
 		Long: `export writes plain files in the backup tool's own layout, in one of two forms.
 
@@ -39,7 +39,14 @@ nothing more of the bucket: it lists the friend's copy, and what the
 import stored with the hash this node captured is acknowledged and never
 sent. The rest, and every write since, go by the network once all is
 confirmed, an hour after the import confirmed its last object, or after
-30 days if nothing was imported. ` + "`lendisk status`" + ` shows the seed.
+30 days if nothing was imported (an alert is raised after 7). ` + "`lendisk status`" + `
+shows the seed.
+
+  export --cancel <bucket> --for <friend>
+
+ends that seed now: what it holds goes by the network, as when the disk
+is lost. Exporting again instead replaces the seed and restarts its 30
+days.
 
   export --lent <stored name> <directory> [--kopia-layout]
 
@@ -63,6 +70,11 @@ see docs/restore-without-lendisk.md.
 		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			switch {
+			case cancel:
+				if forPeer == "" || lent != "" || kopia || len(args) != 1 {
+					return usageError{errors.New("usage: lendisk export --cancel <bucket> --for <friend>")}
+				}
+				return a.cancelSeed(cmd.Context(), args[0], forPeer)
 			case forPeer != "" && lent != "":
 				return usageError{errors.New("give --for <friend> to seed a friend, or --lent <stored name> to export a friend's replica, not both")}
 			case forPeer != "":
@@ -105,7 +117,31 @@ see docs/restore-without-lendisk.md.
 	cmd.Flags().StringVar(&forPeer, "for", "", "the friend to seed: write what of <bucket> is placed there (its node ID)")
 	cmd.Flags().StringVar(&lent, "lent", "", "the friend's bucket, by its name in this node's store (lent-<id16>-<sealed>)")
 	cmd.Flags().BoolVar(&kopia, "kopia-layout", false, "with --lent: write Kopia's sharded filesystem layout, for a Kopia bucket")
+	cmd.Flags().BoolVar(&cancel, "cancel", false, "with <bucket> --for <friend>: end the pending seed; what it holds goes by the network")
 	return cmd
+}
+
+// cancelSeed ends the pending seed of bucket for friend (#95): what it
+// holds goes by the network from now. The daemon need not run; its
+// worker sees the seed ended at its next look at the FIFO.
+func (a *app) cancelSeed(ctx context.Context, bucket, friend string) error {
+	peer, err := identity.ParseNodeID(friend)
+	if err != nil {
+		return usageError{fmt.Errorf("--for %q is not a node ID: %w", friend, err)}
+	}
+	_, db, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.CancelSeed(ctx, peer.String(), bucket, a.now()); errors.Is(err, state.ErrNotFound) {
+		return fmt.Errorf("no pending seed of bucket %s for %s: `lendisk status` shows the seeds", bucket, peer)
+	} else if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.out, "Cancelled the seed of bucket %s for %s; what it held goes by the network now.\n", bucket, peer)
+	fmt.Fprintf(a.out, "A friend that imports the disk anyway stores nothing twice: this node's sends of those objects are acknowledged as already held.\n")
+	return nil
 }
 
 // exportFor writes what of bucket is placed at friend to dir (REPL-8).

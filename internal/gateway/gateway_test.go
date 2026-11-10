@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,12 +119,30 @@ func TestLongSocketPathFallsBack(t *testing.T) {
 	if err != nil || fi.Mode().Perm() != 0o700 {
 		t.Fatalf("socket directory: %v %v", fi.Mode(), err)
 	}
+	// #95: a command finds the socket the daemon moved to.
+	if got := LiveSocket(long); got != g.Socket {
+		t.Fatalf("LiveSocket %q; want %q", got, g.Socket)
+	}
+	if fi, err := os.Stat(SocketPath(long) + ".path"); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("redirect file: %v %v", fi, err)
+	}
+	if c, err := net.Dial("unix", LiveSocket(long)); err != nil {
+		t.Fatalf("dialling the live socket: %v", err)
+	} else {
+		c.Close()
+	}
 	cancel()
 	if err := within(t, "the gateway stopping", errc); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Dir(g.Socket)); !os.IsNotExist(err) {
 		t.Fatal("temporary socket directory left behind")
+	}
+	if got := LiveSocket(long); got != SocketPath(long) {
+		t.Fatalf("LiveSocket after the stop: %q", got)
+	}
+	if got := LiveSocket(dir); got != SocketPath(dir) {
+		t.Fatalf("LiveSocket of a short data_dir: %q", got)
 	}
 }
 
