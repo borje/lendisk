@@ -62,6 +62,8 @@ type Decorator struct {
 	// Fetch opens objects at friends for the read-through (EP-10,
 	// readthrough.go); nil fetches nothing.
 	Fetch Fetcher
+	// FetchBound bounds each fetch's time (#73); zero is the default.
+	FetchBound FetchBound
 	// Now is the clock a bucket's format-1 mark is taken on (COMPAT-1);
 	// nil means time.Now.
 	Now func() time.Time

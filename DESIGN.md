@@ -2468,7 +2468,31 @@ upstream bucket is Q-V.
     place), counted as its failed fetch, and the next place tried. It is
     not an alert: VER-1's challenge (#27) is the verdict on a friend. A
     failure of the local store stops the fetch (`500`); no place would
-    do better.
+    do better. A recorded size of 0 with a hash other than that of no
+    bytes is no version any place can serve: it is refused (`503`,
+    logged as an error) before anything is fetched, since posix would
+    commit an empty object before the hash could refuse it (#73).
+  - *Bounded in time* (#73). Once a place has answered, its body has
+    `FetchBound` to arrive in: 2 minutes plus the recorded size at
+    8 KiB/s (`DefaultFetchBase`, `DefaultFetchRate`; a 16 MiB pack gets
+    about 36 minutes). The stall watchdog ends a body that stops; this
+    ends one trickled a byte at a time, which would otherwise hold the
+    key's lock and the reader as long as the friend liked (versitygw
+    does not cancel a request's context when its client goes). The
+    base is the friend client's stall timeout, so a small object gets
+    what any request does; the rate is the lender's floor for a request
+    body (§3.5 LEND-2, `bridge.DefaultFloorRate`), half the
+    `pace.MinRate` a download limit keeps each fetch above, so a paced
+    fetch is never ended by it. *Precedent:* S3 SDKs (AWS, minio-go) and
+    rclone's `--timeout` bound idleness, not a whole transfer, which is
+    our stall watchdog; a total bound has to scale with the size, as
+    the lender's floor does. The wait for a fetch slot, the dial and the
+    response headers have bounds of their own and are not counted. A
+    fetch ended for its time is the place's failure (logged `the fetch
+    took longer than …`) and the next place is tried
+    (`TestATricklingFriendIsGivenUpOnAtTheFetchDeadline`). Concurrent
+    first misses of different keys at one dead friend each still wait
+    out the dial before it is known failed.
   - *Stored without capture.* The object goes to the backend under the
     decorator, so it gets no queue row and no placement: the places it
     came from hold it already. It carries no `lendisk-capture` token,
@@ -2494,7 +2518,10 @@ upstream bucket is Q-V.
     it says why) from the same marker, in byte order, folding keys under
     a delimiter into common prefixes as posix does; the store's entry
     wins a name both have, and the next continuation token is the last
-    name returned, which posix takes as its marker. An index entry has
+    name returned, which posix takes as its marker. When the store's
+    page is truncated, the merged entries are cut at its last name, so
+    a store that ends a page before `MaxKeys` loses none of its keys to
+    an index key further on (#73). An index entry has
     the size and capture (or listing) time and no ETag. On a node that
     lost nothing the index adds no key the store lacks. `ListObjects`
     (v1) is not merged: restic, Kopia, rclone and the AWS CLI use v2.
@@ -2508,7 +2535,10 @@ upstream bucket is Q-V.
     `TestHeadAndRangedReadFetchTheWholeObject`,
     `TestConflictRefusedAndUnknownNotFound`,
     `TestConcurrentMissesFetchOnce` and
-    `TestListShowsRecoveredKeysBeforeTheyAreRead` (`internal/gateway`);
+    `TestListShowsRecoveredKeysBeforeTheyAreRead`,
+    `TestATricklingFriendIsGivenUpOnAtTheFetchDeadline`,
+    `TestAnEmptyObjectRecordedWithAnotherHashIsRefusedBeforeStoring` and
+    `TestAShortStorePageLosesNoKeysToTheIndex` (`internal/gateway`);
     the restic AC is §3.1 ID-6.
   *Post-v1, evict mode:* an eviction worker would delete a pack once
   `copies` places have acknowledged it and no restic lock is present,
