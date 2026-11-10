@@ -392,3 +392,133 @@ func TestMetadataOnlyATargetListsIsNotLive(t *testing.T) {
 		t.Fatalf("held at the target %v", got)
 	}
 }
+
+// queueOf is bucket's done rows of key: sequence → hash.
+func queueOf(t *testing.T, db *DB, bucket, key string) map[int64]string {
+	t.Helper()
+	rows, err := db.Query(`SELECT seq, coalesce(sha256, '') FROM queue WHERE bucket = ? AND key = ? AND state = 'done'`, bucket, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[int64]string{}
+	for rows.Next() {
+		var s int64
+		var h string
+		if err := rows.Scan(&s, &h); err != nil {
+			t.Fatal(err)
+		}
+		out[s] = h
+	}
+	return out
+}
+
+// ID-5, REPL-13 (#71): a place's list that arrives while this node is
+// writing the same key (captured, not yet done) never supersedes that
+// write, in a generic bucket, whose keys are not named by their hash:
+// the listed version gets no queue row while the write is in flight, so
+// the write, once done, is the key's latest and is replicated, and the
+// lists only add the places that hold it. A list that would change the
+// version an earlier list made count waits the same way. A write that
+// fails leaves the listed version counting, decided again once it ends.
+func TestAListedKeyNeverSupersedesALocalWriteInFlight(t *testing.T) {
+	ctx := context.Background()
+	const key = "docs/report.odt"
+	begin := func(db *DB) int64 {
+		t.Helper()
+		seqs, err := db.BeginCaptures(ctx, []Capture{{Bucket: "laptop", Key: key, Op: OpPut, Class: "data"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return seqs[0]
+	}
+	recovering := func(t *testing.T) *DB {
+		db := recoveringWith(t, "B", "C")
+		if err := db.AddBucket(ctx, Bucket{Name: "laptop", Profile: "generic", Copies: 2, AccessKey: "AK", SecretKey: "s",
+			CreatedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+		return db
+	}
+	old := Listed{Key: key, Size: 5, SHA256: "h-old", Class: "data"}
+
+	t.Run("written", func(t *testing.T) {
+		db := recovering(t)
+		w := begin(db)
+		list(t, db, "B", "laptop", old)
+		if q := queueOf(t, db, "laptop", key); len(q) != 0 {
+			t.Fatalf("the listed version has a queue row while the write is in flight: %v", q)
+		}
+		if v := verdict(t, db, "laptop", key); v.Verdict != VerdictWriting {
+			t.Fatalf("verdict %+v", v)
+		}
+		if _, err := db.FinishPut(ctx, w, 7, "h-new"); err != nil {
+			t.Fatal(err)
+		}
+		if sup, err := db.Superseded(ctx, w); err != nil || sup {
+			t.Fatalf("the local write is superseded: %v %v", sup, err)
+		}
+		settle(t, db)
+		list(t, db, "C", "laptop", old)
+		if q := queueOf(t, db, "laptop", key); len(q) != 1 || q[w] != "h-new" {
+			t.Fatalf("queue %v", q)
+		}
+		if v := verdict(t, db, "laptop", key); v.Verdict != VerdictHeld || v.SHA256 != "h-new" {
+			t.Fatalf("verdict %+v", v)
+		}
+		for _, p := range []string{"B", "C"} {
+			var st string
+			if err := db.QueryRow(`SELECT state FROM placement WHERE place = ? AND seq = ?`, p, w).Scan(&st); err != nil || st != "queued" {
+				t.Fatalf("the write at %s is %q %v, want queued", p, st, err)
+			}
+		}
+	})
+
+	t.Run("failed", func(t *testing.T) {
+		db := recovering(t)
+		w := begin(db)
+		list(t, db, "B", "laptop", old)
+		if err := db.DropCaptures(ctx, w); err != nil {
+			t.Fatal(err)
+		}
+		if n, err := db.Unsettled(ctx); err != nil || n != 1 {
+			t.Fatalf("unsettled %d %v: the key is not decided again", n, err)
+		}
+		settle(t, db)
+		if v := verdict(t, db, "laptop", key); v.Verdict != VerdictSingle || v.SHA256 != "h-old" {
+			t.Fatalf("verdict %+v", v)
+		}
+		if a := ackedAt(t, db, "B", "laptop"); a[key] != "h-old" {
+			t.Fatalf("B holds %v", a)
+		}
+	})
+
+	t.Run("decided before", func(t *testing.T) {
+		db := recovering(t)
+		list(t, db, "B", "laptop", old)
+		q := queueOf(t, db, "laptop", key)
+		if len(q) != 1 {
+			t.Fatalf("queue %v", q)
+		}
+		w := begin(db)
+		// C's list ties with B's: decided now, the recovered row would
+		// go and a new one come after the write.
+		list(t, db, "C", "laptop", Listed{Key: key, Size: 6, SHA256: "h-other", Class: "data"})
+		if got := queueOf(t, db, "laptop", key); len(got) != 1 {
+			t.Fatalf("queue changed under the write: %v, was %v", got, q)
+		}
+		if _, err := db.FinishPut(ctx, w, 7, "h-new"); err != nil {
+			t.Fatal(err)
+		}
+		if sup, err := db.Superseded(ctx, w); err != nil || sup {
+			t.Fatalf("the local write is superseded: %v %v", sup, err)
+		}
+		settle(t, db)
+		if v := verdict(t, db, "laptop", key); v.Verdict != VerdictHeld || v.SHA256 != "h-new" {
+			t.Fatalf("verdict %+v", v)
+		}
+		if cs, _ := db.Conflicts(ctx); len(cs) != 0 {
+			t.Fatalf("conflicts %+v", cs)
+		}
+	})
+}

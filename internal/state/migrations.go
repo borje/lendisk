@@ -1038,4 +1038,13 @@ var migrations = []Migration{
 		ALTER TABLE overflow ADD COLUMN removing_at INTEGER;
 		ALTER TABLE overflow ADD COLUMN keep_data INTEGER;`,
 	},
+	{
+		Version: 48, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Recovered keys a list named while this node was writing them
+		-- (recovered_key.verdict 'writing', #71): the lister counts and
+		-- settles those whose write ended every round, without reading
+		-- every recovered key.
+		CREATE INDEX recovered_key_writing ON recovered_key (bucket, key) WHERE verdict = 'writing';`,
+	},
 }

@@ -40,7 +40,15 @@ import (
 //     another.
 //
 // Only the version that counts has a queue row and acked placement rows,
-// at the places that list that hash.
+// at the places that list that hash. A key this node wrote since
+// recovery is its own, and one it is writing (a pending capture) waits
+// for the write to end (VerdictWriting, #71): a listed version never
+// supersedes a local write.
+//
+// A list is trusted as an acknowledgement is: a friend that deleted an
+// object yet lists it counts as holding it. The daily challenge (VER-1,
+// #27) names recovered acks like any other once the read-through has
+// fetched the object, and a failed one drains the friend's replica.
 
 // Verdicts on a recovered key.
 const (
@@ -50,6 +58,13 @@ const (
 	// VerdictNewest: the places tie on a rewritable key, and one version
 	// is the only one no other place replaced by a rewrite (#74).
 	VerdictNewest = "newest"
+	// VerdictWriting: this node is writing the key (a capture not yet
+	// done) as a list names it (#71). The lists decide nothing until the
+	// write ends: a queue row for the listed version now would come
+	// after the write's and supersede it. Done, the write is the key's
+	// own (VerdictHeld); failed, the lists decide it again
+	// (SettleFinished).
+	VerdictWriting = "writing"
 )
 
 // Listed is one entry of a place's list of a bucket: a key it holds,
@@ -173,11 +188,14 @@ func (db *DB) AbandonRelist(ctx context.Context, place, bucket string) error {
 }
 
 // Unsettled counts the lists that ended (read to their end or
-// abandoned) whose keys SettleFinished has not yet decided again.
+// abandoned) whose keys SettleFinished has not yet decided again, and
+// the keys a list named while this node was writing them whose write
+// has ended (#71).
 func (db *DB) Unsettled(ctx context.Context) (int, error) {
 	var n int
-	err := db.QueryRowContext(ctx, `SELECT count(*) FROM relist
-		WHERE (done IS NOT NULL OR abandoned IS NOT NULL) AND settled IS NULL`).Scan(&n)
+	err := db.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM relist
+		WHERE (done IS NOT NULL OR abandoned IS NOT NULL) AND settled IS NULL)
+		+ (SELECT count(*) FROM recovered_key k WHERE `+writeEnded+`)`).Scan(&n)
 	return n, err
 }
 
@@ -212,7 +230,9 @@ func pause(ctx context.Context) error {
 // in write transactions of SettleBatch keys or SettleBudget, and marks
 // each list settled: an abandoned list's keys, without its entries; a
 // finished list's metadata keys one place alone lists (the
-// lone-metadata rule counts the finished list now). It resumes where a crash stopped it, so the
+// lone-metadata rule counts the finished list now); and the keys a list
+// named while this node was writing them, once the write has ended
+// (VerdictWriting, #71). It resumes where a crash stopped it, so the
 // lister calls it at the start of every round.
 func (db *DB) SettleFinished(ctx context.Context) error {
 	type ended struct {
@@ -272,8 +292,46 @@ func (db *DB) SettleFinished(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	// Keys a list named while this node was writing them, whose write
+	// has ended (#71).
+	for {
+		rows, err := db.QueryContext(ctx, `SELECT k.bucket, k.key FROM recovered_key k WHERE `+writeEnded+`
+			ORDER BY k.bucket, k.key LIMIT ?`, SettleBatch)
+		if err != nil {
+			return err
+		}
+		var bucket string
+		var keys []string
+		for rows.Next() {
+			var b, k string
+			if err := rows.Scan(&b, &k); err != nil {
+				rows.Close()
+				return err
+			}
+			if bucket == "" {
+				bucket = b
+			}
+			if b == bucket {
+				keys = append(keys, k)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil || len(keys) == 0 {
+			return err
+		}
+		if _, err := db.settleKeys(ctx, bucket, keys); err != nil {
+			return err
+		}
+		if err := pause(ctx); err != nil {
+			return err
+		}
+	}
 }
+
+// writeEnded selects recovered keys k decided VerdictWriting whose
+// write is no longer in flight: done or failed, they are decided again.
+const writeEnded = `k.verdict = '` + VerdictWriting + `' AND NOT EXISTS (SELECT 1 FROM queue q
+	WHERE q.bucket = k.bucket AND q.key = k.key AND q.state = 'pending')`
 
 // dropBatch drops up to SettleBatch of an abandoned place's entries for
 // bucket, stopping once SettleBudget has passed, and decides their keys
@@ -517,6 +575,19 @@ func (db *DB) settleKey(ctx context.Context, tx *preparedTx, bucket, key string,
 		}
 		verdict, reason, winner = VerdictHeld, "written on this node since recovery", latestSHA.String
 		return saveVerdict(ctx, tx, bucket, key, verdict, reason, winner, own, picked)
+	}
+
+	// The node is writing the key now (#71): a row for a listed version
+	// would get a later sequence than the write's and supersede it, so
+	// nothing changes until the write ends (VerdictWriting).
+	var writing bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM queue
+		WHERE bucket = ? AND key = ? AND state = 'pending' AND seq > ?)`, bucket, key, own.Int64).Scan(&writing); err != nil {
+		return err
+	}
+	if writing {
+		return saveVerdict(ctx, tx, bucket, key, VerdictWriting,
+			"this node is writing it; decided again once the write ends", "", own, picked)
 	}
 
 	if gone {

@@ -280,6 +280,49 @@ func TestTheLocalCopysOwnFaultsAreNotTheFriends(t *testing.T) {
 	}
 }
 
+// VER-1, ID-5 (#71): recovery trusts a friend's list as it trusts an
+// acknowledgement, so a friend that deleted an object yet still lists
+// it counts as holding it. The challenge is the backstop: an object
+// recovery recorded acked at B is challenged like any other once the
+// read-through has fetched it (from another friend), and B's answer
+// that it does not hold it marks B's replica unverified, so
+// re-placement moves its copies. Not yet fetched, it is skipped.
+func TestARecoveredAckIsChallenged(t *testing.T) {
+	ctx := t.Context()
+	n := newNode(t, 0)
+	body := []byte("an object B listed after deleting it")
+	sum := sha256.Sum256(body)
+	h := hex.EncodeToString(sum[:])
+	const key = "data/recovered"
+	if err := n.db.AddRelists(ctx, []string{peerB, "C"}, []string{"laptop"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, place := range []string{peerB, "C"} {
+		if _, err := n.db.RecordListed(ctx, place, "laptop", []state.Listed{{Key: key, Size: int64(len(body)), SHA256: h,
+			Class: "data"}}, 1, "", true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := n.db.SettleFinished(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if o := n.check(false); o.Outcome != state.VerifyNothing || o.Skipped != 1 {
+		t.Fatalf("before the read-through fetched it: %+v", o)
+	}
+	p := filepath.Join(n.store, "laptop", filepath.FromSlash(key))
+	os.MkdirAll(filepath.Dir(p), 0o700)
+	if err := os.WriteFile(p, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	o := n.check(false)
+	if o.Outcome != state.VerifyFailed || o.Checked != 1 || !strings.Contains(o.Detail, key) {
+		t.Fatalf("outcome %+v", o)
+	}
+	if c := n.record(); !c.Unverified() || n.alerts.Load() != 1 {
+		t.Fatalf("record %+v", c)
+	}
+}
+
 // VER-3 (#27): a full check asks for every object B acknowledged, whole,
 // each with its own nonce, and compares B's HMAC with the same computed
 // over the local copy: no object's bytes cross the tunnel. Passing, it

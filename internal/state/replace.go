@@ -548,13 +548,23 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 	// friends' lists: until every list is read and settled, a copy that
 	// looks missing may be one a friend not yet listed holds, and a row
 	// placed now would stand in the way of the acknowledged row its list
-	// records. The bucket waits for them.
-	var listing bool
-	if err := m.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM relist WHERE bucket = ?
-		AND (abandoned IS NULL AND done IS NULL OR settled IS NULL))`, bucket).Scan(&listing); err != nil || listing {
+	// records. The bucket waits for them, except an unread list at a
+	// place gone past replace_after (#71): its copies count as gone, as
+	// any gone place's do, and the bucket waits again if it answers.
+	unread, err := column(ctx, m.db, `SELECT place FROM relist WHERE bucket = ? AND abandoned IS NULL AND done IS NULL`, bucket)
+	if err != nil {
 		return st, err
 	}
-	var err error
+	for _, p := range unread {
+		if f := m.friends[p]; f == nil || !f.gone(m.db, m.now) {
+			return st, nil
+		}
+	}
+	var unsettled bool
+	if err := m.db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM relist WHERE bucket = ?
+		AND (done IS NOT NULL OR abandoned IS NOT NULL) AND settled IS NULL)`, bucket).Scan(&unsettled); err != nil || unsettled {
+		return st, err
+	}
 	if m.unverified, err = unverifiedAt(ctx, m.db, bucket); err != nil {
 		return st, err
 	}

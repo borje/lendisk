@@ -274,6 +274,10 @@ type StatusRelist struct {
 	Bucket string `json:"bucket"`
 	// Error is why the last attempt failed, if one did.
 	Error string `json:"error,omitempty"`
+	// GoneSince is set when the place is gone past replace_after (no
+	// answer since then, RFC 3339 UTC): the list is not read until it
+	// answers again, and its copies count as gone (#71).
+	GoneSince string `json:"gone_since,omitempty"`
 }
 
 // StatusManifest is the node manifest's delivery (ID-4).
@@ -1036,9 +1040,17 @@ friend, or with no room in the pool), which status shows.`,
 			if err != nil {
 				return err
 			}
+			gone, err := db.GonePlaces(cmd.Context(), a.now())
+			if err != nil {
+				return err
+			}
 			st.Recovery.Pending = []StatusRelist{}
 			for _, r := range rls {
-				st.Recovery.Pending = append(st.Recovery.Pending, StatusRelist{Place: r.Place, Bucket: r.Bucket, Error: r.Error})
+				sr := StatusRelist{Place: r.Place, Bucket: r.Bucket, Error: r.Error}
+				if since, ok := gone[r.Place]; ok {
+					sr.GoneSince = since.UTC().Format(time.RFC3339)
+				}
+				st.Recovery.Pending = append(st.Recovery.Pending, sr)
 			}
 			cs, err := db.Conflicts(cmd.Context())
 			if err != nil {
@@ -1225,7 +1237,10 @@ friend, or with no room in the pool), which status shows.`,
 				fmt.Fprintf(a.out, "Recovery: %d lists of what a friend holds not read yet; read when the friend answers\n", n)
 				for _, r := range st.Recovery.Pending {
 					fmt.Fprintf(a.out, "  %s at %s", r.Bucket, r.Place)
-					if r.Error != "" {
+					if r.GoneSince != "" {
+						fmt.Fprintf(a.out, " (gone: no answer since %s, longer than replication.replace_after; "+
+							"not listed until it answers again, and its copies count as gone)", textTime(r.GoneSince))
+					} else if r.Error != "" {
 						fmt.Fprintf(a.out, " (last try: %s)", r.Error)
 					}
 					fmt.Fprintln(a.out)
