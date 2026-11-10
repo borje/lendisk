@@ -5484,7 +5484,7 @@ the handler's own reads and is never cancelled; nothing below
   real port another way gets through), nor mapping timeouts,
   hairpinning or port preservation; G-1 measures the real thing.
 - **NET-3** A friend's explicit addresses (`lendisk peer address
-  <friend> <ip:port>…`, `--clear`; `friendship.explicit_addresses`) are
+  <friend> <host:port>…`, `--clear`; `friendship.explicit_addresses`) are
   given to the friend's tailcat client as its server's endpoints, as a
   control plane's network map would: magicsock disco-pings them at
   once, beside the call-me-maybe endpoints, and the first that answers
@@ -5496,8 +5496,24 @@ the handler's own reads and is never cancelled; nothing below
   addresses are read at each dial, so a running daemon uses them from
   its next one. A port forward needs a fixed port: `tunnel.port` binds
   the node's engine to it (default 0, any port; Tailscale's 41641 is a
-  good choice). Addresses are IP literals: a dynamic DNS name would be
-  resolved at each dial, which is left for later.
+  good choice). An address is `ip:port` or `name:port`
+  (`transport.ParseExplicitAddress`, #99): a DNS name, such as a
+  dynamic DNS name, is kept as given (lower case, no trailing dot) and
+  looked up at each dial, 2 s at most, every IP it gives becoming an
+  endpoint; one that does not resolve is left out with a warning, and
+  the friend is reached as without it. The name is the user's own
+  choice, not the friend's, so it is trusted as an IP would be; an
+  endpoint is only where disco pings go, and the tunnel still checks
+  the friend's key. The endpoints are given as a network map whose
+  server entry lists them, written as the backend's own map too
+  (`lb.nm`), and the client remembers that map: when tailcat installs
+  another (a netmap change), the next dial finds the map replaced and
+  gives the endpoints again, as it does when they change
+  (`TestExplicitAddressesSurviveANetworkMapChange`). tailcat's meow
+  ping, which starts a client before its engine can be given
+  endpoints, runs without the client's endpoint lock, so a dial whose
+  endpoints are in place never waits behind another dial's network
+  round trip (`TestDialDoesNotWaitForAnotherDialsPing`).
 - **NET-5** Relays are DERP servers. The node's relay set
   (`transport.RelaySet`) is the project's DERP map, shipped in the
   binary (`transport/projectrelays.json`, empty while the project runs
@@ -5531,13 +5547,66 @@ the handler's own reads and is never cancelled; nothing below
   and `generate_204` handlers, a STUN server, HTTP/2 off, over TLS that
   is `self-signed` (made once, kept in `<data_dir>/relay` at 0600, and
   pinned by nodes with `cert = "sha256-raw:<hex>"`, tlsdial's own pin,
-  so an IP-only VPS needs no CA), `letsencrypt` (autocert, TLS-ALPN on
-  :443) or `files`. Settings are `[relay]` (`hostname`, `listen`
-  `:443`, `stun_port` 3478, `tls`, `cert`, `key`); it logs the
-  `relays.list` entry. It forwards for any key, as derper does without
-  `--verify-clients`, which needs a tailscaled. No mesh: a second relay
-  is a second list entry. `TestFriendsThroughASelfHostedRelayOnly`
-  befriends two nodes whose only relay it is.
+  so an IP-only VPS needs no CA; a node refuses a relay whose
+  certificate does not match, `TestWrongPinRelayIsRefused`),
+  `letsencrypt` (autocert, TLS-ALPN on :443; autocert's `h2` is taken
+  out of ALPN, since HTTP/2 is off) or `files`. Settings are `[relay]`
+  (`hostname`, `listen` `:443`, `stun_port` 3478, `tls`, `cert`, `key`,
+  `allow`, `rate_limit`); it logs the `relays.list` entry. No mesh: a
+  second relay is a second list entry.
+  `TestFriendsThroughASelfHostedRelayOnly` befriends two nodes whose
+  only relay it is, both listed in its `relay.allow`.
+
+  *Who a relay relays for (#99).* derper relays for any key unless
+  `--verify-clients` asks the tailscaled beside it whether the key is
+  a node of its tailnet, or `--verify-client-url` asks an admission
+  controller (`tailcfg.DERPAdmitClientRequest`: the key and source IP)
+  at each connection; Headscale's embedded DERP admits the node keys
+  its database knows. Both admit *connections* by key, which works
+  because a Tailscale node has one key. A lendisk node has many: its
+  node ID for its tunnel server, a dial key per friend
+  (`identity.DialKeyFor`, derived from its private key, so no one else
+  can compute it) and, while redeeming, an invite key from a secret
+  written nowhere. A relay operator cannot list those. So
+  `relay.allow` (node IDs, separated by spaces, commas or newlines)
+  filters *packets* instead: with it set, `/derp` is served by
+  `relay.filteredHandler`, derpserver's own handler with the client's
+  half of the connection read through `filterReader`, which takes the
+  connection's key from the cleartext first 32 bytes of its ClientInfo
+  frame (derpserver then checks it against the frame's sealed box) and
+  the destination from the first 32 bytes of each SendPacket frame,
+  and drops a packet when neither is listed. A friend's tunnel always
+  has a listed end, the server whose address names this relay, which is
+  where tailcat's client connects; so the list is the nodes homed at
+  the relay, which every friend knows (`lendisk relay keys` prints its
+  node ID and its friends', ready to paste, run on any friend's node
+  and merged), and the dial and invite keys need no entry. Two keys
+  neither of which is listed, the free relay an abuser wants, get no
+  packet through; packets an outsider sends to a listed node reach a
+  node whose admission hook drops them (SEC-10). The first dropped
+  packet of a connection is logged with both node IDs, so a friend
+  missing from the list shows in the log. A dropped frame is read and
+  discarded, at most one packet's size; a larger one passes for
+  derpserver to refuse, which ends the connection. The list is read at
+  start; a change takes a restart, which costs relayed tunnels a
+  reconnect (direct ones never touch the relay).
+  `relay.rate_limit` (bytes a second, at least 16K) is derpserver's
+  per-client receive limit (`RateConfig`), a second's worth of burst.
+  *Defaults:* `allow` empty, the relay open, with a warning at start
+  saying so and how to close it: a relay that drops friends' packets
+  until its operator fills a list fails silently on first setup, and
+  #42's relays, already running, keep working on upgrade; the operator
+  who pays for the VPS closes it with one paste. `rate_limit` empty, no
+  limit: a lendisk relay carries backups, a seed of hundreds of GB
+  between friends whose NATs defeat hole punching, so any default low
+  enough to deter abuse would throttle the relay's purpose; it bounds
+  each key, not the sum, so it limits a group's heaviest friend, not
+  an abuser with many keys; and derper ships without one. The
+  allowlist is the control against abuse, the rate limit a cap on one
+  friend for an operator on a metered VPS
+  (`TestAllowlistedRelayCarriesOnlyTunnelsWithAListedEnd`,
+  `TestFilterDropsOnlyPacketsWithNoListedEnd`,
+  `TestRelayRateLimitsEachKey`).
 - **NET-5a** With `relays.accept_peer_hints = false` (the default) a
   friend's address must name a relay of the set: `Tailcat.Dial`
   refuses one that does not, before a client is built or the relay

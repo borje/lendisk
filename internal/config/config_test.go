@@ -652,6 +652,61 @@ stun_port = -1
 	}
 }
 
+// #99: [relay] takes the node IDs the relay is for, separated as a user
+// pastes them (spaces, commas, newlines in a multi-line string), and a
+// per-key rate limit; by default neither. A mistyped node ID or a rate
+// below 16K is refused.
+func TestRelayAllowAndRateLimitSettings(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := l.Relay.AllowList(); err != nil || len(ids) != 0 || l.Relay.RateLimitBytes() != 0 {
+		t.Fatalf("defaults: %v %v, rate %d", ids, err, l.Relay.RateLimitBytes())
+	}
+	var want []identity.NodeID
+	for range 3 {
+		p, _ := identity.NewPhrase()
+		id, err := identity.FromPhrase(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, id.NodeID())
+	}
+	p := writeFile(t, `
+[relay]
+allow = """
+`+want[0].String()+`
+`+strings.ToUpper(want[1].String())+`, `+want[2].String()+`
+"""
+rate_limit = "8M"
+`)
+	l, err = load(t, []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids, err := l.Relay.AllowList(); err != nil || !reflect.DeepEqual(ids, want) || l.Relay.RateLimitBytes() != 8<<20 {
+		t.Fatalf("from the file: %v %v, rate %d", ids, err, l.Relay.RateLimitBytes())
+	}
+	l, err = load(t, []string{"--config", none}, map[string]string{"LENDISK_RELAY_ALLOW": want[2].String() + " " + want[0].String()})
+	if ids, _ := l.Relay.AllowList(); err != nil || !reflect.DeepEqual(ids, []identity.NodeID{want[2], want[0]}) {
+		t.Fatalf("from the variable: %v %v", ids, err)
+	}
+	mistyped := []byte(want[0].String())
+	mistyped[5] ^= 1
+	for _, bad := range [][]string{
+		{"--relay-allow", string(mistyped)},
+		{"--relay-allow", "anna"},
+		{"--relay-rate-limit", "8K"},
+		{"--relay-rate-limit", "fast"},
+	} {
+		if _, err := load(t, append([]string{"--config", none}, bad...), nil); err == nil {
+			t.Errorf("%v was accepted", bad)
+		}
+	}
+}
+
 // #42 review M1, NET-5a: relays.tailscale_bootstrap unset is auto: the
 // hosted relays join the set only while the node names no relays of
 // its own; naming some leaves them out unless the user asks for them.

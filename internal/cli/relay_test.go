@@ -22,7 +22,7 @@ import (
 
 // runRelay runs `lendisk relay` for n in this process until the test
 // ends and returns the relays.list entry it reports.
-func runRelay(t *testing.T, n *node) string {
+func runRelay(t *testing.T, n *node, args ...string) string {
 	t.Helper()
 	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
@@ -37,8 +37,8 @@ func runRelay(t *testing.T, n *node) string {
 		serving: func(e string) { entries <- e }}
 	done := make(chan int, 1)
 	go func() {
-		done <- a.run([]string{"relay", "--config", n.config, "--data-dir", n.data, "--relay-hostname", "127.0.0.1",
-			"--relay-listen", "127.0.0.1:0", "--relay-stun-port", strconv.Itoa(stun)})
+		done <- a.run(append([]string{"relay", "--config", n.config, "--data-dir", n.data, "--relay-hostname", "127.0.0.1",
+			"--relay-listen", "127.0.0.1:0", "--relay-stun-port", strconv.Itoa(stun)}, args...))
 	}()
 	t.Cleanup(func() {
 		cancel()
@@ -104,20 +104,30 @@ func TestRelayCommandReportsItsEntry(t *testing.T) {
 // relay is a `lendisk relay`, listed by its entry with the hosted
 // relays off, choose it for their addresses and become friends through
 // it. relays.list replaces the project's map, and with it the hosted
-// relays are left out unless asked for (#42 review M1).
+// relays are left out unless asked for (#42 review M1). The relay
+// lists the two nodes in relay.allow (#99): the invite key and the dial
+// keys they also connect with need no entry.
 func TestFriendsThroughASelfHostedRelayOnly(t *testing.T) {
 	serving(t, 1)
-	entry := runRelay(t, newNode(t))
-	only := []string{"--relays-list", entry}
-	an, bn := newNode(t), newNode(t)
-	for _, n := range []*node{an, bn} {
-		n.regions = nil // the relay set the flags name, not a test source
-		n.flags = only
+	var phrases, ids []string
+	for range 2 {
 		p, err := identity.NewPhrase()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if code, _, e := n.run(p+"\n", "", "init", "--restore"); code != 0 {
+		id, err := identity.FromPhrase(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		phrases, ids = append(phrases, p), append(ids, id.NodeID().String())
+	}
+	entry := runRelay(t, newNode(t), "--relay-allow", strings.Join(ids, ","))
+	only := []string{"--relays-list", entry}
+	an, bn := newNode(t), newNode(t)
+	for i, n := range []*node{an, bn} {
+		n.regions = nil // the relay set the flags name, not a test source
+		n.flags = only
+		if code, _, e := n.run(phrases[i]+"\n", "", "init", "--restore"); code != 0 {
 			t.Fatal(e)
 		}
 	}
@@ -158,6 +168,30 @@ func TestPeerAddRefusesAPeerHintRelayUnlessAccepted(t *testing.T) {
 	}
 }
 
+// #99: `relay keys` prints this node's ID and its friends', one per
+// line, for a relay's relay.allow, which accepts them as printed.
+func TestRelayKeysPrintsThisNodeAndItsFriends(t *testing.T) {
+	parallel(t, 0)
+	n := friendNode(t)
+	other := friendNode(t).identity().NodeID().String()
+	db, err := state.Open(t.Context(), n.data, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddFriendship(t.Context(), state.Friendship{Peer: other, Address: "tc" + other, OwnNumber: 1 << 30,
+		PeerNumber: 1 << 30, CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	code, out, e := n.run("", "", "relay", "keys")
+	if want := n.identity().NodeID().String() + "\n" + other + "\n"; code != 0 || out != want {
+		t.Fatalf("relay keys: %d %q %s, want %q", code, out, e, want)
+	}
+	if code, _, e := n.run("", "", "relay", "--relay-hostname", "127.0.0.1", "--relay-allow", "not-a-node-id"); code != 1 || !strings.Contains(e, "relay.allow") {
+		t.Fatalf("a relay with a bad relay.allow: %d %s", code, e)
+	}
+}
+
 // NET-3 (#42): `peer address` gives a friend explicit addresses, shown
 // by peer list and replaced or cleared by the next call; it refuses
 // what is not a dialable ip:port, and a node that is no friend.
@@ -187,9 +221,20 @@ func TestPeerAddressSetsExplicitAddresses(t *testing.T) {
 	if p := n.peerOf(other); strings.Join(p.ExplicitAddresses, " ") != "198.51.100.7:9" {
 		t.Fatalf("not replaced: %+v", p.ExplicitAddresses)
 	}
+	// #99: a DNS name, such as a dynamic DNS name, is kept as given and
+	// resolved at each dial.
+	if code, out, e := n.run("", "", "peer", "address", other, "Home.DynDNS.example.:41641", "198.51.100.7:9"); code != 0 || !strings.Contains(out, "home.dyndns.example:41641") {
+		t.Fatalf("peer address with a DNS name: %d %s%s", code, out, e)
+	}
+	if p := n.peerOf(other); strings.Join(p.ExplicitAddresses, " ") != "home.dyndns.example:41641 198.51.100.7:9" {
+		t.Fatalf("a DNS name: %+v", p.ExplicitAddresses)
+	}
 	for _, bad := range [][]string{
 		{other},
-		{other, "relay.example:41641"},
+		{other, "relay.example"},
+		{other, "relay.example:0"},
+		{other, "relay_example!:41641"},
+		{other, "-relay.example:41641"},
 		{other, "203.0.113.5"},
 		{other, "0.0.0.0:41641"},
 		{other, "203.0.113.5:0"},

@@ -19,5 +19,18 @@ tls       = "self-signed"         # pinned by the entry's cert field
 # cert = "/etc/lendisk/relay.crt"
 # key  = "/etc/lendisk/relay.key"
 
+# Without allow, the relay forwards for anyone who finds it, and Dag pays
+# for their traffic. With it, only packets to or from a listed node pass.
+# `lendisk relay keys` on Dag's own node prints his node ID and his
+# friends', one per line; a friend whose friends also use the relay runs
+# it too. Paste the lines between triple quotes (allow = """, the lines,
+# """) and restart the relay. A node missing from the list is logged by
+# node ID when its packets are dropped.
+# allow = "<Dag's node ID> <Anna's node ID> <Björn's node ID>"
+# The most bytes a second one connected node may send through the relay,
+# on a metered VPS; empty for no limit. A seed between relayed friends
+# runs at this speed.
+# rate_limit = "8M"
+
 [log]
 level = "info"
