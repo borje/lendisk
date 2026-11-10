@@ -182,12 +182,11 @@ func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
 	if err := put("data/big", big); err == nil || !strings.Contains(err.Error(), "no progress") {
 		t.Fatalf("a send A's store stopped reading: %v", err)
 	}
-	// 64 KiB fits the quota alone, not beside the 64 MiB A still holds
-	// (each object costs 4 KiB besides). It is small enough that the
-	// bridge has passed it all on when the gateway answers 503 unread: a
-	// larger body would break the bridge's write to the gateway's
-	// socket, and B would get "gateway unavailable" instead.
-	next := bytes.Repeat([]byte("n"), 64<<10)
+	// 3 MiB fits the quota alone, not beside the 64 MiB A still holds
+	// (each object costs 4 KiB besides). It is more than gw.sock
+	// buffers, so the gateway answers 503 before reading most of it and
+	// the bridge relays that answer, not "gateway unavailable" (#100).
+	next := bytes.Repeat([]byte("n"), 3<<20)
 	if err := put("data/next", next); !errors.Is(err, replica.ErrBusy) {
 		t.Fatalf("a write beside the abandoned one, while A's store stalls: %v\n%s", err, stop())
 	}

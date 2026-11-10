@@ -54,7 +54,11 @@ func New(socket string, log *slog.Logger) *Bridge {
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
-			return d.DialContext(ctx, "unix", socket)
+			c, err := d.DialContext(ctx, "unix", socket)
+			if err != nil {
+				return nil, err
+			}
+			return newAnswerFirst(c), nil
 		},
 		// Pass Accept-Encoding through untouched; never add gzip.
 		DisableCompression:  true,
