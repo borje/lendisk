@@ -99,6 +99,10 @@ type Overflow struct {
 	// there, no delete sent.
 	RemovingAt time.Time
 	KeepData   bool
+	// FullCycle is the target's rolling full check (VER-1a, #105): every
+	// object it holds downloaded once a FullCycle; 0 for none, the
+	// default, as each download costs egress.
+	FullCycle time.Duration
 }
 
 // Removing reports whether the target is being removed (#96).
@@ -116,16 +120,17 @@ const overflowCols = `name, endpoint, region, bucket, prefix, max_bytes, env_pre
 	coalesce(price_per_gb, 0), versioning, lifecycle, version_removal, added_at, versioning_checked_at,
 	EXISTS (SELECT 1 FROM overflow_versioning c WHERE c.name = overflow.name
 		AND '` + VersioningEnabled + `' IN (c.previous, c.versioning)),
-	removing_at, coalesce(keep_data, 0)`
+	removing_at, coalesce(keep_data, 0), coalesce(full_cycle, 0)`
 
 func scanOverflow(s interface{ Scan(...any) error }) (Overflow, error) {
 	var o Overflow
-	var retention, added int64
+	var retention, added, cycle int64
 	var checked, removing sql.NullInt64
 	err := s.Scan(&o.Name, &o.Endpoint, &o.Region, &o.Bucket, &o.Prefix, &o.MaxBytes, &o.EnvPrefix, &retention,
 		&o.PricePerGB, &o.Versioning, &o.Lifecycle, &o.VersionRemoval, &added, &checked, &o.WasVersioned,
-		&removing, &o.KeepData)
+		&removing, &o.KeepData, &cycle)
 	o.Retention = time.Duration(retention) * time.Second
+	o.FullCycle = time.Duration(cycle) * time.Second
 	o.AddedAt = time.Unix(added, 0)
 	if checked.Valid {
 		o.VersioningCheckedAt = time.Unix(checked.Int64, 0)

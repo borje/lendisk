@@ -72,81 +72,19 @@ func (v *Verifier) target(ctx context.Context, place string) (Target, error) {
 	return v.Overflow(o)
 }
 
-// checkTarget is check for an overflow target.
-func (v *Verifier) checkTarget(ctx context.Context, place, bucket string, full bool) (state.VerifyOutcome, error) {
-	var o state.VerifyOutcome
+// targetChecker is checker for an overflow target: a daily check
+// reads what the provider stores (stat), a whole one downloads.
+func (v *Verifier) targetChecker(ctx context.Context, place, bucket string) (*checker, error) {
 	t, err := v.target(ctx, place)
 	if err != nil {
-		return o, err
+		return nil, err
 	}
-	try := func(c state.Challengeable, whole bool) (bool, error) {
-		var failed string
-		var skipped bool
-		var err error
+	return &checker{done: func() {}, one: func(c state.Challengeable, whole bool) (string, bool, error) {
 		if whole {
-			failed, skipped, err = v.download(ctx, t, place, bucket, c)
-		} else {
-			failed, skipped, err = v.stat(ctx, t, place, bucket, c)
+			return v.download(ctx, t, place, bucket, c)
 		}
-		switch {
-		case err != nil:
-			return false, err
-		case skipped:
-			o.Skipped++
-		case failed != "":
-			o.Checked++
-			o.Outcome, o.Detail = state.VerifyFailed, failed
-			return true, nil
-		default:
-			o.Checked++
-		}
-		return false, nil
-	}
-	if full {
-		var after int64
-		for {
-			page, err := v.DB.ChallengeablePage(ctx, place, bucket, after, pageSize)
-			if err != nil || len(page) == 0 {
-				if err != nil {
-					return o, err
-				}
-				break
-			}
-			for _, c := range page {
-				after = c.Seq
-				if stop, err := try(c, true); stop || err != nil {
-					return o, err
-				}
-			}
-		}
-	} else {
-		n, err := v.DB.ChallengeableCount(ctx, place, bucket)
-		if err != nil {
-			return o, err
-		}
-		picks, err := v.pick(n, or(v.Samples, DefaultSamples))
-		if err != nil {
-			return o, err
-		}
-		for _, i := range picks {
-			c, err := v.DB.ChallengeableAt(ctx, place, bucket, i)
-			if errors.Is(err, state.ErrNotFound) {
-				continue
-			}
-			if err != nil {
-				return o, err
-			}
-			if stop, err := try(c, false); stop || err != nil {
-				return o, err
-			}
-		}
-	}
-	if o.Checked > 0 {
-		o.Outcome = state.VerifyPassed
-	} else {
-		o.Outcome = state.VerifyNothing
-	}
-	return o, nil
+		return v.stat(ctx, t, place, bucket, c)
+	}}, nil
 }
 
 // confirm returns failed once the object is still the one the target

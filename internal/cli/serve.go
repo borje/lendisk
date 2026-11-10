@@ -314,7 +314,7 @@ func (a *app) serveCmd() *cobra.Command {
 				// asks for through lendisk.db. A failure marks the replica
 				// unverified, which the worker's next pass re-places.
 				ver := &verify.Verifier{DB: db, StoreDir: cfg.StorePath(), Self: id, Dial: tun.Dial, Now: a.clock, Random: a.random,
-					Alerted: alerts.Check, Log: log, Pace: pacer, SamplePercent: cfg.OverflowSample()}
+					Alerted: alerts.Check, Log: log, Pace: pacer, SamplePercent: cfg.OverflowSample(), FullCycle: cfg.FullCycle()}
 				// Overflow targets (VER-2, S3-6, #39): the provider's
 				// stored checksums daily, and a downloaded sample weekly.
 				ver.Overflow = func(o state.Overflow) (verify.Target, error) {

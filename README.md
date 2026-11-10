@@ -179,6 +179,7 @@ if none exists.
 | `replication.reroute_after` | `1h` | move unsent copies from a friend failing this long to another with room |
 | `replication.replace_after` | `168h` | a friend failing this long no longer counts as room for copies |
 | `replication.overflow_sample` | `0.1` | percent of the bytes at each overflow target downloaded each week and hashed against what was recorded (VER-2), within the download limits; a target is also checked daily by the provider's stored checksums |
+| `verify.full_cycle` | `30d` | every object a friend holds is challenged whole once in this many days (or hours, `36h`), a slice a day besides the daily random challenge, so a small silent loss is found within it (`1d` to `365d`). Overflow targets opt in per target: `lendisk overflow set <name> --full-cycle <days>` |
 | `alerts.command` | none | absolute path of a program run for each alert, the alert as JSON on stdin |
 | `alerts.webhook` | none | http(s) URL each alert's JSON is POSTed to |
 | `alerts.unreachable_after` | `24h` | alert when a friend has not answered for this long |

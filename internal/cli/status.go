@@ -623,6 +623,10 @@ type StatusReplica struct {
 	// `lendisk verify --full` it passed.
 	LastVerified string `json:"last_verified,omitempty"`
 	LastFull     string `json:"last_full,omitempty"`
+	// LastFullAt is when every object held there was last checked whole
+	// with no failure: the rolling full check's last completed cycle
+	// (VER-1a, #105), or LastFull if later.
+	LastFullAt string `json:"last_full_at,omitempty"`
 	// Unverified is set once it failed a challenge, since
 	// UnverifiedSince, Detail saying what failed: re-placement moves its
 	// copies of the bucket to other friends until a full check passes.
@@ -645,7 +649,11 @@ func replicaLine(r StatusReplica) string {
 	case r.LastVerified == "":
 		return fmt.Sprintf("not verified yet at %s", r.Peer)
 	}
-	return fmt.Sprintf("verified at %s %s", r.Peer, r.LastVerified)
+	line := fmt.Sprintf("verified at %s %s", r.Peer, r.LastVerified)
+	if r.LastFullAt != "" {
+		line += ", every object checked whole " + r.LastFullAt
+	}
+	return line
 }
 
 // rfc3339 is t in RFC 3339, UTC, or "" for the zero time.
@@ -665,7 +673,7 @@ func replicaStatus(ctx context.Context, db *state.DB) (map[string][]StatusReplic
 	out := map[string][]StatusReplica{}
 	for _, c := range cs {
 		out[c.Bucket] = append(out[c.Bucket], StatusReplica{Peer: c.Place, LastVerified: rfc3339(c.VerifiedAt),
-			LastFull: rfc3339(c.FullAt), Unverified: c.Unverified(), UnverifiedSince: rfc3339(c.UnverifiedAt),
+			LastFull: rfc3339(c.FullAt), LastFullAt: rfc3339(c.AllCheckedAt), Unverified: c.Unverified(), UnverifiedSince: rfc3339(c.UnverifiedAt),
 			Detail: c.Detail, Error: c.Error})
 	}
 	return out, nil

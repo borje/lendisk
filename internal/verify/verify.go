@@ -1,8 +1,10 @@
-// Package verify is the borrower's side of verification (VER-1, VER-2,
-// VER-3, VER-4, S3-6; DESIGN §3.6, §3.11): the daily challenge of each
-// friend's replica of each bucket, the checks of overflow targets by
-// their stored checksums and a weekly downloaded sample (overflow.go),
-// and the checks `lendisk verify` asks the daemon for.
+// Package verify is the borrower's side of verification (VER-1, VER-1a,
+// VER-2, VER-3, VER-4, S3-6; DESIGN §3.6, §3.11): the daily challenge of
+// each friend's replica of each bucket, the rolling full check that
+// challenges every object there whole once a cycle (cycle.go), the
+// checks of overflow targets by their stored checksums and a weekly
+// downloaded sample (overflow.go), and the checks `lendisk verify` asks
+// the daemon for.
 //
 // A challenge names one of the node's objects that the friend
 // acknowledged (state.DB.ChallengeableAt), by the bucket's sealed name
@@ -110,6 +112,9 @@ type Verifier struct {
 	// Every, Retry and Poll: DefaultEvery, DefaultRetry and DefaultPoll
 	// when zero.
 	Every, Retry, Poll time.Duration
+	// FullCycle is how long the rolling full check takes to challenge
+	// every object at a friend (cycle.go): DefaultFullCycle when zero.
+	FullCycle time.Duration
 	// Samples and Range: DefaultSamples and DefaultRange when zero.
 	Samples int
 	Range   int64
@@ -192,7 +197,8 @@ func (v *Verifier) Run(ctx context.Context) {
 	}
 }
 
-// pass runs every pending request, then every due replica's challenge.
+// pass runs every pending request, then every due replica's challenge,
+// then every due slice of the rolling full check.
 func (v *Verifier) pass(ctx context.Context) {
 	reqs, err := v.DB.PendingVerifies(ctx)
 	if err != nil {
@@ -222,6 +228,10 @@ func (v *Verifier) pass(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+	}
+	v.cycles(ctx)
+	if ctx.Err() != nil {
+		return
 	}
 	v.sampleTargets(ctx)
 	v.recheckVersioning(ctx)
@@ -267,83 +277,132 @@ var errNoAnswer = errors.New("no answer")
 // check runs the challenges. An error is no answer; a failed proof is an
 // outcome.
 func (v *Verifier) check(ctx context.Context, place, bucket string, full bool) (state.VerifyOutcome, error) {
-	var o state.VerifyOutcome
+	k, err := v.checker(ctx, place, bucket)
+	if err != nil {
+		return state.VerifyOutcome{}, err
+	}
+	defer k.done()
+	if full {
+		if _, err := k.walk(ctx, v.DB, place, bucket, 0, -1); err != nil {
+			return k.o, err
+		}
+		return k.outcome(), nil
+	}
+	n, err := v.DB.ChallengeableCount(ctx, place, bucket)
+	if err != nil {
+		return k.o, err
+	}
+	picks, err := v.pick(n, or(v.Samples, DefaultSamples))
+	if err != nil {
+		return k.o, err
+	}
+	for _, i := range picks {
+		c, err := v.DB.ChallengeableAt(ctx, place, bucket, i)
+		if errors.Is(err, state.ErrNotFound) {
+			continue // deleted or written again since the count
+		}
+		if err != nil {
+			return k.o, err
+		}
+		if stop, err := k.try(c, false); stop || err != nil {
+			return k.o, err
+		}
+	}
+	return k.outcome(), nil
+}
+
+// checker challenges one place's replica of a bucket object by object,
+// counting what it checked and skipped and keeping the first failure:
+// a check, or a slice of the rolling full check (cycle.go).
+type checker struct {
+	o state.VerifyOutcome
+	// one challenges c, ranged or whole: what failed ("" when the answer
+	// was right), skipped, or an error when nothing was decided.
+	one  func(c state.Challengeable, whole bool) (failed string, skipped bool, err error)
+	done func()
+}
+
+// checker returns place's checker for bucket: a friend's challenges, or
+// an overflow target's reads (overflow.go).
+func (v *Verifier) checker(ctx context.Context, place, bucket string) (*checker, error) {
 	if _, ok := state.OverflowName(place); ok {
-		return v.checkTarget(ctx, place, bucket, full)
+		return v.targetChecker(ctx, place, bucket)
 	}
 	f, err := v.DB.GetFriendship(ctx, place)
 	if err != nil {
-		return o, fmt.Errorf("the friendship: %w", err)
+		return nil, fmt.Errorf("the friendship: %w", err)
 	}
 	call, done := v.caller(f)
-	defer done()
 	var largest int64 // the largest object read whole so far: the friend's debt for it is waited out
-	try := func(c state.Challengeable, whole bool) (bool, error) {
+	return &checker{done: done, one: func(c state.Challengeable, whole bool) (string, bool, error) {
 		wait := maxWait + time.Duration(float64(largest)/float64(or(v.WholeRate, DefaultWholeRate))*float64(time.Second))
 		if whole {
 			largest = max(largest, c.Size)
 		}
-		failed, skipped, err := v.challenge(ctx, call, f, bucket, c, whole, wait)
-		switch {
-		case err != nil:
-			return false, err
-		case skipped:
-			o.Skipped++
-		case failed != "":
-			o.Checked++
-			o.Outcome, o.Detail = state.VerifyFailed, failed
-			return true, nil
-		default:
-			o.Checked++
-		}
-		return false, nil
-	}
-	if full {
-		var after int64
-		for {
-			page, err := v.DB.ChallengeablePage(ctx, place, bucket, after, pageSize)
-			if err != nil {
-				return o, err
-			}
-			if len(page) == 0 {
-				break
-			}
-			for _, c := range page {
-				after = c.Seq
-				if stop, err := try(c, true); stop || err != nil {
-					return o, err
-				}
-			}
-		}
-	} else {
-		n, err := v.DB.ChallengeableCount(ctx, place, bucket)
-		if err != nil {
-			return o, err
-		}
-		picks, err := v.pick(n, or(v.Samples, DefaultSamples))
-		if err != nil {
-			return o, err
-		}
-		for _, i := range picks {
-			c, err := v.DB.ChallengeableAt(ctx, place, bucket, i)
-			if errors.Is(err, state.ErrNotFound) {
-				continue // deleted or written again since the count
-			}
-			if err != nil {
-				return o, err
-			}
-			if stop, err := try(c, false); stop || err != nil {
-				return o, err
-			}
-		}
-	}
+		return v.challenge(ctx, call, f, bucket, c, whole, wait)
+	}}, nil
+}
+
+// try challenges c and counts the outcome; stop is a failed proof.
+func (k *checker) try(c state.Challengeable, whole bool) (stop bool, err error) {
+	failed, skipped, err := k.one(c, whole)
 	switch {
-	case o.Checked > 0:
-		o.Outcome = state.VerifyPassed
+	case err != nil:
+		return false, err
+	case skipped:
+		k.o.Skipped++
+	case failed != "":
+		k.o.Checked++
+		k.o.Outcome, k.o.Detail = state.VerifyFailed, failed
+		return true, nil
 	default:
-		o.Outcome = state.VerifyNothing
+		k.o.Checked++
 	}
-	return o, nil
+	return false, nil
+}
+
+// walk challenges whole the objects after sequence after, in write
+// order, at most limit of them (all when limit < 0), and returns the
+// last one it decided (after when none). It stops at a failed proof or
+// an error.
+func (k *checker) walk(ctx context.Context, db *state.DB, place, bucket string, after, limit int64) (int64, error) {
+	for limit != 0 {
+		n := int64(pageSize)
+		if limit > 0 {
+			n = min(n, limit)
+		}
+		page, err := db.ChallengeablePage(ctx, place, bucket, after, int(n))
+		if err != nil || len(page) == 0 {
+			return after, err
+		}
+		for _, c := range page {
+			stop, err := k.try(c, true)
+			if err != nil {
+				return after, err
+			}
+			after = c.Seq
+			if limit > 0 {
+				limit--
+			}
+			if stop {
+				return after, nil
+			}
+		}
+	}
+	return after, nil
+}
+
+// outcome is what the checks so far found: a failure, else passed when
+// any object was checked, else nothing.
+func (k *checker) outcome() state.VerifyOutcome {
+	o := k.o
+	if o.Outcome != state.VerifyFailed {
+		o.Outcome = state.VerifyNothing
+		if o.Checked > 0 {
+			o.Outcome = state.VerifyPassed
+		}
+	}
+	return o
 }
 
 // rng returns a generator seeded from Random.

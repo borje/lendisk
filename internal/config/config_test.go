@@ -179,6 +179,37 @@ func TestReconcileSettings(t *testing.T) {
 	}
 }
 
+// VER-1a (#105): the rolling full check's cycle is 30 days by default,
+// given in days or as a duration, by file, flag or environment, and
+// from a day to a year.
+func TestFullCycleSetting(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.FullCycle() != 30*24*time.Hour {
+		t.Fatalf("default %v", l.FullCycle())
+	}
+	l, err = load(t, []string{"--config", writeFile(t, "[verify]\nfull_cycle = \"7d\"\n")}, nil)
+	if err != nil || l.FullCycle() != 7*24*time.Hour {
+		t.Fatalf("from the file %v %v", l.FullCycle(), err)
+	}
+	l, err = load(t, []string{"--config", none, "--verify-full-cycle", "36h"}, nil)
+	if err != nil || l.FullCycle() != 36*time.Hour {
+		t.Fatalf("from the flag %v %v", l.FullCycle(), err)
+	}
+	l, err = load(t, []string{"--config", none}, map[string]string{"LENDISK_VERIFY_FULL_CYCLE": "365d"})
+	if err != nil || l.FullCycle() != 365*24*time.Hour {
+		t.Fatalf("from the environment %v %v", l.FullCycle(), err)
+	}
+	for _, bad := range []string{"0", "0d", "12h", "366d", "monthly", "-1d", ""} {
+		if _, err := load(t, []string{"--config", none, "--verify-full-cycle", bad}, nil); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}
+
 // VER-5 (#31): the bit-rot sample is a percentage of the stored bytes a
 // week, 0.1 (VER-5's least) by default and never below it, and its
 // disk reads are paced, 8M a second by default; empty is no limit.

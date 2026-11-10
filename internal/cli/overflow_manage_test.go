@@ -40,8 +40,29 @@ func TestOverflowSetChangesMaxBytesAndRetestsAnEndpoint(t *testing.T) {
 	if code, out, e := n.run("", "", "overflow", "set", "b2", "--max-bytes", "100G"); code != 0 || !strings.Contains(out, "up to 100G") {
 		t.Fatalf("set --max-bytes: %d %s%s", code, out, e)
 	}
-	if o := n.status().Capacity.Overflow[0]; o.MaxBytes != 100<<30 || o.Endpoint != srv.Endpoint {
+	if o := n.status().Capacity.Overflow[0]; o.MaxBytes != 100<<30 || o.Endpoint != srv.Endpoint || o.FullCycleSeconds != 0 {
 		t.Fatalf("after set: %+v", o)
+	}
+
+	// VER-1a (#105): a rolling full check at a target is opt-in, since
+	// each object it checks is downloaded; 0 or off turns it off.
+	for _, bad := range []string{"monthly", "400", "12h", "-1"} {
+		if code, _, e := n.run("", "", "overflow", "set", "b2", "--full-cycle", bad); code != 2 || !strings.Contains(e, "--full-cycle") {
+			t.Errorf("--full-cycle %s: exit %d (%s)", bad, code, e)
+		}
+	}
+	for _, c := range []struct {
+		arg  string
+		days int64
+		want string
+	}{{"90", 90, "once in 90 days"}, {"off", 0, "full cycle: off"}, {"7d", 7, "once in 7 days"}, {"0", 0, "full cycle: off"}} {
+		code, out, e := n.run("", "", "overflow", "set", "b2", "--full-cycle", c.arg)
+		if code != 0 || !strings.Contains(out, c.want) || !strings.Contains(out, "up to 100G") {
+			t.Fatalf("set --full-cycle %s: %d %s%s", c.arg, code, out, e)
+		}
+		if o := n.status().Capacity.Overflow[0]; o.FullCycleSeconds != c.days*86400 || o.MaxBytes != 100<<30 {
+			t.Fatalf("after set --full-cycle %s: %+v", c.arg, o)
+		}
 	}
 
 	// An endpoint where the credential does not work: nothing changes.

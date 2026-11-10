@@ -136,6 +136,9 @@ type StatusCapacityOverflow struct {
 	// EnvPrefix names the credential's variables: <env_prefix>ACCESS_KEY
 	// and <env_prefix>SECRET_KEY.
 	EnvPrefix string `json:"env_prefix"`
+	// FullCycleSeconds is its rolling full check's cycle (VER-1a,
+	// `overflow set --full-cycle`); absent while it has none.
+	FullCycleSeconds int64 `json:"full_cycle_seconds,omitempty"`
 	// Retention is who keeps deleted copies for the window (S3-4):
 	// "provider" (versioning and its lifecycle rule) or "client-side"
 	// (no versioning: lendisk holds each delete until the window ends).
@@ -192,7 +195,7 @@ func overflowStatus(ctx context.Context, db *state.DB) ([]StatusCapacityOverflow
 			Prefix: o.Prefix, DataObjects: h.DataObjects, DataBytes: h.DataBytes, PricePerGB: o.PricePerGB,
 			Versioning: o.Versioning, Lifecycle: o.Lifecycle, VersionRemoval: o.VersionRemoval, EnvPrefix: o.EnvPrefix,
 			Retention: o.RetentionMode(), VersioningChecked: rfc3339(o.VersioningCheckedAt), Removing: rfc3339(o.RemovingAt),
-			KeepData: o.KeepData}
+			KeepData: o.KeepData, FullCycleSeconds: int64(o.FullCycle / time.Second)}
 		if ch, ok := changes[o.Name]; ok {
 			so.VersioningChanged, so.VersioningBefore = rfc3339(ch.At), ch.Previous
 		}

@@ -1047,4 +1047,26 @@ var migrations = []Migration{
 		-- every recovered key.
 		CREATE INDEX recovered_key_writing ON recovered_key (bucket, key) WHERE verdict = 'writing';`,
 	},
+	{
+		Version: 49, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The rolling full check (VER-1a, #105): each replica's pass over
+		-- every object it holds, a daily slice at a time, so each is
+		-- challenged whole once a cycle. cycle_after is the cursor, the
+		-- sequence of the last object the pass decided (0 before the
+		-- first); cycle_started_at when the pass began, NULL while none is
+		-- under way; cycle_at the last slice; cycle_checked and
+		-- cycle_skipped what the pass checked and skipped so far;
+		-- cycle_full_at the last pass completed without a failure, or the
+		-- last verify --full that passed. Unix seconds.
+		ALTER TABLE replica_check ADD COLUMN cycle_after INTEGER;
+		ALTER TABLE replica_check ADD COLUMN cycle_started_at INTEGER;
+		ALTER TABLE replica_check ADD COLUMN cycle_at INTEGER;
+		ALTER TABLE replica_check ADD COLUMN cycle_checked INTEGER;
+		ALTER TABLE replica_check ADD COLUMN cycle_skipped INTEGER;
+		ALTER TABLE replica_check ADD COLUMN cycle_full_at INTEGER;
+		-- An overflow target's full cycle (overflow set --full-cycle), in
+		-- seconds; NULL: none, its replicas keep VER-2's sampling alone.
+		ALTER TABLE overflow ADD COLUMN full_cycle INTEGER;`,
+	},
 }

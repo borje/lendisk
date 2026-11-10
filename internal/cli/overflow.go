@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/borje/lendisk/internal/capacity"
+	"github.com/borje/lendisk/internal/config"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/overflow"
 	"github.com/borje/lendisk/internal/recovery"
@@ -19,7 +20,7 @@ import (
 	"github.com/borje/lendisk/internal/state"
 )
 
-// Overflow targets (S3-1, S3-4, S3-5, S3-7, #38, #96): `overflow add`,
+// Overflow targets (S3-1, S3-4, S3-5, S3-7, VER-1a, #38, #96, #105): `overflow add`,
 // `overflow set` and `overflow remove`, and the daemon's start check of
 // their credentials.
 
@@ -71,7 +72,7 @@ add tests it and says what it found.`,
 	var sf overflowFlags
 	set := &cobra.Command{
 		Use:   "set <name>",
-		Short: "Change an overflow target's --max-bytes, or the endpoint its bucket is reached at",
+		Short: "Change an overflow target's --max-bytes, its --full-cycle, or the endpoint its bucket is reached at",
 		Long: `Change an overflow target (#96). --max-bytes is the most this node
 stores there: raised, more copies may go there; lowered below what it
 holds, no new copy goes there, and what it holds moves back to friends
@@ -80,15 +81,24 @@ as they have room (drain-back).
 --endpoint (and --region) is where the same bucket is reached: a
 provider's new URL. The credential is tested there first, as by add,
 and nothing changes if it does not work. To move to another bucket or
-provider, add a new target and remove this one.`,
+provider, add a new target and remove this one.
+
+--full-cycle gives the target a rolling full check (VER-1a): every
+object this node holds there is downloaded and hashed once in that many
+days, a slice a day, within the download limits. Off by default, as
+each download costs the provider's egress fee; 0 or off turns it off
+again. The target is still checked daily by the provider's stored
+checksums and weekly by a downloaded sample (VER-2).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			sf.fullCycleSet = cmd.Flags().Changed("full-cycle")
 			return a.runOverflowSet(cmd.Context(), args[0], cmd.Flags().Changed("region"), sf)
 		},
 	}
 	set.Flags().StringVar(&sf.maxBytes, "max-bytes", "", "the most this node stores there, such as 450G")
 	set.Flags().StringVar(&sf.endpoint, "endpoint", "", "the provider's S3 endpoint URL the bucket is reached at now")
 	set.Flags().StringVar(&sf.region, "region", "", "the bucket's region at the new endpoint (empty: ask the provider)")
+	set.Flags().StringVar(&sf.fullCycle, "full-cycle", "", "download every object held there once in this many days, such as 90 or 90d (VER-1a); 0 or off for none, the default")
 	cmd.AddCommand(set)
 
 	var keep bool
@@ -137,8 +147,15 @@ func noTarget(name string) error {
 }
 
 func (a *app) runOverflowSet(ctx context.Context, name string, regionSet bool, f overflowFlags) error {
-	if f.maxBytes == "" && f.endpoint == "" && !regionSet {
-		return usageError{errors.New("nothing to change: give --max-bytes, --endpoint or --region")}
+	if f.maxBytes == "" && f.endpoint == "" && !regionSet && !f.fullCycleSet {
+		return usageError{errors.New("nothing to change: give --max-bytes, --full-cycle, --endpoint or --region")}
+	}
+	var cycle time.Duration
+	if f.fullCycleSet {
+		var err error
+		if cycle, err = parseFullCycle(f.fullCycle); err != nil {
+			return usageError{fmt.Errorf("--full-cycle: %w", err)}
+		}
 	}
 	if regionSet && f.endpoint == "" {
 		return usageError{errors.New("--region goes with --endpoint: the bucket is reached somewhere else")}
@@ -161,6 +178,9 @@ func (a *app) runOverflowSet(ctx context.Context, name string, regionSet bool, f
 		if o.MaxBytes, err = parseNumber(f.maxBytes); err != nil {
 			return usageError{fmt.Errorf("--max-bytes: %w", err)}
 		}
+	}
+	if f.fullCycleSet {
+		o.FullCycle = cycle
 	}
 	var check *replica.Check
 	if f.endpoint != "" {
@@ -210,6 +230,14 @@ func (a *app) runOverflowSet(ctx context.Context, name string, regionSet bool, f
 		return err
 	}
 	fmt.Fprintf(a.out, "Overflow target %s: bucket %s at %s, up to %s\n", name, o.Bucket, o.Endpoint, formatSize(o.MaxBytes))
+	if f.fullCycleSet {
+		if o.FullCycle > 0 {
+			fmt.Fprintf(a.out, "  full cycle: every object held there is downloaded and hashed once in %s, a slice a day, within the download limits; the provider charges for each download\n",
+				formatCycle(o.FullCycle))
+		} else {
+			fmt.Fprintln(a.out, "  full cycle: off; the target is checked by the provider's stored checksums and a downloaded sample")
+		}
+	}
 	if check != nil {
 		fmt.Fprintf(a.out, "  credential: tested there; versioning %s; lifecycle rule %s; version removal %s\n",
 			check.Versioning, check.Lifecycle, check.VersionRemoval)
@@ -223,6 +251,27 @@ func (a *app) runOverflowSet(ctx context.Context, name string, regionSet bool, f
 	}
 	fmt.Fprintln(a.out, "The daemon uses the change at its next look at the targets; no restart is needed.")
 	return nil
+}
+
+// parseFullCycle reads --full-cycle (VER-1a): 0 or off for none, else
+// days, bare (90) or as the config file gives a cycle (90d, 36h).
+func parseFullCycle(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "0" || strings.EqualFold(s, "off") {
+		return 0, nil
+	}
+	if n, err := strconv.ParseUint(s, 10, 16); err == nil {
+		s = strconv.FormatUint(n, 10) + "d"
+	}
+	return config.ParseCycle(s)
+}
+
+// formatCycle writes a cycle in days, or hours when not whole days.
+func formatCycle(d time.Duration) string {
+	if d%(24*time.Hour) == 0 {
+		return fmt.Sprintf("%d days", d/(24*time.Hour))
+	}
+	return d.String()
 }
 
 // sameBucketSample is how many of a target's objects `overflow set
@@ -309,6 +358,9 @@ func (a *app) runOverflowRemove(ctx context.Context, name string, keep bool) err
 type overflowFlags struct {
 	endpoint, bucket, prefix, region, maxBytes, envPrefix, retention, price string
 	lifecycle                                                               bool
+	// fullCycle is set's --full-cycle, given when fullCycleSet (VER-1a).
+	fullCycle    string
+	fullCycleSet bool
 }
 
 func (a *app) runOverflowAdd(ctx context.Context, name string, f overflowFlags) error {
