@@ -253,6 +253,14 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 			}
 			return fmt.Errorf("lending: settling the tombstones left by the last run: %w", err)
 		}
+		// Rows a lost or rebuilt lendisk.db lacks are rebuilt from the
+		// tombs, so every tomb is kept, counted and purged (#75).
+		if err := lend.rebuildAllTombs(ctx); err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("lending: rebuilding tombstone rows from the store: %w", err)
+		}
 		every := g.PurgeEvery
 		if every <= 0 {
 			every = time.Hour

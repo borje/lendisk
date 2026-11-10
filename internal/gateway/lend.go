@@ -256,7 +256,8 @@ func (l *Lending) GetBucketAcl(ctx context.Context, in *s3.GetBucketAclInput) ([
 // and owned by the borrower's account alone, and records it in the
 // mapping table (PEER-2, PEER-8). The name sent must be a sealed name.
 // A new bucket is admitted like a write (createBucketLent). A retry finds
-// the bucket already its own and records it.
+// the bucket already its own and records it; so does a borrower whose
+// row a lost lendisk.db took, its tombstones rebuilt first (#75).
 func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, acl []byte) error {
 	ctx = detach(ctx)
 	peer, ok := borrower(ctx)
@@ -274,6 +275,17 @@ func (l *Lending) CreateBucket(ctx context.Context, in *s3.CreateBucketInput, ac
 	c := *in
 	c.Bucket = &stored
 	c.ObjectOwnership = types.ObjectOwnershipBucketOwnerEnforced
+	// A bucket not mapped yet may be one whose row a lost lendisk.db took:
+	// its tombs' rows are rebuilt before the mapping lets a write reach
+	// it (#75). A new bucket has no tombs.
+	if has, err := l.DB.HasLentBucket(ctx, peer.String(), sealed); err != nil {
+		return errInternal
+	} else if !has {
+		if err := l.rebuildTombs(ctx, peer.String(), sealed); err != nil {
+			l.log().Error("lending: rebuilding a bucket's tombstones failed; refusing its creation", "peer", peer, "sealed", sealed, "err", err)
+			return errInternal
+		}
+	}
 	return l.createBucketLent(ctx, peer.String(), sealed, func() error {
 		err := l.Next.CreateBucket(ctx, &c, own)
 		if err != nil && !isCode(err, "BucketAlreadyOwnedByYou") {
@@ -293,9 +305,16 @@ func (l *Lending) now() time.Time {
 	return time.Now()
 }
 
+// isCode reports whether err is the store's S3 error code: an APIError,
+// or a BucketError (posix answers a bucket already there with one, #75).
 func isCode(err error, code string) bool {
-	ae, ok := err.(s3err.APIError)
-	return ok && ae.Code == code
+	switch e := err.(type) {
+	case s3err.APIError:
+		return e.Code == code
+	case s3err.BucketError:
+		return e.Code == code
+	}
+	return false
 }
 
 func (l *Lending) PutBucketAcl(ctx context.Context, bucket string, data []byte) error {

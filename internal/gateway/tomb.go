@@ -46,6 +46,8 @@ import (
 //   - A rewrite's replaced version is tombstoned the same way
 //     (rewrite.go, #74), its row marked Rewrite; settleTombs moves a
 //     pending one back if the key holds nothing.
+//   - Rows lendisk.db lost are rebuilt from the tombs themselves
+//     (tombrebuild.go, #75).
 //
 // Every tomb step on a key holds that key's lock (Lending.keys) and the
 // borrower's publication lock shared, so the reconcile sees each object
@@ -119,14 +121,15 @@ func (l *Lending) moveIntoTomb(bucket, key, tomb string) error {
 }
 
 // removeTomb unlinks a tomb (gone already is fine) and the tomb
-// directories that leaves empty.
+// directories that leaves empty, .lendisk itself among them, so a
+// bucket's last tomb leaves the bucket as empty as its keys (#75).
 func (l *Lending) removeTomb(bucket, tomb string) error {
 	l.tombDirs.Lock()
 	defer l.tombDirs.Unlock()
 	if err := os.Remove(l.objectPath(bucket, tomb)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	l.removeEmpty(bucket, tomb, ".lendisk")
+	l.removeEmpty(bucket, tomb, ".")
 	return nil
 }
 
