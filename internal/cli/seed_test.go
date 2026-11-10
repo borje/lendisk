@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/borje/lendisk/internal/gateway"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/seed"
 	"github.com/borje/lendisk/internal/transport"
@@ -143,14 +145,21 @@ func TestScenarioSeedAFriendFromADisk(t *testing.T) {
 	if code, _, e := bn.run("", "", "peer", "quota", aKey, "10G"); code != 0 {
 		t.Fatal(e)
 	}
+	// #95: data goes first; as data was refused, the 4 metadata objects
+	// are left for the network, so no index lands before its pack.
 	code, out, e = bn.run("", "", "import", disk)
-	if code != 1 || !strings.Contains(out, "Imported 8 objects") || !strings.Contains(e, "Refused "+tampered+": its bytes do not match") ||
-		!strings.Contains(e, "Refused "+conflict+": this node holds the key with other bytes") {
+	if code != 1 || !strings.Contains(out, "Imported 4 objects") || !strings.Contains(e, "Refused "+tampered+": its bytes do not match") ||
+		!strings.Contains(e, "Refused "+conflict+": this node holds the key with other bytes") ||
+		!strings.Contains(e, "Left 4 metadata objects for the network") {
 		t.Fatalf("import: exit %d\n%s%s", code, out, e)
 	}
 	held := lentObjects(t, bn, aID, "laptop")
 	for k, h := range want {
 		switch {
+		case !strings.HasPrefix(k, "data/"):
+			if _, ok := held[k]; ok {
+				t.Errorf("B stored metadata %s though data was refused", k)
+			}
 		case k == tampered:
 			if _, ok := held[k]; ok {
 				t.Errorf("B stored the damaged %s", k)
@@ -167,16 +176,16 @@ func TestScenarioSeedAFriendFromADisk(t *testing.T) {
 		t.Fatalf("import on the exporting node: exit %d\n%s", code, e)
 	}
 
-	// Boxes 3 and 4: A's daemon acknowledges the 8 objects B's list shows
-	// with their hash and never sends them; the other two stay queued
+	// Boxes 3 and 4: A's daemon acknowledges the 4 objects B's list shows
+	// with their hash and never sends them; the other six stay queued
 	// while the seed holds, then go by the network.
 	a.start()
 	deadline := time.Now().Add(30 * time.Second)
 	for {
 		st := an.status()
-		if st.Seeds[0].Confirmed == 8 {
-			if q := an.place(bKey).Queue.Objects; st.Seeds[0].Outcome == "" && q != 2 {
-				t.Fatalf("queued at B while the seed holds: %d, want the 2 refused", q)
+		if st.Seeds[0].Confirmed == 4 {
+			if q := an.place(bKey).Queue.Objects; st.Seeds[0].Outcome == "" && q != 6 {
+				t.Fatalf("queued at B while the seed holds: %d, want the 2 refused and 4 metadata", q)
 			}
 			break
 		}
@@ -197,15 +206,45 @@ func TestScenarioSeedAFriendFromADisk(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if got := lentObjects(t, bn, aID, "laptop")[tampered]; got != want[tampered] {
-		t.Errorf("B's %s after the seed: %q, want the network's copy", tampered, got)
+	held = lentObjects(t, bn, aID, "laptop")
+	for k, h := range want {
+		if k != conflict && held[k] != h {
+			t.Errorf("B's %s after the seed: %q, want %q (the network's copy)", k, held[k], h)
+		}
 	}
 	v := scrape(t, maddr)
-	if n := v[`lendisk_replication_objects_total{place="`+bKey+`",op="put"}`]; n != 1 {
-		t.Errorf("A's worker acknowledged %v puts at B; want 1, the damaged object (the seeded 8 never sent)", n)
+	if n := v[`lendisk_replication_objects_total{place="`+bKey+`",op="put"}`]; n != 5 {
+		t.Errorf("A's worker acknowledged %v puts at B; want 5, the damaged object and the metadata (the seeded 4 never sent)", n)
 	}
-	if sent := v[`lendisk_replication_sent_bytes_total{place="`+bKey+`"}`]; sent < 100<<10 || sent > 150<<10 {
-		t.Errorf("A sent B %v bytes; want the damaged object's 100 KiB and at most the held key's 50 KiB", sent)
+	if sent := v[`lendisk_replication_sent_bytes_total{place="`+bKey+`"}`]; sent < 100<<10 || sent > 151<<10 {
+		t.Errorf("A sent B %v bytes; want the damaged object's 100 KiB, the metadata, and at most the held key's 50 KiB", sent)
+	}
+	a.p.kill()
+
+	// #95: a second export starts a seed that status says how to cancel;
+	// the cancel ends it. B imports that newer disk, and refuses the
+	// first one after it, which could bring back what A deleted since.
+	disk2 := filepath.Join(t.TempDir(), "disk2")
+	if code, out, e := an.run("", "", "export", "laptop", "--for", bKey, disk2); code != 0 {
+		t.Fatalf("second export: exit %d\n%s%s", code, out, e)
+	}
+	if _, text, _ := an.run("", "", "status"); !strings.Contains(text, "lendisk export --cancel laptop --for "+bKey) {
+		t.Fatalf("status text of a pending seed:\n%s", text)
+	}
+	if code, out, e := an.run("", "", "export", "--cancel", "laptop", "--for", bKey); code != 0 || !strings.Contains(out, "Cancelled the seed") {
+		t.Fatalf("cancel: exit %d\n%s%s", code, out, e)
+	}
+	if st := an.status(); len(st.Seeds) != 1 || st.Seeds[0].Outcome != "cancelled" {
+		t.Fatalf("seeds after the cancel: %+v", st.Seeds)
+	}
+	if code, _, e := an.run("", "", "export", "--cancel", "laptop", "--for", bKey); code != 1 || !strings.Contains(e, "no pending seed") {
+		t.Fatalf("cancel again: exit %d\n%s", code, e)
+	}
+	if code, _, e := bn.run("", "", "import", disk2); strings.Contains(e, "before the export") {
+		t.Fatalf("the newer disk: exit %d\n%s", code, e)
+	}
+	if code, _, e := bn.run("", "", "import", disk); code != 1 || !strings.Contains(e, "before the export of the same bucket imported here") {
+		t.Fatalf("the older disk after the newer: exit %d\n%s", code, e)
 	}
 }
 
@@ -231,6 +270,9 @@ func TestSeedExportAndImportRefusals(t *testing.T) {
 		{[]string{"export", "nope", "--for", other, dir}, 1, `no bucket "nope"`},
 		{[]string{"export", "laptop", "--for", other, dir}, 1, "is not a friend"},
 		{[]string{"import", dir}, 1, "no seed manifest"},
+		{[]string{"export", "--cancel", "laptop"}, 2, "export --cancel <bucket> --for <friend>"},
+		{[]string{"export", "--cancel", "laptop", "--for", other, dir}, 2, "export --cancel <bucket> --for <friend>"},
+		{[]string{"export", "--cancel", "laptop", "--for", other}, 1, "no pending seed of bucket laptop"},
 	} {
 		if code, _, e := n.run("", "", c.args...); code != c.code || !strings.Contains(e, c.msg) {
 			t.Errorf("%v: exit %d, want %d with %q\n%s", c.args, code, c.code, c.msg, e)
@@ -238,5 +280,42 @@ func TestSeedExportAndImportRefusals(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); err == nil {
 		t.Error("a refused export wrote its directory")
+	}
+}
+
+// #95: with a data_dir too long for a unix socket path, the daemon
+// serves on a private socket it names beside gw.sock; import and every
+// command that asks whether the daemon runs find it there.
+func TestImportFindsTheSocketOfALongDataDir(t *testing.T) {
+	parallel(t, 0)
+	long := filepath.Join(t.TempDir(), strings.Repeat("d", 100))
+	if daemonRunning(long) {
+		t.Fatal("running with nothing serving")
+	}
+	short, err := os.MkdirTemp("", "gw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(short)
+	ln, err := net.Listen("unix", filepath.Join(short, "gw.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	os.MkdirAll(filepath.Dir(gateway.SocketPath(long)), 0o700)
+	if err := os.WriteFile(gateway.SocketPath(long)+".path", []byte(ln.Addr().String()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !daemonRunning(long) {
+		t.Fatal("the daemon's moved socket was not found")
 	}
 }

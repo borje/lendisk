@@ -22,6 +22,7 @@ const (
 	SeedQuiet     = "quiet"     // the import confirmed some, then nothing more for SeedQuietAfter
 	SeedExpired   = "expired"   // nothing confirmed within SeedExpiry of the export
 	SeedRemoved   = "removed"   // the friend is no longer a friend
+	SeedCancelled = "cancelled" // the user cancelled it (`lendisk export --cancel`, #95)
 )
 
 // SeedQuietAfter is how long a seed that confirmed some objects waits for
@@ -33,6 +34,14 @@ const SeedQuietAfter = time.Hour
 // friend's rows: a disk lost or never imported.
 const SeedExpiry = 30 * 24 * time.Hour
 
+// SeedStaleAfter is how long a pending seed may confirm nothing before
+// it is alerted (#95): a disk lost, or never imported, delays that
+// friend's copies of the bucket until SeedExpiry. A week covers a disk
+// sent by post or carried at the next weekly visit, and leaves three
+// weeks of SeedExpiry to import it or cancel the seed; it is
+// replication.replace_after's default too.
+const SeedStaleAfter = 7 * 24 * time.Hour
+
 // SeedObject is a key an export writes for a place: its latest done
 // write, a put placed there (queued or acknowledged).
 type SeedObject struct {
@@ -40,13 +49,14 @@ type SeedObject struct {
 	Key    string
 	Size   int64
 	SHA256 string
+	Class  string // data, metadata or snapshot (EP-7)
 }
 
 // SeedObjects returns the keys of bucket placed at place, in key order:
 // each key whose latest done write is a put with a queued or
 // acknowledged placement row at place.
 func (db *DB) SeedObjects(ctx context.Context, place, bucket string) ([]SeedObject, error) {
-	rows, err := db.QueryContext(ctx, `SELECT q.seq, q.key, coalesce(q.size, 0), coalesce(q.sha256, '')
+	rows, err := db.QueryContext(ctx, `SELECT q.seq, q.key, coalesce(q.size, 0), coalesce(q.sha256, ''), q.class
 		FROM placement p JOIN queue q ON q.seq = p.seq
 		WHERE p.place = ? AND p.bucket = ? AND p.op = 'put' AND p.state IN ('queued', 'acked') AND q.state = 'done'
 		AND `+current+` ORDER BY q.key`, place, bucket)
@@ -57,7 +67,7 @@ func (db *DB) SeedObjects(ctx context.Context, place, bucket string) ([]SeedObje
 	var out []SeedObject
 	for rows.Next() {
 		var o SeedObject
-		if err := rows.Scan(&o.Seq, &o.Key, &o.Size, &o.SHA256); err != nil {
+		if err := rows.Scan(&o.Seq, &o.Key, &o.Size, &o.SHA256, &o.Class); err != nil {
 			return nil, err
 		}
 		out = append(out, o)
@@ -83,24 +93,78 @@ type Seed struct {
 
 // StartSeed records that an export of bucket for place is under way,
 // covering rows up to through: from now on place's queued rows of the
-// bucket are held. A seed of the same place and bucket is replaced.
+// bucket are held. A seed of the same place and bucket is replaced,
+// with its skips.
 func (db *DB) StartSeed(ctx context.Context, place, bucket string, through int64, now time.Time) error {
-	_, err := db.ExecContext(ctx, `INSERT OR REPLACE INTO seed (place, bucket, through, objects, bytes, exported_at)
-		VALUES (?, ?, ?, 0, 0, ?)`, place, bucket, through, now.Unix())
-	return err
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO seed (place, bucket, through, objects, bytes, exported_at)
+		VALUES (?, ?, ?, 0, 0, ?)`, place, bucket, through, now.Unix()); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM seed_skip WHERE place = ? AND bucket = ?`, place, bucket); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-// SeedWritten records what the export wrote, once it finished.
-func (db *DB) SeedWritten(ctx context.Context, place, bucket string, objects, bytes int64, now time.Time) error {
-	_, err := db.ExecContext(ctx, `UPDATE seed SET objects = ?, bytes = ?, exported_at = ? WHERE place = ? AND bucket = ?`,
-		objects, bytes, now.Unix(), place, bucket)
-	return err
+// SeedWritten records what the export wrote, once it finished, and the
+// rows up to through it skipped (a directory marker, a key whose copy
+// changed while it ran): the seed does not wait for the friend's list
+// to show them (#95). They stay held while it is pending, and go by the
+// network after, in order.
+func (db *DB) SeedWritten(ctx context.Context, place, bucket string, objects, bytes int64, skipped []int64, now time.Time) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE seed SET objects = ?, bytes = ?, exported_at = ? WHERE place = ? AND bucket = ?`,
+		objects, bytes, now.Unix(), place, bucket); err != nil {
+		return err
+	}
+	for _, seq := range skipped {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO seed_skip (place, bucket, seq) VALUES (?, ?, ?)`,
+			place, bucket, seq); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // DropSeed removes a seed: an export that failed holds nothing.
 func (db *DB) DropSeed(ctx context.Context, place, bucket string) error {
-	_, err := db.ExecContext(ctx, `DELETE FROM seed WHERE place = ? AND bucket = ?`, place, bucket)
-	return err
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM seed WHERE place = ? AND bucket = ?`, place, bucket); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM seed_skip WHERE place = ? AND bucket = ?`, place, bucket); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// CancelSeed ends place's pending seed of bucket as cancelled (#95):
+// its rows go by the network from now. ErrNotFound if none is pending.
+func (db *DB) CancelSeed(ctx context.Context, place, bucket string, now time.Time) error {
+	r, err := db.ExecContext(ctx, `UPDATE seed SET done_at = ?, outcome = ? WHERE place = ? AND bucket = ? AND done_at IS NULL`,
+		now.Unix(), SeedCancelled, place, bucket)
+	if err != nil {
+		return err
+	}
+	if n, err := r.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 const seedCols = `place, bucket, through, objects, bytes, exported_at, confirmed, progress_at, checked_at,
@@ -158,47 +222,99 @@ type SeedListed struct {
 // ConfirmSeeded acknowledges, at now, each of place's queued puts of
 // bucket up to through whose key listed shows with the captured hash
 // (REPL-10: the hash recorded is the one the place verified). It
-// returns how many it acknowledged.
+// returns how many it acknowledged. The rows are found and acknowledged
+// in one transaction, each only while it is still queued (#95): a row
+// re-placement abandoned or dropped meanwhile is left as it is.
 func (db *DB) ConfirmSeeded(ctx context.Context, place, bucket string, through int64, listed []SeedListed, now time.Time) (int64, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
 	var n int64
 	for _, l := range listed {
-		rows, err := db.QueryContext(ctx, `SELECT p.seq FROM placement p JOIN queue q ON q.seq = p.seq
+		seqs, err := seqColumn(ctx, tx, `SELECT p.seq FROM placement p JOIN queue q ON q.seq = p.seq
 			WHERE p.place = ? AND p.bucket = ? AND p.key = ? AND p.op = 'put' AND p.state = 'queued'
 			AND p.seq <= ? AND q.sha256 = ?`, place, bucket, l.Key, through, l.SHA256)
 		if err != nil {
-			return n, err
+			return 0, err
 		}
-		var seqs []int64
-		for rows.Next() {
-			var s int64
-			if err := rows.Scan(&s); err != nil {
-				rows.Close()
-				return n, err
-			}
-			seqs = append(seqs, s)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return n, err
+		if db.beforeSeedAck != nil && len(seqs) > 0 {
+			db.beforeSeedAck(tx)
 		}
 		for _, s := range seqs {
-			if err := db.AckPlacement(ctx, place, s, l.SHA256, now); err != nil {
-				return n, err
+			acked, err := db.ackPlacement(ctx, tx, place, s, l.SHA256, now, true)
+			if err != nil {
+				return 0, err
 			}
-			n++
+			if acked {
+				n++
+			}
 		}
 	}
-	return n, nil
+	return n, tx.Commit()
+}
+
+// seqColumn reads one integer column of q in tx.
+func seqColumn(ctx context.Context, tx *sql.Tx, q string, args ...any) ([]int64, error) {
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var v int64
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	return out, rows.Err()
 }
 
 // SeedLeft counts place's queued puts of bucket up to through that are
-// still their key's latest done write: what the seed has yet to
-// confirm.
+// still their key's latest done write and that the export did not skip
+// (SeedWritten): what the seed has yet to confirm.
 func (db *DB) SeedLeft(ctx context.Context, place, bucket string, through int64) (int64, error) {
 	var n int64
-	err := db.QueryRowContext(ctx, `SELECT count(*) FROM placement p WHERE p.place = ? AND p.bucket = ?
-		AND p.op = 'put' AND p.state = 'queued' AND p.seq <= ? AND `+current, place, bucket, through).Scan(&n)
+	err := db.QueryRowContext(ctx, `SELECT count(*) FROM placement p WHERE p.place = ?1 AND p.bucket = ?2
+		AND p.op = 'put' AND p.state = 'queued' AND p.seq <= ?3 AND `+current+`
+		AND p.seq NOT IN (SELECT k.seq FROM seed_skip k WHERE k.place = ?1 AND k.bucket = ?2)`, place, bucket, through).Scan(&n)
 	return n, err
+}
+
+// ErrOlderSeed is a seeding disk older than one already imported here
+// from the same borrower's bucket (#95).
+var ErrOlderSeed = errors.New("an export of this bucket newer than this disk was imported here")
+
+// SeedImport records, on the lender, that an export of borrower's bucket
+// sealed made at exported (the borrower's clock, as its manifest says)
+// is being imported. It refuses, with ErrOlderSeed and the newest
+// export imported, an export older than one imported before: an old
+// disk would bring back keys the borrower has deleted since (#95). The
+// same export again (an import run again to finish) and a newer one
+// pass.
+func (db *DB) SeedImport(ctx context.Context, borrower, sealed string, exported, now time.Time) (time.Time, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return time.Time{}, err
+	}
+	defer tx.Rollback()
+	var newest int64
+	err = tx.QueryRowContext(ctx, `SELECT exported_at FROM seed_import WHERE borrower = ? AND sealed = ?`,
+		borrower, sealed).Scan(&newest)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, err
+	}
+	if err == nil && exported.UnixNano() < newest {
+		return time.Unix(0, newest), ErrOlderSeed
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO seed_import (borrower, sealed, exported_at, imported_at)
+		VALUES (?, ?, ?, ?)`, borrower, sealed, exported.UnixNano(), now.Unix()); err != nil {
+		return time.Time{}, err
+	}
+	return exported, tx.Commit()
 }
 
 // SeedChecked records a listing of the seed: confirmed more rows (and

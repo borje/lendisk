@@ -46,6 +46,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -72,6 +73,23 @@ const maxSocketPath = 107
 // SocketPath is the internal socket under the data directory. Run may
 // move it if the path is too long; read Gateway.Socket after ready.
 func SocketPath(dataDir string) string { return filepath.Join(dataDir, "run", "gw.sock") }
+
+// redirectPath is the file beside socket in which Run names the socket
+// it moved to, while it serves there (#95).
+func redirectPath(socket string) string { return socket + ".path" }
+
+// LiveSocket is the socket the daemon of dataDir serves on: SocketPath,
+// or the private one Run moved to for a data_dir too long for a unix
+// socket path, as its redirect file says. Commands that reach the
+// daemon dial this.
+func LiveSocket(dataDir string) string {
+	p := SocketPath(dataDir)
+	b, err := os.ReadFile(redirectPath(p))
+	if s := strings.TrimSpace(string(b)); err == nil && s != "" {
+		return s
+	}
+	return p
+}
 
 // Gateway is a configured, not yet running, embedded versitygw.
 type Gateway struct {
@@ -136,9 +154,13 @@ type Gateway struct {
 // Run serves S3 on the socket until ctx is cancelled. ready, if not nil,
 // is closed once the socket accepts connections.
 func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
+	if err := os.Remove(redirectPath(g.Socket)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err // a stale one, from a run that crashed
+	}
 	if len(g.Socket) > maxSocketPath {
 		// A unix socket path is limited to 108 bytes. A long data_dir
-		// would make the bind fail, so use a private directory instead.
+		// would make the bind fail, so use a private directory instead,
+		// named in a file where the socket would be (LiveSocket).
 		dir, err := os.MkdirTemp("", "lendisk-")
 		if err != nil {
 			return err
@@ -146,7 +168,23 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 		defer os.RemoveAll(dir)
 		g.Log.Warn("data_dir is too long for a unix socket path; using a private temporary directory",
 			"wanted", g.Socket, "using", filepath.Join(dir, "gw.sock"))
+		redirect := redirectPath(g.Socket)
 		g.Socket = filepath.Join(dir, "gw.sock")
+		if err := os.MkdirAll(filepath.Dir(redirect), 0o700); err != nil {
+			return err
+		}
+		f, err := os.OpenFile(redirect, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		_, err = f.WriteString(g.Socket + "\n")
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return err
+		}
+		defer os.Remove(redirect)
 	}
 	if err := os.MkdirAll(filepath.Dir(g.Socket), 0o700); err != nil {
 		return err

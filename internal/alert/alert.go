@@ -14,7 +14,8 @@
 // and missing store marker (EP-14, #8), bit-rot the sampler found in
 // own objects and in friends' (VER-5, #31), a printed recovery
 // sheet gone out of date (ID-7, #33), and the repository above 90% of
-// the protectable size (LEND-7, LEND-8, #37).
+// the protectable size (LEND-7, LEND-8, #37), and a seed from a disk
+// that has confirmed nothing for a week (REPL-8, #95).
 // The Service re-reads them every Interval, and at once after Check;
 // state.SyncAlerts keeps one row per condition, raised once while it
 // holds and cleared when it ends. Each raise is delivered at least once
@@ -210,6 +211,13 @@ const (
 	// credential, it is unset in the daemon's environment, or the
 	// network fails). Subject: the target's name.
 	KindOverflowUnreachable = "overflow_unreachable"
+	// KindSeedStale: a seed from a disk (REPL-8) has had nothing
+	// confirmed by the friend's list for state.SeedStaleAfter since the
+	// export (#95): the disk is lost or not imported, and the friend's
+	// copies of the bucket wait until state.SeedExpiry. Subject:
+	// <peer>/<bucket>. It clears at the first confirmation, or when the
+	// seed ends (cancelled, expired).
+	KindSeedStale = "seed_stale"
 )
 
 // OverflowHighPercent is where KindOverflowHigh is raised (S3-7).
@@ -301,7 +309,7 @@ var kinds = []string{KindFriendUnreachable, KindStoreUnreadable, KindObjectsNotR
 	KindPoolTooSmall, KindCopiesDropped, KindUploadUnmatchable, KindKeyChanged, KindFriendRemoved, KindFriendRefuses, KindPurgeSoon,
 	KindQuotaHigh, KindQuotaExhausted, KindLentOverQuota, KindKopiaFormat1, KindBelowCopies, KindReplicaUnverified,
 	KindReplicaUnchecked, KindReconcileHeld, KindStoreMarkerMissing, KindBitrot, KindLentBitrot, KindRecoverySheetStale,
-	KindProtectable, KindOverflowReceiving, KindOverflowHigh, KindOverflowFull, KindOverflowUnreachable}
+	KindProtectable, KindOverflowReceiving, KindOverflowHigh, KindOverflowFull, KindOverflowUnreachable, KindSeedStale}
 
 // Kinds are the alert kinds the evaluator owns, for the metrics that
 // count pending alerts by kind (OPS-4).
@@ -795,6 +803,19 @@ func (s *Service) conditions(ctx context.Context, now time.Time) ([]state.Alert,
 				printed.UTC().Format(time.RFC3339), strings.Join(changes, ", "))
 			out = append(out, alertOf(KindRecoverySheetStale, "", msg))
 		}
+	}
+	seeds, err := s.DB.Seeds(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, sd := range seeds {
+		if !sd.DoneAt.IsZero() || sd.Confirmed > 0 || now.Sub(sd.ExportedAt) < state.SeedStaleAfter {
+			continue
+		}
+		msg := fmt.Sprintf("the disk exported at %s to seed friend %s with bucket %s has had nothing confirmed by the friend's list since (longer than %v): it is lost, or not imported yet. Copies of %s are not sent to %s until %s. Ask the friend to run `lendisk import <directory>` with its daemon running, or send them over the network now: lendisk export --cancel %s --for %s",
+			sd.ExportedAt.UTC().Format(time.RFC3339), sd.Place, sd.Bucket, state.SeedStaleAfter,
+			sd.Bucket, sd.Place, sd.ExportedAt.Add(state.SeedExpiry).UTC().Format(time.RFC3339), sd.Bucket, sd.Place)
+		out = append(out, alertOf(KindSeedStale, sd.Place+"/"+sd.Bucket, msg))
 	}
 	formers, err := s.DB.FormerFriends(ctx)
 	if err != nil {

@@ -978,4 +978,32 @@ var migrations = []Migration{
 		ALTER TABLE place ADD COLUMN busy_since INTEGER;
 		UPDATE place SET busy_since = since WHERE condition = 'busy';`,
 	},
+	{
+		Version: 45, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Seed follow-ups (REPL-8, #95). On the borrower: the rows of a
+		-- pending seed the export did not write (a directory marker, a key
+		-- whose copy changed while it ran), so the seed does not wait for
+		-- the friend's list to show them; they stay held while it is
+		-- pending and go by the network after. Replaced and dropped with
+		-- their seed row.
+		CREATE TABLE seed_skip (
+			place  TEXT NOT NULL,
+			bucket TEXT NOT NULL,
+			seq    INTEGER NOT NULL,
+			PRIMARY KEY (place, bucket, seq)
+		);
+		-- On the lender: the newest export of each borrower's bucket
+		-- imported here (the manifest's exported_at, Unix nanoseconds, the
+		-- borrower's clock), so an older disk is refused and cannot bring
+		-- back what the borrower has deleted since. imported_at: Unix
+		-- seconds, this node's clock.
+		CREATE TABLE seed_import (
+			borrower    TEXT NOT NULL,
+			sealed      TEXT NOT NULL,
+			exported_at INTEGER NOT NULL,
+			imported_at INTEGER NOT NULL,
+			PRIMARY KEY (borrower, sealed)
+		);`,
+	},
 }

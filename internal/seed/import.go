@@ -8,9 +8,11 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/state"
 )
 
 // Importer puts a seeding disk's objects into the borrower's bucket on
@@ -18,7 +20,11 @@ import (
 // socket), so they pass the policy every borrower's put passes.
 type Importer struct {
 	Self *identity.Identity
+	// DB is the lender's state: the newest export imported per bucket
+	// (state.SeedImport) and the borrower's tombstones here.
+	DB   *state.DB
 	Dial func(ctx context.Context) (net.Conn, error)
+	Now  func() time.Time
 	// Progress, if set, is called after each object, stored or refused.
 	Progress func(done, total int, bytes int64)
 }
@@ -30,6 +36,10 @@ type ImportResult struct {
 	Objects  int64  // stored, or already held with the same hash
 	Bytes    int64
 	Refused  []Refusal
+	// Deferred counts the metadata objects not put because a data object
+	// was refused: metadata names data, and must not land before it
+	// (REPL-12, #95). The borrower's node sends them, after the data.
+	Deferred int64
 }
 
 // Refusal is an object the lender refused, and why.
@@ -42,12 +52,16 @@ type Refusal struct {
 // or the gateway failing.
 var ErrStopped = errors.New("import stopped")
 
-// Import reads m's objects from dir and puts each, in manifest order. A
-// refusal of one object (bytes that do not match the hash, a key held
-// with other bytes, a file missing, of another size, or no regular
+// Import reads m's objects from dir and puts each: every data object,
+// in manifest order, then the metadata and snapshots, only if no data
+// object was refused (REPL-12, #95). A refusal of one object (bytes
+// that do not match the hash, a key held with other bytes, a key the
+// borrower deleted here, a file missing, of another size, or no regular
 // file: a symbolic link or a device is never followed, openPlain) is
 // recorded and the import goes on; a refusal no later object can pass
-// stops it, with ErrStopped and the result so far.
+// stops it, with ErrStopped and the result so far. A disk older than
+// one imported before from the same bucket is refused whole
+// (state.ErrOlderSeed).
 func (im *Importer) Import(ctx context.Context, dir string, m Manifest) (ImportResult, error) {
 	r := ImportResult{Bucket: m.Bucket}
 	borrower, err := identity.ParseNodeID(m.Borrower)
@@ -58,6 +72,25 @@ func (im *Importer) Import(ctx context.Context, dir string, m Manifest) (ImportR
 	secret, err := im.Self.S3Secret(borrower)
 	if err != nil {
 		return r, err
+	}
+	now := time.Now
+	if im.Now != nil {
+		now = im.Now
+	}
+	if newest, err := im.DB.SeedImport(ctx, m.Borrower, m.Bucket, m.ExportedAt, now()); errors.Is(err, state.ErrOlderSeed) {
+		return r, fmt.Errorf("this disk was exported at %s, before the export of the same bucket imported here (%s), "+
+			"and would bring back what %s deleted since: %w; import the newer disk, or let %s's node send the bucket over the network",
+			m.ExportedAt.UTC().Format(time.RFC3339), newest.UTC().Format(time.RFC3339), m.Borrower, err, m.Borrower)
+	} else if err != nil {
+		return r, err
+	}
+	order := make([]Object, 0, len(m.Objects))
+	for _, meta := range []bool{false, true} {
+		for _, o := range m.Objects {
+			if o.meta() == meta {
+				order = append(order, o)
+			}
+		}
 	}
 	c, err := replica.NewSeeder(borrower, secret, func(ctx context.Context) (net.Conn, error) {
 		conn, err := im.Dial(ctx)
@@ -74,8 +107,22 @@ func (im *Importer) Import(ctx context.Context, dir string, m Manifest) (ImportR
 		return r, err
 	}
 	defer root.Close()
-	for i, o := range m.Objects {
-		reason, err := im.put(ctx, c, root, m.Path(o.Key), m.Bucket, o)
+	dataRefused := false
+	for i, o := range order {
+		if o.meta() && dataRefused {
+			r.Deferred++
+			if im.Progress != nil {
+				im.Progress(i+1, len(order), r.Bytes)
+			}
+			continue
+		}
+		reason, err := im.deleted(ctx, m, o)
+		if err == nil && reason == "" {
+			reason, err = im.put(ctx, c, root, m.Path(o.Key), m.Bucket, o)
+		}
+		if reason != "" && !o.meta() {
+			dataRefused = true
+		}
 		switch {
 		case err != nil:
 			return r, err
@@ -86,10 +133,28 @@ func (im *Importer) Import(ctx context.Context, dir string, m Manifest) (ImportR
 			r.Bytes += o.Size
 		}
 		if im.Progress != nil {
-			im.Progress(i+1, len(m.Objects), r.Bytes)
+			im.Progress(i+1, len(order), r.Bytes)
 		}
 	}
 	return r, nil
+}
+
+// deleted is a reason when the borrower deleted o's key here (a
+// tombstone, not a rewrite's replaced version): a put of the same hash
+// would revive it (the gateway's tomb.go), and the disk may predate the
+// delete (#95). If the borrower still holds the key, its node sends it.
+func (im *Importer) deleted(ctx context.Context, m Manifest, o Object) (string, error) {
+	ts, err := im.DB.TombstonesOf(ctx, m.Borrower, m.Bucket, o.Key)
+	if err != nil {
+		return "", err
+	}
+	for _, t := range ts {
+		if !t.Rewrite {
+			return fmt.Sprintf("the friend deleted it here at %s (kept as a tombstone), so the disk does not bring it back",
+				t.DeletedAt.UTC().Format(time.RFC3339)), nil
+		}
+	}
+	return "", nil
 }
 
 // put puts one object: a reason when the lender (or the disk) refuses

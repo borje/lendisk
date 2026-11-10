@@ -30,11 +30,15 @@ for any put, so a damaged disk stores nothing wrong. The disk's manifest
 (.lendisk/seed.json) must authenticate as the friend's and name this
 node.
 
-An object refused alone (damaged on the disk, or a key held here with
-other bytes) is reported and the import goes on; the friend's node sends
-it over the network later. A full quota or floor stops the import. Run it
-again to finish one that stopped: objects already here are not stored
-twice. The friend's node sees what arrived when it next lists its copy
+An object refused alone (damaged on the disk, a key held here with
+other bytes, or a key the friend has deleted here since) is reported and
+the import goes on; the friend's node sends it over the network later.
+Data objects go first; if one was refused, the metadata (indexes,
+snapshots) is left for the network too, so it never names data this
+node lacks. A full quota or floor stops the import. Run it again to
+finish one that stopped: objects already here are not stored twice. A
+disk older than one already imported from the same bucket is refused,
+so it cannot bring back what the friend has deleted since. The friend's node sees what arrived when it next lists its copy
 here, and sends the rest.
 
 The daemon must be running. Exit codes: 0 every object stored; 1 an
@@ -65,7 +69,7 @@ func (a *app) runImport(ctx context.Context, dir string) error {
 	} else if role != state.RolePeer {
 		return fmt.Errorf("node %s, which exported this disk, is not a friend of this node: `lendisk peer list` lists them", m.Borrower)
 	}
-	socket := gateway.SocketPath(cfg.DataDir)
+	socket := gateway.LiveSocket(cfg.DataDir)
 	if !daemonRunning(cfg.DataDir) {
 		return errors.New("the daemon is not running, and import stores through it so the friendship's quota and checks apply: start `lendisk serve`, then import again")
 	}
@@ -75,7 +79,7 @@ func (a *app) runImport(ctx context.Context, dir string) error {
 	}
 	fmt.Fprintf(a.errOut, "Importing %d objects (%s) of %s's bucket %s.\n", len(m.Objects), humanSize(total), m.Borrower, m.Bucket)
 	shown := int64(-1)
-	im := &seed.Importer{Self: id,
+	im := &seed.Importer{Self: id, DB: db, Now: a.now,
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			var d net.Dialer
 			return d.DialContext(ctx, "unix", socket)
@@ -98,6 +102,9 @@ func (a *app) runImport(ctx context.Context, dir string) error {
 		return fmt.Errorf("%w; %d of %d objects are stored: fix the cause and run the same import again", err, r.Objects, len(m.Objects))
 	}
 	fmt.Fprintf(a.out, "Imported %d objects (%s) of %s's bucket %s.\n", r.Objects, humanSize(r.Bytes), m.Borrower, m.Bucket)
+	if r.Deferred > 0 {
+		fmt.Fprintf(a.errOut, "Left %d metadata objects for the network: data was refused, and metadata must not arrive before the data it names.\n", r.Deferred)
+	}
 	if len(r.Refused) > 0 {
 		return fmt.Errorf("%d objects were refused; %s's node sends them over the network", len(r.Refused), m.Borrower)
 	}

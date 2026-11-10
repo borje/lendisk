@@ -362,9 +362,10 @@ func (a *app) pause(ctx context.Context, d time.Duration) error {
 }
 
 // daemonRunning reports whether the daemon answers on the gateway's
-// socket, which it serves for as long as it runs.
+// socket, which it serves for as long as it runs: gateway.LiveSocket,
+// also where a data_dir too long for a socket path moved it (#95).
 func daemonRunning(dataDir string) bool {
-	c, err := net.DialTimeout("unix", gateway.SocketPath(dataDir), time.Second)
+	c, err := net.DialTimeout("unix", gateway.LiveSocket(dataDir), time.Second)
 	if err != nil {
 		return false
 	}

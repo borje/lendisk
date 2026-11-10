@@ -71,6 +71,10 @@ type DB struct {
 	// beforeApply, if set, runs before each re-placement batch takes the
 	// bucket's lock: a capture racing the pass. Tests only.
 	beforeApply func(bucket string, meta bool)
+	// beforeSeedAck, if set, runs in ConfirmSeeded's transaction between
+	// finding a listed key's queued rows and acknowledging them. Tests
+	// only.
+	beforeSeedAck func(tx *sql.Tx)
 }
 
 func (db *DB) now() time.Time {

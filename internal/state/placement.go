@@ -155,51 +155,73 @@ func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 
 		return err
 	}
 	defer tx.Rollback()
-	r, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementDrained+`', acked_at = ?
-		WHERE place = ? AND seq = ? AND state = '`+PlacementDropping+`'`, now.Unix(), place, seq)
-	if err != nil {
+	if _, err := db.ackPlacement(ctx, tx, place, seq, sha256, now, false); err != nil {
 		return err
 	}
-	if n, err := r.RowsAffected(); err != nil {
-		return err
-	} else if n > 0 {
-		return tx.Commit()
+	return tx.Commit()
+}
+
+// ackPlacement is AckPlacement in tx. With onlyQueued it acknowledges
+// the row only if it is still queued, in the statement that marks it
+// (ConfirmSeeded, #95), and reports whether it did.
+func (db *DB) ackPlacement(ctx context.Context, tx *sql.Tx, place string, seq int64, sha256 string, now time.Time, onlyQueued bool) (bool, error) {
+	if !onlyQueued {
+		r, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementDrained+`', acked_at = ?
+			WHERE place = ? AND seq = ? AND state = '`+PlacementDropping+`'`, now.Unix(), place, seq)
+		if err != nil {
+			return false, err
+		}
+		if n, err := r.RowsAffected(); err != nil {
+			return false, err
+		} else if n > 0 {
+			return true, nil
+		}
 	}
 	var bucket, key, op, state string
 	var size int64
-	err = tx.QueryRowContext(ctx, `SELECT bucket, key, op, state, coalesce(size, 0) FROM placement
+	err := tx.QueryRowContext(ctx, `SELECT bucket, key, op, state, coalesce(size, 0) FROM placement
 		WHERE place = ? AND seq = ?`, place, seq).Scan(&bucket, &key, &op, &state, &size)
 	if errors.Is(err, sql.ErrNoRows) {
-		return tx.Commit()
+		return false, nil
 	} else if err != nil {
-		return err
+		return false, err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?1, acked_at = ?2
-		WHERE place = ?3 AND seq = ?4 AND state != '`+PlacementDrained+`'`, nullStr(sha256), now.Unix(), place, seq); err != nil {
-		return err
+	guard := `state != '` + PlacementDrained + `'`
+	if onlyQueued {
+		guard = `state = '` + PlacementQueued + `'`
+	}
+	r, err := tx.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?1, acked_at = ?2
+		WHERE place = ?3 AND seq = ?4 AND `+guard, nullStr(sha256), now.Unix(), place, seq)
+	if err != nil {
+		return false, err
+	}
+	if n, err := r.RowsAffected(); err != nil {
+		return false, err
+	} else if n == 0 && onlyQueued {
+		return false, nil
 	}
 	if op == OpPut && state != PlacementAcked && state != PlacementDrained && size != 0 {
 		if err := freeLatePut(ctx, tx, place, bucket, key, seq, size); err != nil {
-			return err
+			return false, err
 		}
 	}
 	var replaces sql.NullString
 	if err := tx.QueryRowContext(ctx, `SELECT replaces FROM placement WHERE place = ? AND seq = ? AND state = 'acked' AND op = 'put'`,
 		place, seq).Scan(&replaces); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
+		return false, err
 	}
 	if replaces.Valid && replaces.String != place {
 		keep, err := db.keepReplaced(ctx, tx, bucket, seq, replaces.String)
 		if err != nil {
-			return err
+			return false, err
 		}
 		if !keep {
 			if _, err := tx.ExecContext(ctx, markDropping, replaces.String, seq); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
-	return tx.Commit()
+	return true, nil
 }
 
 // keepReplaced reports whether the copy of row seq at replaced must stay
