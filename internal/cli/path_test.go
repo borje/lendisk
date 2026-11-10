@@ -13,14 +13,14 @@ import (
 	"github.com/borje/lendisk/internal/transport"
 )
 
-// fakePaths answers PathInfo: relayed for a friend's first relayedFor
-// probes, then direct; an error for a friend not dialled.
+// fakePaths answers PathInfo: relayed until the test sets direct, then
+// direct; an error for a friend not dialled.
 type fakePaths struct {
 	transport.Transport
-	relayedFor int
-	dialled    identity.NodeID
+	dialled identity.NodeID
 
 	mu     sync.Mutex
+	direct bool
 	calls  int
 	misses int // probes of a friend not dialled
 }
@@ -33,7 +33,7 @@ func (f *fakePaths) PathInfo(_ context.Context, peer identity.NodeID) (transport
 		return transport.Path{}, errors.New("not dialled")
 	}
 	f.calls++
-	if f.calls <= f.relayedFor {
+	if !f.direct {
 		return transport.Path{Relay: "relay.example:443"}, nil
 	}
 	return transport.Path{Direct: true, Endpoint: "198.51.100.7:41641"}, nil
@@ -76,7 +76,7 @@ func TestPathKeeperRetriesWhileRelayed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	tr := &fakePaths{relayedFor: 3, dialled: ids[0]}
+	tr := &fakePaths{dialled: ids[0]}
 	start := time.Now()
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
@@ -91,14 +91,21 @@ func TestPathKeeperRetriesWhileRelayed(t *testing.T) {
 		f, err := db.GetFriendship(t.Context(), ids[0].String())
 		return err == nil && f.Path == "relayed" && f.PathRelay == "relay.example:443" && f.PathEndpoint == "" && !f.PathAt.IsZero()
 	})
+	// Still relayed, so pinged again and again (each ping tries for a
+	// direct path); the fake answers direct only once the test says so,
+	// so a slow runner cannot pass the relayed state unseen.
+	within(t, 20*time.Second, "a relayed friend pinged again", func() bool { return tr.probes() >= 3 })
+	tr.mu.Lock()
+	tr.direct = true
+	tr.mu.Unlock()
 	within(t, 30*time.Second, "the direct path found by a later ping", func() bool {
 		f, err := db.GetFriendship(t.Context(), ids[0].String())
 		return err == nil && f.Path == "direct" && f.PathEndpoint == "198.51.100.7:41641" && f.PathRelay == ""
 	})
 	n := tr.probes()
 	time.Sleep(200 * time.Millisecond)
-	if got := tr.probes(); got != n || n != tr.relayedFor+1 {
-		t.Fatalf("probes: %d relayed then direct should be %d, and none while direct within DirectEvery; got %d, then %d", tr.relayedFor, tr.relayedFor+1, n, got)
+	if got := tr.probes(); got != n {
+		t.Fatalf("probes while direct within DirectEvery: %d, then %d; want none", n, got)
 	}
 	if f, err := db.GetFriendship(t.Context(), ids[1].String()); err != nil || f.Path != "" || !f.PathAt.IsZero() {
 		t.Fatalf("a friend not dialled got a path: %+v %v", f, err)
