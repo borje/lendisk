@@ -1027,4 +1027,15 @@ var migrations = []Migration{
 		);
 		CREATE INDEX overflow_versioning_name ON overflow_versioning (name, at);`,
 	},
+	{
+		Version: 47, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Removing an overflow target (#96): removing_at (Unix seconds) is
+		-- when overflow remove began; from then on no copy goes there, its
+		-- copies are placed elsewhere and then dropped there, and the row
+		-- goes once nothing is left there. keep_data 1: what it holds is
+		-- left there, no delete sent. NULL for a target in use.
+		ALTER TABLE overflow ADD COLUMN removing_at INTEGER;
+		ALTER TABLE overflow ADD COLUMN keep_data INTEGER;`,
+	},
 }

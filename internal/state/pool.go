@@ -118,6 +118,7 @@ func (db *DB) replaceAfter() time.Duration { return cmp.Or(db.ReplaceAfter, 7*24
 type poolPlace struct {
 	peer     string
 	overflow bool  // an overflow target (overflow.go): peer is its place name
+	removing bool  // an overflow target being removed (#96): no candidate, its copies drained
 	quota    int64 // the friendship's quota (LEND-8), or the target's max_bytes (S3-7)
 	use      int64 // place_use: what it holds or will hold
 	cond     string
@@ -213,13 +214,13 @@ type querier interface {
 // poolPlaces lists the pool (D6): friends with an address, then
 // overflow targets, each in place name order.
 func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT x.place, x.overflow, x.quota,
+	rows, err := tx.QueryContext(ctx, `SELECT x.place, x.overflow, x.removing, x.quota,
 		coalesce(u.bytes, 0) + coalesce(fr.bytes, 0),
 		coalesce(c.condition, ''), coalesce(c.since, 0), c.last_ok, c.failing_since, c.busy_since
-		FROM (SELECT f.peer_key AS place, 0 AS overflow,
+		FROM (SELECT f.peer_key AS place, 0 AS overflow, 0 AS removing,
 				min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)) AS quota
 				FROM friendship f WHERE coalesce(f.address, '') != ''
-			UNION ALL SELECT '`+OverflowPrefix+`' || o.name, 1, o.max_bytes FROM overflow o) x
+			UNION ALL SELECT '`+OverflowPrefix+`' || o.name, 1, o.removing_at IS NOT NULL, o.max_bytes FROM overflow o) x
 		LEFT JOIN place_use u ON u.place = x.place LEFT JOIN place c ON c.place = x.place
 		LEFT JOIN place_freed fr ON fr.place = x.place
 		ORDER BY x.overflow, x.place`)
@@ -232,7 +233,7 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 		var p poolPlace
 		var since int64
 		var lastOK, failing, busy sql.NullInt64
-		if err := rows.Scan(&p.peer, &p.overflow, &p.quota, &p.use, &p.cond, &since, &lastOK, &failing, &busy); err != nil {
+		if err := rows.Scan(&p.peer, &p.overflow, &p.removing, &p.quota, &p.use, &p.cond, &since, &lastOK, &failing, &busy); err != nil {
 			return nil, err
 		}
 		p.since = time.Unix(since, 0)
@@ -313,7 +314,7 @@ func (db *DB) choose(ctx context.Context, tx *sql.Tx, bucket string, need int64,
 	var cs []cand
 	var overflow []poolPlace
 	for _, p := range ps {
-		if slices.Contains(exclude, p.peer) || p.quota <= 0 || p.cond == ConditionRemoved || p.full() || p.gone(db, now) ||
+		if slices.Contains(exclude, p.peer) || p.quota <= 0 || p.cond == ConditionRemoved || p.removing || p.full() || p.gone(db, now) ||
 			reachableOnly && p.unreachable(db, now) || unverified[p.peer] {
 			continue
 		}
@@ -1023,8 +1024,8 @@ func (db *DB) applyReroute(ctx context.Context, ops []rerouteOp, sending func(st
 
 // PoolSize is how many places the pool has for copies: friends with an
 // address that do not refuse this node and are not gone past
-// replace_after, and overflow targets not gone past it (OPS-2, EP-6,
-// #38).
+// replace_after, and overflow targets not gone past it nor being
+// removed (OPS-2, EP-6, #38, #96).
 func (db *DB) PoolSize(ctx context.Context) (int, error) {
 	ps, err := poolPlaces(ctx, db)
 	if err != nil {
@@ -1032,7 +1033,7 @@ func (db *DB) PoolSize(ctx context.Context) (int, error) {
 	}
 	now, n := db.now(), 0
 	for _, p := range ps {
-		if p.cond != ConditionRemoved && !p.gone(db, now) {
+		if p.cond != ConditionRemoved && !p.gone(db, now) && !p.removing {
 			n++
 		}
 	}

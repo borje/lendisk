@@ -243,7 +243,7 @@ func (db *DB) keepReplaced(ctx context.Context, tx *sql.Tx, bucket string, seq i
 	now := db.now()
 	intact := map[string]bool{}
 	for _, p := range ps {
-		if p.cond != ConditionRemoved && !p.gone(db, now) && !unverified[p.peer] {
+		if p.cond != ConditionRemoved && !p.gone(db, now) && !p.removing && !unverified[p.peer] {
 			intact[p.peer] = true
 		}
 	}

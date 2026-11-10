@@ -299,12 +299,7 @@ func (f *Client) CheckOverflow(ctx context.Context, name string, lifecycleDays i
 	}
 	if c.Lifecycle == state.LifecycleAbsent && c.Versioning == state.VersioningEnabled {
 		if lifecycleDays > 0 && cfg != nil {
-			cfg.Rules = append(cfg.Rules, lifecycle.Rule{
-				ID:                          "lendisk-" + name,
-				Status:                      "Enabled",
-				RuleFilter:                  lifecycle.Filter{Prefix: strings.TrimPrefix(prefix+"/", "/")},
-				NoncurrentVersionExpiration: lifecycle.NoncurrentVersionExpiration{NoncurrentDays: lifecycle.ExpirationDays(lifecycleDays)},
-			})
+			cfg.Rules = append(cfg.Rules, LifecycleRule(name, prefix, lifecycleDays))
 			if err := f.core.SetBucketLifecycle(ctx, bucket, cfg); err != nil {
 				c.Notes = append(c.Notes, fmt.Sprintf("lifecycle: the rule could not be created (%v); create one that expires non-current versions after %d days under %q", f.classify(err), lifecycleDays, prefix))
 			} else {
@@ -321,13 +316,41 @@ func (f *Client) CheckOverflow(ctx context.Context, name string, lifecycleDays i
 	return c, nil
 }
 
+// AbortUploadDays is how long after it began the lifecycle rule
+// lendisk creates aborts a multipart upload never completed, so the
+// parts of an abandoned upload are not billed for ever (S3-4, #96). A
+// week, as AWS recommends: the worker resumes an upload a restart cut
+// short within minutes, and one older than that it begins again
+// (NoSuchUpload).
+const AbortUploadDays = 7
+
+// LifecycleRule is the rule `overflow add --lifecycle` adds for target
+// name (S3-4): under prefix, non-current versions expire days after
+// they became non-current, and multipart uploads not completed are
+// aborted AbortUploadDays after they began (#96).
+func LifecycleRule(name, prefix string, days int) lifecycle.Rule {
+	return lifecycle.Rule{
+		ID:                             "lendisk-" + name,
+		Status:                         "Enabled",
+		RuleFilter:                     lifecycle.Filter{Prefix: strings.TrimPrefix(strings.TrimSuffix(prefix, "/")+"/", "/")},
+		NoncurrentVersionExpiration:    lifecycle.NoncurrentVersionExpiration{NoncurrentDays: lifecycle.ExpirationDays(days)},
+		AbortIncompleteMultipartUpload: lifecycle.AbortIncompleteMultipartUpload{DaysAfterInitiation: AbortUploadDays},
+	}
+}
+
 // coversPrefix: an enabled rule of cfg expires non-current versions of
-// every key under prefix.
+// every key under prefix. A rule that filters by tag or by size covers
+// only some of them (#96), whatever its prefix.
 func coversPrefix(cfg *lifecycle.Configuration, prefix string) bool {
 	if cfg == nil {
 		return false
 	}
 	for _, r := range cfg.Rules {
+		f := r.RuleFilter
+		if !f.Tag.IsEmpty() || len(f.And.Tags) > 0 || f.ObjectSizeGreaterThan > 0 || f.ObjectSizeLessThan > 0 ||
+			f.And.ObjectSizeGreaterThan > 0 || f.And.ObjectSizeLessThan > 0 {
+			continue
+		}
 		p := r.RuleFilter.Prefix
 		if p == "" {
 			p = r.RuleFilter.And.Prefix

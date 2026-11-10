@@ -15,6 +15,7 @@ import (
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/profile"
+	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/state"
 )
 
@@ -33,6 +34,10 @@ type Lister struct {
 	// key after; nil means the control API list call over Dial. Tests
 	// set it.
 	Page func(ctx context.Context, f state.Friendship, sealed, after string) (control.ListPage, error)
+	// Overflow builds the client listing an overflow target's copies
+	// (#96): replica.NewOverflow with the credential from the
+	// environment. Nil leaves the targets' lists pending.
+	Overflow func(o state.Overflow) (Target, error)
 	// Profiles classify each listed key by its bucket's profile (EP-7);
 	// nil means the compiled-in ones.
 	Profiles profile.Set
@@ -274,25 +279,51 @@ func (l *Lister) logger() *slog.Logger {
 // res; abandoned reports a list past MaxKeys or MaxPages. listCtx bounds
 // the calls to the place, ctx the recording.
 func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles profile.Set, res *Result) (abandoned bool, err error) {
-	f, err := l.DB.GetFriendship(ctx, r.Place)
-	if errors.Is(err, state.ErrNotFound) {
-		// No longer a friend: nothing to list there.
-		_, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, nil, 0, "", true)
-		return false, err
-	} else if err != nil {
-		return false, err
-	}
 	prof := profiles.Get("")
 	if b, err := l.DB.GetBucket(ctx, r.Bucket); err == nil {
 		prof = profiles.Get(b.Profile)
 	} else if !errors.Is(err, state.ErrNotFound) {
 		return false, err
 	}
-	page := l.Page
-	if page == nil {
-		var done func()
-		page, done = l.controlPage(f)
-		defer done()
+	var page func(ctx context.Context, after string) (control.ListPage, error)
+	if name, ok := state.OverflowName(r.Place); ok {
+		o, err := l.DB.GetOverflow(ctx, name)
+		if errors.Is(err, state.ErrNotFound) {
+			// No longer a target: nothing to list there.
+			_, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, nil, 0, "", true)
+			return false, err
+		} else if err != nil {
+			return false, err
+		}
+		if l.Overflow == nil {
+			return false, errNoOverflow
+		}
+		t, err := l.Overflow(o)
+		if err != nil {
+			return false, err
+		}
+		page = func(ctx context.Context, after string) (control.ListPage, error) {
+			return l.overflowPage(ctx, t, prof, r.Bucket, after)
+		}
+	} else {
+		f, err := l.DB.GetFriendship(ctx, r.Place)
+		if errors.Is(err, state.ErrNotFound) {
+			// No longer a friend: nothing to list there.
+			_, err := l.DB.RecordListed(ctx, r.Place, r.Bucket, nil, 0, "", true)
+			return false, err
+		} else if err != nil {
+			return false, err
+		}
+		fpage := l.Page
+		if fpage == nil {
+			var done func()
+			fpage, done = l.controlPage(f)
+			defer done()
+		}
+		sealed := l.Self.SealedName(r.Bucket)
+		page = func(ctx context.Context, after string) (control.ListPage, error) {
+			return fpage(ctx, f, sealed, after)
+		}
 	}
 	maxKeys, maxPages := l.MaxKeys, l.MaxPages
 	if maxKeys <= 0 {
@@ -301,10 +332,10 @@ func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles 
 	if maxPages <= 0 {
 		maxPages = DefaultMaxPages
 	}
-	sealed, after, seen, pages := l.Self.SealedName(r.Bucket), r.After, r.Seen, r.Pages
+	after, seen, pages := r.After, r.Seen, r.Pages
 	for {
 		pctx, cancel := context.WithTimeout(listCtx, or(l.Timeout, time.Minute))
-		p, err := page(pctx, f, sealed, after)
+		p, err := page(pctx, after)
 		cancel()
 		var ce *control.CallError
 		if errors.As(err, &ce) && ce.Code == control.CodeNoSuchBucket {
@@ -360,6 +391,56 @@ func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles 
 		}
 		after = p.Next
 	}
+}
+
+// Target is an overflow target as recovery lists it (#96):
+// replica.Client.
+type Target interface {
+	// ListPage lists up to limit live keys of the node's bucket at the
+	// target after the key after, in key order; next is "" at the end.
+	ListPage(ctx context.Context, bucket, after string, limit int) ([]replica.Listed, string, error)
+	// Stat reads what the target stores about key, lendisk's hash
+	// included; ok is false when it holds no object there.
+	Stat(ctx context.Context, bucket, key string) (replica.ObjectStat, bool, error)
+}
+
+// errNoOverflow is an overflow target's list in a Lister that cannot
+// reach targets: it stays pending for one that can.
+var errNoOverflow = errors.New("overflow targets are listed by `lendisk serve`, with the credential in its environment")
+
+// overflowPage is one page of what overflow target t holds of bucket
+// after the key after, as a friend's list gives it (#96). The provider
+// lists keys and sizes only: a key named by its hash has that hash
+// (the list's checks hold it to it like a friend's), and any other is
+// read with a HEAD for the hash lendisk stored with it
+// (x-amz-meta-lendisk-sha256). An object without one is not lendisk's
+// and is left out (it is listed with an empty hash, which reject
+// refuses and logs).
+func (l *Lister) overflowPage(ctx context.Context, t Target, prof *profile.Profile, bucket, after string) (control.ListPage, error) {
+	keys, next, err := t.ListPage(ctx, bucket, after, gateway.MaxListPage)
+	if err != nil {
+		return control.ListPage{}, err
+	}
+	p := control.ListPage{Next: next, Objects: make([]control.ListObject, 0, len(keys))}
+	for _, k := range keys {
+		o := control.ListObject{Key: k.Key, Size: k.Size}
+		switch {
+		case gateway.CheckKey(k.Key) != nil || prof.Classify(k.Key) == profile.LocalOnly:
+			// reject or the class drops it: no HEAD for it.
+		case prof.HashNamed(k.Key):
+			o.SHA256 = profile.NameHash(k.Key)
+		default:
+			st, ok, err := t.Stat(ctx, bucket, k.Key)
+			if err != nil {
+				return control.ListPage{}, err
+			}
+			if ok {
+				o.SHA256, o.Size = st.SHA256, st.Size
+			}
+		}
+		p.Objects = append(p.Objects, o)
+	}
+	return p, nil
 }
 
 // reject says why a listed entry cannot be a copy of the borrower's

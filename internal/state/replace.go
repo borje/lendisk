@@ -40,9 +40,9 @@ import (
 //     (the lender keeps a tomb for the window, RET-1);
 //   - surplus copies (copies lowered, or a gone friend back while its
 //     replacement waits) are cancelled while unsent, the fullest place
-//     first (an overflow target before any friend unless placement is
-//     split), then marked dropping while more than `copies` are
-//     acknowledged;
+//     first (an overflow target before any friend, except the last
+//     target copy while placement is split), then marked dropping while
+//     more than `copies` are acknowledged;
 //   - drain-back (#40): while the friends hold the repository with the
 //     hysteresis of overflowDrain, and placement is not split, a last
 //     round gives each object with an acknowledged copy at an overflow
@@ -163,8 +163,12 @@ func (db *DB) PoolFingerprint(ctx context.Context) (string, error) {
 	now := db.now()
 	var b strings.Builder
 	for _, p := range ps {
-		fmt.Fprintf(&b, "%s %d %t %t %t %t;", p.peer, p.quota, p.cond == ConditionRemoved, p.gone(db, now),
+		fmt.Fprintf(&b, "%s %d %t %t %t %t", p.peer, p.quota, p.cond == ConditionRemoved, p.gone(db, now),
 			capped(p.use) > capped(p.quota), p.full())
+		if p.removing {
+			b.WriteString(" removing") // #96
+		}
+		b.WriteString(";")
 	}
 	rows, err := db.QueryContext(ctx, `SELECT name, copies FROM buckets ORDER BY name`)
 	if err != nil {
@@ -337,7 +341,10 @@ func (db *DB) Replace(ctx context.Context, sending func(place string, seq int64)
 	}
 	for _, p := range ps {
 		f := &rfriend{poolPlace: p, reachable: !p.unreachable(db, m.now)}
-		f.drainAll = p.cond == ConditionRemoved || p.gone(db, m.now)
+		// A target being removed is drained like a friend that ended
+		// (#96): its copies are placed elsewhere and dropped there once
+		// the object has `copies` acknowledged copies without them.
+		f.drainAll = p.cond == ConditionRemoved || p.gone(db, m.now) || p.removing
 		f.candidate = p.quota > 0 && !f.drainAll && !p.full()
 		// An overflow target above max_bytes is not drained: its
 		// copies move back to friends only by drain-back (#40).
@@ -933,17 +940,26 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 				queued = append(queued, r)
 			}
 		}
-		// An overflow target first unless placement is split (it is
-		// the second choice, always: §4.11), then unreachable friends
-		// (the others answer, #26 review), then the fullest.
+		// Which copy goes (#96): an overflow target's first (it is the
+		// second choice, always: §4.11), except, while placement is
+		// split, the object's last copy at a target, which goes after
+		// every friend's (split keeps copies − 1 friends and one
+		// target); then unreachable friends (the others answer, #26
+		// review), then the fullest.
+		split := m.split && copies >= 2
+		targets := 0
+		for _, r := range good {
+			if m.overflowPlace(r.place) {
+				targets++
+			}
+		}
 		byFull := func(a, b prow) int {
-			if !(m.split && copies >= 2) {
-				if oa, ob := m.overflowPlace(a.place), m.overflowPlace(b.place); oa != ob {
-					if oa {
-						return -1
-					}
-					return 1
+			if oa, ob := m.overflowPlace(a.place), m.overflowPlace(b.place); oa != ob {
+				first := !split || targets > 1 // a target's copy goes first
+				if oa == first {
+					return -1
 				}
+				return 1
 			}
 			ra, rb := m.reachable(a.place), m.reachable(b.place)
 			if ra != rb {
@@ -954,25 +970,41 @@ func (m *replacer) decide(ctx context.Context, bucket string, o robj, copies int
 			}
 			return m.fullness(a.place, b.place)
 		}
-		slices.SortFunc(queued, byFull)
-		slices.SortFunc(ackedRows, byFull)
-		for _, r := range queued {
-			if surplus == 0 {
-				break
+		// next is the index in rs of the copy to go next among those ok
+		// allows, or -1: the order depends on the targets' copies left.
+		next := func(rs []prow, ok func(prow) bool) int {
+			best := -1
+			for i, r := range rs {
+				if ok(r) && (best < 0 || byFull(r, rs[best]) < 0) {
+					best = i
+				}
 			}
-			if commit && m.sending != nil && m.sending(r.place, o.seq) {
-				continue
-			}
-			ops = append(ops, rop{kind: opCancel, place: r.place})
-			surplus--
+			return best
 		}
-		for _, r := range ackedRows {
-			if surplus == 0 || acked <= copies {
+		gone := func(r prow) {
+			surplus--
+			if m.overflowPlace(r.place) {
+				targets--
+			}
+		}
+		for surplus > 0 {
+			i := next(queued, func(r prow) bool { return !(commit && m.sending != nil && m.sending(r.place, o.seq)) })
+			if i < 0 {
 				break
 			}
-			ops = append(ops, rop{kind: opDrop, place: r.place})
-			surplus--
+			ops = append(ops, rop{kind: opCancel, place: queued[i].place})
+			gone(queued[i])
+			queued = slices.Delete(queued, i, i+1)
+		}
+		for surplus > 0 && acked > copies {
+			i := next(ackedRows, func(prow) bool { return true })
+			if i < 0 {
+				break
+			}
+			ops = append(ops, rop{kind: opDrop, place: ackedRows[i].place})
+			gone(ackedRows[i])
 			acked--
+			ackedRows = slices.Delete(ackedRows, i, i+1)
 		}
 		// What is still surplus is queued and taken or being sent, so
 		// not cancelled, and keeps as many acknowledged copies.

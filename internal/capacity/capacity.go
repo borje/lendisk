@@ -246,7 +246,8 @@ func SuggestMaxTotal(size int64, copies int) int64 {
 }
 
 // Read is the node's plan from db: its repository, every friendship
-// with an address and every overflow target's max_bytes (the pool, D6),
+// with an address and every overflow target's max_bytes but those being
+// removed (the pool, D6, #96),
 // with defaultCopies for a node with no bucket.
 func Read(ctx context.Context, db *state.DB, defaultCopies int) (Plan, error) {
 	use, err := db.RepositoryUse(ctx)
@@ -272,6 +273,9 @@ func Read(ctx context.Context, db *state.DB, defaultCopies int) (Plan, error) {
 		return Plan{}, err
 	}
 	for _, o := range targets {
+		if o.Removing() {
+			continue // leaving the pool (#96)
+		}
 		p.Overflow = append(p.Overflow, o.MaxBytes)
 	}
 	return p, nil

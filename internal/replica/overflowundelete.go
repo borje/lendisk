@@ -130,6 +130,42 @@ func (f *Client) ListLive(ctx context.Context, bucket string) ([]string, error) 
 	return out, nil
 }
 
+// Listed is a live key of a bucket at an overflow target, with its
+// size (#96).
+type Listed struct {
+	Key  string
+	Size int64
+}
+
+// ListPage lists up to limit live keys of bucket at the target after
+// the key after, in key order, for recovery to rebuild the target's
+// placement (#96); next is the last key listed when more may follow, ""
+// at the end. A bucket the provider does not have holds nothing.
+func (f *Client) ListPage(ctx context.Context, bucket, after string, limit int) ([]Listed, string, error) {
+	b, pfx := f.where(bucket, "")
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	opts := minio.ListObjectsOptions{Prefix: pfx, Recursive: true, MaxKeys: limit}
+	if after != "" {
+		opts.StartAfter = pfx + after
+	}
+	var out []Listed
+	for o := range f.core.Client.ListObjects(lctx, b, opts) {
+		if o.Err != nil {
+			var er minio.ErrorResponse
+			if errors.As(o.Err, &er) && er.Code == "NoSuchBucket" {
+				return nil, "", nil
+			}
+			return nil, "", f.classify(fmt.Errorf("listing %s: %w", pfx, o.Err))
+		}
+		out = append(out, Listed{Key: strings.TrimPrefix(o.Key, pfx), Size: o.Size})
+		if len(out) == limit {
+			return out, out[len(out)-1].Key, nil
+		}
+	}
+	return out, "", nil
+}
+
 // ErrNoSuchKey is a place's answer that it holds no object at a key, for
 // replicas other than Client (test doubles); NotFound recognises it.
 var ErrNoSuchKey = errors.New("no such key at the place")

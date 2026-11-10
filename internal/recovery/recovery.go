@@ -161,6 +161,9 @@ func Restore(ctx context.Context, db *state.DB, m *manifest.Manifest) (Restored,
 		if err != nil && !errors.Is(err, state.ErrExists) {
 			return r, fmt.Errorf("restoring overflow target %s: %w", o.Name, err)
 		}
+		// Its copies are listed like a friend's (#96), so they count as
+		// held there rather than missing.
+		places = append(places, state.OverflowPlace(o.Name))
 	}
 	for _, b := range m.Buckets {
 		buckets = append(buckets, b.Name)
