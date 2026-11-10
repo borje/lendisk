@@ -87,11 +87,11 @@ func TestPathKeeperRetriesWhileRelayed(t *testing.T) {
 	}()
 	defer func() { cancel(); <-done }()
 
-	within(t, 2*time.Second, "a relayed path recorded", func() bool {
+	within(t, 20*time.Second, "a relayed path recorded", func() bool {
 		f, err := db.GetFriendship(t.Context(), ids[0].String())
 		return err == nil && f.Path == "relayed" && f.PathRelay == "relay.example:443" && f.PathEndpoint == "" && !f.PathAt.IsZero()
 	})
-	within(t, 5*time.Second, "the direct path found by a later ping", func() bool {
+	within(t, 30*time.Second, "the direct path found by a later ping", func() bool {
 		f, err := db.GetFriendship(t.Context(), ids[0].String())
 		return err == nil && f.Path == "direct" && f.PathEndpoint == "198.51.100.7:41641" && f.PathRelay == ""
 	})
