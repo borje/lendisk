@@ -44,6 +44,15 @@ import (
 //     changed: an edit in place outside the endpoint, which EP-11 judges
 //     as any write (#88). The same bytes record the file's identity.
 //
+// A file is hashed for either only once it has been still for Settle
+// (#88): its change time (st_ctime, which no copy tool sets back) is
+// Settle old by the node's clock, or a pass saw it with the same
+// identity and change time at least Settle before. A file still being
+// copied in, or an edit half done, is left, and its bucket is passed
+// again once it may have settled; a file that changes while it is
+// hashed is left the same way. Truncated bytes are never a version, so
+// they never replicate over the friends' good copies.
+//
 // Guards against mass deletion (a delete goes to every place, where
 // lenders keep it only as a tombstone for the retention window):
 //
@@ -103,6 +112,27 @@ type ReconcileSettings struct {
 	// Pace paces the reads of objects hashed again (pace.Pacer.Scrub);
 	// nil reads unpaced.
 	Pace func(ctx context.Context, r io.Reader) io.Reader
+	// Settle is how long a file written outside the endpoint must have
+	// been still before it is hashed and enqueued (#88); zero means
+	// DefaultSettle.
+	Settle time.Duration
+}
+
+// DefaultSettle is ReconcileSettings.Settle when zero, and how long the
+// bit-rot sampler leaves a file written outside the endpoint before it
+// judges it. A copy that pauses for longer is taken as it is.
+const DefaultSettle = 10 * time.Minute
+
+// maxSightings bounds the files a bucket's passes watch settle (a
+// restore of the whole store changes every file at once). A file past
+// it settles by its change time alone.
+const maxSightings = 10_000
+
+// sighting is a file left to settle: its identity (fileStamp and change
+// time) and when a pass first saw it so.
+type sighting struct {
+	id string
+	at time.Time
 }
 
 type reconciler struct {
@@ -119,6 +149,84 @@ type reconciler struct {
 	// beforeLock, if set, runs when a re-hash has read an object and has
 	// not yet taken its key's lock. Tests only.
 	beforeLock func()
+
+	// Files left to settle (#88), kept by the pass that holds mu: seen
+	// is each bucket's sightings from its last pass, next the running
+	// pass's and waiting how many it left; due is when a bucket with
+	// files left is passed again.
+	seen    map[string]map[string]sighting
+	next    map[string]sighting
+	waiting int
+	due     map[string]time.Time
+}
+
+func (r *reconciler) settle() time.Duration {
+	if r.Settle > 0 {
+		return r.Settle
+	}
+	return DefaultSettle
+}
+
+// settled reports whether key's file in bucket has been still for the
+// settle time, and returns its identity (fileStamp), which the bytes
+// hashed must come from. A file that has not is recorded (sighting) and
+// its bucket passed again once it may have. A key with no regular file
+// to stat (or a store whose files are not read) is "", true: the read
+// decides.
+func (r *reconciler) settled(bucket, key string) (string, bool) {
+	fi, ok := r.d.fileOf(bucket, key)
+	if !ok {
+		return "", true
+	}
+	stamp, changed := fileStamp(fi), changeTime(fi)
+	now, settle := r.now(), r.settle()
+	if !changed.After(now.Add(-settle)) {
+		return stamp, true
+	}
+	id := fmt.Sprintf("%s:%d", stamp, changed.UnixNano())
+	s, seen := r.seen[bucket][key]
+	if seen && s.id == id && !now.Before(s.at.Add(settle)) {
+		return stamp, true // changed ahead of the clock, and watched still
+	}
+	if !seen || s.id != id {
+		s = sighting{id: id, at: now}
+	}
+	if r.next != nil && len(r.next) < maxSightings {
+		r.next[key] = s
+	}
+	since := s.at
+	if changed.Before(since) {
+		since = changed
+	}
+	r.later(bucket, since.Add(settle))
+	return stamp, false
+}
+
+// later has bucket passed again at at, or sooner if it already is due.
+func (r *reconciler) later(bucket string, at time.Time) {
+	r.waiting++
+	if r.due == nil {
+		r.due = map[string]time.Time{}
+	}
+	if d, ok := r.due[bucket]; !ok || at.Before(d) {
+		r.due[bucket] = at
+	}
+}
+
+// dueBuckets returns the buckets with files left to settle that may have
+// settled by now.
+func (r *reconciler) dueBuckets() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var bs []string
+	now := r.now()
+	for b, at := range r.due {
+		if !now.Before(at) {
+			bs = append(bs, b)
+		}
+	}
+	slices.Sort(bs)
+	return bs
 }
 
 func (r *reconciler) page() int {
@@ -156,7 +264,7 @@ func (r *reconciler) loop(ctx context.Context) {
 			if ctx.Err() == nil {
 				r.log.Error("reconcile: reading the allowed deletes failed", "err", err)
 			}
-		} else if len(bs) > 0 {
+		} else if bs = append(bs, r.dueBuckets()...); len(bs) > 0 {
 			if err := r.pass(ctx, bs); err != nil && ctx.Err() == nil {
 				r.log.Error("reconcile: a pass failed; trying again at the next", "err", err)
 			}
@@ -270,6 +378,9 @@ func noBucket(err error) bool {
 	return (errors.As(err, &be) && be.Code == "NoSuchBucket") || (errors.As(err, &ae) && ae.Code == "NoSuchBucket")
 }
 
+// errChanged: a file changed while it was hashed.
+var errChanged = errors.New("the file changed while it was read")
+
 // errNoBucketDir: the bucket's directory is not in the store.
 var errNoBucketDir = errors.New("the bucket's directory is not in the store")
 
@@ -365,6 +476,23 @@ const DeleteWindow = 7 * 24 * time.Hour
 // allowance is used only for the hold it was given for, and is dropped
 // by a pass that does not finish.
 func (r *reconciler) bucket(ctx context.Context, bucket string) error {
+	delete(r.due, bucket)
+	r.next, r.waiting = map[string]sighting{}, 0
+	defer func() {
+		if r.seen == nil {
+			r.seen = map[string]map[string]sighting{}
+		}
+		if len(r.next) > 0 {
+			r.seen[bucket] = r.next
+		} else {
+			delete(r.seen, bucket)
+		}
+		if r.waiting > 0 {
+			r.log.Info("reconcile: files written to outside the endpoint within the settle time are left until they are still",
+				"bucket", bucket, "files", r.waiting, "settle", r.settle())
+		}
+		r.next, r.waiting = nil, 0
+	}()
 	st, err := r.d.DB.ReconcileState(ctx, bucket)
 	if err != nil {
 		return err
@@ -526,6 +654,10 @@ func (r *reconciler) write(ctx context.Context, bucket, key string) (bool, error
 	if err != nil || !captured(k.class) {
 		return false, err
 	}
+	want, ok := r.settled(bucket, key)
+	if !ok {
+		return false, nil
+	}
 	unlock, err := r.d.keys.lock(ctx, bucket, key)
 	if err != nil {
 		return false, err
@@ -552,11 +684,17 @@ func (r *reconciler) write(ctx context.Context, bucket, key string) (bool, error
 		return false, err
 	}
 	n, sum, stamp, err := r.d.hashStamped(ctx, bucket, key, r.Pace)
+	if err == nil && want != "" && stamp != want {
+		// Written to since it settled, or while it was read: the bytes
+		// may be half a write. Left until it is still again.
+		r.later(bucket, r.now().Add(r.settle()))
+		err = errChanged
+	}
 	if err != nil {
 		if derr := r.d.DB.DropCaptures(context.Background(), seqs...); derr != nil {
 			r.d.strand(seqs...)
 		}
-		if notFound(err) {
+		if notFound(err) || errors.Is(err, errChanged) {
 			return false, nil
 		}
 		return false, err
@@ -584,9 +722,19 @@ func (r *reconciler) rehash(ctx context.Context, bucket string, k state.IndexedK
 	if class, err := r.d.classify(&bucket, &k.Key); err != nil || !captured(class) {
 		return false, err
 	}
+	want, ok := r.settled(bucket, k.Key)
+	if !ok {
+		return false, nil
+	}
 	n, sum, stamp, err := r.d.hashStamped(ctx, bucket, k.Key, r.Pace)
-	if notFound(err) || err == nil && stamp == "" {
-		return false, nil // gone, or changing while read: the next pass
+	if notFound(err) {
+		return false, nil
+	}
+	if err == nil && (stamp == "" || stamp != want) {
+		// Changing while read, or since it settled: left until it is
+		// still again.
+		r.later(bucket, r.now().Add(r.settle()))
+		return false, nil
 	}
 	if err != nil {
 		return false, err

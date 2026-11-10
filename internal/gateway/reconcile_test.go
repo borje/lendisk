@@ -38,9 +38,13 @@ func (h *harness) remove(bucket, key string) {
 }
 
 // reconciler is a store reconciler on the running gateway's decorator,
-// with settings s.
+// with settings s. Files are taken as soon as they are still (#88)
+// unless s sets a settle time.
 func (h *harness) reconciler(s ReconcileSettings) *reconciler {
 	h.t.Helper()
+	if s.Settle == 0 {
+		s.Settle = time.Nanosecond
+	}
 	d, ok := h.gw.running.Load().Next.(*Decorator)
 	if !ok {
 		h.t.Fatal("no decorator")

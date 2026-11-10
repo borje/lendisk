@@ -296,15 +296,33 @@ type filePaths interface {
 // stampOf is the identity of the file holding key's object in bucket
 // (fileStamp), "" if there is none or it cannot be read.
 func (d *Decorator) stampOf(bucket, key string) string {
-	fp, ok := d.Uploads.(filePaths)
+	fi, ok := d.fileOf(bucket, key)
 	if !ok {
 		return ""
 	}
+	return fileStamp(fi)
+}
+
+// fileOf stats the regular file holding key's object in bucket; false
+// if there is none or it cannot be read.
+func (d *Decorator) fileOf(bucket, key string) (os.FileInfo, bool) {
+	fp, ok := d.Uploads.(filePaths)
+	if !ok {
+		return nil, false
+	}
 	fi, err := os.Lstat(fp.Path(bucket, key))
 	if err != nil || !fi.Mode().IsRegular() {
-		return ""
+		return nil, false
 	}
-	return fileStamp(fi)
+	return fi, true
+}
+
+// still reports whether key's file in bucket was last written to (its
+// change time) at least settle before now; a file that cannot be
+// stated is not (#88).
+func (d *Decorator) still(bucket, key string, now time.Time, settle time.Duration) bool {
+	fi, ok := d.fileOf(bucket, key)
+	return ok && !changeTime(fi).After(now.Add(-settle))
 }
 
 // markHeld marks key's version of hash sum held locally, with stamp the

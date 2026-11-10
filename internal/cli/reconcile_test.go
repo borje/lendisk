@@ -43,6 +43,8 @@ func TestStoreChangesWhileStoppedAreReconciledAtStart(t *testing.T) {
 	n := newNode(t)
 	n.mustInit(t)
 	laptop := n.addBucket(t, "laptop", "restic")
+	// The dropped file is taken once it has been still this long (#88).
+	n.tuneReconcile = func(s *gateway.ReconcileSettings) { s.Settle, s.Poll = 200*time.Millisecond, 20*time.Millisecond }
 	d := n.serve(t)
 	c := s3client(d.addr, laptop)
 	for i := range 20 {
