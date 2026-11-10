@@ -460,6 +460,12 @@ func (s *sampler) mismatchOwn(ctx context.Context, bucket, key string, seen stat
 	if v.Seq != seen.Seq || v.Stamp != seen.Stamp || !v.Held() || v.Pending || v.Changed || s.d.stampOf(bucket, key) != stamp {
 		return nil // written, deleted, held back or changed since it was read
 	}
+	if !sameFile(v.Stamp, stamp) && !s.d.still(bucket, key, s.now(), DefaultSettle) {
+		// Written to here within the settle time: maybe half a write
+		// still going on (#88), neither a version nor rot. The store
+		// reconciler or a later sample takes it once it is still.
+		return nil
+	}
 	src, ok, err := s.d.DB.Source(ctx, bucket, key)
 	if err != nil {
 		return err

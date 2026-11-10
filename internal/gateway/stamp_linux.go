@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"syscall"
+	"time"
 )
 
 // fileStamp is a file's identity as the bit-rot sampler and the store
@@ -17,4 +18,15 @@ func fileStamp(fi os.FileInfo) string {
 		ino = uint64(st.Ino) //nolint:unconvert // uint32 on some 32-bit platforms
 	}
 	return fmt.Sprintf("%d:%d:%d", ino, fi.Size(), fi.ModTime().UnixNano())
+}
+
+// changeTime is when a file's inode last changed (st_ctime): a write,
+// a rename, a utimes. Unlike the modification time, which cp -p, rsync
+// and tar set back to the source's, no tool can set it, so it says when
+// a file was last written to here (#88).
+func changeTime(fi os.FileInfo) time.Time {
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		return time.Unix(st.Ctim.Unix())
+	}
+	return fi.ModTime()
 }

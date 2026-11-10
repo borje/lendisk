@@ -2645,6 +2645,28 @@ upstream bucket is Q-V.
     between the row and its finish leaves a pending row with no token,
     which startup's `ResolvePending` settles as landed (the object
     carries no other write's token) and hashes.
+  - *Settling (#88's first item).* A file is hashed, as a write or as an
+    edit in place (below), only once it has been still for
+    `ReconcileSettings.Settle` (`DefaultSettle`, 10 minutes; not a
+    config setting): its change time (`st_ctime`, `changeTime`), which
+    no copy tool sets back as `cp -p`, rsync and tar set the
+    modification time, is that old by the node's clock, or, for a
+    change time ahead of the clock, a pass saw the same identity and
+    change time at least that long before (`sighting`, kept in memory
+    per bucket, at most 10,000 a bucket). A file changed within it, a
+    copy in progress or an edit half done, is left and counted in the
+    log, and its bucket is passed again once it may have settled
+    (`dueBuckets`, within `Poll`), not a day later. A file whose
+    identity moves while it is hashed, or between the check and the
+    hash, is left the same way, its pending row dropped. So truncated
+    bytes are never a version: for a rewritable key they would
+    replicate over the friends' good copies. A copy that pauses longer
+    than the settle time is taken as it is, as by any watcher.
+    `TestAFileStillBeingCopiedIsNotEnqueued`,
+    `TestAHalfWrittenEditNeverReplicatesOverGoodCopies`,
+    `TestAFileChangedAheadOfTheClockSettlesByWatching`,
+    `TestAFileChangingWhileHashedIsNotEnqueued`,
+    `TestASettlingFileIsTakenWithoutWaitingForTheNextPass`.
   - *Held locally* (`queue.local`, migration 33, unix seconds): set on a
     done put when this node knew its object to be in its own store:
     `FinishPut` (a capture stored it, also startup's settling; an
@@ -2761,10 +2783,11 @@ upstream bucket is Q-V.
     (`TestReconcilerRehashesObjectsChangedInPlace`). A chmod or chown
     changes no identity and hashes nothing; a restore of the store with
     `cp -a` (new inodes) costs one pass that hashes everything. A key
-    with no identity recorded is the sampler's to verify. No clock is
-    read, so a file whose times are ahead of the node's clock is hashed
-    once (`TestAFileAheadOfTheClockIsHashedOnce`). #88's first item
-    (files still being copied) stays open.
+    with no identity recorded is the sampler's to verify. The edit is
+    told by identity, not a clock, so a file whose times are ahead of
+    the node's clock is hashed once
+    (`TestAFileAheadOfTheClockIsHashedOnce`); the clock only says when
+    an edit has settled (above).
   - *Rule for later code:* anything that removes an own bucket's object
     from the store without a captured delete (post-v1 evict) must hold
     the key's lock and clear `queue.local` first, or the next pass
@@ -5803,7 +5826,11 @@ the handler's own reads and is never cancelled; nothing below
       rewritable restic `config` is repaired, not enqueued, and the
       reconciler leaves it to the sampler);
     - *another modification time or inode:* an edit outside the
-      endpoint, the user's write (#88);
+      endpoint, the user's write (#88), judged only once the file's
+      change time is `DefaultSettle` old by the sampler's clock (§3.3
+      EP-14, settling): until then it may be half a write and is left
+      to the reconciler or a later sample, neither captured nor taken
+      for rot (so is an unverified file's, below);
     - *no identity recorded (unverified):* the right bytes record the
       identity; other bytes are taken for the user's write, never for
       rot, with one exception. *Decision (#31 second review):* an
