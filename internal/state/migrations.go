@@ -1093,4 +1093,13 @@ var migrations = []Migration{
 		-- answer that gives room makes a pass due.
 		ALTER TABLE replace_pass ADD COLUMN short_min INTEGER;`,
 	},
+	{
+		Version: 52, Compat: 1, Release: "0.1",
+		SQL: `
+		-- In recovery, whether a listed key's bucket profile reads the
+		-- union of its metadata (union_metadata, #78): a metadata key one
+		-- place lists is then a single source, though a place listed to
+		-- its end lacks it.
+		ALTER TABLE listed ADD COLUMN unioned INTEGER; -- 1: the profile reads the union`,
+	},
 }

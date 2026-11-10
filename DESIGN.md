@@ -1194,6 +1194,44 @@ upstream bucket is Q-V.
   key not named by its hash, a colluding majority of friends therefore
   wins: that is the rule decided, and #70 covers restic's `config` and
   `keys/*`.
+  *A tool that reads the union of its metadata (#78).* In a bucket
+  whose profile sets `union_metadata` (Kopia), a metadata or snapshot
+  key one friend lists is a `single` source even when another friend
+  listed the bucket to its end without it. Kopia names none of its
+  blobs by the plain SHA-256, and creates and deletes index, epoch and
+  session blobs all the time, so with two or more friends at different
+  replication progress each lists blobs the other lacks: one it has
+  not received yet, or one Kopia deleted and that friend received the
+  delete of. Under the restic rule each was a conflict, and recovery
+  asked the user to pick through keys whose versions never disagreed.
+  The rule follows Kopia's own treatment of these blobs (Kopia 0.23.1
+  `internal/epoch/epoch_manager.go`): it writes each one once under its
+  name (an HMAC of the content or a random session ID; the three
+  rewritable format blobs aside, which keep their #74 rule); it reads
+  every blob it lists and merges them, index entries by timestamp; and
+  it deletes one only once superseded: an epoch marker below the
+  current epoch less one, a deletion watermark below the newest, an
+  uncompacted index blob (`xn`) of an epoch whose compacted index
+  (`xs`) has been written for its cleanup safety margin. A superseded
+  blob that recovery brings back is ignored as Kopia ignores it before
+  its cleanup (the newest marker and watermark count; a settled
+  epoch's `xs` is read instead of its `xn`), and the next maintenance
+  deletes it again. So recovery takes the union of the friends'
+  metadata, as Kopia would read one store holding all of it. restic
+  keeps the conflict: its `keys/*` deleted at one friend is a password
+  the user removed. The listed row records the flag
+  (`listed.unioned`, migration 52; `state.Listed.Union`), so the lone
+  metadata pass after a list ends (`loneBatch`) skips such keys. A key
+  only overflow targets list is still not live (#96's rule above).
+  Tests: `TestLoneMetadataOfAUnionProfileIsASingleSource`
+  (`internal/state`); `TestRecoverKopiaFromTwoFriendsAtDifferentProgress`
+  (`internal/cli`), with real Kopia: a bucket at one copy replicated to
+  B and C, C offline for a snapshot, a full maintenance whose watermark
+  supersedes the first (the test deletes the superseded one as Kopia's
+  cleanup would after its safety margin of at least ten minutes) and
+  another snapshot; recovery with both online reports no conflict, and
+  Kopia lists, restores and verifies the latest snapshot through the
+  read-through.
   *Rewritable keys (#74).* Friends may hold different versions of a
   key the profile names rewritable (one was offline for the last
   Kopia maintenance run, or a password change), and with two friends
@@ -2330,7 +2368,11 @@ upstream bucket is Q-V.
   key's last segment is the snapshot's ID as the tool shows it, so
   `status` names the snapshot that is offsite (§3.4 REPL-11): `true`
   for `restic`; off for `kopia`, whose snapshot keys are index blobs,
-  and `generic`, which has none. A bucket whose
+  and `generic`, which has none. A flag, `union_metadata` (#78), says
+  the tool writes each metadata and snapshot key once under its name
+  (its rewritable keys aside) and reads the union of what it lists, so
+  recovery counts a metadata key one friend lacks as a single source
+  (§3.1 ID-5): `true` for `kopia` only. A bucket whose
   profile has no file classifies every key as data and none as
   rewritable. The compiled-in
   files are `restic`, `kopia` and `generic`. `kopia` (#7) is EP-7's

@@ -73,6 +73,13 @@ type Profile struct {
 	// it status names the snapshot key's capture time: Kopia's snapshot
 	// keys are index blobs, which name no snapshot.
 	NamesSnapshots bool `toml:"names_snapshots"`
+	// UnionMetadata: the tool writes each metadata and snapshot key once
+	// under its name (the rewritable keys aside) and reads the union of
+	// what it lists, superseded keys ignored, so a key one friend lacks
+	// is one that friend has not received yet or deleted as superseded.
+	// Recovery then counts a metadata key one friend lists as a single
+	// source, not a conflict (ID-5, #78).
+	UnionMetadata bool `toml:"union_metadata"`
 	// Format1Keys are keys only an unsupported old repository format
 	// writes (COMPAT-1, #79: Kopia format 1's legacy index, compaction
 	// log and cleanup blobs). UpgradedKeys are keys the tool writes when

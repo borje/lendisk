@@ -27,7 +27,8 @@ import (
 //   - a key one place lists is a single source and counts, except a
 //     metadata or snapshot key that another place, listed to its end,
 //     lacks: REPL-12 puts metadata at every friend, so that is a
-//     conflict;
+//     conflict, unless the bucket's profile reads the union of its
+//     metadata (Kopia, union_metadata, #78);
 //   - places that tie are a conflict: no version counts, so no place
 //     counts as holding it and the read-through refuses it (KeyConflict)
 //     until the user picks a place (ResolveKey) or a later list breaks
@@ -81,6 +82,10 @@ type Listed struct {
 	HashNamed bool
 	// Rewritable: the bucket's profile names the key rewritable (EP-7).
 	Rewritable bool
+	// Union: the bucket's profile reads the union of its metadata
+	// (union_metadata, #78), so a friend that lacks the key casts no
+	// doubt on it.
+	Union bool
 	// Replaced are the hashes of the versions of the key this place
 	// replaced by rewrites and still keeps as tombstones (#74).
 	Replaced []string
@@ -383,7 +388,7 @@ func (db *DB) loneBatch(ctx context.Context, place, bucket string) (int, error) 
 		return 0, err
 	}
 	keys, err := column(ctx, tx, `SELECT key FROM listed WHERE bucket = ? AND key > ? AND class IN ('metadata', 'snapshot')
-		AND named = 0 GROUP BY key HAVING count(*) = 1 ORDER BY key LIMIT ?`, bucket, after, SettleBatch)
+		AND named = 0 AND unioned IS NULL GROUP BY key HAVING count(*) = 1 ORDER BY key LIMIT ?`, bucket, after, SettleBatch)
 	if err != nil || len(keys) == 0 {
 		return 0, err
 	}
@@ -525,12 +530,12 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 			c.Tombstoned++
 			continue
 		}
-		if _, err := p.ExecContext(ctx, `INSERT INTO listed (bucket, key, place, size, sha256, class, named, rewritable, replaced)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		if _, err := p.ExecContext(ctx, `INSERT INTO listed (bucket, key, place, size, sha256, class, named, rewritable, replaced, unioned)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (bucket, key, place) DO UPDATE SET size = excluded.size, sha256 = excluded.sha256, class = excluded.class,
-				named = excluded.named, rewritable = excluded.rewritable, replaced = excluded.replaced`,
+				named = excluded.named, rewritable = excluded.rewritable, replaced = excluded.replaced, unioned = excluded.unioned`,
 			bucket, o.Key, place, o.Size, o.SHA256, o.Class, o.HashNamed, nullTrue(o.Rewritable),
-			nullString(strings.Join(o.Replaced, " "))); err != nil {
+			nullString(strings.Join(o.Replaced, " ")), nullTrue(o.Union)); err != nil {
 			return c, err
 		}
 		keys = append(keys, o.Key)
@@ -575,10 +580,10 @@ func listedPlaces(ctx context.Context, tx *sql.Tx, bucket string) (map[string]bo
 }
 
 type listedRow struct {
-	place, sha, class string
-	size              int64
-	named, rewritable bool
-	replaced          []string
+	place, sha, class          string
+	size                       int64
+	named, rewritable, unioned bool
+	replaced                   []string
 }
 
 // preparedTx runs statements in a transaction, preparing each distinct
@@ -795,7 +800,8 @@ func onlyTargetsList(ls []listedRow) bool {
 
 // decide is the rule: the user's pick, else the hash most places list,
 // a tie being a conflict; one place alone is a single source, unless it
-// is a metadata key another place listed to its end lacks.
+// is a metadata key another place listed to its end lacks, in a bucket
+// whose profile does not read the union of its metadata (#78).
 func decide(ls []listedRow, picked string, done map[string]bool) (verdict, reason, winner string) {
 	if len(ls) == 0 {
 		return VerdictConflict, "no place lists it any more", ""
@@ -813,8 +819,11 @@ func decide(ls []listedRow, picked string, done map[string]bool) (verdict, reaso
 	if len(ls) == 1 {
 		r := ls[0]
 		// A key named by its hash is that object whoever lists it: a
-		// friend that lacks it does not make it doubtful.
-		if (r.class == "metadata" || r.class == "snapshot") && !r.named {
+		// friend that lacks it does not make it doubtful. Nor in a
+		// bucket whose tool reads the union of its metadata (#78): the
+		// friend has not received the key yet, or deleted it as the tool
+		// did, superseded.
+		if (r.class == "metadata" || r.class == "snapshot") && !r.named && !r.unioned {
 			var lacking []string
 			for p := range done {
 				if p != r.place {
@@ -853,8 +862,8 @@ func decide(ls []listedRow, picked string, done map[string]bool) (verdict, reaso
 
 // listedRows is what every place listed of key.
 func listedRows(ctx context.Context, q querier, bucket, key string) ([]listedRow, error) {
-	rows, err := q.QueryContext(ctx, `SELECT place, sha256, class, size, named, coalesce(rewritable, 0), coalesce(replaced, '')
-		FROM listed WHERE bucket = ? AND key = ? ORDER BY place`, bucket, key)
+	rows, err := q.QueryContext(ctx, `SELECT place, sha256, class, size, named, coalesce(rewritable, 0), coalesce(replaced, ''),
+		coalesce(unioned, 0) FROM listed WHERE bucket = ? AND key = ? ORDER BY place`, bucket, key)
 	if err != nil {
 		return nil, err
 	}
@@ -863,7 +872,7 @@ func listedRows(ctx context.Context, q querier, bucket, key string) ([]listedRow
 	for rows.Next() {
 		var r listedRow
 		var replaced string
-		if err := rows.Scan(&r.place, &r.sha, &r.class, &r.size, &r.named, &r.rewritable, &replaced); err != nil {
+		if err := rows.Scan(&r.place, &r.sha, &r.class, &r.size, &r.named, &r.rewritable, &replaced, &r.unioned); err != nil {
 			return nil, err
 		}
 		r.replaced = strings.Fields(replaced)

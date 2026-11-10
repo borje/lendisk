@@ -41,6 +41,16 @@ hash_named = []
 # version a rewrite replaces as a tombstone for the retention window.
 rewritable = ["kopia.repository", "kopia.blobcfg", "kopia.maintenance"]
 
+# Kopia writes every other blob once under its name and reads the union
+# of the blobs it lists (#78; Kopia 0.23.1 internal/epoch/epoch_manager.go):
+# the newest epoch marker (xe) and deletion watermark (xw) count, a
+# settled epoch's compacted index (xs) supersedes its uncompacted blobs
+# (xn), and index entries merge by timestamp. It deletes a marker or an
+# index blob only once superseded. So a metadata blob one friend lists
+# and another lacks is one the other has not received yet or deleted as
+# superseded: recovery counts it as a single source, not a conflict.
+union_metadata = true
+
 # Kopia repository format version 1 (Kopia 0.8 and earlier, never
 # upgraded) is not supported (COMPAT-1, #79): only its legacy index
 # manager writes the index blobs n*, the compaction log m* and the cleanup

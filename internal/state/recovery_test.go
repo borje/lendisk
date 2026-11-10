@@ -237,6 +237,37 @@ func TestSingleSourceAndLoneMetadata(t *testing.T) {
 	}
 }
 
+// #78: in a bucket whose profile reads the union of its metadata
+// (Kopia), a metadata or snapshot key one friend lists and another,
+// listed to its end, lacks is a single source, not a conflict: the
+// other has not received it yet, or already deleted it as superseded.
+// Each friend's lone keys count, and are held where they are listed,
+// whichever list ends first.
+func TestLoneMetadataOfAUnionProfileIsASingleSource(t *testing.T) {
+	db := recoveringWith(t, "B", "C")
+	list(t, db, "B", "laptop",
+		Listed{Key: "kopia.repository", Size: 1, SHA256: "hr", Class: "metadata", Union: true, Rewritable: true},
+		Listed{Key: "xn0_new", Size: 1, SHA256: "hn", Class: "snapshot", Union: true},
+		Listed{Key: "xw2", Size: 1, SHA256: "hw2", Class: "metadata", Union: true})
+	list(t, db, "C", "laptop",
+		Listed{Key: "kopia.repository", Size: 1, SHA256: "hr", Class: "metadata", Union: true, Rewritable: true},
+		Listed{Key: "xw1", Size: 1, SHA256: "hw1", Class: "metadata", Union: true})
+	for key, place := range map[string]string{"xn0_new": "B", "xw2": "B", "xw1": "C"} {
+		if v := verdict(t, db, "laptop", key); v.Verdict != VerdictSingle {
+			t.Errorf("%s, listed by %s alone: %+v", key, place, v)
+		}
+		if a := ackedAt(t, db, place, "laptop"); a[key] == "" {
+			t.Errorf("%s not held at %s: %v", key, place, a)
+		}
+	}
+	if v := verdict(t, db, "laptop", "kopia.repository"); v.Verdict != VerdictHeld {
+		t.Errorf("kopia.repository at both: %+v", v)
+	}
+	if cs, err := db.Conflicts(context.Background()); err != nil || len(cs) != 0 {
+		t.Fatalf("conflicts %+v %v", cs, err)
+	}
+}
+
 // #29 review: a key the node wrote itself after recovery is its own;
 // lists only add the places that hold that version.
 func TestLocalWriteAfterRecoveryWins(t *testing.T) {

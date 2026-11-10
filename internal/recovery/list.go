@@ -399,7 +399,7 @@ func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles 
 			}
 			objs = append(objs, state.Listed{Key: o.Key, Size: o.Size, SHA256: o.SHA256, Class: string(class),
 				Tombstoned: o.TombstonedAt != nil, HashNamed: prof.HashNamed(o.Key),
-				Rewritable: prof.Rewritable(o.Key), Replaced: o.Replaced})
+				Rewritable: prof.Rewritable(o.Key), Replaced: o.Replaced, Union: prof.UnionMetadata})
 		}
 		if p.Next != "" && (p.Next <= after || p.Next < last) {
 			return false, fmt.Errorf("the place's list does not move on from %q", after)
