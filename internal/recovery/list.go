@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -23,7 +24,8 @@ import (
 // and records them in placement (ID-5): `recover` makes one round, and
 // the daemon runs it until every place has been listed, so a place that
 // was offline at recovery is listed when it returns. Its objects count
-// as held where other lists found them until then.
+// as held where other lists found them until then. A place gone past
+// replace_after is not listed until it answers again (#71).
 type Lister struct {
 	DB   *state.DB
 	Self *identity.Identity
@@ -121,16 +123,34 @@ func (l *Lister) due(r state.Relist, now time.Time) bool {
 	return now.Sub(r.TriedAt) >= min(wait, ceil)
 }
 
-// Pending reports how many lists are still to read, or ended without
-// their keys being decided again yet (state.Unsettled): the daemon makes
-// rounds while any is.
+// Pending reports how many lists are still to read at places not gone
+// past replace_after (readable), or ended without their keys being
+// decided again yet (state.Unsettled): the daemon makes rounds while
+// any is.
 func (l *Lister) Pending(ctx context.Context) (int, error) {
-	rs, err := l.DB.Relists(ctx)
+	rs, err := l.readable(ctx)
 	if err != nil {
 		return 0, err
 	}
 	n, err := l.DB.Unsettled(ctx)
 	return len(rs) + n, err
+}
+
+// readable are the lists still to read (state.Relists) but those at a
+// place gone past replace_after (state.GonePlaces, #71): a friend that
+// never returns is not listed for ever. Its copies count as gone, as
+// any gone place's do (re-placement, REPL-13), and its lists are read
+// once it answers again.
+func (l *Lister) readable(ctx context.Context) ([]state.Relist, error) {
+	rs, err := l.DB.Relists(ctx)
+	if err != nil || len(rs) == 0 {
+		return rs, err
+	}
+	gone, err := l.DB.GonePlaces(ctx, l.now())
+	if err != nil {
+		return nil, err
+	}
+	return slices.DeleteFunc(rs, func(r state.Relist) bool { _, ok := gone[r.Place]; return ok }), nil
 }
 
 // settle decides again what lists that ended affect, within ctx (the
@@ -144,7 +164,8 @@ func (l *Lister) settle(ctx context.Context) {
 // Round reads every list that is due, with no time budget.
 func (l *Lister) Round(ctx context.Context) ([]Result, error) { return l.RoundWithin(ctx, 0) }
 
-// RoundWithin reads every list that is due, Parallel places at a time,
+// RoundWithin reads every list that is due (readable, and past its
+// backoff), Parallel places at a time,
 // each place's lists one after another, for at most budget (0: no
 // limit). A place that fails one list is not asked for its others in
 // this round: each is recorded as failed, and tried again after the
@@ -154,7 +175,7 @@ func (l *Lister) Round(ctx context.Context) ([]Result, error) { return l.RoundWi
 // starts one place further on than the last. Results are by place and
 // bucket.
 func (l *Lister) RoundWithin(ctx context.Context, budget time.Duration) ([]Result, error) {
-	rs, err := l.DB.Relists(ctx)
+	rs, err := l.readable(ctx)
 	if err != nil {
 		return nil, err
 	}

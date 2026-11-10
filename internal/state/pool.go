@@ -178,14 +178,18 @@ func (p poolPlace) failingSince() time.Time {
 // answer (or its first failure, if it never answered). It is no longer
 // room (REPL-12); re-placement (REPL-13, #26) moves what it held.
 func (p poolPlace) gone(db *DB, now time.Time) bool {
-	// Silence counts from the last answer, a probe's included (#65
-	// review): a friend full for a week that answers probes, then misses
-	// one, is not gone.
-	from := p.lastOK
-	if from.IsZero() {
-		from = p.failingSince()
+	return p.unreachable(db, now) && now.Sub(p.silentSince()) >= db.replaceAfter()
+}
+
+// silentSince is what gone counts from: the last answer, a probe's
+// included (#65 review: a friend full for a week that answers probes,
+// then misses one, is not gone), or its first failure if it never
+// answered.
+func (p poolPlace) silentSince() time.Time {
+	if p.lastOK.IsZero() {
+		return p.failingSince()
 	}
-	return p.unreachable(db, now) && now.Sub(from) >= db.replaceAfter()
+	return p.lastOK
 }
 
 // full: its last answer was 507 (LEND-2). The lender's word corrects the
@@ -1038,6 +1042,25 @@ func (db *DB) PoolSize(ctx context.Context) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// GonePlaces returns the places gone past replace_after at now (REPL-13:
+// unreachable, and silent that long), each with the time its silence is
+// counted from. Re-placement drains them; recovery stops listing them
+// and no longer waits for their lists (ID-5, #71) until they answer
+// again.
+func (db *DB) GonePlaces(ctx context.Context, now time.Time) (map[string]time.Time, error) {
+	ps, err := poolPlaces(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]time.Time{}
+	for _, p := range ps {
+		if p.gone(db, now) {
+			out[p.peer] = p.silentSince()
+		}
+	}
+	return out, nil
 }
 
 // DroppedBelowCopies returns, per bucket, the live objects below copies

@@ -296,3 +296,99 @@ func TestOfflinePlaceListedWhenItReturns(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// ID-5, REPL-13 (#71): a friend that never returns is not listed for
+// ever. Once it is gone past replace_after (the pool's rule: no answer
+// to the daemon's sends and probes for that long), its lists are no
+// longer read nor counted pending, and status says so; before that it
+// is tried after each backoff. A gone friend that answers again is
+// listed.
+func TestAFriendGonePastReplaceAfterIsNoLongerListed(t *testing.T) {
+	ctx := t.Context()
+	db := openDB(t)
+	self := newID(t)
+	start := time.Unix(1_800_000_000, 0)
+	now := start
+	var clock sync.Mutex
+	tick := func() time.Time { clock.Lock(); defer clock.Unlock(); return now }
+	at := func(d time.Duration) { clock.Lock(); now = start.Add(d); clock.Unlock() }
+	db.Clock = tick
+	for _, f := range []string{"B", "C"} {
+		if err := db.AddFriendship(ctx, state.Friendship{Peer: f, Address: "tc" + f, OwnNumber: 1 << 30, PeerNumber: 1 << 30,
+			CreatedAt: start}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.AddBucket(ctx, state.Bucket{Name: "laptop", Profile: "restic", Copies: 2, AccessKey: "A", SecretKey: "S",
+		CreatedAt: start}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AddRelists(ctx, []string{"B", "C"}, []string{"laptop"}); err != nil {
+		t.Fatal(err)
+	}
+	h := sum("pack")
+	objs := []control.ListObject{{Key: "data/aa/" + h, Size: 100, SHA256: h}}
+	p := &pages{held: map[string][]control.ListObject{"B": objs, "C": objs}, offline: map[string]bool{"C": true},
+		sealed: self.SealedName("laptop"), t: t}
+	var mu sync.Mutex
+	asked := map[string]int{}
+	askedC := func() int { mu.Lock(); defer mu.Unlock(); return asked["C"] }
+	page := func(ctx context.Context, f state.Friendship, sealed, after string) (control.ListPage, error) {
+		mu.Lock()
+		asked[f.Peer]++
+		mu.Unlock()
+		return p.page(ctx, f, sealed, after)
+	}
+	l := &Lister{DB: db, Self: self, Page: page, Now: tick, Log: quiet}
+	// The daemon's worker records C's silence (state.SetPlaceCondition).
+	if err := db.SetPlaceCondition(ctx, "C", state.ConditionRetrying, "dial: no route", start); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Round(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// Six days on, C is away but not gone: tried after its backoff.
+	at(6 * 24 * time.Hour)
+	if rs, _ := l.Round(ctx); len(rs) != 1 || rs[0].Place != "C" || rs[0].Err == nil || askedC() != 2 {
+		t.Fatalf("C before replace_after: %+v, asked %d times", rs, askedC())
+	}
+	if n, _ := l.Pending(ctx); n != 1 {
+		t.Fatalf("pending %d", n)
+	}
+	// Past replace_after (7 days by default) it is gone, a month on too.
+	for _, d := range []time.Duration{7*24*time.Hour + time.Minute, 30 * 24 * time.Hour} {
+		at(d)
+		if rs, _ := l.Round(ctx); len(rs) != 0 || askedC() != 2 {
+			t.Fatalf("C gone for %v: %+v, asked %d times", d, rs, askedC())
+		}
+		if n, _ := l.Pending(ctx); n != 0 {
+			t.Fatalf("pending %d: the daemon keeps listing a gone friend", n)
+		}
+	}
+	if gs, err := db.GonePlaces(ctx, tick()); err != nil || len(gs) != 1 || !gs["C"].Equal(start) {
+		t.Fatalf("gone places %v %v", gs, err)
+	}
+	if rs := mustRelists(t, db); len(rs) != 1 || rs[0].Place != "C" {
+		t.Fatalf("C's list is no longer kept for its return: %+v", rs)
+	}
+	// C answers again: it is listed.
+	p.set("C", false)
+	if err := db.ProbeAnswered(ctx, "C", tick()); err != nil {
+		t.Fatal(err)
+	}
+	if rs, _ := l.Round(ctx); len(rs) != 1 || rs[0].Err != nil || rs[0].Listed != 1 {
+		t.Fatalf("C back: %+v", rs)
+	}
+	if n, _ := l.Pending(ctx); n != 0 {
+		t.Fatalf("pending %d", n)
+	}
+}
+
+func mustRelists(t *testing.T, db *state.DB) []state.Relist {
+	t.Helper()
+	rs, err := db.Relists(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rs
+}

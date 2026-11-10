@@ -1303,18 +1303,56 @@ upstream bucket is Q-V.
   `seq`) is not possible as things stand: the lender cannot read `seq`
   inside the sealed envelope, and putting it outside would be an
   envelope change.
-  *Known gaps, follow-ups to file:* a list read while a write of the
-  same key is still pending here (captured, not yet done) races the
-  write; a friend can list objects this node deleted before it was
-  lost, unless the friend tombstoned them (#17: its list then carries
-  `tombstoned_at` and recovery counts them as deleted); and a friend that never returns keeps its lists
-  pending for ever (backing off to an hour), with no point at which
-  recovery gives up on it. A place that is offline is listed when it
+  A place that is offline is listed when it
   returns: the daemon runs the same lister (every minute, a failed
   list due again after 1 min doubling to 1 h), and `status` shows the
   lists still to read (`recovery.pending`). Until then its objects
   count as held wherever else a list found them, and are below
   `copies` where no other place holds enough of them.
+  *A friend that never returns* (#71) is judged by the pool's rule, not
+  one of recovery's own: once it is gone past `replication.replace_after`
+  (§3.4 D6: unreachable, and no answer to the worker's sends and
+  probes for that long, `state.GonePlaces`), the lister no longer
+  reads its lists nor counts them pending, and re-placement no longer
+  waits for them; its copies count as gone, as any gone friend's do
+  (REPL-13, #26). Like a gone friend in the pool, this is not final:
+  once it answers again (a probe), its lists are read from where they
+  stopped. Status keeps such a list in `recovery.pending` with
+  `gone_since` (the time its silence counts from) and says it is not
+  read until the friend answers; no alert of recovery's own is raised,
+  since `friend_unreachable` and `below_copies` (raised at
+  `replace_after`) already name the friend and what it held
+  (`TestAFriendGonePastReplaceAfterIsNoLongerListed`,
+  `TestRecoverFromPhraseAndOneLendersAddress`). A list a friend never
+  answered recorded nothing, so nothing of it counts; a list cut short
+  keeps the entries it recorded, and their acknowledged rows are
+  drained like any gone friend's copies.
+  *A list never supersedes a local write* (#71). The daemon serves the
+  bucket while its lister runs, so a list may name a key this node is
+  writing (a capture still `pending`). Deciding the key then would give
+  the listed version a queue row after the write's, and the write,
+  once done, would count as superseded and never be replicated. So
+  `settleKey` decides nothing while a pending capture of the key comes
+  after its recovered row (or there is none): the key's verdict is
+  `writing` and its rows stay as they were. When the write ends,
+  `SettleFinished` decides it again (`state.Unsettled` counts it, so
+  the daemon's lister makes the round; migration 48 indexes the
+  `writing` verdicts so neither reads every recovered key): done, it is the node's own
+  write, which the lists only add holders to; failed, the lists decide
+  it as before (`TestAListedKeyNeverSupersedesALocalWriteInFlight`, a
+  generic bucket).
+  *A friend's list is trusted like its acknowledgement* (#71). A friend
+  that deleted an object, or never stored it, can still list it, and
+  recovery then records it `acked` there: copies look complete when
+  they are not. Normal acknowledgements trust the friend the same way,
+  and the same backstop covers both: the daily challenge (§3.6 VER-1,
+  #27) names recovered acks like any other acknowledged object once
+  the read-through has fetched the object (until then it has no local
+  copy to compare with and is skipped), and a failed one marks the
+  friend's replica unverified, so re-placement moves its copies
+  (`TestARecoveredAckIsChallenged`, `internal/verify`). A friend that
+  tombstoned the object lists it so (#17: `tombstoned_at`), and
+  recovery counts it as deleted.
   *Limit: a lender that lost its own `lendisk.db`* keeps the manifest
   file but admits no one without a friendship (SEC-10, ID-4 above), so
   it serves neither the manifest nor a list to a recovering node: that
@@ -3252,7 +3290,11 @@ upstream bucket is Q-V.
   a friend not yet listed holds, and a row placed meanwhile would stand
   in the way of the acknowledged row its list records
   (`TestReplacementWaitsForRecoveryLists`,
-  `TestRecoverFromPhraseAndOneLendersAddress`). A recovered node's
+  `TestRecoverFromPhraseAndOneLendersAddress`). An unread list at a
+  friend gone past `replace_after` does not hold the bucket back (#71):
+  its copies count as gone, as any gone friend's do, and the bucket
+  waits again if it answers
+  (`TestAGoneFriendsUnreadListDoesNotHoldReplacementBack`). A recovered node's
   store starts empty, so the sender puts an object it holds no file for
   there first through the read-through (`replica.Worker.Fill`, which
   `serve` sets to `gateway.Gateway.Fill`: fetched from a friend that
@@ -5214,7 +5256,11 @@ the handler's own reads and is never cancelled; nothing below
     or no longer matches its capture hash (VER-5's business; the HMAC
     cannot tell whose bytes changed) is skipped; a check that skipped
     every object is recorded as an error ("nothing to check")
-    (`TestTheLocalCopysOwnFaultsAreNotTheFriends`). The friend is asked
+    (`TestTheLocalCopysOwnFaultsAreNotTheFriends`). An `acked` row
+    recovery wrote from a friend's list (§3.1 ID-5) is challenged like
+    any other once the object is fetched: it is the backstop for a
+    friend that lists an object it no longer holds (#71,
+    `TestARecoveredAckIsChallenged`). The friend is asked
     first and the local copy read after its answer, after any wait for
     its pacing. Before a failure is recorded, the object's row is read
     again (`state.DB.StillChallengeable`): it must still be `acked` at

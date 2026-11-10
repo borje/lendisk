@@ -647,3 +647,35 @@ func TestReplaceOfManyObjectsIsFast(t *testing.T) {
 		t.Fatalf("a pass over %d objects took %v, %.1f times the %v over %d", manyRows, took, ratio, quarter, manyRows/4)
 	}
 }
+
+// REPL-13, ID-5 (#71): a friend gone past replace_after holds no bucket
+// back with a list it never answered: re-placement counts its copies
+// as gone and places them elsewhere. Gone for less, its list is still
+// waited for.
+func TestAGoneFriendsUnreadListDoesNotHoldReplacementBack(t *testing.T) {
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.friend("D", 10)
+	p.bucket("laptop", 2)
+	d1 := p.put("laptop", "data/1", "data", 1)
+	p.wantPlaces("data/1", d1, "B", "C")
+	if _, err := p.db.Exec(`UPDATE placement SET state = 'acked' WHERE seq = ?`, d1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.db.Exec(`INSERT INTO relist (place, bucket) VALUES ('C', 'laptop')`); err != nil {
+		t.Fatal(err)
+	}
+	p.condition("C", ConditionRetrying, p.now.Add(-6*24*time.Hour), time.Time{})
+	if s := p.replace(); s.Placed != 0 {
+		t.Fatalf("placed %d copies while C, not yet gone, is unread", s.Placed)
+	}
+	p.gone("C")
+	if gs, err := p.db.GonePlaces(context.Background(), p.now); err != nil || len(gs) != 1 || gs["C"].IsZero() {
+		t.Fatalf("gone places %v %v", gs, err)
+	}
+	p.replace()
+	if st, replaces := p.rowOf("D", d1); st != "queued" || replaces != "C" {
+		t.Fatalf("D's row of data/1 is %q replacing %q, want queued replacing C", st, replaces)
+	}
+}

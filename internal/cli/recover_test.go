@@ -24,6 +24,7 @@ import (
 	"github.com/borje/lendisk/internal/manifest"
 	"github.com/borje/lendisk/internal/overflow/overflowtest"
 	"github.com/borje/lendisk/internal/replica"
+	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
 )
 
@@ -280,6 +281,25 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 		if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != m {
 			t.Errorf("%s: %v %v, want %04o", p, fi, err, m)
 		}
+	}
+
+	// #71: had C been silent past replace_after (7 days), status would
+	// say its list is not read until it answers, its copies gone.
+	gdb := openDB(t, fresh)
+	if err := gdb.SetPlaceCondition(t.Context(), cKey, state.ConditionRetrying, "dial: no route",
+		time.Now().Add(-8*24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range fresh.status().Recovery.Pending {
+		if (p.Place == cKey) != (p.GoneSince != "") {
+			t.Fatalf("gone since in %+v", p)
+		}
+	}
+	if _, out, _ := fresh.run("", "", "status"); !strings.Contains(out, "laptop at "+cKey+" (gone: no answer since ") {
+		t.Fatalf("status does not say C is gone:\n%s", out)
+	}
+	if err := gdb.ProbeAnswered(t.Context(), cKey, time.Now()); err != nil {
+		t.Fatal(err)
 	}
 
 	// The daemon: C returns and is listed; B and C admit A and take its
