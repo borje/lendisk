@@ -110,7 +110,13 @@ func newFriend(access, secret string, dial func(ctx context.Context) (net.Conn, 
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			ctx, cancel := context.WithTimeout(ctx, dt)
 			defer cancel()
-			return dial(ctx)
+			c, err := dial(ctx)
+			if err != nil {
+				return nil, err
+			}
+			// A friend's early answer outlives the reset of the write
+			// it refused (#109).
+			return newAnswerFirst(c, o.stallTimeout()), nil
 		},
 		ResponseHeaderTimeout: o.stallTimeout(),
 		MaxIdleConnsPerHost:   2,
