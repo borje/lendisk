@@ -606,3 +606,95 @@ send = "2M"
 		}
 	}
 }
+
+// NET-5, NET-5a (#42): [relays] takes a map URL, self-hosted relays as
+// `lendisk relay` prints them (in the file, a flag or the variable),
+// and two switches written as TOML booleans; by default the project's
+// map with the hosted relays as a bootstrap, and no peer hints.
+func TestRelaysSettings(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	l, err := load(t, []string{"--config", none}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Relays.MapURL != "" || len(l.Relays.List) != 0 || l.Relays.TailscaleBootstrap != "" || !l.Relays.Bootstrap() || l.Relays.AcceptPeerHints.On() || l.Tunnel.Port.Int() != 0 {
+		t.Fatalf("defaults: %+v, tunnel %+v", l.Relays, l.Tunnel)
+	}
+	pin := "sha256-raw:" + strings.Repeat("ab", 32)
+	p := writeFile(t, `
+[tunnel]
+port = 41641
+
+[relays]
+map_url = "https://relays.example/derpmap.json"
+tailscale_bootstrap = false
+accept_peer_hints = true
+
+[[relays.list]]
+host = "relay.example.org"
+cert = "`+pin+`"
+
+[[relays.list]]
+host = "192.0.2.7"
+port = 8443
+stun_port = -1
+`)
+	l, err = load(t, []string{"--config", p}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.Relays.MapURL != "https://relays.example/derpmap.json" || l.Relays.Bootstrap() || !l.Relays.AcceptPeerHints.On() || l.Tunnel.Port.Int() != 41641 {
+		t.Fatalf("from the file: %+v", l.Relays)
+	}
+	want := []RelayEntry{{Host: "relay.example.org", Cert: pin}, {Host: "192.0.2.7", Port: 8443, STUNPort: -1}}
+	if !reflect.DeepEqual(l.Relays.List, want) {
+		t.Fatalf("list %+v, want %+v", l.Relays.List, want)
+	}
+	l, err = load(t, []string{"--config", p}, map[string]string{"LENDISK_RELAYS_LIST": "host=vps.example,port=443,stun_port=3478,cert=" + pin})
+	if err != nil || len(l.Relays.List) != 1 || l.Relays.List[0].Host != "vps.example" || l.Relays.List[0].STUNPort != 3478 {
+		t.Fatalf("the variable replaces the file's list: %+v, %v", l.Relays.List, err)
+	}
+	for _, bad := range [][]string{
+		{"--relays-map-url", "ftp://relays.example/map.json"},
+		{"--relays-map-url", "http://relays.example/map.json"},
+		{"--relays-list", "port=443"},
+		{"--relays-list", "host=relay.example,port=70000"},
+		{"--relays-list", "host=relay.example,stun_port=-2"},
+		{"--relays-list", "host=relay.example,cert=sha256:abcd"},
+		{"--relays-list", "host=https://relay.example"},
+		{"--relays-tailscale-bootstrap", "yes"},
+		{"--relays-accept-peer-hints", "1"},
+		{"--tunnel-port", "70000"},
+		{"--relay-stun-port", "-1"},
+	} {
+		if _, err := load(t, append([]string{"--config", none}, bad...), nil); err == nil {
+			t.Errorf("%v was accepted", bad)
+		}
+	}
+}
+
+// #42 review M1, NET-5a: relays.tailscale_bootstrap unset is auto: the
+// hosted relays join the set only while the node names no relays of
+// its own; naming some leaves them out unless the user asks for them.
+func TestTailscaleBootstrapIsAutoUnlessSet(t *testing.T) {
+	none := filepath.Join(t.TempDir(), "none.toml")
+	pin := "host=relay.example.org"
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{nil, true},
+		{[]string{"--relays-list", pin}, false},
+		{[]string{"--relays-map-url", "https://relays.example/map.json"}, false},
+		{[]string{"--relays-list", pin, "--relays-tailscale-bootstrap", "true"}, true},
+		{[]string{"--relays-tailscale-bootstrap", "false"}, false},
+	} {
+		l, err := load(t, append([]string{"--config", none}, tc.args...), nil)
+		if err != nil {
+			t.Fatalf("%v: %v", tc.args, err)
+		}
+		if got := l.Relays.Bootstrap(); got != tc.want {
+			t.Errorf("%v: bootstrap %v, want %v", tc.args, got, tc.want)
+		}
+	}
+}

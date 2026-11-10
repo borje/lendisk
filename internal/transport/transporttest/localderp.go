@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -32,17 +33,30 @@ type LocalDERP struct {
 
 // Start starts a local relay and stops it when the test ends.
 func Start(t testing.TB) *LocalDERP {
+	return StartNamed(t, "")
+}
+
+// StartNamed starts a local relay whose node gives host as its host
+// name and no IPv4 address, so it is reached by resolving host; ""
+// gives 127.0.0.1 as both.
+func StartNamed(t testing.TB, host string) *LocalDERP {
 	t.Helper()
-	d, err := start(logger.Discard)
+	d, err := start(logger.Discard, host)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(d.close)
+	t.Cleanup(d.Close)
 	return d
 }
 
-func start(logf logger.Logf) (*LocalDERP, error) {
+func start(logf logger.Logf, host string) (*LocalDERP, error) {
 	const ip = "127.0.0.1"
+	v4 := ip
+	if host == "" {
+		host = ip
+	} else {
+		v4 = ""
+	}
 	d := derpserver.New(key.NewNode(), logf)
 	ln, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
 	if err != nil {
@@ -72,8 +86,8 @@ func start(logf logger.Logf) (*LocalDERP, error) {
 		Nodes: []*tailcfg.DERPNode{{
 			Name:             fmt.Sprintf("%da", RegionID),
 			RegionID:         RegionID,
-			HostName:         ip,
-			IPv4:             ip,
+			HostName:         host,
+			IPv4:             v4,
 			IPv6:             "none",
 			STUNPort:         stun.LocalAddr().(*net.UDPAddr).Port,
 			DERPPort:         ln.Addr().(*net.TCPAddr).Port,
@@ -81,30 +95,82 @@ func start(logf logger.Logf) (*LocalDERP, error) {
 			STUNTestIP:       ip,
 		}},
 	}
-	return &LocalDERP{Region: reg, close: func() {
-		cancel()
-		hs.CloseClientConnections()
-		hs.Close()
-		d.Close()
-	}}, nil
+	var once sync.Once
+	l := &LocalDERP{Region: reg}
+	l.close = func() {
+		once.Do(func() {
+			live.Lock()
+			delete(live.m, l)
+			live.Unlock()
+			cancel()
+			hs.CloseClientConnections()
+			hs.Close()
+			d.Close()
+		})
+	}
+	live.Lock()
+	if live.m == nil {
+		live.m = map[*LocalDERP]bool{}
+	}
+	live.m[l] = true
+	live.Unlock()
+	return l, nil
 }
+
+// live are the process's running local relays, which a Source offers
+// beside its own as a project map lists every relay.
+var live struct {
+	sync.Mutex
+	m map[*LocalDERP]bool
+}
+
+// Close stops the relay and its STUN server before the test ends, as a
+// relay that goes away does; the test's end does nothing more.
+func (l *LocalDERP) Close() { l.close() }
 
 // Map is a DERP map holding only this relay's region.
 func (l *LocalDERP) Map() *tailcfg.DERPMap {
 	return &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{RegionID: l.Region}}
 }
 
-// Source is a transport.RegionSource that offers only this relay and
-// picks it without measuring anything. Fetches counts DERPMap calls.
+// Source is a transport.RegionSource that picks this relay without
+// measuring anything. Its map is the node's relay set (NET-5): this
+// relay as RegionID and, unless Alone, every other local relay running
+// in the process, as regions 901 and up, as a project map lists every
+// relay, so test nodes on relays of their own may dial each other
+// (NET-5a). Fetches counts DERPMap calls.
 type Source struct {
 	D       *LocalDERP
+	Alone   bool
 	Fetches atomic.Int64
 }
 
 // DERPMap returns the local map.
 func (s *Source) DERPMap(context.Context) (*tailcfg.DERPMap, error) {
 	s.Fetches.Add(1)
-	return s.D.Map(), nil
+	m := s.D.Map()
+	if s.Alone {
+		return m, nil
+	}
+	live.Lock()
+	defer live.Unlock()
+	id := tailcfg.DERPRegionID(RegionID)
+	for l := range live.m {
+		if l == s.D {
+			continue
+		}
+		id++
+		r := *l.Region
+		r.RegionID, r.RegionCode = id, fmt.Sprintf("local-%d", id)
+		r.Nodes = nil
+		for _, n := range l.Region.Nodes {
+			c := *n
+			c.RegionID, c.Name = id, fmt.Sprintf("%da", id)
+			r.Nodes = append(r.Nodes, &c)
+		}
+		m.Regions[id] = &r
+	}
+	return m, nil
 }
 
 // Pick returns the local region.

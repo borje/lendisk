@@ -953,4 +953,18 @@ var migrations = []Migration{
 		-- seconds; NULL for a tomb never refused.
 		ALTER TABLE overflow_tomb ADD COLUMN denied_at INTEGER;`,
 	},
+	{
+		Version: 43, Compat: 1, Release: "0.1",
+		SQL: `
+		-- Explicit addresses (NET-3, #42): the friend's UDP ip:port
+		-- addresses the user gave (a static address or port forward),
+		-- space-separated, dialled directly; NULL for none.
+		ALTER TABLE friendship ADD COLUMN explicit_addresses TEXT;
+		-- The path keeper's last disco ping (NET-4, #42): the relay
+		-- carrying a relayed path, the friend's ip:port for a direct one,
+		-- and when (Unix seconds); path itself says direct or relayed.
+		ALTER TABLE friendship ADD COLUMN path_relay TEXT;
+		ALTER TABLE friendship ADD COLUMN path_endpoint TEXT;
+		ALTER TABLE friendship ADD COLUMN path_at INTEGER;`,
+	},
 }

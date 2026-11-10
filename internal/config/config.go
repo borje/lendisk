@@ -18,6 +18,7 @@
 package config
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -55,7 +56,11 @@ type Config struct {
 	Store    Store    `toml:"store"`
 	Endpoint Endpoint `toml:"endpoint"`
 	Tunnel   Tunnel   `toml:"tunnel"`
-	Alerts   Alerts   `toml:"alerts"`
+	// Relays is [relays] (NET-5, NET-5a); Relay is [relay], `lendisk
+	// relay`.
+	Relays Relays `toml:"relays"`
+	Relay  Relay  `toml:"relay"`
+	Alerts Alerts `toml:"alerts"`
 	// Replication is [replication] (D6, §3.4).
 	Replication Replication `toml:"replication"`
 	// Lending is [lending]: what this node lends its friends (LEND-1).
@@ -188,6 +193,89 @@ type Log struct {
 // Tunnel is the [tunnel] section: the peer connection (NET-1, SEC-14).
 type Tunnel struct {
 	Region string `toml:"region" help:"DERP relay region in this node's address, by ID or code; empty picks the nearest once. Changing it changes the address"`
+	// Port is the tunnel engine's UDP port (NET-3).
+	Port Number `toml:"port" default:"0" help:"UDP port the tunnel's direct paths use, for a port forward or firewall rule that friends then give as this node's explicit address (NET-3), such as 41641; 0 picks any port at each start"`
+}
+
+// Relays is the [relays] section: the relays this node uses (NET-5,
+// NET-5a). map_url and list each replace the project's relay map.
+type Relays struct {
+	MapURL string `toml:"map_url" help:"https URL of a DERP map (JSON, as Tailscale publishes one) whose relays replace the project's relay map (NET-5); with relays.list, both are used; empty for none"`
+	// List is [[relays.list]]: self-hosted relays, as `lendisk relay`
+	// prints them.
+	List []RelayEntry `toml:"list" help:"self-hosted relays (lendisk relay) that replace the project's relay map (NET-5), repeatable, as the relay prints its entry: 'host=relay.example.org,port=443,stun_port=3478,cert=sha256-raw:<hex>'; port 0 is 443, stun_port 0 is 3478 and -1 none, cert pins a self-signed certificate"`
+	// TailscaleBootstrap adds the hosted relays as a last resort; unset
+	// is auto (see Relays.Bootstrap).
+	TailscaleBootstrap Switch `toml:"tailscale_bootstrap" help:"also use Tailscale's hosted relays, as a last resort when none of this node's own relays answers (NET-5): true or false; unset, they are used only while relays.map_url and relays.list are both empty, so a node with relays of its own depends on no relay run by a third party"`
+	// AcceptPeerHints lets a friend's address choose the relay (NET-5a).
+	AcceptPeerHints Switch `toml:"accept_peer_hints" default:"false" help:"dial a friend through the relay its address names even when that relay is not one of this node's relays (NET-5a): true or false. A relay sees both nodes' IP addresses and how much they send"`
+}
+
+// Bootstrap reports whether Tailscale's hosted relays join the relay
+// set (NET-5, NET-5a): as relays.tailscale_bootstrap says, or, unset,
+// only while the node has no relays of its own (no map_url, no list):
+// which relays may see a node's traffic is the user's decision, so a
+// user who names relays gets those alone unless they ask for more.
+func (r Relays) Bootstrap() bool {
+	if strings.TrimSpace(string(r.TailscaleBootstrap)) == "" {
+		return r.MapURL == "" && len(r.List) == 0
+	}
+	return r.TailscaleBootstrap.On()
+}
+
+// RelayEntry is one [[relays.list]] entry: a DERP server.
+type RelayEntry struct {
+	Host     string `toml:"host"`
+	Port     int    `toml:"port"`
+	STUNPort int    `toml:"stun_port"`
+	Cert     string `toml:"cert"`
+}
+
+func (e RelayEntry) check() error {
+	switch {
+	case strings.TrimSpace(e.Host) == "" || strings.ContainsAny(e.Host, ":/ ") && net.ParseIP(e.Host) == nil:
+		return fmt.Errorf("host = %q: want a DNS name or an IP address", e.Host)
+	case e.Port < 0 || e.Port > 65535:
+		return fmt.Errorf("port = %d: want 1 to 65535, or 0 for 443", e.Port)
+	case e.STUNPort < -1 || e.STUNPort > 65535:
+		return fmt.Errorf("stun_port = %d: want 1 to 65535, 0 for 3478 or -1 for none", e.STUNPort)
+	}
+	if e.Cert != "" {
+		h, ok := strings.CutPrefix(e.Cert, "sha256-raw:")
+		if _, err := hex.DecodeString(h); !ok || err != nil || len(h) != 64 {
+			return fmt.Errorf("cert = %q: want sha256-raw: and 64 hex digits, as lendisk relay prints it, or empty for a certificate from a public CA", e.Cert)
+		}
+	}
+	return nil
+}
+
+// Relay is the [relay] section: `lendisk relay`, a self-hosted relay
+// (NET-5).
+type Relay struct {
+	Hostname string `toml:"hostname" help:"for lendisk relay: the DNS name or IP address friends' nodes reach this relay by; its certificate names it"`
+	Listen   string `toml:"listen" default:":443" help:"for lendisk relay: TCP address the relay serves on, over HTTPS"`
+	STUNPort Number `toml:"stun_port" default:"3478" help:"for lendisk relay: UDP port of its STUN server, which nodes learn their public address from; 0 for none"`
+	TLS      string `toml:"tls" default:"self-signed" help:"for lendisk relay: self-signed (kept in <data_dir>/relay, pinned by the entry's cert), letsencrypt (hostname a DNS name pointing here, listen on port 443) or files (relay.cert and relay.key)"`
+	Cert     string `toml:"cert" help:"for lendisk relay with tls = \"files\": absolute path of the certificate chain (PEM), re-read at each connection"`
+	Key      string `toml:"key" help:"for lendisk relay with tls = \"files\": absolute path of the private key (PEM)"`
+}
+
+// Switch is a true or false setting: a TOML boolean or the strings
+// "true" and "false", which Validate checks.
+type Switch string
+
+// UnmarshalText accepts a TOML boolean or string.
+func (s *Switch) UnmarshalText(b []byte) error { *s = Switch(b); return nil }
+
+// On is the setting, which Validate checked.
+func (s Switch) On() bool { return strings.EqualFold(strings.TrimSpace(string(s)), "true") }
+
+func (s Switch) check() error {
+	switch strings.ToLower(strings.TrimSpace(string(s))) {
+	case "true", "false":
+		return nil
+	}
+	return fmt.Errorf("%q: want true or false", string(s))
 }
 
 // Alerts is the [alerts] section (OPS-2, OPS-3).
@@ -471,6 +559,35 @@ func (c *Config) Validate() error {
 		if v, err := ParseSize(m); err != nil || v == 0 || v > 1<<62 {
 			errs = append(errs, fmt.Errorf("lending.max_total = %q: want a size above zero such as 240G, or empty for no cap", c.Lending.MaxTotal))
 		}
+	}
+	if n, err := strconv.Atoi(string(c.Tunnel.Port)); err != nil || n < 0 || n > 65535 {
+		errs = append(errs, fmt.Errorf("tunnel.port = %q: want a UDP port from 1 to 65535, or 0 for any", c.Tunnel.Port))
+	}
+	if u := c.Relays.MapURL; u != "" {
+		// The map's host chooses every relay the node uses: only
+		// over TLS (#42 review M2).
+		if p, err := url.Parse(u); err != nil || p.Scheme != "https" || p.Host == "" {
+			errs = append(errs, fmt.Errorf("relays.map_url = %q: want an https:// URL of a DERP map; its host chooses this node's relays, so plain http is refused", u))
+		}
+	}
+	for i, e := range c.Relays.List {
+		if err := e.check(); err != nil {
+			errs = append(errs, fmt.Errorf("relays.list entry %d (%s): %w", i+1, e.Host, err))
+		}
+	}
+	for _, s := range []struct {
+		key string
+		v   Switch
+	}{{"relays.tailscale_bootstrap", c.Relays.TailscaleBootstrap}, {"relays.accept_peer_hints", c.Relays.AcceptPeerHints}} {
+		if s.key == "relays.tailscale_bootstrap" && strings.TrimSpace(string(s.v)) == "" {
+			continue // auto
+		}
+		if err := s.v.check(); err != nil {
+			errs = append(errs, fmt.Errorf("%s = %w", s.key, err))
+		}
+	}
+	if n, err := strconv.Atoi(string(c.Relay.STUNPort)); err != nil || n < 0 || n > 65535 {
+		errs = append(errs, fmt.Errorf("relay.stun_port = %q: want a UDP port from 1 to 65535, or 0 for none", c.Relay.STUNPort))
 	}
 	if c.Alerts.Webhook != "" {
 		// Never echo the URL: its path or query may be a secret.

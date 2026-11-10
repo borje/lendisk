@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -20,13 +21,45 @@ import (
 	"github.com/borje/lendisk/internal/transport"
 )
 
-// relays is where the tunnel region is chosen from; tests set
-// app.regions to a local relay.
-func (a *app) relays() transport.RegionSource {
-	if a.regions == nil {
-		return transport.PublicRelays
+// relays is the node's relay set (NET-5): where the tunnel region is
+// chosen from, and the relays it dials friends through (NET-5a). Fetched
+// maps are kept in st, if given. Tests set app.regions to a local relay.
+func (a *app) relays(cfg *config.Loaded, st transport.NodeStore) transport.RegionSource {
+	if a.regions != nil {
+		return a.regions
 	}
-	return a.regions
+	set := &transport.RelaySet{MapURL: cfg.Relays.MapURL, Bootstrap: cfg.Relays.Bootstrap()}
+	if st != nil {
+		set.Cache = transport.StoreMapCache{Store: st}
+	}
+	for _, e := range cfg.Relays.List {
+		set.List = append(set.List, transport.RelayServer{Host: e.Host, Port: e.Port, STUNPort: e.STUNPort, Cert: e.Cert})
+	}
+	return set
+}
+
+// dialPolicy makes tc dial friends only through the node's relays,
+// unless relays.accept_peer_hints (NET-5a), and dial a friend's
+// explicit addresses directly (NET-3).
+func (a *app) dialPolicy(tc *transport.Tailcat, cfg *config.Loaded, db *state.DB, log *slog.Logger) {
+	tc.SetRelays(a.relays(cfg, db), cfg.Relays.AcceptPeerHints.On())
+	tc.SetEndpoints(func(peer identity.NodeID) []netip.AddrPort {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		f, err := db.GetFriendship(ctx, peer.String())
+		if err != nil {
+			return nil
+		}
+		var eps []netip.AddrPort
+		for _, s := range f.ExplicitAddresses {
+			if ap, err := netip.ParseAddrPort(s); err == nil {
+				eps = append(eps, ap)
+			} else {
+				log.Warn("ignoring a friend's explicit address that is not ip:port", "peer", f.Peer, "address", s)
+			}
+		}
+		return eps
+	})
 }
 
 // tunnel is the running peer transport.
@@ -58,7 +91,7 @@ type tunnel struct {
 // friend's quota call applied its number (the quota exchanger, #24).
 func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.Identity, db *state.DB, log *slog.Logger,
 	changed, ended func(), reported func(peer string)) (*tunnel, error) {
-	region, chosen, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays())
+	region, chosen, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays(cfg, db))
 	if err != nil {
 		return nil, err
 	}
@@ -69,6 +102,8 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 	if err != nil {
 		return nil, err
 	}
+	a.dialPolicy(tc, cfg, db, log)
+	tc.SetPort(uint16(cfg.Tunnel.Port.Int()))
 	adm := transport.NewAdmission(func(ctx context.Context, key identity.NodeID) (bool, error) {
 		_, r, err := db.TunnelPeer(ctx, key.String(), a.now())
 		return r != state.RoleNone, err
@@ -124,6 +159,7 @@ func (a *app) startTunnel(ctx context.Context, cfg *config.Loaded, id *identity.
 	conns := &bridge.Conns{}
 	go bridge.ServeTunnel(ctx, ln, tc.PeerOf, caps, conns, bridge.TunnelHandler(bridge.RolesIn(db, a.now), ctl, s3, caps, log), log)
 	go purgeInvites(ctx, db, adm, a.now, log)
+	go (&pathKeeper{Tr: tc, DB: db, Now: a.now, Log: log}).run(ctx)
 	log.Info("tunnel listening", "address", tc.Address(), "port", transport.Port, "region", region.RegionCode)
 	return &tunnel{Transport: tc, Admission: adm, S3: s3, Conns: conns, Manifests: manifests, Undeleter: undeleter}, nil
 }
@@ -172,7 +208,7 @@ func purgeInvites(ctx context.Context, db *state.DB, adm *transport.Admission, n
 // chooseRegion saves a tunnel region at init. Failing is not fatal:
 // serve chooses one when the relays are reachable.
 func (a *app) chooseRegion(ctx context.Context, cfg *config.Loaded, db *state.DB, log *slog.Logger) {
-	if _, _, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays()); err != nil {
+	if _, _, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays(cfg, db)); err != nil {
 		log.Warn("no tunnel region yet, so no address; `lendisk serve` chooses one when the relays are reachable", "err", err)
 	}
 }

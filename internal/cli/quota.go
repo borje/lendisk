@@ -177,15 +177,16 @@ func humanSize(n int64) string {
 }
 
 // reachability is PEER-4's: direct, relayed or offline, from the quota
-// call's last outcome; unknown before the first.
+// call's last outcome and the path keeper's disco pings (NET-4);
+// unknown before the first.
 func reachability(f state.Friendship) string {
 	switch {
 	case f.ExchangeError != "":
 		return "offline"
+	case f.Path != "":
+		return f.Path
 	case f.SeenAt.IsZero():
 		return "unknown"
-	case f.Path == "":
-		return "online"
 	}
-	return f.Path
+	return "online"
 }

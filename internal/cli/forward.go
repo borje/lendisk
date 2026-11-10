@@ -116,6 +116,7 @@ func (a *app) runPeerForward(cmd *cobra.Command, friend, listen string) error {
 		return err
 	}
 	defer dl.Close()
+	a.dialPolicy(dl, cfg, db, log)
 
 	printForward(a.out, ln.Addr().String(), peer.String(), id, secret, held)
 	if a.serving != nil {

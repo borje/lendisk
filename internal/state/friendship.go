@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -30,8 +31,17 @@ type Friendship struct {
 	PeerUse            int64  // the friend's count of what it stores here
 	LentThere          int64  // the friend's count, as lender, of what this node stores there
 	PeerProtocol       string // the friend's protocol version (NET-6)
-	Path               string // how the last answered call went: direct or relayed
+	Path               string // how the last answered call or path probe went: direct or relayed
 	ExchangeError      string // why the last call failed; "" once one is answered
+
+	// ExplicitAddresses are the friend's UDP addresses the user gave
+	// (NET-3), ip:port each, dialled directly.
+	ExplicitAddresses []string
+	// What the path keeper's last disco ping found (NET-4): the relay
+	// of a relayed path, the friend's ip:port of a direct one, and
+	// when; zero before the first.
+	PathRelay, PathEndpoint string
+	PathAt                  time.Time
 
 	// Since when each side has used less than half of the quota, as the
 	// quota calls found it (LEND-7, #37): LowThereSince this node at the
@@ -310,15 +320,16 @@ func addFriendship(ctx context.Context, x interface {
 
 const friendshipCols = `peer_key, created_at, address, own_number, peer_number, own_retention, peer_retention, dial_key,
 	told_number, seen_at, peer_repo_size, peer_use, lent_there, peer_protocol, path, exchange_error,
-	low_there_since, low_here_since`
+	low_there_since, low_here_since, explicit_addresses, path_relay, path_endpoint, path_at`
 
 func scanFriendship(row interface{ Scan(...any) error }) (Friendship, error) {
 	var f Friendship
 	var created int64
-	var addr, dial, proto, path, exErr sql.NullString
-	var own, peer, ownRet, peerRet, told, seen, size, use, there, lowThere, lowHere sql.NullInt64
+	var addr, dial, proto, path, exErr, explicit, pathRelay, pathEndpoint sql.NullString
+	var own, peer, ownRet, peerRet, told, seen, size, use, there, lowThere, lowHere, pathAt sql.NullInt64
 	err := row.Scan(&f.Peer, &created, &addr, &own, &peer, &ownRet, &peerRet, &dial,
-		&told, &seen, &size, &use, &there, &proto, &path, &exErr, &lowThere, &lowHere)
+		&told, &seen, &size, &use, &there, &proto, &path, &exErr, &lowThere, &lowHere,
+		&explicit, &pathRelay, &pathEndpoint, &pathAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return f, ErrNotFound
 	} else if err != nil {
@@ -341,7 +352,43 @@ func scanFriendship(row interface{ Scan(...any) error }) (Friendship, error) {
 	if lowHere.Valid {
 		f.LowHereSince = time.Unix(lowHere.Int64, 0)
 	}
+	f.ExplicitAddresses = strings.Fields(explicit.String)
+	f.PathRelay, f.PathEndpoint = pathRelay.String, pathEndpoint.String
+	if pathAt.Valid {
+		f.PathAt = time.Unix(pathAt.Int64, 0)
+	}
 	return f, nil
+}
+
+// SetExplicitAddresses replaces the friend's explicit addresses (NET-3),
+// ip:port each; none clears them. ErrNotFound if peer is no friend.
+func (db *DB) SetExplicitAddresses(ctx context.Context, peer string, addrs []string) error {
+	res, err := db.ExecContext(ctx, `UPDATE friendship SET explicit_addresses = ? WHERE peer_key = ?`,
+		nullString(strings.Join(addrs, " ")), peer)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// RecordPath stores what a path probe of the friend found (NET-4):
+// direct with the friend's endpoint, or relayed through relay. A
+// friendship ended meanwhile is left alone.
+func (db *DB) RecordPath(ctx context.Context, peer string, direct bool, relay, endpoint string, at time.Time) error {
+	path := "relayed"
+	if direct {
+		path, relay = "direct", ""
+	} else {
+		endpoint = ""
+	}
+	_, err := db.ExecContext(ctx, `UPDATE friendship SET path = ?, path_relay = ?, path_endpoint = ?, path_at = ? WHERE peer_key = ?`,
+		path, nullString(relay), nullString(endpoint), at.Unix(), peer)
+	return err
 }
 
 // GetFriendship reads the friendship with peer; ErrNotFound if none.
