@@ -57,8 +57,13 @@ restic init && restic backup ~
 Add a friend. Each of you runs a node; friends reach each other
 directly where their NATs allow, and through relays otherwise, so both
 need internet access but no open ports. `lendisk status` and
-`lendisk peer list` say which. To use only your own relay, run
-`lendisk relay` on a VPS and list its entry in `relays.list`.
+`lendisk peer list` say which. Two friends need a relay both can
+reach for their first handshake. The project runs no relays yet, so by
+default lendisk uses Tailscale's hosted relays: Tailscale then sees
+which IP addresses talk to each other and how much, never what (the
+traffic is end-to-end encrypted). To use only your own relay, run
+`lendisk relay` on a VPS and list its entry in `relays.list`; with any
+relay of your own listed, Tailscale's are not used.
 
 ```sh
 # on the friend's node: lend you 100G, print a single-use invite

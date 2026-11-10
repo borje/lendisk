@@ -1,6 +1,6 @@
 # lendisk — requirements
 
-Status: draft v0.11.5, 2026-11-09. Split out of SPEC v0.6 as v0.7; v0.8
+Status: draft v0.11.6, 2026-11-10. Split out of SPEC v0.6 as v0.7; v0.8
 admits a storage engine with its own on-disk format (P-5); v0.8.1 makes
 peer admission fail closed (SEC-10 to SEC-15); v0.9 admits an
 S3-compatible service the user names as the store, holding the node's
@@ -25,7 +25,8 @@ replaced version (EP-7, EP-11, LEND-4, RET-1); v0.11.4 supports Kopia repositori
 in format version 2 or later only (COMPAT-1); v0.11.5 places each data
 object of a bucket with `copies` ≥ 2 at one friend fewer and an
 overflow target while friends cannot hold `copies` of the repository
-(REPL-12). The design
+(REPL-12); v0.11.6 says the first handshake between two nodes needs a
+relay, after which a direct path needs none (NET-2, NET-3). The design
 decisions that were §3 of that document, and the implementation detail
 that was mixed into its §4, live in DESIGN.md.
 
@@ -786,10 +787,15 @@ double the surface for no change in the core problem.
   and from pending invites.
 - **NET-2** Two nodes behind different NATs, including symmetric NAT on one
   side, shall be able to replicate. Direct connection is attempted first;
-  relay is the fallback. AC: integration test with two nodes behind
-  simulated NAT, with and without a relay reachable.
+  relay is the fallback. The first handshake between two nodes needs a
+  relay both can reach; once a direct path exists, traffic uses it and
+  survives the relay going away. AC: integration test with two nodes
+  behind simulated NAT: with a relay reachable they connect, directly
+  where the NATs allow, and keep replicating after the relay stops;
+  with no relay reachable no connection is made.
 - **NET-3** A node with a static public address or port forward shall be
-  dialled directly. Users may add explicit addresses to a peer record.
+  dialled directly once the first handshake (NET-2) has been made. Users
+  may add explicit addresses to a peer record.
 - **NET-4** Relay use shall be visible in status output, and the node
   should re-attempt a direct path periodically while relayed.
 - **NET-5** Relays shall exist for peers that cannot connect directly.
