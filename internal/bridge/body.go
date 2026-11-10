@@ -80,18 +80,20 @@ func (b *Bridge) floor() (rate int64, window time.Duration) {
 // deadline, as before.
 type boundedBody struct {
 	io.ReadCloser
-	rc      *http.ResponseController
-	stall   time.Duration
-	min     int64
-	rate    int64
-	window  time.Duration
-	mu      sync.Mutex
-	win     int64
-	since   time.Time // the floor window's start
-	got     int64     // bytes in the floor window
-	done    bool
-	stalled bool
-	slow    bool // ended for the floor rate
+	rc       *http.ResponseController
+	stall    time.Duration
+	min      int64
+	rate     int64
+	window   time.Duration
+	mu       sync.Mutex
+	win      int64
+	deadline time.Time // the stall deadline
+	since    time.Time // the floor window's start
+	got      int64     // bytes in the floor window
+	done     bool
+	stalled  bool
+	slow     bool   // ended for the floor rate
+	release  func() // ends the body's share of the lending limit
 }
 
 // errBelowFloor ends a body's read when it brought too little over a
@@ -101,32 +103,40 @@ var errBelowFloor = errors.New("the request body arrives below the floor rate")
 // bound wraps r's body, if it has one, and returns the function the
 // handler calls when it returns. With a Pace, the body is read at the
 // borrower's lending limit (LEND-5), and the time the limit holds it
-// back moves its floor window on, so the lender's own pacing never ends
-// a borrower's body as slow.
+// back, up to the body's fair share of the limit, moves its floor
+// window and its stall deadline on, so the lender's own pacing never
+// ends a borrower's body as slow, and a body trickling behind another
+// of the borrower's that keeps the limit busy is not excused for that
+// one's bytes (#87).
 func (b *Bridge) bound(w http.ResponseWriter, r *http.Request, peer string) (finish func()) {
 	if r.Body == nil || r.Body == http.NoBody || r.ContentLength == 0 {
 		return func() {}
 	}
 	rc := http.NewResponseController(w)
-	if err := rc.SetReadDeadline(time.Now().Add(b.stall())); err != nil {
+	deadline := time.Now().Add(b.stall())
+	if err := rc.SetReadDeadline(deadline); err != nil {
 		b.Log.Warn("tunnel: cannot bound a request body; serving it unbounded", "err", err)
 		return func() {}
 	}
 	rate, window := b.floor()
 	bb := &boundedBody{ReadCloser: r.Body, rc: rc, stall: b.stall(), min: b.minProgress(),
-		rate: rate, window: window, since: time.Now()}
+		rate: rate, window: window, since: time.Now(), deadline: deadline, release: func() {}}
 	if b.Pace != nil {
+		paced, done := b.Pace.LendIn(r.Context(), peer, r.Body, bb.excuse)
 		bb.ReadCloser = struct {
 			io.Reader
 			io.Closer
-		}{b.Pace.LendIn(r.Context(), peer, r.Body, bb.excuse), r.Body}
+		}{paced, r.Body}
+		bb.release = done
 	}
 	r.Body = bb
 	return bb.finish
 }
 
-// excuse moves the floor window and the stall deadline on by d, a wait
-// the lender's own limit made (LEND-5).
+// excuse moves the floor window and the stall deadline on by d, the
+// part of a wait the lender's own limit made that the body's own bytes
+// account for (LEND-5, pace.Pacer.LendIn). Only MinProgress more bytes
+// set the stall deadline a whole stall period ahead (Read).
 func (bb *boundedBody) excuse(d time.Duration) {
 	bb.mu.Lock()
 	defer bb.mu.Unlock()
@@ -134,7 +144,8 @@ func (bb *boundedBody) excuse(d time.Duration) {
 		return
 	}
 	bb.since = bb.since.Add(d)
-	bb.rc.SetReadDeadline(time.Now().Add(bb.stall))
+	bb.deadline = bb.deadline.Add(d)
+	bb.rc.SetReadDeadline(bb.deadline)
 }
 
 func (bb *boundedBody) Read(p []byte) (int, error) {
@@ -154,7 +165,8 @@ func (bb *boundedBody) Read(p []byte) (int, error) {
 		bb.win += int64(n)
 		if bb.win >= bb.min {
 			bb.win = 0
-			bb.rc.SetReadDeadline(time.Now().Add(bb.stall))
+			bb.deadline = time.Now().Add(bb.stall)
+			bb.rc.SetReadDeadline(bb.deadline)
 		}
 		bb.got += int64(n)
 		if el := time.Since(bb.since); el >= bb.window {
@@ -179,6 +191,7 @@ func (bb *boundedBody) finish() {
 	if !bb.done {
 		bb.done = true
 		bb.rc.SetReadDeadline(time.Time{})
+		bb.release()
 	}
 }
 

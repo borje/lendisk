@@ -54,17 +54,35 @@ func (x *Fetcher) Fetch(ctx context.Context, place, bucket, key string) (io.Read
 	if err != nil {
 		return nil, err
 	}
-	body, err := c.Get(ctx, bucket, key)
-	if err != nil || x.Pace == nil {
-		return body, err
+	if x.Pace == nil {
+		return c.Get(ctx, bucket, key)
 	}
-	return pacedBody{Reader: x.Pace.Fetch(ctx, place, body), Closer: body}, nil
+	// A fetch slot, held until the body is closed, keeps each fetch
+	// sharing a download limit at MinRate at least (#87).
+	release, err := x.Pace.FetchSlot(ctx, place)
+	if err != nil {
+		return nil, fmt.Errorf("waiting for a fetch slot under the download limit: %w", err)
+	}
+	body, err := c.Get(ctx, bucket, key)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	return &pacedBody{Reader: x.Pace.Fetch(ctx, place, body), body: body, release: release}, nil
 }
 
-// pacedBody is a fetched body read through the pacer.
+// pacedBody is a fetched body read through the pacer; closing it gives
+// its fetch slot back.
 type pacedBody struct {
 	io.Reader
-	io.Closer
+	body    io.Closer
+	release func()
+}
+
+func (b *pacedBody) Close() error {
+	err := b.body.Close()
+	b.release()
+	return err
 }
 
 func (x *Fetcher) client(place, addr string) (*Friend, error) {

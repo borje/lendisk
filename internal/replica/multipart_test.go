@@ -486,3 +486,110 @@ func TestALargeRewriteIsMarkedAtItsCreate(t *testing.T) {
 		t.Fatalf("log %v, want %q", b.log, want)
 	}
 }
+
+// REPL-6 (#87): the upload of a row that left its place's FIFO by
+// another way than its sender (re-routed, refused or cancelled while the
+// daemon was down, say) is aborted at the place, as far as it answers,
+// as well as forgotten here, so its parts do not stay counted at the
+// lender until it abandons them a week later.
+func TestAStaleUploadIsAbortedAtThePlace(t *testing.T) {
+	fx := newFixture(t, "B")
+	fx.paced(pace.Settings{PartSize: 5})
+	seq := fx.write("laptop", "data/big", twentyThree)
+	b := fx.places["B"]
+	id, err := b.Create(t.Context(), Object{Bucket: "laptop", Key: "data/big", Size: 23, SHA256: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.db.BeginTransfer(t.Context(), state.Transfer{Place: "B", Seq: seq, UploadID: id, PartSize: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if err := fx.db.RefusePlacement(t.Context(), "B", seq, "refused elsewhere"); err != nil {
+		t.Fatal(err)
+	}
+	fx.run()
+	fx.settle("the stale upload not aborted at the place", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return len(b.uploads) == 0
+	})
+	if got := fx.placeLog("B"); strings.Join(got, "|") != "create laptop/data/big|abort laptop/data/big" {
+		t.Fatalf("the place saw %v", got)
+	}
+	if _, ok := fx.transfer("B", seq); ok {
+		t.Fatal("the stale upload is still recorded")
+	}
+}
+
+// REPL-6 (#87): a completion whose answer was lost (the place stored the
+// object, the worker never heard) is not sent again from the first
+// part: the retry finds the upload gone, asks the place for the key,
+// and acknowledges it when the place holds it with the object's hash.
+func TestALostCompletionAnswerIsAcknowledgedFromThePlace(t *testing.T) {
+	fx := newFixture(t, "B")
+	fx.paced(pace.Settings{PartSize: 5})
+	b := fx.places["B"]
+	var lost atomic.Bool
+	b.fail = func(op, key string) error {
+		if op == "complete" && !lost.Swap(true) {
+			// Complete it as the place would, under b.mu, then lose the
+			// answer.
+			for id, u := range b.uploads {
+				var whole []byte
+				for i := 1; i <= len(u.parts); i++ {
+					whole = append(whole, u.parts[i]...)
+				}
+				b.objs[u.key] = whole
+				delete(b.uploads, id)
+			}
+			return errors.New("connection reset after the answer was sent")
+		}
+		return nil
+	}
+	seq := fx.write("laptop", "data/big", twentyThree)
+	fx.run()
+	fx.drained("B")
+	if string(b.objs["laptop/data/big"]) != twentyThree {
+		t.Fatal("assembled wrong")
+	}
+	if n := strings.Count(strings.Join(fx.placeLog("B"), "|"), "create"); n != 1 {
+		t.Fatalf("the object was sent again after its completion: %v", fx.placeLog("B"))
+	}
+	if _, _, _, read := b.snapshot(); read != 23 {
+		t.Fatalf("read %d bytes, want the object once", read)
+	}
+	if _, ok := fx.transfer("B", seq); ok {
+		t.Fatal("the transfer is kept after the acknowledgement")
+	}
+	if s := fx.rowState("B", seq); s != state.PlacementAcked {
+		t.Fatalf("the row at B is %v, want acknowledged", s)
+	}
+}
+
+// REPL-6 (#87): after a lost completion answer, a place holding the key
+// with other bytes (not this object) does not acknowledge it: the
+// object starts over.
+func TestALostCompletionWithOtherBytesAtTheKeyStartsOver(t *testing.T) {
+	fx := newFixture(t, "B")
+	fx.paced(pace.Settings{PartSize: 5})
+	b := fx.places["B"]
+	var lost atomic.Bool
+	b.fail = func(op, key string) error {
+		if op == "complete" && !lost.Swap(true) {
+			b.uploads = map[string]*upload{}
+			b.objs["laptop/data/big"] = []byte("something else")
+			return errors.New("connection reset")
+		}
+		return nil
+	}
+	fx.write("laptop", "data/big", twentyThree)
+	fx.run()
+	fx.settle("not stored", func() bool {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		return string(b.objs["laptop/data/big"]) == twentyThree
+	})
+	if n := strings.Count(strings.Join(fx.placeLog("B"), "|"), "create"); n != 2 {
+		t.Fatalf("%d uploads created, want the object started over: %v", n, fx.placeLog("B"))
+	}
+}

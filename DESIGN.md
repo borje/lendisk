@@ -2937,6 +2937,8 @@ upstream bucket is Q-V.
   | Put refused (507, 412, LEND-4; or the node's store, #50) | nothing new | 0 (out of the count); a 412's other bytes only from the answer |
   | Put dropped (never sent, #19, #25) | 0 | 0 |
   | Put abandoned (taken, never acknowledged, #21) | S if a send landed, else 0 | 0 until the answer |
+  | Put in parts, under way (#23) | the parts received, plus 4 KiB | S (queued) |
+  | Put in parts whose row left the FIFO (re-routed, refused, cancelled), the upload forgotten (#87) | its parts, plus 4 KiB, until the borrower's abort or, unreached, a week with no part (§3.5 LEND-1) | 0 |
   | Unstarted put cancelled by a delete | 0 | 0 (row removed) |
   | Delete queued or acknowledged | the object, then its tomb, until the purge | S: −S in `place_use`, +S in `place_freed` |
   | Put acknowledged after its delete was placed (#85) | S, then its tomb, until the purge | S: the put keeps S, its delete takes −S more, +S in `place_freed` |
@@ -4081,8 +4083,20 @@ upstream bucket is Q-V.
   place (best effort) and drop its record (`Worker.forget`); records
   of rows that left their FIFO otherwise (re-routed, refused by another
   sender) are dropped at start and on each re-routing tick
-  (`state.DB.StaleTransfers`), their uploads left for the lender to
-  abandon. Objects up to the part size are one PUT and restart whole.
+  (`state.DB.StaleTransfers`), and their uploads aborted at the place
+  off the worker's loop, one at a time, as far as the place answers
+  (`Worker.abortStale`, a client built from `lendisk.db`, 30 s each);
+  one it does not reach the lender abandons after a week (#87,
+  `TestAStaleUploadIsAbortedAtThePlace`). *A lost completion answer
+  (#87):* an upload the place no longer has (`NoSuchUpload` at the
+  listing or the completion) is first checked with a `HEAD` of the key:
+  if the place holds the object with the row's hash, the completion
+  landed and its answer was lost, so the row is acknowledged, not sent
+  again from the first part; otherwise the object starts over; a
+  failed `HEAD` keeps the record to ask again
+  (`TestALostCompletionAnswerIsAcknowledgedFromThePlace`,
+  `TestALostCompletionWithOtherBytesAtTheKeyStartsOver`). Objects up to
+  the part size are one PUT and restart whole.
   *Decision:* the record is per placement row, not on the queue row
   the requirement's wording suggests, because each place's upload has
   its own ID and parts. Against a real lender with `SIGKILL` inside part
@@ -4115,7 +4129,17 @@ upstream bucket is Q-V.
   for its length), so a body is never trickled below the floor; a
   per-friend limit applies to one body at a time, as each place sends
   one object at a time (`TestUploadSlotsKeepEveryBodyAboveTheFloor`,
-  `TestAGlobalLimitPacesByConcurrency`).
+  `TestAGlobalLimitPacesByConcurrency`). Downloads have no floor at the
+  lender but a per-write deadline (2 minutes, §3.9 *Per-friend caps*),
+  and read-through fetches run at once, so a fetch takes a fetch slot
+  until its body is closed (`Pacer.FetchSlot`, #87): the global
+  `download_limit` and the friend's own each admit as many fetches as
+  they keep at `MinRate` each, at least one
+  (`TestFetchSlotsKeepEveryFetchAboveMinRate`,
+  `TestAFetchWaitsForASlotUnderTheDownloadLimit`). A friend's limiter
+  is made on its first transfer with the rates read under the lock
+  `Pacer.Set` holds, so a reload beside it cannot leave the old rate
+  (`TestALimiterMadeDuringASetHasTheNewRate`).
   The schedule (`replication.schedule`, local-time windows such as
   "01:00-07:00", comma-separated, one ending before it starts running
   past midnight; empty is always) is checked before a row is taken and
@@ -4137,9 +4161,14 @@ upstream bucket is Q-V.
   still apply on top (`cli.reloader`). The pacing settings
   (`part_size`, `schedule`, the limits, LEND-5's) apply from each
   transfer's next read (`Pacer.Set`, `SetLimitAt`, Q-Y.4); a file that
-  no longer loads keeps the settings in force, with an error logged;
-  a change to any other setting is logged as waiting for the next
-  start (`TestPacingChangesApplyWithoutARestart`). Precedent: rclone
+  no longer loads keeps the settings in force, with an error logged
+  (`TestABadConfigFileOnReloadKeepsTheRatesInForce`); a change to any
+  other setting is logged as waiting for the next start
+  (`TestPacingChangesApplyWithoutARestart`). SIGHUP's default action
+  ends a process, so `serve` installs its handler first, before the
+  config, `lendisk.db` and its migrations: a reload racing the start
+  is kept and applied once the reloader runs
+  (`TestASIGHUPDuringStartUpReloadsTheRatesAndDoesNotKill`, #87). Precedent: rclone
   changes `--bwlimit` at run time through its rc API
   (`core/bwlimit`) and a timetable, restic's `--limit-upload` is fixed
   for the run, Syncthing applies most settings from its config live and
@@ -4750,8 +4779,20 @@ the handler's own reads and is never cancelled; nothing below
   lender's own limit holds a body back moves its floor window and its
   stall deadline on (`boundedBody.excuse`), so a lender's pacing never
   ends a borrower's body as slow, however many of its bodies share the
-  limit (`TestALenderLimitsOneBorrowerWithoutEndingItsBodies`). It
-  changes without a restart, like REPL-7's.
+  limit (`TestALenderLimitsOneBorrowerWithoutEndingItsBodies`,
+  `TestBodiesSharingABorrowersLimitAreAllServed`). A body is credited
+  a wait only up to its fair share (#87, `Pacer.LendIn`): the bytes
+  that read brought at the limit, times the borrower's bodies under
+  way; and the credit moves the stall deadline by as much, while only
+  `MinProgress` more bytes set it a whole stall period ahead. Credited
+  in full, a body trickling a byte at a time beside one the borrower
+  keeps at its limit waited as long as that one and was excused all of
+  it, so neither the floor nor the stall bound ever ended it. So the
+  bound above holds for a paced body too
+  (`TestABodyTricklingBesideABusyOneIsEndedByTheFloorRate`,
+  `TestABodyTricklingBesideABusyOneIsEndedByTheStallBound`,
+  `TestALendWaitIsCreditedOnlyUpToTheBodysFairShare`). It changes
+  without a restart, like REPL-7's.
 - **LEND-4** `Lending` hashes a borrower's body as it streams it to the
   backend (SHA-256) and compares with `x-amz-meta-lendisk-sha256` at
   the end of the stream: a mismatch fails that last read, so posix
