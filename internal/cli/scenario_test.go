@@ -151,7 +151,10 @@ func (f *fourFriends) drain() {
 	f.t.Helper()
 	for id, pn := range f.friends {
 		if pn.p != nil && !pn.p.exited() {
-			if p := f.an.drained(id, 90*time.Second); p.Refused != 0 {
+			// Three minutes: on a loaded runner a send retried after a
+			// busy answer (#92, #93: backoff or Retry-After) can take
+			// well over the 90 s this was (TestScenarioQuota flaked).
+			if p := f.an.drained(id, 3*time.Minute); p.Refused != 0 {
 				f.t.Fatalf("place %+v", p)
 			}
 		}
