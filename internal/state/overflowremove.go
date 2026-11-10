@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -84,21 +85,65 @@ func (db *DB) forgetSplit() {
 
 // UpdateOverflow writes o's endpoint, region and max_bytes, and what a
 // new check found (lifecycle, version_removal), to the target of its
-// name (#96); its versioning goes through RecordOverflowVersioning.
-// ErrNotFound if there is no such target.
-func (db *DB) UpdateOverflow(ctx context.Context, o Overflow) error {
+// name (#96), in one transaction with the versioning that check read
+// at now, recorded as RecordOverflowVersioning records it ("": no
+// check, versioning unchanged). It returns the versioning change, if
+// any. ErrNotFound if there is no such target.
+func (db *DB) UpdateOverflow(ctx context.Context, o Overflow, versioning string, now time.Time) (*VersioningChange, error) {
 	defer db.forgetSplit()
-	r, err := db.ExecContext(ctx, `UPDATE overflow SET endpoint = ?, region = ?, max_bytes = ?, lifecycle = ?,
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	r, err := tx.ExecContext(ctx, `UPDATE overflow SET endpoint = ?, region = ?, max_bytes = ?, lifecycle = ?,
 		version_removal = ? WHERE name = ?`, o.Endpoint, o.Region, o.MaxBytes, o.Lifecycle, o.VersionRemoval, o.Name)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if n, err := r.RowsAffected(); err != nil {
-		return err
+		return nil, err
 	} else if n == 0 {
-		return ErrNotFound
+		return nil, ErrNotFound
 	}
-	return nil
+	var ch *VersioningChange
+	if versioning != "" {
+		if ch, err = recordVersioning(ctx, tx, o.Name, versioning, now); err != nil {
+			return nil, err
+		}
+	}
+	return ch, tx.Commit()
+}
+
+// HeldSample returns up to n of the objects place acknowledged and
+// still holds as their keys' latest writes, spread over the write order
+// (#96: `overflow set --endpoint` asks the new endpoint for them).
+func (db *DB) HeldSample(ctx context.Context, place string, n int) ([]SampleObject, error) {
+	total, _, err := db.Sampleable(ctx, place)
+	if err != nil || total == 0 || n <= 0 {
+		return nil, err
+	}
+	var out []SampleObject
+	seen := map[int64]bool{}
+	for i := range n {
+		at := int64(0)
+		if n > 1 {
+			at = int64(i) * (total - 1) / int64(n-1)
+		}
+		if seen[at] {
+			continue
+		}
+		seen[at] = true
+		o, err := db.SampleableAt(ctx, place, at)
+		if errors.Is(err, ErrNotFound) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, nil
 }
 
 // removable is the SQL condition that the overflow target of table

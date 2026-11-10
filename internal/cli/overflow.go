@@ -191,18 +191,23 @@ func (a *app) runOverflowSet(ctx context.Context, name string, regionSet bool, f
 		}
 		check = &ch
 		o.Lifecycle, o.VersionRemoval = ch.Lifecycle, ch.VersionRemoval
+		// The same bucket (#96 review): the objects the target holds
+		// must be there, or the endpoint reaches another bucket and every
+		// copy there would count as held where it is not.
+		if err := sameBucket(cctx, db, c, o); err != nil {
+			return fmt.Errorf("overflow target %s not changed: %w", name, err)
+		}
 	}
-	if err := db.UpdateOverflow(ctx, o); errors.Is(err, state.ErrNotFound) {
+	// Its versioning as read there is recorded with the change, as the
+	// daily read records one (#97).
+	versioning := ""
+	if check != nil {
+		versioning = check.Versioning
+	}
+	if _, err := db.UpdateOverflow(ctx, o, versioning, a.now()); errors.Is(err, state.ErrNotFound) {
 		return noTarget(name)
 	} else if err != nil {
 		return err
-	}
-	if check != nil {
-		// Its versioning as read there, a change recorded as the daily
-		// read records one (#97).
-		if _, err := db.RecordOverflowVersioning(ctx, name, check.Versioning, a.now()); err != nil {
-			return err
-		}
 	}
 	fmt.Fprintf(a.out, "Overflow target %s: bucket %s at %s, up to %s\n", name, o.Bucket, o.Endpoint, formatSize(o.MaxBytes))
 	if check != nil {
@@ -217,6 +222,35 @@ func (a *app) runOverflowSet(ctx context.Context, name string, regionSet bool, f
 			formatSize(holds[name].Use))
 	}
 	fmt.Fprintln(a.out, "The daemon uses the change at its next look at the targets; no restart is needed.")
+	return nil
+}
+
+// sameBucketSample is how many of a target's objects `overflow set
+// --endpoint` asks the new endpoint for.
+const sameBucketSample = 3
+
+// sameBucket checks that c, the client at o's new endpoint, reaches the
+// bucket the target is: up to sameBucketSample of the objects it
+// acknowledged, spread over the write order, must be there with the
+// hash lendisk stored (#96 review). A target holding nothing passes.
+func sameBucket(ctx context.Context, db *state.DB, c *replica.Client, o state.Overflow) error {
+	sample, err := db.HeldSample(ctx, o.Place(), sameBucketSample)
+	if err != nil {
+		return err
+	}
+	for _, s := range sample {
+		st, ok, err := c.Stat(ctx, s.Bucket, s.Key)
+		switch {
+		case err != nil:
+			return fmt.Errorf("asking %s for an object the target holds: %w", o.Endpoint, err)
+		case !ok:
+			return fmt.Errorf("%s has no %s of bucket %s, which the target holds: it does not reach the same bucket; "+
+				"to move to another bucket or provider, add a new target and remove this one", o.Endpoint, s.Key, s.Bucket)
+		case st.SHA256 != "" && st.SHA256 != s.SHA256:
+			return fmt.Errorf("%s holds another version of %s of bucket %s than the target: it does not reach the same bucket",
+				o.Endpoint, s.Key, s.Bucket)
+		}
+	}
 	return nil
 }
 

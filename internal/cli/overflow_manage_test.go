@@ -7,11 +7,12 @@ import (
 
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/overflow/overflowtest"
+	"github.com/borje/lendisk/internal/replica"
 )
 
 // #96: `overflow set` changes a target's max_bytes, and its endpoint
-// only after the credential is tested there; a failure changes
-// nothing. Usage errors exit 2, an unknown target 1.
+// only after the credential is tested there and the objects the target
+// holds are found there; a failure changes nothing. Usage errors exit 2, an unknown target 1.
 func TestOverflowSetChangesMaxBytesAndRetestsAnEndpoint(t *testing.T) {
 	serving(t, 0) // the provider is versitygw, in this process
 	srv := overflowtest.Start(t, "offsite", true)
@@ -52,10 +53,51 @@ func TestOverflowSetChangesMaxBytesAndRetestsAnEndpoint(t *testing.T) {
 	if o := n.status().Capacity.Overflow[0]; o.MaxBytes != 100<<30 {
 		t.Fatalf("a failed set changed the target: %+v", o)
 	}
-	// The same bucket at another URL for it (localhost for 127.0.0.1):
-	// tested, then written.
+	// The target holds a pack, as the index says. An endpoint that
+	// reaches a bucket without it, or with other bytes there, is not the
+	// same bucket: refused, nothing changes (#96 review).
 	n.env = overflowEnv(srv)
 	moved := strings.Replace(srv.Endpoint, "127.0.0.1", "localhost", 1)
+	const pack, sha = "data/ab/abcdef", "ab01cd23ab01cd23ab01cd23ab01cd23ab01cd23ab01cd23ab01cd23ab01cd23"
+	db := openDB(t, n)
+	r, err := db.Exec(`INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
+		VALUES ('laptop', ?, 'put', 'data', 'done', 4, ?, 1)`, pack, sha)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq, _ := r.LastInsertId()
+	if _, err := db.Exec(`INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
+		VALUES (?, 'overflow:b2', 'laptop', ?, 'put', 'acked', ?, 1, 4100)`, seq, pack, sha); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	key := replica.OverflowKey("lendisk", n.identity().SealedName("laptop"), pack)
+	for _, c := range []struct {
+		what string
+		put  func() error
+		want string
+	}{
+		{"a bucket without the pack", func() error { return nil }, "does not reach the same bucket"},
+		{"other bytes at the key", func() error {
+			return srv.Put(t.Context(), key, []byte("othr"), map[string]string{replica.MetaSHA256: strings.Repeat("0", 64)})
+		}, "another version"},
+	} {
+		if err := c.put(); err != nil {
+			t.Fatal(err)
+		}
+		code, out, e := n.run("", "", "overflow", "set", "b2", "--endpoint", moved, "--region", "us-east-1")
+		if code != 1 || !strings.Contains(e, "not changed") || !strings.Contains(e, c.want) {
+			t.Fatalf("set --endpoint at %s: %d %s%s", c.what, code, out, e)
+		}
+		if o := n.status().Capacity.Overflow[0]; o.Endpoint != srv.Endpoint {
+			t.Fatalf("set --endpoint at %s changed the target: %+v", c.what, o)
+		}
+	}
+	// The same bucket at another URL for it (localhost for 127.0.0.1),
+	// holding the pack: tested, then written.
+	if err := srv.Put(t.Context(), key, []byte("pack"), map[string]string{replica.MetaSHA256: sha}); err != nil {
+		t.Fatal(err)
+	}
 	code, out, e = n.run("", "", "overflow", "set", "b2", "--endpoint", moved, "--region", "us-east-1")
 	if code != 0 || !strings.Contains(out, "credential: tested there; versioning enabled") {
 		t.Fatalf("set --endpoint: %d %s%s", code, out, e)

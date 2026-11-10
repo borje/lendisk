@@ -231,6 +231,7 @@ func (db *DB) ackPlacement(ctx context.Context, tx *sql.Tx, place string, seq in
 // when re-placement moved a copy rather than drained one, and without
 // it the object would have fewer than `copies` acknowledged copies at
 // such places. Re-placement then drops it when that is safe (decide).
+// A target being removed (#96) is kept the same way.
 func (db *DB) keepReplaced(ctx context.Context, tx *sql.Tx, bucket string, seq int64, replaced string) (bool, error) {
 	ps, err := poolPlaces(ctx, tx)
 	if err != nil {
@@ -242,12 +243,19 @@ func (db *DB) keepReplaced(ctx context.Context, tx *sql.Tx, bucket string, seq i
 	}
 	now := db.now()
 	intact := map[string]bool{}
+	removing := false
 	for _, p := range ps {
 		if p.cond != ConditionRemoved && !p.gone(db, now) && !p.removing && !unverified[p.peer] {
 			intact[p.peer] = true
 		}
+		if p.peer == replaced && p.removing {
+			removing = true
+		}
 	}
-	if !intact[replaced] {
+	// A target being removed still holds its copy, and counts until the
+	// object has `copies` intact ones without it (#96 review): its copy
+	// goes only then, whatever happened to the others meanwhile.
+	if !intact[replaced] && !removing {
 		return false, nil // drained: it never counted
 	}
 	acked, err := column(ctx, tx, `SELECT place FROM placement WHERE seq = ? AND state = 'acked' AND place != ?`, seq, replaced)

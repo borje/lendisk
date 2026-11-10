@@ -1132,10 +1132,17 @@ upstream bucket is Q-V.
   (`listedPlaces` reads friends only): it holds metadata only beside
   data. `recover` lists a target only when its credential is in the
   shell's environment; otherwise the list waits, failed, for the daemon,
-  which has it. What a target listed of a key whose delete it held as a
-  client-side tomb (the tombs live in the lost `lendisk.db`) comes back
-  as a live single copy; restic and Kopia ignore an unreferenced pack,
-  and the next prune deletes it again.
+  which has it. A target may still hold keys the node deleted, their
+  deletes held as client-side tombs in the lost `lendisk.db` (S3-4).
+  So a metadata or snapshot key that only targets list is not live on
+  their word (`onlyTargetsList`, #96 review): friends hold every live
+  metadata key (REPL-12), and a revived restic index would let later
+  backups dedupe against packs pruned at the friends, so later
+  snapshots would reference missing data. A friend's list naming the
+  key decides it again, the target's copy counted with it
+  (`TestMetadataOnlyATargetListsIsNotLive`). A data key a target alone
+  lists counts as a single source, as a friend's: restic and Kopia
+  ignore an unreferenced pack, and the next prune deletes it again.
   The
   `placement` table (D6) and the hash index are then rebuilt from the
   control API `list` of each reachable place for each sealed bucket
@@ -7112,9 +7119,13 @@ of the `copies`, and the estimated cost (S3-7).
   [--endpoint URL [--region R]]` writes the row (`state.UpdateOverflow`;
   the split and the pool fingerprint see it at once). A new endpoint is
   where the same bucket is reached: the credential is tested there as
-  by add (`CheckOverflow`, no lifecycle rule created) before anything is
-  written, and its versioning is recorded as the daily read records one
-  (`RecordOverflowVersioning`); the worker rebuilds the target's client
+  by add (`CheckOverflow`, no lifecycle rule created), and up to three
+  objects the target acknowledged, spread over the write order
+  (`HeldSample`), must be there with the hash lendisk stored, or it
+  reaches another bucket and the change is refused (a target holding
+  nothing passes); only then is the row written, in one transaction
+  with the versioning read there, recorded as the daily read records
+  one (`UpdateOverflow`); the worker rebuilds the target's client
   when its endpoint or region changes. A `max_bytes` below what it
   holds places no new copy there, and what it holds moves back to
   friends by drain-back (it is not drained). Another bucket or provider
@@ -7128,7 +7139,11 @@ of the `copies`, and the estimated cost (S3-7).
   took are dropped; (2) re-placement drains it like a friend that ended
   (`drainAll`): each object it holds gets a copy at a friend or another
   target by D6's choice, and the target's copy is dropped only once the
-  object has `copies` acknowledged copies without it; copies with no
+  object has `copies` acknowledged copies without it, at the
+  acknowledgement of its replacement too (`keepReplaced` counts a
+  removing target's copy like an intact one's, so a friend lost
+  meanwhile never leaves the replacement alone,
+  `TestARemovingTargetsCopyStaysWhileTheObjectNeedsIt`); copies with no
   room elsewhere stay, and the command says when the pool without it
   is short; (3) each drop is a delete the retention-preserving way, a
   marker at a versioned target, a client-side tomb sent after

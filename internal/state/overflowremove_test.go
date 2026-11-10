@@ -248,3 +248,38 @@ func TestWhileSplitASecondTargetsCopyGoesBeforeAFriends(t *testing.T) {
 		t.Fatalf("targets' rows %s and %s: want exactly one dropping", st1, st2)
 	}
 }
+
+// #96 review: a target being removed keeps its copy at the ack of the
+// copy replacing it while the object would have fewer than `copies`
+// intact copies without it: here A went away meanwhile, so B's copy
+// alone is intact, and the target's stays until another is.
+func TestARemovingTargetsCopyStaysWhileTheObjectNeedsIt(t *testing.T) {
+	p := newPool(t)
+	p.friend("A", 10)
+	o := p.overflow("b2", 100)
+	p.bucket("r", 2)
+	d := p.put("r", "data/1", "data", 1)
+	p.ackQueued()
+	p.wantPlaces("data", d, "A", o)
+	p.removeOverflow("b2", false)
+	p.friend("B", 10)
+	p.replace()
+	if st, replaces := p.rowOf("B", d); st != PlacementQueued || replaces != o {
+		t.Fatalf("B's row %s replacing %q, want queued replacing the target", st, replaces)
+	}
+	p.gone("A")
+	p.ack("B", d)
+	p.wantState(o, d, PlacementAcked)
+	p.replace()
+	p.wantState(o, d, PlacementAcked)
+	if got := p.finishRemovals(); len(got) != 0 {
+		t.Fatalf("removed %v while it holds a copy the object needs", got)
+	}
+	// Another friend: once its copy is acknowledged the object has two
+	// intact copies, and the next pass drops the target's.
+	p.friend("C", 10)
+	p.replace()
+	p.ackQueued()
+	p.replace()
+	p.wantState(o, d, PlacementDropping)
+}

@@ -127,9 +127,22 @@ func TestRecoveryListsEachOverflowTargetAndRebuildsItsPlacement(t *testing.T) {
 	if n, _ := l.Pending(ctx); n != 0 {
 		t.Fatalf("%d lists pending after the round", n)
 	}
+	// The pack counts; config, metadata no friend lists, does not (#96
+	// review) until a friend's list names it.
 	held, err := db.HeldAt(ctx, "laptop")
-	if err != nil || held[place] != 2 {
-		t.Fatalf("held %v, %v: want 2 at %s", held, err, place)
+	if err != nil || held[place] != 1 {
+		t.Fatalf("held %v, %v: want the pack at %s", held, err, place)
+	}
+	if err := db.AddFriendship(ctx, state.Friendship{Peer: "F", Address: "tcF", OwnNumber: 1 << 30, PeerNumber: 1 << 30,
+		CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.RecordListed(ctx, "F", "laptop", []state.Listed{{Key: "config", Size: int64(len(config)),
+		SHA256: hex.EncodeToString(csum[:]), Class: "metadata"}}, 1, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if held, err := db.HeldAt(ctx, "laptop"); err != nil || held[place] != 2 {
+		t.Fatalf("held %v, %v: want the pack and config at %s once a friend lists config", held, err, place)
 	}
 	keys, err := db.RecoveredKeys(ctx, "laptop")
 	if err != nil {
