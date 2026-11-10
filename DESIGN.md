@@ -4408,13 +4408,22 @@ the handler's own reads and is never cancelled; nothing below
   back within seconds of the lender's store reading again, and the
   next write is answered `SlowDown` only until then
   (`TestALenderFreesAnAbandonedSendsReservationWithinSeconds`, #93).
-  *Open (#93):* the gateway answers these refusals before reading the
-  body and closes the connection, so for a body larger than what
-  `gw.sock` buffers (a few hundred KiB) the bridge's write of the rest
-  fails (`broken pipe`) about half the time and the borrower gets the
-  bridge's `503 ServiceUnavailable` "gateway unavailable", a network
-  failure, instead of `SlowDown` (seen in the test above with a 3 MiB
-  body; a `507` is answered the same way, so likely the same). Once
+  The gateway answers these refusals (`507` and `503 SlowDown`) before
+  reading the body and closes the connection, so for a body larger
+  than what `gw.sock` buffers (a few hundred KiB) the bridge's write of
+  the rest fails (`broken pipe`). The bridge relays the answer anyway
+  (#100): its connection to `gw.sock` (`bridge.answerFirst`) holds a
+  write that failed so, until the transport, which reads the answer
+  while it writes the body, has relayed the answer and closed the
+  connection; without it the write's error raced the answer and about
+  half the 3 MiB sends got the bridge's own `503 ServiceUnavailable`
+  "gateway unavailable", a network failure. Nothing more of the body is
+  read from the borrower meanwhile; a gateway that closed without an
+  answer is still "gateway unavailable" at once
+  (`TestABusyAnswerBeforeALargeBodyIsReadReachesTheBorrower`,
+  `TestAQuotaAnswerBeforeALargeBodyIsReadReachesTheBorrower`; the test
+  above sends 3 MiB). seed's `answered` does the same on the import
+  path (#36), where no bridge stands between. Once
   they have stored, the retry is answered 507 if it no longer
   fits. The check reads the counter under the same lock that admits the
   write. A completion is checked against the floor alone, for the size
@@ -5537,7 +5546,10 @@ the handler's own reads and is never cancelled; nothing below
   other tunnel request is an S3 request: it is checked (SEC-11,
   SEC-12) and then proxied. versitygw terminates the signature;
   lendisk never computes one on any path. The hop costs one in-process
-  proxy per request on every listener, loopback included (Q-L).
+  proxy per request on every listener, loopback included (Q-L). An
+  answer the gateway gives before it has read the body (a refusal,
+  §3.5 LEND-2) is relayed, not lost to the failed write of the rest
+  (#100).
 - **NET-7** The gate admits exactly these S3 operations from a
   borrower's account: `PutObject`, `CreateMultipartUpload`,
   `UploadPart`, `CompleteMultipartUpload`, `AbortMultipartUpload`,
