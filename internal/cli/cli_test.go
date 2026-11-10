@@ -71,6 +71,9 @@ type node struct {
 	env map[string]string
 	// flags, when set, are added to every command run gives.
 	flags []string
+	// betweenStatusReads, when set, is given to every command (app's
+	// field of that name).
+	betweenStatusReads func()
 }
 
 func newNode(t *testing.T) *node {
@@ -96,6 +99,8 @@ func (n *node) run(stdin string, phrase string, args ...string) (int, string, st
 		afterFetch: n.afterFetch, listBudget: n.listBudget, sleep: n.sleep,
 		lendStatfs: func(string) (store.Space, error) { return store.Space{Total: cmp.Or(n.lendSpace, 1<<50)}, nil },
 		env:        func(k string) (string, bool) { v, ok := n.env[k]; return v, ok },
+
+		betweenStatusReads: n.betweenStatusReads,
 	}
 	args = append(append(args, n.flags...), "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", "127.0.0.1:0")
 	code := a.run(args)

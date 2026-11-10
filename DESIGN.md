@@ -2198,7 +2198,14 @@ upstream bucket is Q-V.
     `SQLITE_BUSY_SNAPSHOT` when another connection commits in between
     (#47); writers wait for the lock up to `busy_timeout`, 30 s, which is
     a queue of millisecond transactions, never a held lock, since no
-    transaction does I/O other than SQLite's own.
+    transaction does I/O other than SQLite's own. A report built from
+    many reads takes `state.DB.Snapshot`: a view of the database whose
+    every query goes through one deferred read transaction (`BEGIN`, as
+    the driver begins a `ReadOnly` one), so it sees one moment and, in
+    WAL mode, blocks no writer; its writes fail. `status` builds its
+    whole report from one, so a re-placement pass committing between
+    its places and its capacity reads cannot show a target empty while
+    its deletes are still queued (#110).
   - *Same-key ordering.* `seq` is assigned when the row is written,
     before the store call, so two overlapping writes to one key could
     reach the store in the other order and leave the key's last done row

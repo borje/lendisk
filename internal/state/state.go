@@ -75,6 +75,70 @@ type DB struct {
 	// finding a listed key's queued rows and acknowledging them. Tests
 	// only.
 	beforeSeedAck func(tx *sql.Tx)
+
+	// snap, on a Snapshot, is the read transaction every query goes
+	// through.
+	snap *sql.Tx
+}
+
+// errSnapshot refuses a write through a Snapshot.
+var errSnapshot = errors.New("state: a snapshot is read-only")
+
+// Snapshot returns a read-only view of db: every read through it sees
+// the database as of the view's first read, so a report built from many
+// reads is never torn by a write committing between two of them (#110).
+// It is one deferred read transaction (BEGIN, not the DSN's IMMEDIATE),
+// so in WAL mode writers are not blocked while it is open. The view's
+// own writes and transactions fail. Callers must call done, which ends
+// the transaction, and must not use the view after it. Reads use the
+// context methods (QueryContext, QueryRowContext); the package's own
+// read methods all do.
+func (db *DB) Snapshot(ctx context.Context) (view *DB, done func() error, err error) {
+	if db.snap != nil {
+		return nil, nil, errors.New("state: a snapshot within a snapshot")
+	}
+	tx, err := db.DB.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	// No overflowSplit cache: it would outlive the transaction.
+	view = &DB{DB: db.DB, Path: db.Path, Clock: db.Clock, RerouteAfter: db.RerouteAfter, ReplaceAfter: db.ReplaceAfter,
+		splitTTL: -1, snap: tx}
+	return view, tx.Rollback, nil
+}
+
+// QueryContext runs a query, in the snapshot's transaction on a
+// Snapshot.
+func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	if db.snap != nil {
+		return db.snap.QueryContext(ctx, query, args...)
+	}
+	return db.DB.QueryContext(ctx, query, args...)
+}
+
+// QueryRowContext runs a one-row query, in the snapshot's transaction
+// on a Snapshot.
+func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	if db.snap != nil {
+		return db.snap.QueryRowContext(ctx, query, args...)
+	}
+	return db.DB.QueryRowContext(ctx, query, args...)
+}
+
+// ExecContext runs a statement; a Snapshot refuses it.
+func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	if db.snap != nil {
+		return nil, errSnapshot
+	}
+	return db.DB.ExecContext(ctx, query, args...)
+}
+
+// BeginTx begins a transaction; a Snapshot refuses it.
+func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	if db.snap != nil {
+		return nil, errSnapshot
+	}
+	return db.DB.BeginTx(ctx, opts)
 }
 
 func (db *DB) now() time.Time {

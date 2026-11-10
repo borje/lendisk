@@ -927,6 +927,14 @@ friend, or with no room in the pool), which status shows.`,
 			defer db.Close()
 			// As the daemon judges reachability: which friends are gone (D6).
 			db.Clock, db.RerouteAfter, db.ReplaceAfter = a.clock, cfg.RerouteAfter(), cfg.ReplaceAfter()
+			// The whole report reads one snapshot, so a write the daemon
+			// commits meanwhile cannot tear it: a place and the capacity
+			// read before and after a pass (#110). The daemon writes on.
+			db, done, err := db.Snapshot(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer done()
 			bs, err := db.Buckets(cmd.Context())
 			if err != nil {
 				return err
@@ -1014,6 +1022,9 @@ friend, or with no room in the pool), which status shows.`,
 			}
 			if st.Places, err = places(cmd.Context(), db, a.now()); err != nil {
 				return err
+			}
+			if a.betweenStatusReads != nil {
+				a.betweenStatusReads()
 			}
 			if st.Capacity, err = a.capacityStatus(cmd.Context(), db, cfg.Replication.Copies.Int(), a.now()); err != nil {
 				return err

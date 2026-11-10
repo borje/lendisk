@@ -251,3 +251,27 @@ func newPhrase(t *testing.T) string {
 	}
 	return p
 }
+
+// OPS-1 (#110): status reads its whole report in one snapshot. A write
+// committing between its places and its capacity reads (here a target
+// added, as a re-placement pass could mark a target's copies dropping)
+// shows in neither, so the two never disagree.
+func TestStatusReadsPlacesAndCapacityInOneSnapshot(t *testing.T) {
+	parallel(t, 0)
+	n := friendNode(t)
+	n.betweenStatusReads = func() {
+		if err := openDB(t, n).AddOverflow(t.Context(), state.Overflow{Name: "b2", Endpoint: "https://s3.example",
+			Bucket: "offsite", MaxBytes: 1 << 30, EnvPrefix: "X_", Retention: time.Hour, AddedAt: time.Now()}); err != nil {
+			t.Errorf("a write while status reads: %v", err)
+		}
+	}
+	st := n.status()
+	if c := capacityOf(t, st); len(st.Places) != 0 || len(c.Overflow) != 0 {
+		t.Fatalf("a torn report: places %+v, capacity overflow %+v", st.Places, c.Overflow)
+	}
+	n.betweenStatusReads = nil
+	st = n.status()
+	if c := capacityOf(t, st); len(st.Places) != 1 || len(c.Overflow) != 1 {
+		t.Fatalf("the next status: places %+v, capacity overflow %+v", st.Places, c.Overflow)
+	}
+}
