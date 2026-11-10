@@ -11,14 +11,17 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/capacity"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/overflow"
+	"github.com/borje/lendisk/internal/recovery"
 	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/state"
 )
 
-// Overflow targets (S3-1, S3-4, S3-5, S3-7, #38): `overflow add` and the
-// daemon's start check of their credentials.
+// Overflow targets (S3-1, S3-4, S3-5, S3-7, #38, #96): `overflow add`,
+// `overflow set` and `overflow remove`, and the daemon's start check of
+// their credentials.
 
 // overflowCheckTimeout bounds overflow add's calls to the provider.
 const overflowCheckTimeout = 2 * time.Minute
@@ -64,7 +67,243 @@ add tests it and says what it found.`,
 	add.Flags().BoolVar(&f.lifecycle, "lifecycle", false, "create the lifecycle rule expiring non-current versions after --retention, if the bucket has none")
 	add.Flags().StringVar(&f.price, "price-per-gb", "", "the provider's price per GB and month, for status's cost estimate, such as 0.006")
 	cmd.AddCommand(add)
+
+	var sf overflowFlags
+	set := &cobra.Command{
+		Use:   "set <name>",
+		Short: "Change an overflow target's --max-bytes, or the endpoint its bucket is reached at",
+		Long: `Change an overflow target (#96). --max-bytes is the most this node
+stores there: raised, more copies may go there; lowered below what it
+holds, no new copy goes there, and what it holds moves back to friends
+as they have room (drain-back).
+
+--endpoint (and --region) is where the same bucket is reached: a
+provider's new URL. The credential is tested there first, as by add,
+and nothing changes if it does not work. To move to another bucket or
+provider, add a new target and remove this one.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runOverflowSet(cmd.Context(), args[0], cmd.Flags().Changed("region"), sf)
+		},
+	}
+	set.Flags().StringVar(&sf.maxBytes, "max-bytes", "", "the most this node stores there, such as 450G")
+	set.Flags().StringVar(&sf.endpoint, "endpoint", "", "the provider's S3 endpoint URL the bucket is reached at now")
+	set.Flags().StringVar(&sf.region, "region", "", "the bucket's region at the new endpoint (empty: ask the provider)")
+	cmd.AddCommand(set)
+
+	var keep bool
+	remove := &cobra.Command{
+		Use:   "remove <name>",
+		Short: "Remove an overflow target once its copies are held elsewhere",
+		Long: `Remove an overflow target (#96). No new copy goes there from now on.
+The daemon then copies each object it holds to a friend or another
+target, so every bucket keeps its copies throughout, and only then
+deletes its copies there, the retention-preserving way: a delete
+marker at a target with versioning (the lifecycle rule expires it), a
+delete held for --retention at one without. The target is dropped once
+nothing is left there; ` + "`lendisk status`" + ` shows it until then.
+Keep ` + "`lendisk serve`" + ` running, with the target's credential in its
+environment.
+
+Copies that find no room elsewhere stay at the target until a friend
+or target is added, or a quota raised.
+
+With --keep-data the copies are left at the target and nothing more is
+deleted there (deletes it holds for the retention window are dropped
+unsent): the target is dropped as soon as its data is held elsewhere.
+Given again with --keep-data, a removal under way stops deleting.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return a.runOverflowRemove(cmd.Context(), args[0], keep)
+		},
+	}
+	remove.Flags().BoolVar(&keep, "keep-data", false, "leave the copies at the target, deleting nothing there")
+	cmd.AddCommand(remove)
 	return cmd
+}
+
+// checkEndpoint refuses an endpoint that is not a provider's URL.
+func checkEndpoint(ep string) error {
+	if u, err := url.Parse(ep); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" ||
+		u.User != nil || strings.Trim(u.Path, "/") != "" {
+		return usageError{fmt.Errorf("--endpoint %q: give the provider's URL, such as https://s3.example.com, without a path", ep)}
+	}
+	return nil
+}
+
+// noTarget is the error for a target name that is not there.
+func noTarget(name string) error {
+	return fmt.Errorf("no overflow target %s: `lendisk status` lists them", name)
+}
+
+func (a *app) runOverflowSet(ctx context.Context, name string, regionSet bool, f overflowFlags) error {
+	if f.maxBytes == "" && f.endpoint == "" && !regionSet {
+		return usageError{errors.New("nothing to change: give --max-bytes, --endpoint or --region")}
+	}
+	if regionSet && f.endpoint == "" {
+		return usageError{errors.New("--region goes with --endpoint: the bucket is reached somewhere else")}
+	}
+	cfg, db, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	o, err := db.GetOverflow(ctx, name)
+	if errors.Is(err, state.ErrNotFound) {
+		return noTarget(name)
+	} else if err != nil {
+		return err
+	}
+	if o.Removing() {
+		return fmt.Errorf("overflow target %s is being removed; nothing to change", name)
+	}
+	if f.maxBytes != "" {
+		if o.MaxBytes, err = parseNumber(f.maxBytes); err != nil {
+			return usageError{fmt.Errorf("--max-bytes: %w", err)}
+		}
+	}
+	var check *replica.Check
+	if f.endpoint != "" {
+		if err := checkEndpoint(f.endpoint); err != nil {
+			return err
+		}
+		o.Endpoint, o.Region = strings.TrimRight(f.endpoint, "/"), f.region
+		// The credential is tested where the bucket is reached now; a
+		// failure changes nothing (S3-1).
+		id, err := identity.Load(cfg.ConfigDir())
+		if err != nil {
+			return err
+		}
+		cred, err := overflow.Lookup(a.getenv(), o.EnvPrefix)
+		if err != nil {
+			return err
+		}
+		c, err := replica.NewOverflow(o, cred, id.SealedName, replica.Options{})
+		if err != nil {
+			return usageError{err}
+		}
+		cctx, cancel := context.WithTimeout(ctx, overflowCheckTimeout)
+		defer cancel()
+		ch, err := c.CheckOverflow(cctx, name, 0)
+		if err != nil {
+			return fmt.Errorf("overflow target %s not changed: the credential from %s does not work at %s: %s",
+				name, strings.TrimSuffix(o.EnvPrefix, "_")+"_*", o.Endpoint, cred.Redact(err.Error()))
+		}
+		check = &ch
+		o.Lifecycle, o.VersionRemoval = ch.Lifecycle, ch.VersionRemoval
+		// The same bucket (#96 review): the objects the target holds
+		// must be there, or the endpoint reaches another bucket and every
+		// copy there would count as held where it is not.
+		if err := sameBucket(cctx, db, c, o); err != nil {
+			return fmt.Errorf("overflow target %s not changed: %w", name, err)
+		}
+	}
+	// Its versioning as read there is recorded with the change, as the
+	// daily read records one (#97).
+	versioning := ""
+	if check != nil {
+		versioning = check.Versioning
+	}
+	if _, err := db.UpdateOverflow(ctx, o, versioning, a.now()); errors.Is(err, state.ErrNotFound) {
+		return noTarget(name)
+	} else if err != nil {
+		return err
+	}
+	fmt.Fprintf(a.out, "Overflow target %s: bucket %s at %s, up to %s\n", name, o.Bucket, o.Endpoint, formatSize(o.MaxBytes))
+	if check != nil {
+		fmt.Fprintf(a.out, "  credential: tested there; versioning %s; lifecycle rule %s; version removal %s\n",
+			check.Versioning, check.Lifecycle, check.VersionRemoval)
+		for _, n := range check.Notes {
+			fmt.Fprintf(a.out, "  %s\n", n)
+		}
+	}
+	if holds, err := db.OverflowHolds(ctx); err == nil && holds[name].Use > o.MaxBytes {
+		fmt.Fprintf(a.out, "  It holds %s, more than that: no new copy goes there, and what it holds moves back to friends as they have room.\n",
+			formatSize(holds[name].Use))
+	}
+	fmt.Fprintln(a.out, "The daemon uses the change at its next look at the targets; no restart is needed.")
+	return nil
+}
+
+// sameBucketSample is how many of a target's objects `overflow set
+// --endpoint` asks the new endpoint for.
+const sameBucketSample = 3
+
+// sameBucket checks that c, the client at o's new endpoint, reaches the
+// bucket the target is: up to sameBucketSample of the objects it
+// acknowledged, spread over the write order, must be there with the
+// hash lendisk stored (#96 review). A target holding nothing passes.
+func sameBucket(ctx context.Context, db *state.DB, c *replica.Client, o state.Overflow) error {
+	sample, err := db.HeldSample(ctx, o.Place(), sameBucketSample)
+	if err != nil {
+		return err
+	}
+	for _, s := range sample {
+		st, ok, err := c.Stat(ctx, s.Bucket, s.Key)
+		switch {
+		case err != nil:
+			return fmt.Errorf("asking %s for an object the target holds: %w", o.Endpoint, err)
+		case !ok:
+			return fmt.Errorf("%s has no %s of bucket %s, which the target holds: it does not reach the same bucket; "+
+				"to move to another bucket or provider, add a new target and remove this one", o.Endpoint, s.Key, s.Bucket)
+		case st.SHA256 != "" && st.SHA256 != s.SHA256:
+			return fmt.Errorf("%s holds another version of %s of bucket %s than the target: it does not reach the same bucket",
+				o.Endpoint, s.Key, s.Bucket)
+		}
+	}
+	return nil
+}
+
+func (a *app) runOverflowRemove(ctx context.Context, name string, keep bool) error {
+	_, db, err := a.openState(ctx)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	before, err := db.GetOverflow(ctx, name)
+	if errors.Is(err, state.ErrNotFound) {
+		return noTarget(name)
+	} else if err != nil {
+		return err
+	}
+	if err := db.RemoveOverflow(ctx, name, keep, a.now()); errors.Is(err, state.ErrNotFound) {
+		return noTarget(name)
+	} else if err != nil {
+		return err
+	}
+	o, err := db.GetOverflow(ctx, name)
+	if err != nil {
+		return err
+	}
+	holds, err := db.OverflowHolds(ctx)
+	if err != nil {
+		return err
+	}
+	h := holds[name]
+	w := a.out
+	if before.Removing() {
+		fmt.Fprintf(w, "Overflow target %s is being removed since %s.\n", name, o.RemovingAt.UTC().Format(time.RFC3339))
+	} else {
+		fmt.Fprintf(w, "Overflow target %s is being removed: no new copy goes there.\n", name)
+	}
+	fmt.Fprintf(w, "  It holds %s for which it is one of the copies (%s); each is copied to a friend or another target first, so every bucket keeps its copies.\n",
+		countObjects(h.DataObjects), formatSize(h.DataBytes))
+	switch {
+	case o.KeepData:
+		fmt.Fprintln(w, "  Its copies are then left there (--keep-data): nothing more is deleted there.")
+	case o.ClientSide():
+		fmt.Fprintf(w, "  Its copies there are then deleted, each held for its retention of %s first (no versioning: retention client-side).\n",
+			formatDays(o.Retention))
+	default:
+		fmt.Fprintln(w, "  Its copies there are then deleted as delete markers, which its lifecycle rule expires.")
+	}
+	fmt.Fprintln(w, "  The target is dropped once nothing is left there; `lendisk status` shows it until then.")
+	if plan, err := capacity.Read(ctx, db, state.DefaultCopies); err == nil && plan.Size() > 0 && plan.Protectable() < plan.Size() {
+		fmt.Fprintf(w, "  ! Without it the pool protects %s of the repository's %s: the copies that find no room stay at the target until you add a friend or target, or a quota is raised.\n",
+			formatSize(plan.Protectable()), formatSize(plan.Size()))
+	}
+	fmt.Fprintln(w, "Keep `lendisk serve` running, with the target's credential in its environment: the daemon does the moving.")
+	return nil
 }
 
 type overflowFlags struct {
@@ -76,9 +315,8 @@ func (a *app) runOverflowAdd(ctx context.Context, name string, f overflowFlags) 
 	if err := overflow.CheckName(name); err != nil {
 		return usageError{err}
 	}
-	if u, err := url.Parse(f.endpoint); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" ||
-		u.User != nil || strings.Trim(u.Path, "/") != "" {
-		return usageError{fmt.Errorf("--endpoint %q: give the provider's URL, such as https://s3.example.com, without a path", f.endpoint)}
+	if err := checkEndpoint(f.endpoint); err != nil {
+		return err
 	}
 	if f.bucket == "" {
 		return usageError{errors.New("--bucket is required")}
@@ -160,6 +398,20 @@ func (a *app) runOverflowAdd(ctx context.Context, name string, f overflowFlags) 
 	fmt.Fprintf(a.out, "Copies go there only when fewer than a bucket's copies friends have room.\n")
 	fmt.Fprintf(a.out, "The daemon reads %s and %s from its environment: set them there (systemd EnvironmentFile= or the container's secrets) and restart `lendisk serve`; it refuses to start without them.\n", an, sn)
 	return nil
+}
+
+// overflowLister builds the client recovery lists an overflow target
+// with (#96), its credential from getenv: in recover, the user's
+// shell, where it may not be set yet (the list then waits for the
+// daemon); in serve, the daemon's environment.
+func overflowLister(getenv overflow.Getenv, id *identity.Identity) func(o state.Overflow) (recovery.Target, error) {
+	return func(o state.Overflow) (recovery.Target, error) {
+		cred, err := overflow.Lookup(getenv, o.EnvPrefix)
+		if err != nil {
+			return nil, err
+		}
+		return replica.NewOverflow(o, cred, id.SealedName, replica.Options{})
+	}
 }
 
 // checkOverflowCredentials refuses to serve while an overflow target's

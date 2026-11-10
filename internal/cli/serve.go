@@ -409,7 +409,8 @@ func (a *app) serveCmd() *cobra.Command {
 			// A recovered node lists each place it could not reach at
 			// recovery when it answers again (ID-5); a node with nothing
 			// left to list only waits.
-			lister := &recovery.Lister{DB: db, Self: id, Dial: tun.Dial, Profiles: profiles, Now: a.clock, Log: log}
+			lister := &recovery.Lister{DB: db, Self: id, Dial: tun.Dial, Profiles: profiles, Now: a.clock, Log: log,
+				Overflow: overflowLister(a.getenv(), id)}
 			if a.tuneRecovery != nil {
 				a.tuneRecovery(lister)
 			}

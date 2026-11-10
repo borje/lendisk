@@ -19,6 +19,13 @@ AWSCLI=amazon/aws-cli:2.31.13
 ACCESS=lendisk-ci-$(head -c 6 /dev/urandom | od -An -tx1 | tr -d ' \n')
 SECRET=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
 
+# In GitHub Actions the generated keys are masked in every later log
+# line first (#96). stdout goes to $GITHUB_ENV, so the ::add-mask::
+# commands go to stderr, which the runner reads for commands too.
+if [ "${GITHUB_ACTIONS:-}" = true ]; then
+  echo "::add-mask::$ACCESS" >&2
+  echo "::add-mask::$SECRET" >&2
+fi
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" -p 127.0.0.1::9000 \
   -e RUSTFS_ACCESS_KEY="$ACCESS" -e RUSTFS_SECRET_KEY="$SECRET" \

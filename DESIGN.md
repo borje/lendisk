@@ -1116,7 +1116,33 @@ upstream bucket is Q-V.
   credential (#38 review), so the rebuilt node's manifest still names
   the target rather than erasing the only copy of its endpoint, and its
   daemon refuses to start until the credential is in its environment.
-  The target is not listed: its copies are placed again as if missing.
+  Each target is listed like a friend (#96): `Restore` adds a list of
+  `overflow:<name>` for every bucket, and the lister reads it through
+  the overflow client (`Lister.Overflow`, `replica.Client.ListPage`:
+  `ListObjectsV2` under `<prefix>/<sealed name>/` from the resume key,
+  1,000 keys a page). The provider lists keys and sizes only, so a key
+  the profile names by its hash takes the hash its name gives, and any
+  other (restic's `config` and `keys/`) is read with a HEAD for the
+  `x-amz-meta-lendisk-sha256` lendisk stored with it; an object without
+  one is not lendisk's, and is rejected and logged like a friend's bad
+  entry. The rows are recorded and settled as a friend's, so a target's
+  copies count as held and are never placed again as if missing
+  (`TestRecoveryListsEachOverflowTargetAndRebuildsItsPlacement`). A
+  target is never a place "listed to its end" for the metadata rule
+  (`listedPlaces` reads friends only): it holds metadata only beside
+  data. `recover` lists a target only when its credential is in the
+  shell's environment; otherwise the list waits, failed, for the daemon,
+  which has it. A target may still hold keys the node deleted, their
+  deletes held as client-side tombs in the lost `lendisk.db` (S3-4).
+  So a metadata or snapshot key that only targets list is not live on
+  their word (`onlyTargetsList`, #96 review): friends hold every live
+  metadata key (REPL-12), and a revived restic index would let later
+  backups dedupe against packs pruned at the friends, so later
+  snapshots would reference missing data. A friend's list naming the
+  key decides it again, the target's copy counted with it
+  (`TestMetadataOnlyATargetListsIsNotLive`). A data key a target alone
+  lists counts as a single source, as a friend's: restic and Kopia
+  ignore an unreferenced pack, and the next prune deletes it again.
   The
   `placement` table (D6) and the hash index are then rebuilt from the
   control API `list` of each reachable place for each sealed bucket
@@ -7088,7 +7114,56 @@ of the `copies`, and the estimated cost (S3-7).
   rules: with no enabled rule expiring non-current versions under the
   prefix it offers one, and creates it, added to the bucket's rules
   as `lendisk-<name>` with the retention in whole days, when given
-  `--lifecycle`. Any failure of the credential leaves no row. Every error the
+  `--lifecycle`. Any failure of the credential leaves no row.
+  *Changing a target (#96).* `overflow set <name> [--max-bytes N]
+  [--endpoint URL [--region R]]` writes the row (`state.UpdateOverflow`;
+  the split and the pool fingerprint see it at once). A new endpoint is
+  where the same bucket is reached: the credential is tested there as
+  by add (`CheckOverflow`, no lifecycle rule created), and up to three
+  objects the target acknowledged, spread over the write order
+  (`HeldSample`), must be there with the hash lendisk stored, or it
+  reaches another bucket and the change is refused (a target holding
+  nothing passes); only then is the row written, in one transaction
+  with the versioning read there, recorded as the daily read records
+  one (`UpdateOverflow`); the worker rebuilds the target's client
+  when its endpoint or region changes. A `max_bytes` below what it
+  holds places no new copy there, and what it holds moves back to
+  friends by drain-back (it is not drained). Another bucket or provider
+  is a new target and the removal of this one.
+  *Removing a target (#96).* `overflow remove <name> [--keep-data]`
+  never leaves an object short of copies (`state/overflowremove.go`):
+  (1) `overflow.removing_at` (migration 47) is set: the target is no
+  candidate at capture or in re-placement, is sent no more metadata,
+  counts in neither the split, drain-back's test, the capacity plan,
+  `PoolSize` nor the offsite holders, and its unsent puts no sender
+  took are dropped; (2) re-placement drains it like a friend that ended
+  (`drainAll`): each object it holds gets a copy at a friend or another
+  target by D6's choice, and the target's copy is dropped only once the
+  object has `copies` acknowledged copies without it, at the
+  acknowledgement of its replacement too (`keepReplaced` counts a
+  removing target's copy like an intact one's, so a friend lost
+  meanwhile never leaves the replacement alone,
+  `TestARemovingTargetsCopyStaysWhileTheObjectNeedsIt`); copies with no
+  room elsewhere stay, and the command says when the pool without it
+  is short; (3) each drop is a delete the retention-preserving way, a
+  marker at a versioned target, a client-side tomb sent after
+  `--retention` at one without; (4) the worker, at each re-routing tick
+  (`state.FinishOverflowRemovals`), drops the row with every per-place
+  row of the target once nothing is in its FIFO, it holds no live copy
+  (data, or metadata, which re-placement drops once it holds no data of
+  the bucket and the window of its deletes there has passed) and no
+  held delete. With `keep_data` (`--keep-data`, which may be given
+  again during a removal and never turned off) nothing more is deleted
+  there: the held deletes are forgotten and every delete or drop is
+  acknowledged unsent (`HoldOverflowDelete`), and the row goes once its
+  data is held elsewhere, its metadata left there too. A credential
+  without delete permission keeps its denied tombs and so the row:
+  `--keep-data` ends that. `status` lists the target until its row
+  goes, with `removing` and `keep_data` in `capacity.overflow[]`
+  (`TestRemovingATargetPlacesItsCopiesElsewhereBeforeDeletingThem`,
+  `TestRemovingATargetKeepingItsDataSendsNoDelete`,
+  `TestScenarioOverflowRemoveMovesItsCopiesThenDropsTheTarget`).
+  Every error the
   overflow client returns has the credential's keys taken out of its
   message (`replica.redacted`; Garage's 403 names the access key), so
   `place.detail`, the log, alerts and webhooks never carry it. `serve`
@@ -7241,7 +7316,10 @@ of the `copies`, and the estimated cost (S3-7).
   not, that friend copy is a surplus and is cancelled while unsent
   (`TestAnUnsentDrainBackCopyIsCancelledWhenDrainBackTurnsOff`), as a
   split's move is. A surplus copy goes from an overflow target before
-  any friend unless placement is split. *Lowest priority:* a queued
+  any friend; while placement is split, an object's last target copy
+  goes after its friends' instead, since the split keeps one there
+  (#96, `TestSurplusCopiesGoFromOverflowTargetsFirst`,
+  `TestWhileSplitASecondTargetsCopyGoesBeforeAFriends`). *Lowest priority:* a queued
   row replacing a target copy (`state.drainBack`, `Placement.DrainBack`)
   comes after every other row of its friend's FIFO, newer captures and
   dropping rows included (`NextPlacement`), and holds no metadata
@@ -7341,8 +7419,12 @@ of the `copies`, and the estimated cost (S3-7).
   to that job, and an `overflow-versioned` job against RustFS
   (`.github/rustfs.sh`, `rustfs/rustfs:1.0.3`, a bucket with
   versioning made through the AWS CLI; `LENDISK_TEST_OVERFLOW_VERSIONED_*`)
-  running `TestAVersionedProviderUndeletesByCopyingTheVersionBeforeTheMarker`
-  and `TestScenarioOverflowRetentionAtAVersionedProvider`. Locally the
+  running `TestAVersionedProviderUndeletesByCopyingTheVersionBeforeTheMarker`,
+  `TestOverflowAddCreatesTheLifecycleRuleAtAProvider` (#96) and
+  `TestScenarioOverflowRetentionAtAVersionedProvider`. Both scripts
+  mask the generated access and secret key (`::add-mask::`, on stderr
+  since stdout goes to `$GITHUB_ENV`) before anything else is logged
+  (#96). Locally the
   same scenarios run against versitygw with versioning on and off
   (`TestScenarioOverflowRetentionVersioned`, `…Unversioned`);
   `overflowtest` sets versitygw's `CopyObjectThreshold` to 5 GiB, since
@@ -7351,6 +7433,20 @@ of the `copies`, and the estimated cost (S3-7).
   delete is recorded locally and issued after the window; `status`
   labels the target "retention: client-side". Drain-back deletes go
   the same way.
+  *Lifecycle rule (#96).* The rule `--lifecycle` adds
+  (`replica.LifecycleRule`) also aborts multipart uploads not completed
+  7 days after they began (`AbortIncompleteMultipartUpload`,
+  `replica.AbortUploadDays`), so the parts of an upload the node
+  abandoned are not billed for ever. *Decision:* 7 days, the period AWS
+  recommends; the worker resumes an upload a restart cut short within
+  minutes, and one the provider aborted begins again (`NoSuchUpload`).
+  A rule already there counts as covering the prefix (`coversPrefix`)
+  only when it filters by prefix alone: one filtered by a tag or an
+  object size expires some versions only, and lendisk offers its own.
+  Rule creation is tested against RustFS 1.0.3, which implements
+  lifecycle configuration (CI's `overflow-versioned` job,
+  `TestOverflowAddCreatesTheLifecycleRuleAtAProvider`); versitygw and
+  Garage do not.
   *Retention and undelete, realised (#39).* A target is client-side
   when `overflow add` found versioning anything but enabled
   (`state.Overflow.ClientSide`; *suspended* counts, as a delete there

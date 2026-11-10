@@ -359,3 +359,36 @@ func TestKeyTombstonedAtEveryPlaceIsNotRecovered(t *testing.T) {
 		t.Fatalf("C holds %v", a)
 	}
 }
+
+// #96 review: a metadata or snapshot key only an overflow target lists
+// is not live on its word: a target without versioning may still hold
+// an index the node pruned, its delete held in the lost lendisk.db, and
+// a revived index would let restic dedupe against packs pruned at the
+// friends. Its data packs count as a friend's. Once a friend lists the
+// key, it counts, held at both.
+func TestMetadataOnlyATargetListsIsNotLive(t *testing.T) {
+	db := recoveringWith(t, "B")
+	target := OverflowPlace("spill")
+	if err := db.AddRelists(context.Background(), []string{target}, []string{"laptop"}); err != nil {
+		t.Fatal(err)
+	}
+	list(t, db, target, "laptop",
+		Listed{Key: "data/1", Size: 10, SHA256: "h1", Class: "data", HashNamed: true},
+		Listed{Key: "index/old", Size: 5, SHA256: "h2", Class: "metadata", HashNamed: true},
+		Listed{Key: "snapshots/old", Size: 5, SHA256: "h3", Class: "snapshot", HashNamed: true},
+		Listed{Key: "index/new", Size: 5, SHA256: "h4", Class: "metadata", HashNamed: true})
+	if got := ackedAt(t, db, target, "laptop"); len(got) != 1 || got["data/1"] != "h1" {
+		t.Fatalf("held at the target %v, want its pack only", got)
+	}
+	ks, err := db.RecoveredKeys(context.Background(), "laptop")
+	if err != nil || len(ks) != 1 || ks[0].Key != "data/1" || ks[0].Verdict != VerdictSingle {
+		t.Fatalf("recovered %+v %v", ks, err)
+	}
+	list(t, db, "B", "laptop", Listed{Key: "index/new", Size: 5, SHA256: "h4", Class: "metadata", HashNamed: true})
+	if k := verdict(t, db, "laptop", "index/new"); k.SHA256 != "h4" || k.Places[target] != "h4" || k.Places["B"] != "h4" {
+		t.Fatalf("index/new %+v", k)
+	}
+	if got := ackedAt(t, db, target, "laptop"); got["index/new"] != "h4" || got["index/old"] != "" {
+		t.Fatalf("held at the target %v", got)
+	}
+}

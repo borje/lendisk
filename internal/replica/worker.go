@@ -290,6 +290,7 @@ func (w *Worker) Run(ctx context.Context) {
 			rerouted = now
 			w.reroute(ctx)
 			w.dropStale(ctx)
+			w.finishRemovals(ctx)
 			if again {
 				replaced = time.Time{}
 			}
@@ -470,6 +471,20 @@ func (w *Worker) reroute(ctx context.Context) {
 	}
 	if err != nil && ctx.Err() == nil {
 		w.Log.Error("replication: re-routing unsent data failed", "err", err)
+	}
+}
+
+// finishRemovals drops the overflow targets being removed that nothing
+// depends on any more (#96, state.FinishOverflowRemovals); their
+// senders stop at the next read of the targets.
+func (w *Worker) finishRemovals(ctx context.Context) {
+	names, err := w.DB.FinishOverflowRemovals(ctx)
+	for _, n := range names {
+		w.Log.Info("replication: overflow target removed: its copies are held elsewhere and nothing is left there to delete",
+			"place", state.OverflowPlace(n))
+	}
+	if err != nil && ctx.Err() == nil {
+		w.Log.Error("replication: finishing the removal of overflow targets failed", "err", err)
 	}
 }
 

@@ -136,6 +136,12 @@ type StatusCapacityOverflow struct {
 	// is tried again daily. Absent when none.
 	DeleteDenied      int64 `json:"delete_denied,omitempty"`
 	DeleteDeniedBytes int64 `json:"delete_denied_bytes,omitempty"`
+	// Removing is when `overflow remove` began removing the target
+	// (RFC 3339, UTC), and KeepData whether its copies are left there;
+	// absent for a target in use (#96). It is listed until its row
+	// goes, once nothing is left there.
+	Removing string `json:"removing,omitempty"`
+	KeepData bool   `json:"keep_data,omitempty"`
 }
 
 // overflowStatus reads each overflow target's room, use and cost (S3-7).
@@ -162,7 +168,8 @@ func overflowStatus(ctx context.Context, db *state.DB) ([]StatusCapacityOverflow
 		so := StatusCapacityOverflow{Name: o.Name, MaxBytes: o.MaxBytes, Use: h.Use, Endpoint: o.Endpoint, Bucket: o.Bucket,
 			Prefix: o.Prefix, DataObjects: h.DataObjects, DataBytes: h.DataBytes, PricePerGB: o.PricePerGB,
 			Versioning: o.Versioning, Lifecycle: o.Lifecycle, VersionRemoval: o.VersionRemoval, EnvPrefix: o.EnvPrefix,
-			Retention: o.RetentionMode(), VersioningChecked: rfc3339(o.VersioningCheckedAt)}
+			Retention: o.RetentionMode(), VersioningChecked: rfc3339(o.VersioningCheckedAt), Removing: rfc3339(o.RemovingAt),
+			KeepData: o.KeepData}
 		if ch, ok := changes[o.Name]; ok {
 			so.VersioningChanged, so.VersioningBefore = rfc3339(ch.At), ch.Previous
 		}
@@ -211,7 +218,12 @@ func overflowLine(o StatusCapacityOverflow) string {
 	if o.VersionRemoval == state.VersionRemovalAllowed {
 		l += "; its credential can remove versions"
 	}
-	if o.Percent >= 100 {
+	switch {
+	case o.Removing != "" && o.KeepData:
+		l += fmt.Sprintf("; being removed since %s: its copies move elsewhere and stay there too (--keep-data)", o.Removing)
+	case o.Removing != "":
+		l += fmt.Sprintf("; being removed since %s: its copies move elsewhere, then are deleted there", o.Removing)
+	case o.Percent >= 100:
 		l += "; full: no new copies go there"
 	}
 	return l

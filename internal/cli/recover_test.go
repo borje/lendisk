@@ -22,6 +22,8 @@ import (
 	"github.com/borje/lendisk/internal/control"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/manifest"
+	"github.com/borje/lendisk/internal/overflow/overflowtest"
+	"github.com/borje/lendisk/internal/replica"
 	"github.com/borje/lendisk/internal/transport"
 )
 
@@ -65,6 +67,10 @@ func heldManifest(t *testing.T, lender *node, borrower *identity.Identity) (*man
 //     older manifest than C holds: recover asks every friend and keeps
 //     the newest, overflow credential and all, which it shows once and
 //     writes nowhere.
+//   - The overflow target the manifest names (versitygw in this process)
+//     holds one of A's packs: recover leaves its list to the daemon, as
+//     the credential is not in its environment, and the daemon lists it
+//     and records the pack as held there (#96).
 //   - With nothing but the phrase and B's address, a fresh machine gets
 //     A's identity, address, friends (with the keys they dial A with),
 //     buckets and the version to continue from; placement is rebuilt
@@ -76,10 +82,11 @@ func heldManifest(t *testing.T, lender *node, borrower *identity.Identity) (*man
 //     manifest version, above every copy they held), C is listed, and B
 //     dialling A with its dial key is admitted as A's friend.
 func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
-	parallel(t, 4)
+	serving(t, 4) // the overflow target is versitygw, in this process
 	if testing.Short() {
 		t.Skip("long")
 	}
+	srv := overflowtest.Start(t, "spill", false)
 	phraseA, _ := identity.NewPhrase()
 	an, bn, cn := newNode(t), newNode(t), newNode(t)
 	bn.regions, cn.regions = an.regions, an.regions // one relay for all
@@ -104,9 +111,10 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 	aAddr, bAddr, cAddr := an.status().Node.Address, bn.status().Node.Address, cn.status().Node.Address
 
 	s3c := s3client(a.addr, own)
-	body := make([]byte, 2048)
+	bodies := map[string][]byte{}
 	// restic's layout: packs, indexes and snapshots named by their hash.
 	for _, k := range []string{"config", "keys/k1", "index/", "data/", "data/", "snapshots/", "locks/l1"} {
+		body := make([]byte, 2048)
 		rand.Read(body)
 		if h := sha256Hex(body); k == "data/" {
 			k += h[:2] + "/" + h
@@ -117,6 +125,7 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 			Body: bytes.NewReader(body)}); err != nil {
 			t.Fatal(err)
 		}
+		bodies[k] = body
 	}
 	an.drained(bKey, 60*time.Second)
 	an.drained(cKey, 60*time.Second)
@@ -153,9 +162,20 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 	// credential, which recover shows and must not write.
 	newer := *old
 	newer.Seq = old.Seq + 1
-	const overflowSecret = "OVERFLOWSECRETdoNotWrite0123456789"
-	newer.Overflow = []manifest.Overflow{{Name: "spill", Endpoint: "https://s3.example.net", Bucket: "spill",
-		AccessKey: "OVERFLOWACCESS", SecretKey: overflowSecret}}
+	overflowSecret, overflowAccess := srv.Secret, srv.Access
+	newer.Overflow = []manifest.Overflow{{Name: "spill", Endpoint: srv.Endpoint, Bucket: srv.Bucket, Prefix: "lendisk",
+		AccessKey: overflowAccess, SecretKey: overflowSecret}}
+	// The target holds one of the packs, as the split put it there.
+	var pack string
+	for k := range want {
+		if strings.HasPrefix(k, "data/") {
+			pack = k
+			break
+		}
+	}
+	if err := srv.Put(t.Context(), replica.OverflowKey("lendisk", aID.SealedName("laptop"), pack), bodies[pack], nil); err != nil {
+		t.Fatal(err)
+	}
 	sealed, err := manifest.Seal(aID, &newer, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +211,7 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 		bKey + ": version " + strconv.FormatInt(old.Seq, 10) + ", older",
 		cKey + ": version " + strconv.FormatInt(newer.Seq, 10) + " (newest)",
 		"Friends: 2", "laptop (restic, copies 2)",
-		"at " + bKey + ": 6 objects", "at " + cKey + ": not listed",
+		"at " + bKey + ": 6 objects", "at " + cKey + ": not listed", "at overflow:spill: not listed",
 		overflowSecret, "nothing was downloaded", "lendisk serve", "lendisk bucket show",
 	} {
 		if !strings.Contains(out, s) {
@@ -208,8 +228,13 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 	if st.Manifest.Version != newer.Seq {
 		t.Fatalf("manifest version %d, want to continue from %d", st.Manifest.Version, newer.Seq)
 	}
-	if p := st.Recovery.Pending; len(p) != 1 || p[0].Place != cKey || p[0].Bucket != "laptop" || p[0].Error == "" {
-		t.Fatalf("lists pending %+v", p)
+	pending := map[string]string{}
+	for _, p := range st.Recovery.Pending {
+		pending[p.Place+" "+p.Bucket] = p.Error
+	}
+	if len(pending) != 2 || pending[cKey+" laptop"] == "" ||
+		!strings.Contains(pending["overflow:spill laptop"], "LENDISK_OVERFLOW_SPILL_ACCESS_KEY") {
+		t.Fatalf("lists pending %+v", st.Recovery.Pending)
 	}
 	peers := map[string]PeerJSON{}
 	for _, p := range fresh.peers() {
@@ -245,7 +270,7 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 			assertNotIn(t, n, secret)
 		}
 	}
-	assertNotIn(t, fresh, overflowSecret, "OVERFLOWACCESS")
+	assertNotIn(t, fresh, overflowSecret, overflowAccess)
 	assertNoPhrase(t, filepath.Dir(filepath.Dir(fresh.config)), phraseA)
 	for p, m := range map[string]os.FileMode{
 		filepath.Dir(fresh.config):                                0o700,
@@ -262,7 +287,7 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 	c.start()
 	// The overflow target came back from the manifest, so the daemon
 	// starts only with its credential in the environment (SEC-3, #38).
-	fa := newProcNode(t, fresh, fast, "LENDISK_OVERFLOW_SPILL_ACCESS_KEY=OVERFLOWACCESS",
+	fa := newProcNode(t, fresh, fast, "LENDISK_OVERFLOW_SPILL_ACCESS_KEY="+overflowAccess,
 		"LENDISK_OVERFLOW_SPILL_SECRET_KEY="+overflowSecret)
 	fa.start()
 	deadline = time.Now().Add(90 * time.Second)
@@ -274,6 +299,10 @@ func TestRecoverFromPhraseAndOneLendersAddress(t *testing.T) {
 	}
 	if got := ackedAt(t, fresh, cKey, "laptop"); !maps.Equal(got, want) {
 		t.Fatalf("held at C %v, want %v", got, want)
+	}
+	// The target's list rebuilt its placement: the pack is held there.
+	if got := ackedAt(t, fresh, "overflow:spill", "laptop"); len(got) != 1 || got[pack] != want[pack] {
+		t.Fatalf("held at the overflow target %v, want %s", got, pack)
 	}
 	if st := fresh.status(); st.Buckets[0].BelowCopies.Objects != 0 {
 		t.Fatalf("below copies after both lists: %+v", st.Buckets[0])

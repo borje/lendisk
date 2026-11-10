@@ -201,7 +201,7 @@ func (a *app) runRecover(ctx context.Context, addr string, skip map[string]bool)
 		return err
 	}
 	lister := &recovery.Lister{DB: db, Self: id, Dial: dl.Dial, Profiles: profiles, Now: a.clock,
-		Timeout: a.redeemTimeout(), Skip: skip, Log: log}
+		Timeout: a.redeemTimeout(), Skip: skip, Log: log, Overflow: overflowLister(a.getenv(), id)}
 	budget := a.listBudget
 	if budget <= 0 {
 		budget = defaultListBudget

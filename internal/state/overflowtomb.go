@@ -77,6 +77,8 @@ type OverflowTomb struct {
 // A row gone since its sender took it is held as nothing: such a target
 // is never sent a delete outside a tomb. The caller then acknowledges
 // the row as for a sent delete.
+// At a target being removed with keep_data, every row is held as
+// nothing: no delete is sent there any more (#96).
 func (db *DB) HoldOverflowDelete(ctx context.Context, place string, seq int64, now time.Time) (held bool, err error) {
 	name, ok := OverflowName(place)
 	if !ok {
@@ -86,8 +88,16 @@ func (db *DB) HoldOverflowDelete(ctx context.Context, place string, seq int64, n
 	if errors.Is(err, ErrNotFound) {
 		return false, nil
 	}
-	if err != nil || !o.ClientSide() {
+	if err != nil {
 		return false, err
+	}
+	if o.KeepData {
+		// Being removed with its data kept (#96): nothing more is
+		// deleted there, and the row is acknowledged unsent.
+		return true, nil
+	}
+	if !o.ClientSide() {
+		return false, nil
 	}
 	return db.insertTomb(ctx, place, seq, now, now.Add(o.Retention), false)
 }

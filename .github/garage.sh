@@ -49,6 +49,13 @@ KEY=$(g key create lendisk-ci)
 ACCESS=$(echo "$KEY" | awk '/Key ID:/ {print $3}')
 SECRET=$(echo "$KEY" | awk '/Secret key:/ {print $3}')
 g bucket create offsite >/dev/null
+# In GitHub Actions the generated keys are masked in every later log
+# line first (#96). stdout goes to $GITHUB_ENV, so the ::add-mask::
+# commands go to stderr, which the runner reads for commands too.
+if [ "${GITHUB_ACTIONS:-}" = true ]; then
+  echo "::add-mask::$ACCESS" >&2
+  echo "::add-mask::$SECRET" >&2
+fi
 g bucket allow --read --write --owner offsite --key lendisk-ci >/dev/null
 PORT=$(docker port "$NAME" 3900/tcp | head -1 | sed 's/.*://')
 echo "LENDISK_TEST_OVERFLOW_ENDPOINT=http://127.0.0.1:$PORT"

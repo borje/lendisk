@@ -94,7 +94,15 @@ type Overflow struct {
 	// to enabled: the target may hold delete markers lendisk sent while
 	// it had versioning, whatever it has now (#97).
 	WasVersioned bool
+	// RemovingAt is when `overflow remove` began removing the target
+	// (#96); zero for a target in use. KeepData: its copies are left
+	// there, no delete sent.
+	RemovingAt time.Time
+	KeepData   bool
 }
+
+// Removing reports whether the target is being removed (#96).
+func (o Overflow) Removing() bool { return !o.RemovingAt.IsZero() }
 
 // Markers reports whether the target may hold delete markers of
 // lendisk's deletes: it has versioning now, or had it at some time
@@ -107,29 +115,30 @@ func (o Overflow) Place() string { return OverflowPlace(o.Name) }
 const overflowCols = `name, endpoint, region, bucket, prefix, max_bytes, env_prefix, retention,
 	coalesce(price_per_gb, 0), versioning, lifecycle, version_removal, added_at, versioning_checked_at,
 	EXISTS (SELECT 1 FROM overflow_versioning c WHERE c.name = overflow.name
-		AND '` + VersioningEnabled + `' IN (c.previous, c.versioning))`
+		AND '` + VersioningEnabled + `' IN (c.previous, c.versioning)),
+	removing_at, coalesce(keep_data, 0)`
 
 func scanOverflow(s interface{ Scan(...any) error }) (Overflow, error) {
 	var o Overflow
 	var retention, added int64
-	var checked sql.NullInt64
+	var checked, removing sql.NullInt64
 	err := s.Scan(&o.Name, &o.Endpoint, &o.Region, &o.Bucket, &o.Prefix, &o.MaxBytes, &o.EnvPrefix, &retention,
-		&o.PricePerGB, &o.Versioning, &o.Lifecycle, &o.VersionRemoval, &added, &checked, &o.WasVersioned)
+		&o.PricePerGB, &o.Versioning, &o.Lifecycle, &o.VersionRemoval, &added, &checked, &o.WasVersioned,
+		&removing, &o.KeepData)
 	o.Retention = time.Duration(retention) * time.Second
 	o.AddedAt = time.Unix(added, 0)
 	if checked.Valid {
 		o.VersioningCheckedAt = time.Unix(checked.Int64, 0)
+	}
+	if removing.Valid {
+		o.RemovingAt = time.Unix(removing.Int64, 0)
 	}
 	return o, err
 }
 
 // AddOverflow inserts an overflow target; ErrExists if one has its name.
 func (db *DB) AddOverflow(ctx context.Context, o Overflow) error {
-	defer func() {
-		db.splitMu.Lock()
-		db.splitAt = time.Time{} // the pool changed: ask again
-		db.splitMu.Unlock()
-	}()
+	defer db.forgetSplit()
 	var price any
 	if o.PricePerGB > 0 {
 		price = o.PricePerGB
@@ -256,7 +265,7 @@ func (db *DB) overflowSplit(ctx context.Context, q querier) (bool, error) {
 		return db.splitVal, nil
 	}
 	var targets int
-	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM overflow`).Scan(&targets); err != nil {
+	if err := q.QueryRowContext(ctx, `SELECT count(*) FROM overflow WHERE removing_at IS NULL`).Scan(&targets); err != nil {
 		return false, err
 	}
 	split := false
@@ -308,7 +317,7 @@ const DrainWindow = 30 * 24 * time.Hour
 // as it is now first.
 func (db *DB) overflowDrain(ctx context.Context) (bool, error) {
 	var targets int
-	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM overflow`).Scan(&targets); err != nil || targets == 0 {
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM overflow WHERE removing_at IS NULL`).Scan(&targets); err != nil || targets == 0 {
 		return false, err
 	}
 	u, err := repositoryUse(ctx, db)
@@ -376,13 +385,14 @@ func recordPeak(ctx context.Context, x execer, u RepositoryUse, now time.Time) e
 // and the buckets' copies.
 const splitKey = `SELECT coalesce((SELECT group_concat(peer_key || ':' || coalesce(address, '') || ':' ||
 		coalesce(own_number, 0) || ':' || coalesce(peer_number, 0), ',') FROM friendship), '') || '|' ||
-	coalesce((SELECT group_concat(name || ':' || max_bytes, ',') FROM overflow), '') || '|' ||
+	coalesce((SELECT group_concat(name || ':' || max_bytes || ':' || coalesce(removing_at, ''), ',') FROM overflow), '') || '|' ||
 	coalesce((SELECT group_concat(name || ':' || copies, ',') FROM buckets), '')`
 
 // overflowHolding lists the overflow targets that hold data of bucket
-// at now, in place order (holdsLiveData).
+// at now, in place order (holdsLiveData); a target being removed is
+// sent no more metadata (#96).
 func overflowHolding(ctx context.Context, q querier, bucket string, now int64) ([]string, error) {
-	return column(ctx, q, `SELECT p FROM (SELECT '`+OverflowPrefix+`' || name AS p FROM overflow)
+	return column(ctx, q, `SELECT p FROM (SELECT '`+OverflowPrefix+`' || name AS p FROM overflow WHERE removing_at IS NULL)
 		WHERE `+holdsLiveData("p", "?1", "?2")+` ORDER BY p`, bucket, now)
 }
 

@@ -60,8 +60,17 @@ func (db *DB) RecordOverflowVersioning(ctx context.Context, name, versioning str
 		return nil, err
 	}
 	defer tx.Rollback()
+	ch, err := recordVersioning(ctx, tx, name, versioning, now)
+	if err != nil {
+		return nil, err
+	}
+	return ch, tx.Commit()
+}
+
+// recordVersioning is RecordOverflowVersioning inside tx.
+func recordVersioning(ctx context.Context, tx *sql.Tx, name, versioning string, now time.Time) (*VersioningChange, error) {
 	var prev string
-	err = tx.QueryRowContext(ctx, `UPDATE overflow SET versioning_checked_at = ? WHERE name = ?
+	err := tx.QueryRowContext(ctx, `UPDATE overflow SET versioning_checked_at = ? WHERE name = ?
 		RETURNING versioning`, now.Unix(), name).Scan(&prev)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
@@ -80,7 +89,7 @@ func (db *DB) RecordOverflowVersioning(ctx context.Context, name, versioning str
 			return nil, err
 		}
 	}
-	return ch, tx.Commit()
+	return ch, nil
 }
 
 // LastVersioningChanges returns each overflow target's latest change of

@@ -476,6 +476,16 @@ func (db *DB) settleKey(ctx context.Context, tx *preparedTx, bucket, key string,
 	if err != nil {
 		return err
 	}
+	if onlyTargetsList(ls) {
+		// #96 review: a metadata or snapshot key no friend lists is not
+		// live on an overflow target's word. Friends hold every live
+		// metadata key (REPL-12); a target may still hold one the node
+		// pruned, its delete held as a client-side tomb in the lost
+		// lendisk.db (S3-4), and a revived restic index would let later
+		// backups dedupe against packs pruned at the friends. A friend's
+		// list that names it decides it again.
+		ls = nil
+	}
 	var own sql.NullInt64
 	var picked sql.NullString
 	err = tx.QueryRowContext(ctx, `SELECT seq, picked FROM recovered_key WHERE bucket = ? AND key = ?`, bucket, key).Scan(&own, &picked)
@@ -590,6 +600,20 @@ func saveVerdict(ctx context.Context, tx *preparedTx, bucket, key, verdict, reas
 			sha256 = excluded.sha256, seq = excluded.seq, picked = excluded.picked`,
 		bucket, key, verdict, nullString(reason), nullString(sha), seq, picked)
 	return err
+}
+
+// onlyTargetsList reports whether ls is a metadata or snapshot key's
+// listing by overflow targets alone (#96 review).
+func onlyTargetsList(ls []listedRow) bool {
+	if len(ls) == 0 {
+		return false
+	}
+	for _, r := range ls {
+		if _, target := OverflowName(r.place); !target || r.class != "metadata" && r.class != "snapshot" {
+			return false
+		}
+	}
+	return true
 }
 
 // decide is the rule: the user's pick, else the hash most places list,
