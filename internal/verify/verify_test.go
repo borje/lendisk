@@ -378,16 +378,27 @@ func TestRunChallengesDailyAndOnRequest(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	eventually("the first challenge", func() bool { return len(n.b.requests()) > 0 && !n.record().VerifiedAt.IsZero() })
-	first := len(n.b.requests())
+	// The daily challenge's ranged requests only: the rolling full
+	// check (VER-1a, #105) adds whole-object ones on its own schedule.
+	ranged := func() int {
+		c := 0
+		for _, r := range n.b.requests() {
+			if !r.Whole {
+				c++
+			}
+		}
+		return c
+	}
+	eventually("the first challenge", func() bool { return ranged() > 0 && !n.record().VerifiedAt.IsZero() })
+	first := ranged()
 	n.advance(23 * time.Hour)
 	n.v.Kick()
 	time.Sleep(50 * time.Millisecond)
-	if got := len(n.b.requests()); got != first {
+	if got := ranged(); got != first {
 		t.Fatalf("challenged again within the day: %d, then %d", first, got)
 	}
 	n.advance(time.Hour)
-	eventually("the next day's challenge", func() bool { return len(n.b.requests()) > first })
+	eventually("the next day's challenge", func() bool { return ranged() > first })
 
 	id, err := n.db.RequestVerify(t.Context(), peerB, "laptop", true, n.now)
 	if err != nil {
