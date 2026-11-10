@@ -20,8 +20,8 @@ import (
 // -parallel places, so TestMain raises -parallel's default
 // (parallelDefault) and these two bound the work instead. A test that
 // needs a quiet process stays serial, saying why: go test runs the
-// serial tests before the parallel ones. Three read the process's own
-// sockets.
+// serial tests before the parallel ones. Those that read the process's
+// own sockets (ownSockets) are such tests.
 
 var (
 	gatewayHeld sync.Mutex

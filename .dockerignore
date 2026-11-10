@@ -1,0 +1,3 @@
+# The image needs only the cross-built binaries (see Dockerfile).
+*
+!dist/linux-*/lendisk

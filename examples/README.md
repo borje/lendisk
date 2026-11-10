@@ -1,12 +1,17 @@
 # lendisk deployment examples
 
-These files follow DESIGN.md v0.15 and REQUIREMENTS.md v0.11
-(2026-11-04). The daemon does not exist yet, so the TOML keys and the
-image name are the proposed surface, kept consistent with the design
-text: one static binary, one `[store]` section for both roles,
-third-party credentials from the environment and never from a file the
-daemon writes (SEC-3), `network_mode: host` so NAT traversal is not
-behind Docker's own NAT (D2, G-1).
+One static binary, one `[store]` section for both roles, third-party
+credentials from the environment and never from a file the daemon
+writes (SEC-3), `network_mode: host` so NAT traversal is not behind
+Docker's own NAT (D2, G-1). A test (`internal/config/examples_test.go`)
+loads every v1 example against the shipped settings: no unknown key,
+and every setting shown somewhere, set or commented out.
+
+The image is built from the `Dockerfile` at the repository root
+(distroless, user 65532, no shell); nothing is published yet, so
+`ghcr.io/lendisk/lendisk` stands for an image you build with
+`docker build -t ghcr.io/lendisk/lendisk:0.10 .` after the build step
+the Dockerfile describes.
 
 | Folder | Who | What it shows |
 |---|---|---|
@@ -14,7 +19,8 @@ behind Docker's own NAT (D2, G-1).
 | `lender-only-pi/` | Carla, Raspberry Pi with a USB disk | The lender-only profile (PEER-9): a node with no buckets yet, symmetric friendships with two people, 60-day window |
 | `garage-on-lan/` | Björn, homelab behind CGNAT | **Post-v1 (EP-16).** A store the user already runs: Garage as a second compose service, named as the `s3` backend. Kept for v1.1; in v1 Björn runs the default install |
 | `provider-store-vps/` | Dag, small VPS with a public IP | **Post-v1 (EP-16).** A provider as the store, Hetzner Object Storage behind the `s3` backend, Kopia. Kept for v1.1; in v1 Dag's store is the VPS disk |
-| `systemd/` | Any of the above without Docker | The unit file and the root-owned environment file that SEC-3 assumes |
+| `relay-vps/` | Dag, small VPS with a public IP | `lendisk relay` for the group (NET-5), so their nodes need no relay run by a third party; the `[relay]` settings |
+| `systemd/` | Any of the above without Docker | The unit file and the root-owned environment file that SEC-3 assumes; the release package holds both |
 
 ## What is in the config file and what is not
 

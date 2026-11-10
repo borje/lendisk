@@ -6171,6 +6171,19 @@ the handler's own reads and is never cancelled; nothing below
   copy holds bucket secrets, so lendisk creates it empty at 0600
   first (`VACUUM INTO` accepts an empty file) and a failure to do so
   stops the migration (#53).
+  Two checks hold the rule (#44).
+  `TestRealHistoryUpgradesAndKeepsTheEarlierSchemaUsable` takes a
+  database through the real history one migration at a time. After
+  each step that keeps Compat below its version, the binary one step
+  back must open the database in downgrade mode and find every table
+  and column it knew unchanged. No new column may be NOT NULL without a
+  default, and no new unique index may cover only columns the older
+  binary writes. A step that raises Compat must be refused by the
+  binary it locks out. CI's `downgrade` job does the same with real
+  binaries (`.github/downgrade.sh`). The previous release tag, or the
+  previous commit until there is a tag, makes a node and a bucket. This
+  commit migrates it, adds a bucket and serves. The earlier binary then
+  runs `status`, lists the new bucket, adds one and serves.
 
 ### 3.9 Security
 
@@ -6292,7 +6305,12 @@ the handler's own reads and is never cancelled; nothing below
   interfaces is the peer connection NET-1 names. There is no child
   process and no other socket. Every listener is one REQUIREMENTS.md
   names. Checked with `ss -lntup` and `ss -lxp`, with and without an
-  `endpoint.listen` entry.
+  `endpoint.listen` entry. `TestListenerAuditShowsOnlyTheNamedSockets`
+  (#44) reads the daemon's sockets from `/proc/self` in both cases.
+  The new TCP listeners must be exactly the loopback endpoint and the
+  configured address. The datagram sockets must be tailcat's on the
+  wildcard address, one per address family. The only unix listener
+  must be `gw.sock`.
 - **SEC-9** The classification is Go code: `gateway.Surface`, one entry
   per S3 action versitygw v1.10.0 routes (by its metrics action name,
   with a request that routes there), and `gateway.BackendMethods`, one
@@ -6577,11 +6595,71 @@ the handler's own reads and is never cancelled; nothing below
   `kopia` bucket that captures a blob only format 1 writes is marked,
   shown in `status` and alerted (`kopia_format1`), never refused
   (§3.3 EP-7, *Kopia format 1*).
+  *The tool matrix (#44).* CI's `compat` job runs restic 0.19.1,
+  0.18.1 and 0.17.3 and Kopia 0.23.1, 0.22.3 and 0.21.1: the latest
+  patch of the latest minor release and of the two before it. Each
+  row installs one pinned version (`.github/install-tool.sh`, checked
+  against its SHA-256) and runs that tool's end-to-end tests through
+  the S3 endpoint, without the race detector. For restic that is
+  `TestResticEndToEnd`, `TestReplicateResticBackupToFriend`,
+  `TestResticRestoreThroughFriendsAfterRecovery` and
+  `TestResticPruneTombstonesAtEveryFriend`. For Kopia it is
+  `TestKopiaEndToEnd`, `TestReplicateKopiaToFriend`,
+  `TestKopiaFormat1RepositoryIsWarnedUntilUpgraded` and
+  `TestKopiaOpensAnExportAsAFilesystemRepository`. The `test` job pins
+  the latest of each. When a tool releases, the oldest row goes, the
+  new latest comes in, and the `test` job's pin moves to it.
 - **COMPAT-2** lendisk is one static Go binary for amd64, arm64 and
   32-bit ARM, so the package exists for every v1 platform.
   The container image recommends `network_mode: host` (D2). versitygw
   also builds on macOS, BSD and Windows, which keeps post-v1 ports
   open.
+  *Packaging (#44).* CI's `build` job cross-compiles the binary with
+  `CGO_ENABLED=0` for linux amd64, arm64 and armv7 (`GOARM=7`) and fails
+  unless `file` reports it statically linked. `.github/package.sh` then
+  packs one tarball per platform, `lendisk-<version>-linux-<arch>.tar.gz`
+  with a `.sha256` beside it. The tarball holds the binary, the systemd
+  unit, its environment file and the README, with root ownership and
+  mtime 0. A tarball is the package: a static binary needs no
+  dependency resolution, so a .deb would add a format and change
+  nothing else. The artefacts stay in the workflow and nothing is
+  published.
+  *The systemd unit* (`examples/systemd/lendisk.service`) runs as the
+  system user `lendisk`. Third-party credentials come from
+  `EnvironmentFile=-/etc/lendisk.env`, which root owns at 0600.
+  `StateDirectory=lendisk` (0700) is the data directory and
+  `ReadWritePaths=/etc/lendisk` the config directory. Hardening:
+  NoNewPrivileges, an empty capability bounding set,
+  `ProtectSystem=strict`, ProtectHome, PrivateTmp, PrivateDevices, the
+  ProtectKernel*/Clock/Hostname/ControlGroups options,
+  `ProtectProc=invisible`, `SystemCallFilter=@system-service
+  ~@privileged` (EPERM), MemoryDenyWriteExecute and `UMask=0077`.
+  `RestrictAddressFamilies` allows IP, unix and netlink. The tunnel's
+  direct paths and an `interface` entry of `endpoint.listen` list the
+  host's addresses, and Go does that over netlink.
+  *The container image* is `Dockerfile` at the root: the build job's
+  binary on `gcr.io/distroless/static-debian13:nonroot`, pinned by
+  digest, user 65532. The base adds the CA certificates (overflow
+  targets, relay maps, webhooks) and time zones (`replication.schedule`
+  is local time), and nothing that runs: there is no shell, so an
+  alert hook in the container is a static program. The image has no
+  RUN step, so CI's `image` job builds all three platforms without
+  emulation. It keeps the image as an OCI archive artefact.
+  `.github/image-smoke.sh` then runs the amd64 image as the compose
+  examples do (`--user`, `--cap-drop ALL`, no-new-privileges,
+  `--read-only` with a tmpfs `/tmp`, host network). It initialises a
+  node from a phrase, serves, and checks `status`, `bucket add` and
+  the daemon's `/proc` status: not root, every capability set empty,
+  NoNewPrivs.
+  *The examples* are checked against `config.Config` by
+  `internal/config/examples_test.go`. Each v1 example's `lendisk.toml`
+  loads and validates with no unknown key. Its commented-out
+  `key = value` lines and table headers are real keys too. Together
+  the v1 examples show every setting, so a new setting cannot ship
+  undocumented. The post-v1 `s3` store examples are checked for keys
+  only. The environment, compose and unit files may name only
+  variables lendisk reads. The unit and every compose service running
+  the image must be unprivileged.
 - **COMPAT-3** `lendisk bucket import <name> <path> --profile
   restic|kopia [--copies N] [--resume]` (#9) creates the bucket as
   `bucket add` does (row, credential, directory through the posix

@@ -34,11 +34,20 @@ overlay network that works behind NAT.
 
 ## Install
 
-No releases yet. Build from source with Go (pure Go, no cgo):
+No releases yet. CI builds a package per platform (Linux amd64, arm64,
+armv7): a tarball with the static binary, the systemd unit and its
+environment file, kept as a workflow artefact. Or build from source
+with Go (pure Go, no cgo):
 
 ```sh
-go build -o lendisk ./cmd/lendisk
+CGO_ENABLED=0 go build -o lendisk ./cmd/lendisk
 ```
+
+The unit runs lendisk as an unprivileged user; its comments give the
+install steps. For a container, the `Dockerfile` packs the binary on a
+distroless base (`dist/linux-amd64/lendisk`, then `docker build .`);
+run it with every capability dropped and a read-only root, as
+[examples/](examples/) does.
 
 ## Quick start
 
