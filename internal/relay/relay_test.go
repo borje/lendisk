@@ -28,15 +28,19 @@ func newID(t *testing.T) *identity.Identity {
 	return id
 }
 
-// run starts a self-signed relay on 127.0.0.1 and returns its entry.
-func run(t *testing.T, dir string) Entry {
+// run starts a self-signed relay on 127.0.0.1 and returns its entry;
+// set, if given, changes its config first.
+func run(t *testing.T, dir string, set ...func(*Config)) Entry {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	ready := make(chan Entry, 1)
+	c := Config{Hostname: "127.0.0.1", Listen: "127.0.0.1:0", STUNPort: 0, TLS: "self-signed", Dir: dir, Log: quiet}
+	for _, f := range set {
+		f(&c)
+	}
 	go func() {
-		done <- Run(ctx, Config{Hostname: "127.0.0.1", Listen: "127.0.0.1:0", STUNPort: 0, TLS: "self-signed", Dir: dir, Log: quiet},
-			func(e Entry) { ready <- e })
+		done <- Run(ctx, c, func(e Entry) { ready <- e })
 	}()
 	t.Cleanup(func() {
 		cancel()

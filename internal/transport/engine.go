@@ -87,48 +87,80 @@ func setEnginePort(s *tailcat.Server, port uint16) error {
 // setPeerEndpoints gives a started client's engine eps as the server's
 // UDP addresses, as a control plane's network map would: magicsock
 // disco-pings each, and the first to answer becomes the direct path.
-func setPeerEndpoints(c *tailcat.Client, eps []netip.AddrPort) error {
+// The map it installs is also the backend's own, so tailcat reads the
+// endpoints back, and it returns that map: when tailcat installs
+// another, the endpoints are gone and must be given again (applied).
+func setPeerEndpoints(c *tailcat.Client, eps []netip.AddrPort) (*netmap.NetworkMap, error) {
 	b, err := backendOf(c)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	mc, err := b.magicsock()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	nm := *b.nm
-	b.mu.Unlock()
 	if nm == nil || len(nm.Peers) != 1 {
-		return errInternals // a client's map holds its server alone
+		return nil, errInternals // a client's map holds its server alone
 	}
 	peer := nm.Peers[0].AsStruct()
 	peer.Endpoints = slices.Clone(eps)
-	mc.SetNetworkMap(nm.SelfNode, []tailcfg.NodeView{peer.View()})
-	return nil
+	next := *nm
+	next.Peers = []tailcfg.NodeView{peer.View()}
+	*b.nm = &next
+	// Under the backend's lock, as tailcat's own setNetworkMapLocked
+	// does, so no map tailcat installs meanwhile is overwritten.
+	mc.SetNetworkMap(next.SelfNode, next.Peers)
+	return &next, nil
+}
+
+// applied reports whether c's backend still holds nm, the map that
+// carried its explicit addresses; a client whose internals cannot be
+// read counts as holding it, since nothing can be given to it again.
+func applied(c *tailcat.Client, nm *netmap.NetworkMap) bool {
+	b, err := backendOf(c)
+	if err != nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return *b.nm == nm
 }
 
 // direct gives c's engine the friend's explicit addresses (NET-3) when
-// they changed since it was last given them. The engine exists once the
-// client has started, so a client not yet up is started first, with
-// tailcat's meow ping, which the dial does anyway.
+// they changed since it was last given them, or when the client's
+// network map was replaced since, which drops them (#99). The engine
+// exists once the client has started, so a client not yet up is
+// started first, with tailcat's meow ping, which the dial does anyway.
+// The ping is a network round trip, so it runs without c.epsMu: a
+// concurrent dial to the same friend whose addresses are in place does
+// not wait for it (#99).
 func (t *Tailcat) direct(ctx context.Context, c *tailcatClient, eps []netip.AddrPort) {
-	eps = slices.Clone(eps)
-	slices.SortFunc(eps, func(a, b netip.AddrPort) int { return a.Compare(b) })
-	eps = slices.Compact(eps)
+	current := func() bool {
+		return slices.Equal(c.eps, eps) && (len(eps) == 0 || applied(c.Client, c.nm))
+	}
 	c.epsMu.Lock()
-	defer c.epsMu.Unlock()
-	if slices.Equal(c.eps, eps) {
+	done := current()
+	c.epsMu.Unlock()
+	if done {
 		return
 	}
-	if _, err := c.Ping(ctx); err != nil {
+	if err := t.ping(ctx, c); err != nil {
 		return // the dial fails the same way, and the next one tries again
 	}
-	if err := setPeerEndpoints(c.Client, eps); err != nil {
+	c.epsMu.Lock()
+	defer c.epsMu.Unlock()
+	if current() {
+		return // a concurrent dial gave them
+	}
+	nm, err := setPeerEndpoints(c.Client, eps)
+	if err != nil {
 		t.log.Warn("transport: a friend's explicit addresses could not be given to the tunnel; it is reached by hole punching and the relay",
 			"peer", c.peer.String(), "err", err)
 		return
 	}
 	t.logf("tunnel to %s: explicit addresses %v", c.peer, eps)
-	c.eps = eps
+	c.eps, c.nm = eps, nm
 }

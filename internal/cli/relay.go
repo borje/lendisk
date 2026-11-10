@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,7 +23,7 @@ import (
 
 // relayCmd is `lendisk relay` (NET-5): a self-hosted relay on a VPS.
 func (a *app) relayCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "relay",
 		Short: "Run a relay for friends who cannot connect directly",
 		Long: `relay runs a DERP relay and a STUN server, as Tailscale's derper does,
@@ -39,15 +38,27 @@ by. With relay.tls = "self-signed" (the default) the certificate is made
 once, kept in <data_dir>/relay, and pinned by the entry's cert field;
 with "letsencrypt", relay.hostname must be a DNS name pointing here and
 relay.listen on port 443. The relay forwards packets it cannot read, but
-it sees the IP addresses of the nodes it relays and how much they send.`,
+it sees the IP addresses of the nodes it relays and how much they send.
+
+Without relay.allow it relays for any node that finds it, as derper
+does. Set relay.allow to the node IDs of your group, which
+` + "`lendisk relay keys`" + ` prints on any friend's node, and it forwards only
+packets to or from one of them; relay.rate_limit caps what each
+connected key may send. A node it drops packets for is logged by node
+ID, so a friend missing from the list shows in the log.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, log, err := a.load(a.out) // a daemon: logs on stdout
 			if err != nil {
 				return err
 			}
+			allow, err := cfg.Relay.AllowList()
+			if err != nil {
+				return err // Load validated it
+			}
 			c := relay.Config{Hostname: cfg.Relay.Hostname, Listen: cfg.Relay.Listen, STUNPort: cfg.Relay.STUNPort.Int(),
-				TLS: cfg.Relay.TLS, CertFile: cfg.Relay.Cert, KeyFile: cfg.Relay.Key, Dir: filepath.Join(cfg.DataDir, "relay"), Log: log}
+				TLS: cfg.Relay.TLS, CertFile: cfg.Relay.Cert, KeyFile: cfg.Relay.Key, Dir: filepath.Join(cfg.DataDir, "relay"),
+				Allow: allow, RateLimit: cfg.Relay.RateLimitBytes(), Log: log}
 			if err := c.Check(); err != nil {
 				return usageError{err}
 			}
@@ -67,17 +78,66 @@ it sees the IP addresses of the nodes it relays and how much they send.`,
 			})
 		},
 	}
+	cmd.AddCommand(a.relayKeysCmd())
+	return cmd
+}
+
+// relayKeysCmd is `lendisk relay keys` (#99): what a relay's
+// relay.allow needs for this node and its friends.
+func (a *app) relayKeysCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "keys",
+		Short: "Print the node IDs a relay's relay.allow needs for this node and its friends",
+		Long: `relay keys prints this node's ID and those of its friends, one per line,
+for the relay.allow setting of a relay your group runs with ` + "`lendisk relay`" + `.
+Paste them into the relay's lendisk.toml, as one string with a node ID
+per line, and restart the relay:
+
+  [relay]
+  allow = """
+  <the lines relay keys printed>
+  """
+
+A relay with relay.allow forwards only packets to or from a listed node.
+Every node whose address names the relay must be listed; a friend that
+only dials such a node needs no entry, nor do the other keys a node
+dials with. Run it on each friend's node whose friends use the relay,
+and merge the lists.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, db, err := a.openState(cmd.Context())
+			if err != nil {
+				return err
+			}
+			defer db.Close()
+			id, err := identity.Load(cfg.ConfigDir())
+			if err != nil {
+				return err
+			}
+			fs, err := db.Friendships(cmd.Context())
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(a.out, id.NodeID())
+			for _, f := range fs {
+				fmt.Fprintln(a.out, f.Peer)
+			}
+			return nil
+		},
+	}
 }
 
 // peerAddressCmd is `lendisk peer address` (NET-3).
 func (a *app) peerAddressCmd() *cobra.Command {
 	var clear bool
 	cmd := &cobra.Command{
-		Use:   "address <friend> [ip:port ...]",
+		Use:   "address <friend> [host:port ...]",
 		Short: "Give a friend's static address, dialled directly",
 		Long: `peer address sets the UDP addresses a friend's node is reached at
 directly (NET-3): its static public IP, or a router's port forward to
-the port the friend sets as tunnel.port, as ip:port. They replace the
+the port the friend sets as tunnel.port, as ip:port, or as name:port
+with a DNS name, such as a dynamic DNS name, which is looked up again
+at each dial. They replace the
 ones given before; --clear removes them. Each dial of the friend tries
 them at once, beside hole punching and the relay, and the first that
 answers carries the tunnel; a running daemon uses them from its next
@@ -105,14 +165,11 @@ func (a *app) runPeerAddress(ctx context.Context, s string, addrs []string, clea
 	}
 	var keep []string
 	for _, s := range addrs {
-		ap, err := netip.ParseAddrPort(strings.TrimSpace(s))
-		switch {
-		case err != nil:
-			return usageError{fmt.Errorf("%q is not ip:port, such as 203.0.113.5:41641 or [2001:db8::5]:41641", s)}
-		case ap.Port() == 0 || ap.Addr().IsUnspecified() || ap.Addr().IsMulticast():
-			return usageError{fmt.Errorf("%q cannot be dialled: give a host's IP address and a port from 1 to 65535", s)}
+		k, err := transport.ParseExplicitAddress(s)
+		if err != nil {
+			return usageError{err}
 		}
-		keep = append(keep, netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port()).String())
+		keep = append(keep, k)
 	}
 	_, db, err := a.openState(ctx)
 	if err != nil {

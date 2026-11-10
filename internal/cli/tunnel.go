@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -43,22 +42,14 @@ func (a *app) relays(cfg *config.Loaded, st transport.NodeStore) transport.Regio
 // explicit addresses directly (NET-3).
 func (a *app) dialPolicy(tc *transport.Tailcat, cfg *config.Loaded, db *state.DB, log *slog.Logger) {
 	tc.SetRelays(a.relays(cfg, db), cfg.Relays.AcceptPeerHints.On())
-	tc.SetEndpoints(func(peer identity.NodeID) []netip.AddrPort {
+	tc.SetEndpoints(func(peer identity.NodeID) []string {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		f, err := db.GetFriendship(ctx, peer.String())
 		if err != nil {
 			return nil
 		}
-		var eps []netip.AddrPort
-		for _, s := range f.ExplicitAddresses {
-			if ap, err := netip.ParseAddrPort(s); err == nil {
-				eps = append(eps, ap)
-			} else {
-				log.Warn("ignoring a friend's explicit address that is not ip:port", "peer", f.Peer, "address", s)
-			}
-		}
-		return eps
+		return f.ExplicitAddresses // ip:port or name:port, resolved by the transport at each dial
 	})
 }
 

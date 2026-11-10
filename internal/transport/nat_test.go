@@ -2,12 +2,17 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
+	"slices"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/tailscale/tailcat"
 	"tailscale.com/envknob"
+	"tailscale.com/tailcfg"
 
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/transport/transporttest"
@@ -163,8 +168,8 @@ func TestNoReachableRelayNoTunnel(t *testing.T) {
 	p := newNATPair(t, false, false, func(srv, dl *Tailcat) {
 		port = freeUDPPort(t)
 		srv.SetPort(port)
-		dl.SetEndpoints(func(identity.NodeID) []netip.AddrPort {
-			return []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)}
+		dl.SetEndpoints(func(identity.NodeID) []string {
+			return []string{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port).String()}
 		})
 	})
 	p.d.Close()
@@ -180,14 +185,21 @@ func TestNoReachableRelayNoTunnel(t *testing.T) {
 // directly. Both nodes are behind symmetric NATs, so hole punching
 // finds no path (TestNATBothSymmetricFallBackToTheRelay); the lender's
 // engine listens on a fixed port (tunnel.port, a port forward), and the
-// borrower is given it: the path is direct.
+// borrower is given it: the path is direct. The address is a DNS name
+// (#99), as a dynamic DNS name would be, looked up at the dial.
 func TestExplicitAddressIsDialledDirectly(t *testing.T) {
 	var port uint16
 	p := newNATPair(t, true, true, func(srv, dl *Tailcat) {
 		port = freeUDPPort(t)
 		srv.SetPort(port)
-		dl.SetEndpoints(func(peer identity.NodeID) []netip.AddrPort {
-			return []netip.AddrPort{netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)}
+		dl.relays.lookup = func(ctx context.Context, host string) ([]netip.Addr, error) {
+			if host == "lender.dyndns.example" {
+				return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+			}
+			return defaultLookup(ctx, host)
+		}
+		dl.SetEndpoints(func(peer identity.NodeID) []string {
+			return []string{net.JoinHostPort("lender.dyndns.example", strconv.Itoa(int(port)))}
 		})
 	})
 	c, s := p.dial(t)
@@ -196,6 +208,145 @@ func TestExplicitAddressIsDialledDirectly(t *testing.T) {
 		t.Fatalf("want the direct path to the explicit address 127.0.0.1:%d, got %+v", port, pi)
 	}
 	echo(t, c, s, "explicit")
+}
+
+// peerEndpoints are the server's endpoints in the network map c's
+// backend holds now.
+func peerEndpoints(t *testing.T, c *tailcatClient) []netip.AddrPort {
+	t.Helper()
+	b, err := backendOf(c.Client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	nm := *b.nm
+	if nm == nil || len(nm.Peers) != 1 {
+		t.Fatalf("network map %+v", nm)
+	}
+	return nm.Peers[0].Endpoints().AsSlice()
+}
+
+// #99: the explicit addresses are part of the network map the client's
+// backend holds, and when tailcat installs another map without them,
+// the next dial gives them again; a dial with them in place leaves the
+// map alone.
+func TestExplicitAddressesSurviveANetworkMapChange(t *testing.T) {
+	ep := netip.MustParseAddrPort("127.0.0.1:9")
+	p := newNATPair(t, false, false, func(srv, dl *Tailcat) {
+		dl.SetEndpoints(func(identity.NodeID) []string { return []string{ep.String()} })
+	})
+	p.dial(t)
+	p.dl.mu.Lock()
+	c := p.dl.clients[p.srvID.NodeID()]
+	p.dl.mu.Unlock()
+	if got := peerEndpoints(t, c); !slices.Contains(got, ep) {
+		t.Fatalf("after the first dial the map's endpoints are %v", got)
+	}
+	b, err := backendOf(c.Client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mc, err := b.magicsock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A map as tailcat builds one: the server with no endpoints.
+	b.mu.Lock()
+	fresh := **b.nm
+	peer := fresh.Peers[0].AsStruct()
+	peer.Endpoints = nil
+	fresh.Peers = []tailcfg.NodeView{peer.View()}
+	*b.nm = &fresh
+	mc.SetNetworkMap(fresh.SelfNode, fresh.Peers)
+	b.mu.Unlock()
+	p.dial(t)
+	if got := peerEndpoints(t, c); !slices.Contains(got, ep) {
+		t.Fatalf("after a network map change the next dial left the endpoints %v", got)
+	}
+	b.mu.Lock()
+	held := *b.nm
+	b.mu.Unlock()
+	p.dial(t)
+	b.mu.Lock()
+	again := *b.nm
+	b.mu.Unlock()
+	if again != held {
+		t.Fatal("a dial with the addresses in place installed another map")
+	}
+}
+
+// #99: a dial whose explicit addresses are in place does not wait for
+// another dial to the same friend that is pinging its client before
+// giving it new ones.
+func TestDialDoesNotWaitForAnotherDialsPing(t *testing.T) {
+	tc, err := NewDialer(newID(t), quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tc.Close()
+	pinging, release := make(chan struct{}), make(chan struct{})
+	tc.ping = func(ctx context.Context, _ *tailcatClient) error {
+		close(pinging)
+		<-release
+		return errors.New("no answer")
+	}
+	old := []netip.AddrPort{netip.MustParseAddrPort("192.0.2.1:41641")}
+	c := &tailcatClient{Client: &tailcat.Client{}, t: tc, eps: old}
+	go tc.direct(t.Context(), c, []netip.AddrPort{netip.MustParseAddrPort("192.0.2.2:41641")})
+	<-pinging
+	done := make(chan struct{})
+	go func() { tc.direct(t.Context(), c, old); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a dial with its addresses in place waited for another dial's ping")
+	}
+	close(release)
+}
+
+// #99: an explicit address is ip:port or name:port; a name is looked
+// up at each dial, every IP it gives is an endpoint, and one that does
+// not resolve is left out.
+func TestExplicitAddressNamesResolveAtEachDial(t *testing.T) {
+	for in, want := range map[string]string{
+		"203.0.113.5:41641":           "203.0.113.5:41641",
+		"[::ffff:203.0.113.5]:41641":  "203.0.113.5:41641",
+		" Home.DynDNS.Example.:41641": "home.dyndns.example:41641",
+		"[2001:db8::5]:1":             "[2001:db8::5]:1",
+	} {
+		if got, err := ParseExplicitAddress(in); err != nil || got != want {
+			t.Errorf("%q: %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"home.example", "home.example:0", "home.example:70000", "0.0.0.0:1", "[ff02::1]:1",
+		"-home.example:1", "home_example:1", "1.2.3:41641", "", ":41641"} {
+		if got, err := ParseExplicitAddress(bad); err == nil {
+			t.Errorf("%q accepted as %q", bad, got)
+		}
+	}
+	tc, err := NewDialer(newID(t), quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tc.Close()
+	ip := "198.51.100.1"
+	tc.relays.lookup = func(_ context.Context, host string) ([]netip.Addr, error) {
+		if host == "home.dyndns.example" {
+			return []netip.Addr{netip.MustParseAddr(ip), netip.MustParseAddr("2001:db8::1")}, nil
+		}
+		return nil, errors.New("no such host")
+	}
+	addrs := []string{"home.dyndns.example:41641", "gone.example:41641", "203.0.113.5:41641"}
+	want := []netip.AddrPort{netip.MustParseAddrPort("198.51.100.1:41641"), netip.MustParseAddrPort("203.0.113.5:41641"),
+		netip.MustParseAddrPort("[2001:db8::1]:41641")}
+	if got := tc.endpointsOf(t.Context(), "friend", addrs); !slices.Equal(got, want) {
+		t.Fatalf("endpoints %v, want %v", got, want)
+	}
+	ip = "198.51.100.2" // the dynamic address moved
+	if got := tc.endpointsOf(t.Context(), "friend", addrs); got[0] != netip.MustParseAddrPort("198.51.100.2:41641") {
+		t.Fatalf("a moved name was not looked up again: %v", got)
+	}
 }
 
 func freeUDPPort(t *testing.T) uint16 {

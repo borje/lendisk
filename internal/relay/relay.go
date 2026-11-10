@@ -1,10 +1,12 @@
 // Package relay runs a self-hosted relay (NET-5, `lendisk relay`): a
 // DERP server and a STUN server, as Tailscale's derper runs them, for
-// friends whose nodes cannot reach each other directly. It is a relay
-// for anyone who knows its address: it forwards WireGuard packets it
-// cannot read, between keys it does not check, and sees only their IP
-// addresses and volume (NET-5a). Nodes use it by listing it in
-// relays.list, with the entry Run reports.
+// friends whose nodes cannot reach each other directly. It forwards
+// WireGuard packets it cannot read and sees only their IP addresses and
+// volume (NET-5a). With Config.Allow empty it relays for anyone who
+// knows its address, as derper does; with it, only packets to or from
+// a listed node (allow.go, #99). Config.RateLimit caps what each
+// connected key may send. Nodes use it by listing it in relays.list,
+// with the entry Run reports.
 //
 // Rules a caller must keep:
 //
@@ -12,6 +14,9 @@
 //     self-signed certificate's key and the ACME account key.
 //   - The entry names Hostname: friends' nodes dial it, so it must be
 //     the name or IP they reach this host by.
+//   - Config.Allow names every node whose address names this relay
+//     (its tunnel server's home); its friends' other keys need no
+//     entry.
 package relay
 
 import (
@@ -34,6 +39,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +48,8 @@ import (
 	"tailscale.com/derp/derpserver"
 	"tailscale.com/net/stunserver"
 	"tailscale.com/types/key"
+
+	"github.com/borje/lendisk/internal/identity"
 )
 
 // Config is how the relay serves.
@@ -63,7 +71,13 @@ type Config struct {
 	CertFile, KeyFile string
 	// Dir keeps the self-signed certificate and the ACME cache.
 	Dir string
-	Log *slog.Logger
+	// Allow, when not empty, are the nodes the relay is for: a packet
+	// is forwarded only from or to one of them (#99).
+	Allow []identity.NodeID
+	// RateLimit is the most bytes a second the relay accepts from one
+	// connected key; 0 is no limit (#99).
+	RateLimit uint64
+	Log       *slog.Logger
 }
 
 // Entry is how a node lists a relay in relays.list, in the compact
@@ -139,9 +153,23 @@ func Run(ctx context.Context, c Config, ready func(Entry)) error {
 	}
 	d := derpserver.New(key.NewNode(), logf)
 	defer d.Close()
+	if c.RateLimit > 0 {
+		// A second's worth of burst; derpserver raises it to one packet.
+		d.UpdateRateLimits(derpserver.RateConfig{PerClientRateLimitBytesPerSec: c.RateLimit, PerClientRateBurstBytes: c.RateLimit})
+	}
+	handler := derpserver.Handler(d)
+	if len(c.Allow) > 0 {
+		allow := allowSet{}
+		for _, id := range c.Allow {
+			allow[id] = true
+		}
+		handler = filteredHandler(d, allow, c.Log)
+	} else {
+		c.Log.Warn("relay.allow is empty: this relay forwards packets between any nodes that find it; list your group's node IDs (lendisk relay keys) to relay for them alone")
+	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/derp", derpserver.Handler(d))
+	mux.Handle("/derp", handler)
 	mux.HandleFunc("/derp/probe", derpserver.ProbeHandler)
 	mux.HandleFunc("/derp/latency-check", derpserver.ProbeHandler)
 	mux.HandleFunc("/generate_204", derpserver.ServeNoContent)
@@ -172,7 +200,8 @@ func Run(ctx context.Context, c Config, ready func(Entry)) error {
 		go func() { errc <- stun.Serve() }()
 		e.STUNPort = stun.LocalAddr().(*net.UDPAddr).Port
 	}
-	c.Log.Info("relay serving; nodes list it in relays.list", "entry", e.String(), "listen", ln.Addr().String(), "tls", c.TLS)
+	c.Log.Info("relay serving; nodes list it in relays.list", "entry", e.String(), "listen", ln.Addr().String(), "tls", c.TLS,
+		"allowed_nodes", len(c.Allow), "rate_limit", c.RateLimit)
 	if ready != nil {
 		ready(e)
 	}
@@ -200,7 +229,11 @@ func (c Config) tlsConfig() (*tls.Config, string, error) {
 			HostPolicy: autocert.HostWhitelist(c.Hostname),
 			Cache:      autocert.DirCache(filepath.Join(c.Dir, "acme")),
 		}
-		return m.TLSConfig(), "", nil
+		tc := m.TLSConfig()
+		// autocert offers h2, but HTTP/2 is off: DERP upgrades an
+		// HTTP/1.1 connection, so no client may negotiate h2.
+		tc.NextProtos = slices.DeleteFunc(tc.NextProtos, func(p string) bool { return p == "h2" })
+		return tc, "", nil
 	case "files":
 		if _, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile); err != nil {
 			return nil, "", fmt.Errorf("relay.cert and relay.key: %w", err)

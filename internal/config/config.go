@@ -258,6 +258,33 @@ type Relay struct {
 	TLS      string `toml:"tls" default:"self-signed" help:"for lendisk relay: self-signed (kept in <data_dir>/relay, pinned by the entry's cert), letsencrypt (hostname a DNS name pointing here, listen on port 443) or files (relay.cert and relay.key)"`
 	Cert     string `toml:"cert" help:"for lendisk relay with tls = \"files\": absolute path of the certificate chain (PEM), re-read at each connection"`
 	Key      string `toml:"key" help:"for lendisk relay with tls = \"files\": absolute path of the private key (PEM)"`
+	// Allow and RateLimit keep the relay from being anyone's free
+	// relay (#99, DESIGN §3.7 NET-5).
+	Allow     string `toml:"allow" help:"for lendisk relay: node IDs of the nodes this relay is for, separated by spaces, commas or newlines, as lendisk relay keys prints them on a friend's node; it then forwards only packets to or from one of them. List every node whose address names this relay; its friends' other keys need no entry. Empty forwards for any node that finds it"`
+	RateLimit string `toml:"rate_limit" help:"for lendisk relay: most bytes a second it accepts from one connected key, such as 8M; at least 16K, empty for no limit"`
+}
+
+// AllowList is relay.allow, parsed; Validate checked it.
+func (r Relay) AllowList() ([]identity.NodeID, error) {
+	var ids []identity.NodeID
+	for _, s := range strings.FieldsFunc(r.Allow, func(c rune) bool { return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r' }) {
+		id, err := identity.ParseNodeID(s)
+		if err != nil {
+			return nil, fmt.Errorf("relay.allow: %q: %w; give node IDs as lendisk relay keys or lendisk status prints them", s, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+// RateLimitBytes is relay.rate_limit in bytes a second, 0 for none;
+// Validate checked it.
+func (r Relay) RateLimitBytes() uint64 {
+	if strings.TrimSpace(r.RateLimit) == "" {
+		return 0
+	}
+	v, _ := ParseSize(r.RateLimit)
+	return v
 }
 
 // Switch is a true or false setting: a TOML boolean or the strings
@@ -588,6 +615,14 @@ func (c *Config) Validate() error {
 	}
 	if n, err := strconv.Atoi(string(c.Relay.STUNPort)); err != nil || n < 0 || n > 65535 {
 		errs = append(errs, fmt.Errorf("relay.stun_port = %q: want a UDP port from 1 to 65535, or 0 for none", c.Relay.STUNPort))
+	}
+	if _, err := c.Relay.AllowList(); err != nil {
+		errs = append(errs, err)
+	}
+	if r := strings.TrimSpace(c.Relay.RateLimit); r != "" {
+		if v, err := ParseSize(r); err != nil || v < pace.MinRate || v > 1<<40 {
+			errs = append(errs, fmt.Errorf("relay.rate_limit = %q: want bytes a second of at least 16K, such as 8M, or empty for no limit", c.Relay.RateLimit))
+		}
 	}
 	if c.Alerts.Webhook != "" {
 		// Never echo the URL: its path or query may be a secret.

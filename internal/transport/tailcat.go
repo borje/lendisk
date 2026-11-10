@@ -22,6 +22,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
+	"tailscale.com/types/netmap"
 	"tailscale.com/wgengine/filter"
 
 	"github.com/borje/lendisk/internal/identity"
@@ -75,8 +76,11 @@ type Tailcat struct {
 	// endpoints gives a friend's explicit addresses (NET-3), dialled
 	// directly; nil for none. port is the UDP port the server's engine
 	// binds, 0 for any (SetPort).
-	endpoints func(identity.NodeID) []netip.AddrPort
+	endpoints func(identity.NodeID) []string
 	port      uint16
+	// ping starts a client with tailcat's meow ping before its engine
+	// is given explicit addresses; tests wrap it.
+	ping func(context.Context, *tailcatClient) error
 
 	admit    func(identity.NodeID) bool
 	server   *tailcat.Server // set by Listen
@@ -99,9 +103,11 @@ type tailcatClient struct {
 	active atomic.Int64  // Tailcat.elapsed when a connection last moved bytes
 
 	// eps are the explicit addresses given to the client's engine
-	// (NET-3), guarded by epsMu.
+	// (NET-3), and nm the network map that carried them; guarded by
+	// epsMu.
 	epsMu sync.Mutex
 	eps   []netip.AddrPort
+	nm    *netmap.NetworkMap
 
 	refs    int  // open connections, dials in flight and a running check
 	conns   int  // open connections
@@ -150,6 +156,10 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 		retired:      map[*tailcatClient]bool{},
 		shutting:     map[*tailcatClient]bool{},
 		done:         make(chan struct{}),
+	}
+	t.ping = func(ctx context.Context, c *tailcatClient) error {
+		_, err := c.Ping(ctx)
+		return err
 	}
 	t.check = t.dialCheck
 	t.listenTailcat = t.startServer
@@ -330,8 +340,9 @@ func (t *Tailcat) SetRelays(set RegionSource, acceptHints bool) {
 // SetEndpoints sets where a friend's explicit addresses come from
 // (NET-3): each is given to the friend's client as an address the
 // friend's engine listens on, so the client tries it directly at once.
-// fn is asked at each dial.
-func (t *Tailcat) SetEndpoints(fn func(identity.NodeID) []netip.AddrPort) {
+// fn is asked at each dial; it gives ip:port or name:port
+// (ParseExplicitAddress), a name being looked up at each dial (#99).
+func (t *Tailcat) SetEndpoints(fn func(identity.NodeID) []string) {
 	t.mu.Lock()
 	t.endpoints = fn
 	t.mu.Unlock()
@@ -390,7 +401,7 @@ func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (
 	endpoints := t.endpoints
 	t.mu.Unlock()
 	if endpoints != nil {
-		t.direct(ctx, c, endpoints(peer))
+		t.direct(ctx, c, t.endpointsOf(ctx, peer.String(), endpoints(peer)))
 	}
 
 	conn, err := t.dial(ctx, c)
