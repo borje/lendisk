@@ -80,6 +80,9 @@ const (
 	// envReloadEvery is how often the daemon looks at its config file (a
 	// Go duration, #23).
 	envReloadEvery = "LENDISK_TEST_RELOAD_EVERY"
+	// envStartHold holds the daemon's start-up once lendisk.db is open
+	// (a Go duration, #87).
+	envStartHold = "LENDISK_TEST_START_HOLD"
 	// envBitrotEvery is the bit-rot sampler's time between steps (a Go
 	// duration, #31).
 	envBitrotEvery = "LENDISK_TEST_BITROT_EVERY"
@@ -143,6 +146,9 @@ func TestMain(m *testing.M) {
 		}
 		if d, err := time.ParseDuration(os.Getenv(envReloadEvery)); err == nil {
 			a.reloadEvery = d
+		}
+		if d, err := time.ParseDuration(os.Getenv(envStartHold)); err == nil {
+			a.afterOpen = func() { time.Sleep(d) }
 		}
 		if d, err := time.ParseDuration(os.Getenv(envBitrotEvery)); err == nil {
 			a.tuneSample = func(s *gateway.SampleSettings) { s.Every = d }

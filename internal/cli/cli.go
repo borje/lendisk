@@ -132,6 +132,9 @@ type app struct {
 	// reloadEvery is how often serve looks at its config file for changed
 	// pacing settings; zero means defaultReloadEvery. Tests set it.
 	reloadEvery time.Duration
+	// afterOpen, if set, runs once serve has opened lendisk.db: a long
+	// start-up, for tests only.
+	afterOpen func()
 	// lendStatfs reads the store's size for the default lending cap
 	// (maxTotal); nil means the store checker's Statfs. Tests set it.
 	lendStatfs func(dir string) (store.Space, error)

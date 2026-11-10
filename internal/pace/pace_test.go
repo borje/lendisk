@@ -3,11 +3,14 @@ package pace
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 // clock is a fake clock whose sleeps advance it: a paced transfer's
@@ -164,7 +167,7 @@ func TestALenderLimitsEachBorrowerIndependently(t *testing.T) {
 	p := paced(c, Settings{Up: MinRate, Down: MinRate, Lend: map[string]Rates{"B": {Up: 64 << 10, Down: 128 << 10}}})
 	var waited time.Duration
 	start := c.now()
-	drain(t, p.LendIn(t.Context(), "B", zeros(1<<20), func(d time.Duration) { waited += d }))
+	drain(t, lendIn(p, t.Context(), "B", zeros(1<<20), func(d time.Duration) { waited += d }))
 	el := c.now().Sub(start)
 	if el < 7*time.Second || el > 8*time.Second || waited != el {
 		t.Fatalf("1 MiB in from B at 128 KiB/s took %v, waits reported %v", el, waited)
@@ -180,7 +183,7 @@ func TestALenderLimitsEachBorrowerIndependently(t *testing.T) {
 	// C has no limit, and the node's own replication limits do not
 	// apply to what it lends.
 	start = c.now()
-	drain(t, p.LendIn(t.Context(), "C", zeros(4<<20), nil))
+	drain(t, lendIn(p, t.Context(), "C", zeros(4<<20), nil))
 	io.Copy(p.LendOut(t.Context(), "C", io.Discard), zeros(4<<20))
 	if el := c.now().Sub(start); el != 0 {
 		t.Fatalf("C unlimited took %v", el)
@@ -191,7 +194,7 @@ func TestALenderLimitsEachBorrowerIndependently(t *testing.T) {
 func TestANilPacerPassesThrough(t *testing.T) {
 	var p *Pacer
 	if drain(t, p.Send(t.Context(), "B", zeros(10))) != 10 || drain(t, p.Fetch(t.Context(), "B", zeros(10))) != 10 ||
-		drain(t, p.LendIn(t.Context(), "B", zeros(10), nil)) != 10 || !p.Open() {
+		drain(t, lendIn(p, t.Context(), "B", zeros(10), nil)) != 10 || !p.Open() {
 		t.Fatal("nil pacer")
 	}
 	r, err := p.Slot(t.Context())
@@ -294,5 +297,141 @@ func TestBitrotReadsHoldToTheirLimit(t *testing.T) {
 	var none *Pacer
 	if n := drain(t, none.Scrub(t.Context(), zeros(10))); n != 10 {
 		t.Fatal(n)
+	}
+}
+
+// LEND-5 (#87): a wait is credited to a body only up to its fair share
+// of the borrower's limit: the bytes it brought at the limit, times the
+// borrower's bodies under way. A body trickling a byte at a time behind
+// another that keeps the limit busy waits as long as that one, but is
+// credited a byte's share, so the floor rate and the stall bound still
+// end it; the busy body is credited its whole wait.
+func TestALendWaitIsCreditedOnlyUpToTheBodysFairShare(t *testing.T) {
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	p := New(func() time.Time { return now }) // waits do not move the clock: every reservation contends
+	p.Sleep = func(context.Context, time.Duration) error { return nil }
+	p.Set(Settings{Lend: map[string]Rates{"B": {Down: 64 << 10}}})
+	var busyWaits, trickleWaits []time.Duration
+	busy, doneBusy := p.LendIn(t.Context(), "B", zeros(1<<20), func(d time.Duration) { busyWaits = append(busyWaits, d) })
+	trickle, doneTrickle := p.LendIn(t.Context(), "B", zeros(10), func(d time.Duration) { trickleWaits = append(trickleWaits, d) })
+	defer doneTrickle()
+	buf := make([]byte, Burst)
+	io.ReadFull(busy, buf) // the burst: no wait
+	io.ReadFull(busy, buf) // 1 s behind it
+	if len(busyWaits) != 1 || busyWaits[0] != time.Second {
+		t.Fatalf("the busy body was credited %v, want its whole 1 s wait", busyWaits)
+	}
+	if n, _ := trickle.Read(buf[:1]); n != 1 {
+		t.Fatal(n)
+	}
+	// It waited about 1 s, behind the busy body's reservation; its share
+	// is 1 byte at 64 KiB/s for each of 2 bodies.
+	share := 2 * time.Second / (64 << 10)
+	if len(trickleWaits) != 1 || trickleWaits[0] > share+time.Microsecond {
+		t.Fatalf("a 1-byte read behind a busy body was credited %v, want at most %v", trickleWaits, share)
+	}
+	// With the busy body ended, the trickling one is alone.
+	doneBusy()
+	doneBusy() // done is idempotent
+	trickle.Read(buf[:1])
+	if len(trickleWaits) != 2 || trickleWaits[1] > share/2+time.Microsecond {
+		t.Fatalf("alone, a 1-byte read was credited %v, want at most %v", trickleWaits, share/2)
+	}
+}
+
+// #87: a friend's limiter made on its first transfer has the rates of
+// the last Set, though the Set raced with that transfer's start: the
+// settings are read where the limiter is made. Racy by nature; before
+// the fix a round now and then made the limiter at the old rate.
+func TestALimiterMadeDuringASetHasTheNewRate(t *testing.T) {
+	p := New(nil)
+	old := Settings{Lend: map[string]Rates{}, Peers: map[string]Rates{}}
+	cur := Settings{Lend: map[string]Rates{}, Peers: map[string]Rates{}}
+	const rounds = 500
+	for i := range rounds {
+		peer := fmt.Sprintf("P%d", i)
+		old.Lend[peer], old.Peers[peer] = Rates{Up: MinRate, Down: MinRate}, Rates{Up: MinRate, Down: MinRate}
+		cur.Lend[peer], cur.Peers[peer] = Rates{Up: 4 * MinRate, Down: 4 * MinRate}, Rates{Up: 4 * MinRate, Down: 4 * MinRate}
+	}
+	want := rate.Limit(4 * MinRate)
+	for i := range rounds {
+		peer := fmt.Sprintf("P%d", i)
+		p.Set(old)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); p.Set(cur) }()
+		go func() {
+			defer wg.Done()
+			p.Send(t.Context(), peer, zeros(0))
+			_, done := p.LendIn(t.Context(), peer, zeros(0), nil)
+			done()
+		}()
+		wg.Wait()
+		p.mu.Lock()
+		up, in := p.peers[peer].up.Limit(), p.lend[peer].down.Limit()
+		p.mu.Unlock()
+		if up != want || in != want {
+			t.Fatalf("round %d: limiters made beside a Set at %v and %v, want %v", i, up, in, want)
+		}
+	}
+}
+
+// lendIn is LendIn's reader alone, for a body that ends with the test.
+func lendIn(p *Pacer, ctx context.Context, peer string, r io.Reader, waited func(time.Duration)) io.Reader {
+	pr, _ := p.LendIn(ctx, peer, r, waited)
+	return pr
+}
+
+// REPL-7 (#87): like uploads, a download limit admits only as many
+// fetches at once as it can keep at MinRate each (at least one), the
+// global limit and the friend's alike, so many read-throughs sharing
+// it do not slow each below what a lender's write deadline allows.
+func TestFetchSlotsKeepEveryFetchAboveMinRate(t *testing.T) {
+	p := New(nil)
+	p.Set(Settings{Down: 2*MinRate + MinRate/2, Peers: map[string]Rates{"B": {Down: MinRate}}})
+	admitted := func(peer string) (func(), bool) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		r, err := p.FetchSlot(ctx, peer)
+		return r, err == nil
+	}
+	b1, ok := admitted("B")
+	if !ok {
+		t.Fatal("B's first fetch waits")
+	}
+	if _, ok := admitted("B"); ok {
+		t.Fatal("a second fetch from B admitted at B's limit of MinRate")
+	}
+	c1, ok := admitted("C")
+	if !ok {
+		t.Fatal("C's fetch waits behind B's own limit")
+	}
+	if _, ok := admitted("D"); ok {
+		t.Fatal("a third fetch admitted at 2.5 × MinRate")
+	}
+	got := make(chan func(), 1)
+	go func() {
+		r, err := p.FetchSlot(t.Context(), "D")
+		if err != nil {
+			t.Error(err)
+		}
+		got <- r
+	}()
+	c1()
+	(<-got)()
+	b1()
+	b1() // release is idempotent
+	p.Set(Settings{})
+	for range 10 {
+		if _, ok := admitted("B"); !ok {
+			t.Fatal("unlimited, a fetch waits")
+		}
+	}
+	var none *Pacer
+	if r, err := none.FetchSlot(t.Context(), "B"); err != nil {
+		t.Fatal(err)
+	} else {
+		r()
 	}
 }

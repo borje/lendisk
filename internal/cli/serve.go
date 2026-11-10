@@ -45,6 +45,17 @@ func (a *app) serveCmd() *cobra.Command {
 		Short: "Run the lendisk daemon",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// SIGHUP asks for a reload (§3.4 REPL-7). Its default action
+			// ends the process, so the handler is in place before
+			// anything that can take long (lendisk.db's migrations, the
+			// tunnel): a reload racing the start is applied once the
+			// daemon runs, as the channel keeps it (#87).
+			var hup chan os.Signal
+			if a.ctx == nil {
+				hup = make(chan os.Signal, 1)
+				signal.Notify(hup, syscall.SIGHUP)
+				defer signal.Stop(hup)
+			}
 			// The daemon logs to stdout (OPS-5).
 			cfg, log, err := a.load(a.out)
 			if err != nil {
@@ -79,6 +90,9 @@ func (a *app) serveCmd() *cobra.Command {
 				return err
 			}
 			defer db.Close()
+			if a.afterOpen != nil {
+				a.afterOpen()
+			}
 			db.Clock = a.clock
 			db.RerouteAfter, db.ReplaceAfter = cfg.RerouteAfter(), cfg.ReplaceAfter()
 			if prev, ok, err := db.GetNode(ctx, "id"); err != nil {
@@ -429,10 +443,7 @@ func (a *app) serveCmd() *cobra.Command {
 			// Pacing changes apply without a restart: the file is looked
 			// at every 10 s, and at once on SIGHUP (§3.4 REPL-7).
 			rl := &reloader{Load: a.flags.Load, Path: cfg.Path, Pace: pacer, Log: log, Every: a.reloadEvery, started: cfg.Config}
-			if a.ctx == nil {
-				hup := make(chan os.Signal, 1)
-				signal.Notify(hup, syscall.SIGHUP)
-				defer signal.Stop(hup)
+			if hup != nil {
 				rl.Hup = hup
 			}
 			running++

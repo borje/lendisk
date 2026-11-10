@@ -119,6 +119,9 @@ type Worker struct {
 	// friendships reads the friendships; nil means DB.Friendships. Tests
 	// set it to fail.
 	friendships func(context.Context) ([]state.Friendship, error)
+	// stale carries the uploads dropStale forgot to abortStale, which
+	// aborts them at their places (#87); made by Run.
+	stale chan state.Transfer
 	// open opens a file in the store; nil means os.Open. Tests set it to
 	// inject open, stat and read failures.
 	open func(name string) (fs.File, error)
@@ -280,6 +283,10 @@ func (w *Worker) Run(ctx context.Context) {
 	if friendships == nil {
 		friendships = w.DB.Friendships
 	}
+	w.stale = make(chan state.Transfer, 1024)
+	aborter := make(chan struct{})
+	go func() { defer close(aborter); w.abortStale(ctx, w.stale) }()
+	defer func() { <-aborter }()
 	w.start(ctx)
 	var rerouted, replaced time.Time
 	var pool string // the pool's fingerprint at the last re-placement pass
@@ -434,8 +441,10 @@ func (w *Worker) start(ctx context.Context) {
 }
 
 // dropStale forgets the uploads of rows no longer queued at their place
-// (acknowledged, refused, re-routed). The place's own upload is left to
-// it: a lender aborts an upload with no part for a week (§3.5 LEND-1).
+// (acknowledged, refused, cancelled, re-routed) and hands each to the
+// aborter (abortStale), which aborts it at the place as far as the place
+// answers (#87); one it does not reach, the lender abandons after a
+// week with no part (§3.5 LEND-1).
 func (w *Worker) dropStale(ctx context.Context) {
 	stale, err := w.DB.StaleTransfers(ctx)
 	if err != nil {
@@ -445,10 +454,73 @@ func (w *Worker) dropStale(ctx context.Context) {
 		return
 	}
 	for _, t := range stale {
-		if err := w.DB.DropTransfer(ctx, t.Place, t.Seq); err != nil && ctx.Err() == nil {
-			w.Log.Error("replication: forgetting an unfinished upload failed", "place", t.Place, "seq", t.Seq, "err", err)
+		if err := w.DB.DropTransfer(ctx, t.Place, t.Seq); err != nil {
+			if ctx.Err() == nil {
+				w.Log.Error("replication: forgetting an unfinished upload failed", "place", t.Place, "seq", t.Seq, "err", err)
+			}
+			continue
+		}
+		if t.Key == "" {
+			continue // its queue row is gone: nothing names the key to abort
+		}
+		select {
+		case w.stale <- t:
+		default: // the aborter is behind: the upload lapses at the place
 		}
 	}
+}
+
+// abortStale aborts at their places, one at a time, the uploads
+// dropStale forgot, until ctx ends: off the worker's loop, since a place
+// that does not answer holds an abort for its timeout.
+func (w *Worker) abortStale(ctx context.Context, stale <-chan state.Transfer) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case t := <-stale:
+			r, err := w.placeClient(ctx, t.Place)
+			if err != nil {
+				w.Log.Debug("replication: cannot reach the place to abort a forgotten upload; it lapses there", "place", t.Place,
+					"seq", t.Seq, "err", err)
+				continue
+			}
+			mp, ok := r.(Multipart)
+			if !ok {
+				continue
+			}
+			actx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err = mp.Abort(actx, t.Bucket, t.Key, t.UploadID)
+			cancel()
+			if err != nil && !errors.Is(err, ErrNoSuchUpload) {
+				w.Log.Debug("replication: aborting a forgotten upload at the place failed; it lapses there", "place", t.Place,
+					"seq", t.Seq, "err", err)
+			}
+		}
+	}
+}
+
+// placeClient builds a client for place, a friend or an overflow
+// target, from lendisk.db.
+func (w *Worker) placeClient(ctx context.Context, place string) (Replica, error) {
+	if name, ok := state.OverflowName(place); ok {
+		if w.ConnectOverflow == nil {
+			return nil, errors.New("no overflow client")
+		}
+		o, err := w.DB.GetOverflow(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		return w.ConnectOverflow(o)
+	}
+	f, err := w.DB.GetFriendship(ctx, place)
+	if err != nil {
+		return nil, err
+	}
+	if f.Address == "" {
+		return nil, errors.New("no address")
+	}
+	return w.connect(f)
 }
 
 // reroute moves unsent data from friends failing for longer than
@@ -1199,7 +1271,7 @@ func (w *Worker) put(ctx context.Context, place string, r Replica, p state.Place
 			return terr
 		}
 		if p.Size > w.Pace.PartSize() || p.Size > MaxPutSize || has {
-			err = w.putParts(ctx, place, mp, p, replaces, tr, has)
+			err = w.putParts(ctx, place, r, mp, p, replaces, tr, has)
 		} else {
 			err = w.putOnce(ctx, place, r, p, replaces)
 		}
@@ -1273,8 +1345,10 @@ func partSizeFor(size, configured int64) int64 {
 // upload the place no longer has starts the object over, as does one
 // begun with another mark than the row now needs. The schedule is
 // checked before each part, so a closing window stops the object at the
-// end of the part in flight (REPL-7).
-func (w *Worker) putParts(ctx context.Context, place string, mp Multipart, p state.Placement, replaces string, tr state.Transfer, has bool) error {
+// end of the part in flight (REPL-7). An upload gone at the place
+// whose object the place holds at the key with its hash was completed,
+// its answer lost: it is acknowledged, not sent again (#87).
+func (w *Worker) putParts(ctx context.Context, place string, r Replica, mp Multipart, p state.Placement, replaces string, tr state.Transfer, has bool) error {
 	body, done, err := w.openFilled(ctx, p)
 	if err != nil {
 		return err
@@ -1295,6 +1369,9 @@ func (w *Worker) putParts(ctx context.Context, place string, mp Multipart, p sta
 		listed, err := mp.Parts(ctx, p.Bucket, p.Key, tr.UploadID)
 		switch {
 		case errors.Is(err, ErrNoSuchUpload):
+			if done, herr := w.completed(ctx, place, r, p); herr != nil || done {
+				return herr
+			}
 			w.dropTransfer(place, p.Seq)
 			has = false
 		case err != nil:
@@ -1363,10 +1440,32 @@ func (w *Worker) putParts(ctx context.Context, place string, mp Multipart, p sta
 		// Stored, or refused and removed by the place with the upload.
 		w.dropTransfer(place, p.Seq)
 	case errors.Is(err, ErrNoSuchUpload):
+		if done, herr := w.completed(ctx, place, r, p); herr != nil || done {
+			return herr
+		}
 		w.dropTransfer(place, p.Seq)
 		return fmt.Errorf("the place no longer has the upload of %s; starting the object over: %w", p.Key, err)
 	}
 	return err
+}
+
+// completed asks the place, whose upload of p is gone, whether it holds
+// p's object at the key with p's hash: a completion it took, whose
+// answer was lost (#87). If so the upload's record is dropped and done
+// is true, and the row is acknowledged as sent. A failed question keeps
+// the record, to ask again at the next try.
+func (w *Worker) completed(ctx context.Context, place string, r Replica, p state.Placement) (done bool, err error) {
+	sha, ok, err := r.Head(ctx, p.Bucket, p.Key)
+	if err != nil {
+		return false, fmt.Errorf("the place no longer has the upload of %s; asking whether it completed: %w", p.Key, err)
+	}
+	if !ok || !strings.EqualFold(sha, p.SHA256) {
+		return false, nil
+	}
+	w.Log.Info("replication: the place holds the object whose upload it no longer has: its completion's answer was lost; acknowledged",
+		"place", place, "bucket", p.Bucket, "key", p.Key, "seq", p.Seq)
+	w.dropTransfer(place, p.Seq)
+	return true, nil
 }
 
 // putPart sends part n, read from the store through section; off is

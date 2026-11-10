@@ -14,7 +14,10 @@
 //     when the body ends. A global upload limit admits only as many
 //     bodies at once as it can keep at MinRate each, and every limit is
 //     at least MinRate (CheckRate), so a paced body never arrives at a
-//     lender below its floor rate.
+//     lender below its floor rate. Likewise take a FetchSlot for each
+//     fetch and release it when its body is closed (#87).
+//   - Call LendIn's done when the body ends: until then the body counts
+//     among the borrower's, whose waits are credited by fair share.
 //   - Each read through a paced reader is cut to Burst before it waits,
 //     so a changed limit applies from the next read (Set, Q-Y.4).
 //   - The clock and the sleep are fields (Now, Sleep): tests set them.
@@ -107,10 +110,17 @@ type Pacer struct {
 	peers    map[string]*pair
 	lend     map[string]*pair
 	slots    int           // bodies holding an upload slot
+	fetches  int           // fetches holding a fetch slot
 	freed    chan struct{} // closed when a slot frees or the limit changes
 }
 
-type pair struct{ up, down *rate.Limiter }
+// pair is one friend's limiters. bodies counts what is under way on
+// them: as a lender, the borrower's request bodies being received
+// (LendIn); as a borrower, the fetches from the friend (FetchSlot).
+type pair struct {
+	up, down *rate.Limiter
+	bodies   int
+}
 
 // New returns a pacer with no limits, open always.
 func New(now func() time.Time) *Pacer {
@@ -188,10 +198,21 @@ func (p *Pacer) Settings() Settings {
 	return p.s
 }
 
-// of returns peer's pair in m, made with rs's rates on first use.
-func (p *Pacer) of(m map[string]*pair, rs map[string]Rates, peer string) *pair {
+// of returns peer's pair, as a lender's borrower (lend) or as a
+// friend this node sends to and fetches from, made on first use with
+// the rates in force. The rates are read here, under the lock Set
+// holds, so a Set beside the first use cannot leave the old rate.
+func (p *Pacer) of(lend bool, peer string) *pair {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.ofLocked(lend, peer)
+}
+
+func (p *Pacer) ofLocked(lend bool, peer string) *pair {
+	m, rs := p.peers, p.s.Peers
+	if lend {
+		m, rs = p.lend, p.s.Lend
+	}
 	l := m[peer]
 	if l == nil {
 		r := rs[peer]
@@ -219,16 +240,54 @@ func (p *Pacer) Slot(ctx context.Context) (release func(), err error) {
 	if p == nil {
 		return func() {}, nil
 	}
+	return p.admit(ctx, func() (func(), bool) {
+		if !room(p.s.Up, p.slots) {
+			return nil, false
+		}
+		p.slots++
+		return func() { p.slots-- }, true
+	})
+}
+
+// FetchSlot admits one fetch from peer (the read-through, REPL-7),
+// waiting while the global download limit, or peer's own, already
+// carries as many fetches as it can keep at MinRate each (at least one
+// for each). So many reads sharing a limit do not slow each past what
+// the lender's per-write deadline allows (§3.9 *Per-friend caps*). The
+// caller releases it when the body is closed.
+func (p *Pacer) FetchSlot(ctx context.Context, peer string) (release func(), err error) {
+	if p == nil {
+		return func() {}, nil
+	}
+	return p.admit(ctx, func() (func(), bool) {
+		pr := p.ofLocked(false, peer)
+		if !room(p.s.Down, p.fetches) || !room(p.s.Peers[peer].Down, pr.bodies) {
+			return nil, false
+		}
+		p.fetches++
+		pr.bodies++
+		return func() { p.fetches--; pr.bodies-- }, true
+	})
+}
+
+// room reports whether a limit of limit bytes a second keeps one more
+// body than the n it carries at MinRate (always, with no limit).
+func room(limit int64, n int) bool {
+	return limit <= 0 || n < max(1, int(limit/MinRate))
+}
+
+// admit waits until take, called under p.mu, takes a slot; the release
+// it returns is called under p.mu too, once, and wakes the waiters.
+func (p *Pacer) admit(ctx context.Context, take func() (func(), bool)) (release func(), err error) {
 	for {
 		p.mu.Lock()
-		if n := p.s.Up / MinRate; p.s.Up <= 0 || p.slots < max(1, int(n)) {
-			p.slots++
+		if give, ok := take(); ok {
 			p.mu.Unlock()
 			var once sync.Once
 			return func() {
 				once.Do(func() {
 					p.mu.Lock()
-					p.slots--
+					give()
 					close(p.freed)
 					p.freed = make(chan struct{})
 					p.mu.Unlock()
@@ -251,7 +310,7 @@ func (p *Pacer) Send(ctx context.Context, peer string, r io.Reader) io.Reader {
 	if p == nil {
 		return r
 	}
-	return &reader{ctx: ctx, r: r, p: p, lims: []*rate.Limiter{p.of(p.peers, p.Settings().Peers, peer).up, p.up}}
+	return &reader{ctx: ctx, r: r, p: p, lims: []*rate.Limiter{p.of(false, peer).up, p.up}}
 }
 
 // Fetch paces r, a body this node fetches from peer as a borrower (the
@@ -260,7 +319,7 @@ func (p *Pacer) Fetch(ctx context.Context, peer string, r io.Reader) io.Reader {
 	if p == nil {
 		return r
 	}
-	return &reader{ctx: ctx, r: r, p: p, lims: []*rate.Limiter{p.of(p.peers, p.Settings().Peers, peer).down, p.down}}
+	return &reader{ctx: ctx, r: r, p: p, lims: []*rate.Limiter{p.of(false, peer).down, p.down}}
 }
 
 // Scrub paces r, the bit-rot sampler's read of an object in the local
@@ -273,13 +332,43 @@ func (p *Pacer) Scrub(ctx context.Context, r io.Reader) io.Reader {
 }
 
 // LendIn paces r, a request body borrower peer sends this node, by its
-// lending limit (LEND-5). waited, if set, is told each wait, which is
-// this node's doing and not the borrower's slowness.
-func (p *Pacer) LendIn(ctx context.Context, peer string, r io.Reader, waited func(time.Duration)) io.Reader {
+// lending limit (LEND-5). The caller calls done when the body ends:
+// until then it is one of the borrower's bodies sharing the limit.
+// waited, if set, is told the part of each wait that is this node's
+// doing and not the borrower's slowness: the wait, but at most the
+// body's fair share: what the bytes the read brought take at the
+// limit divided among the borrower's bodies under way (#87). A body
+// trickling behind another that keeps the limit busy waits as long as
+// that one, but is credited only what its own bytes needed.
+func (p *Pacer) LendIn(ctx context.Context, peer string, r io.Reader, waited func(time.Duration)) (paced io.Reader, done func()) {
 	if p == nil {
-		return r
+		return r, func() {}
 	}
-	return &reader{ctx: ctx, r: r, p: p, lims: []*rate.Limiter{p.of(p.lend, p.Settings().Lend, peer).down}, waited: waited}
+	p.mu.Lock()
+	pr := p.ofLocked(true, peer)
+	pr.bodies++
+	p.mu.Unlock()
+	rd := &reader{ctx: ctx, r: r, p: p, lims: []*rate.Limiter{pr.down}}
+	if waited != nil {
+		rd.waited = func(n int, d time.Duration) {
+			p.mu.Lock()
+			k := max(1, pr.bodies)
+			p.mu.Unlock()
+			if lim := pr.down.Limit(); lim != rate.Inf && lim > 0 {
+				// As rate computes a reservation's delay.
+				d = min(d, time.Duration(float64(time.Second)*(float64(n*k)/float64(lim))))
+			}
+			waited(d)
+		}
+	}
+	var once sync.Once
+	return rd, func() {
+		once.Do(func() {
+			p.mu.Lock()
+			pr.bodies--
+			p.mu.Unlock()
+		})
+	}
 }
 
 // LendOut paces w, an answer this node sends borrower peer, by its
@@ -288,7 +377,7 @@ func (p *Pacer) LendOut(ctx context.Context, peer string, w io.Writer) io.Writer
 	if p == nil {
 		return w
 	}
-	return &writer{ctx: ctx, w: w, p: p, lim: p.of(p.lend, p.Settings().Lend, peer).up}
+	return &writer{ctx: ctx, w: w, p: p, lim: p.of(true, peer).up}
 }
 
 // wait takes n bytes from every limiter in lims at once and sleeps for
@@ -311,7 +400,7 @@ type reader struct {
 	r      io.Reader
 	p      *Pacer
 	lims   []*rate.Limiter
-	waited func(time.Duration)
+	waited func(n int, d time.Duration) // told each read's wait
 }
 
 func (r *reader) Read(b []byte) (int, error) {
@@ -322,7 +411,7 @@ func (r *reader) Read(b []byte) (int, error) {
 	if n > 0 {
 		d, werr := r.p.wait(r.ctx, r.lims, n)
 		if d > 0 && r.waited != nil {
-			r.waited(d)
+			r.waited(n, d)
 		}
 		if werr != nil {
 			return n, werr
