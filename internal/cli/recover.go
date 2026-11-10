@@ -149,6 +149,7 @@ func (a *app) runRecover(ctx context.Context, addr string, skip map[string]bool)
 		return err
 	}
 	defer dl.Close()
+	a.dialPolicy(dl, cfg, db, log)
 	fmt.Fprintf(w, "Fetching the manifest from %s and the friends it names…\n", lenderID)
 	m, tried, err := recovery.Newest(ctx, addr, func(ctx context.Context, addr string) (*manifest.Manifest, error) {
 		fctx, cancel := context.WithTimeout(ctx, a.redeemTimeout())

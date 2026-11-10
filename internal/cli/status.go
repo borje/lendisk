@@ -367,6 +367,26 @@ type StatusPlace struct {
 	Dropping int64 `json:"dropping"`
 	// LastOK is when the place last acknowledged anything (RFC 3339).
 	LastOK string `json:"last_ok,omitempty"`
+	// Path is how a friend is reached (NET-4): direct or relayed, as the
+	// daemon's last disco ping or quota call found it; empty before the
+	// first, and for an overflow target. PathRelay names the relay of a
+	// relayed path, PathEndpoint the friend's ip:port of a direct one;
+	// PathCheckedAt is when the daemon last probed it (RFC 3339).
+	Path          string `json:"path,omitempty"`
+	PathRelay     string `json:"path_relay,omitempty"`
+	PathEndpoint  string `json:"path_endpoint,omitempty"`
+	PathCheckedAt string `json:"path_checked_at,omitempty"`
+}
+
+// pathText is a friend's path in words, "" when unknown.
+func pathText(path, relay string) string {
+	switch {
+	case path == "relayed" && relay != "":
+		return "relayed via " + relay
+	case path == "relayed":
+		return "relayed"
+	}
+	return path
 }
 
 // replacingLine says what re-placement is doing for bucket b, or "".
@@ -431,9 +451,11 @@ func places(ctx context.Context, db *state.DB, now time.Time) ([]StatusPlace, er
 	}
 	var names []string
 	seen := map[string]bool{}
+	friends := map[string]state.Friendship{}
 	for _, f := range fs {
 		names = append(names, f.Peer)
 		seen[f.Peer] = true
+		friends[f.Peer] = f
 	}
 	// Overflow targets beside the friends (S3-1).
 	targets, err := db.Overflows(ctx)
@@ -463,6 +485,12 @@ func places(ctx context.Context, db *state.DB, now time.Time) ([]StatusPlace, er
 			LagSeconds: int64(st.Lag / time.Second), Refused: st.Refused, Dropping: st.Dropping}
 		if !c.LastOK.IsZero() {
 			sp.LastOK = c.LastOK.UTC().Format(time.RFC3339)
+		}
+		if f, ok := friends[p]; ok {
+			sp.Path, sp.PathRelay, sp.PathEndpoint = f.Path, f.PathRelay, f.PathEndpoint
+			if !f.PathAt.IsZero() {
+				sp.PathCheckedAt = f.PathAt.UTC().Format(time.RFC3339)
+			}
 		}
 		out = append(out, sp)
 	}
@@ -1126,10 +1154,17 @@ friend, or with no room in the pool), which status shows.`,
 			// status --json keeps them.
 			if len(st.Places) > 0 && st.Node.Role != "lender" {
 				fmt.Fprintf(a.out, "Places:  %d\n", len(st.Places))
+			} else if len(st.Places) > 0 {
+				fmt.Fprintln(a.out, "Paths:")
 			}
 			for _, p := range st.Places {
 				if st.Node.Role == "lender" {
-					break
+					// No copies go out (PEER-9), but how each friend is
+					// reached still matters (NET-4).
+					if p.Kind == "friend" && !p.Removed {
+						fmt.Fprintf(a.out, "  %s (friend): %s\n", p.Place, cmp.Or(pathText(p.Path, p.PathRelay), "path not known yet"))
+					}
+					continue
 				}
 				if p.Removed {
 					fmt.Fprintf(a.out, "  %s (former friend): its copies no longer count; nothing more is sent there\n", p.Place)
@@ -1137,6 +1172,9 @@ friend, or with no room in the pool), which status shows.`,
 				}
 				fmt.Fprintf(a.out, "  %s (%s): %s, queue %d objects, %d bytes, lag %s", p.Place, p.Kind, placeStates[p.State],
 					p.Queue.Objects, p.Queue.Bytes, time.Duration(p.LagSeconds)*time.Second)
+				if t := pathText(p.Path, p.PathRelay); t != "" {
+					fmt.Fprintf(a.out, ", %s", t)
+				}
 				if p.Refused > 0 {
 					fmt.Fprintf(a.out, ", %d refused", p.Refused)
 				}

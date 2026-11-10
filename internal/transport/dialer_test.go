@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/tailscale/tailcat"
+	"tailscale.com/envknob"
 	"tailscale.com/tailcfg"
 
 	"github.com/borje/lendisk/internal/identity"
@@ -736,9 +738,65 @@ func TestRelayIdentity(t *testing.T) {
 		{"public regions by ID", tailcat.ConnInfo{RegionID: 1}, tailcat.ConnInfo{RegionID: 1}, true},
 		{"other public regions", tailcat.ConnInfo{RegionID: 1}, tailcat.ConnInfo{RegionID: 2}, false},
 	} {
-		if got := relayOf(tc.x).overlaps(relayOf(tc.y)); got != tc.same {
-			t.Errorf("%s: same relay = %v, want %v (%v vs %v)", tc.name, got, tc.same, relayOf(tc.x), relayOf(tc.y))
+		x, y := relayOf(tc.x, nil, nil), relayOf(tc.y, nil, nil)
+		if got := x.overlaps(y); got != tc.same {
+			t.Errorf("%s: same relay = %v, want %v (%v vs %v)", tc.name, got, tc.same, x, y)
 		}
+	}
+}
+
+// #60 review, #42: two addresses naming disjoint nodes of one meshed
+// region of the node's relay set are one relay, since the region's
+// nodes forward to each other and a second client with the key would
+// stall the first; two DNS names, or a name and its IP, for one DERP
+// server are one relay; and a port of 0 is the scheme's: 443 over
+// HTTPS, 3340 over plain HTTP.
+func TestRelayIdentityAcrossMeshesAndAliases(t *testing.T) {
+	node := func(host, v4 string, port int) *tailcfg.DERPNode {
+		return &tailcfg.DERPNode{HostName: host, IPv4: v4, IPv6: "none", DERPPort: port}
+	}
+	ci := func(nodes ...*tailcfg.DERPNode) tailcat.ConnInfo {
+		return tailcat.ConnInfo{Region: []*tailcfg.DERPRegion{{RegionID: 1, Nodes: nodes}}}
+	}
+	nyc1, nyc2 := node("derp1-nyc.example", "", 0), node("derp2-nyc.example", "198.51.100.2", 0)
+	fra := node("derp1-fra.example", "", 0)
+	known := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{
+		1: {RegionID: 1, RegionCode: "nyc", Nodes: []*tailcfg.DERPNode{nyc1, nyc2}},
+		4: {RegionID: 4, RegionCode: "fra", Nodes: []*tailcfg.DERPNode{fra}},
+	}}
+	dns := map[string][]netip.Addr{
+		"relay.example":     {netip.MustParseAddr("192.0.2.10")},
+		"derp.example":      {netip.MustParseAddr("192.0.2.10")},
+		"elsewhere.example": {netip.MustParseAddr("192.0.2.99")},
+	}
+	resolve := func(h string) []netip.Addr { return dns[h] }
+	for _, tc := range []struct {
+		name  string
+		x, y  tailcat.ConnInfo
+		known *tailcfg.DERPMap
+		same  bool
+	}{
+		{"disjoint nodes of one meshed region", ci(nyc1), ci(nyc2), known, true},
+		{"disjoint nodes of one region, unknown to the node", ci(nyc1), ci(nyc2), nil, false},
+		{"nodes of two regions", ci(nyc1), ci(fra), known, false},
+		{"two names for one server", ci(node("relay.example", "", 0)), ci(node("derp.example", "", 0)), nil, true},
+		{"a name and its IP", ci(node("relay.example", "", 0)), ci(node("", "192.0.2.10", 0)), nil, true},
+		{"names for two servers", ci(node("relay.example", "", 0)), ci(node("elsewhere.example", "", 0)), nil, false},
+		{"a name and another port", ci(node("relay.example", "", 0)), ci(node("derp.example", "", 8443)), nil, false},
+		{"port 0 over HTTPS is 443", ci(node("relay.example", "", 0)), ci(node("relay.example", "", 443)), nil, true},
+		{"port 0 over HTTPS is not 3340", ci(node("relay.example", "", 0)), ci(node("relay.example", "", 3340)), nil, false},
+	} {
+		x, y := relayOf(tc.x, tc.known, resolve), relayOf(tc.y, tc.known, resolve)
+		if got := x.overlaps(y); got != tc.same {
+			t.Errorf("%s: same relay = %v, want %v (%v vs %v)", tc.name, got, tc.same, x, y)
+		}
+	}
+
+	envknob.SetenvForTest(t, "TS_DEBUG_USE_DERP_HTTP", "true")
+	zero, http, https := relayOf(ci(node("relay.example", "", 0)), nil, nil), relayOf(ci(node("relay.example", "", 3340)), nil, nil),
+		relayOf(ci(node("relay.example", "", 443)), nil, nil)
+	if !zero.overlaps(http) || zero.overlaps(https) {
+		t.Errorf("over plain HTTP, port 0 should be 3340: %v vs %v and %v", zero, http, https)
 	}
 }
 
@@ -747,7 +805,10 @@ func TestRelayIdentity(t *testing.T) {
 // keeps its one client, so no second client with the same key is built
 // for the server the first one still talks to.
 func TestNodeListChangeKeepsTheClient(t *testing.T) {
-	d := transporttest.Start(t)
+	// The relay is named "localhost" with no IP, so the IP-only node
+	// below is the same server only by what the name resolves to (#60
+	// review): a relay whose host name is its IP would match trivially.
+	d := transporttest.StartNamed(t, "localhost")
 	srvID, me := newID(t), newID(t)
 	srv := newTailcat(t, srvID, d)
 	srv.Admit(func(identity.NodeID) bool { return true })
@@ -761,10 +822,13 @@ func TestNodeListChangeKeepsTheClient(t *testing.T) {
 	a, sa := dialed(t, dl, srv, peer, l)
 	old := dl.client(peer)
 	local := d.Region.Nodes[0]
+	if local.HostName != "localhost" || local.IPv4 != "" {
+		t.Fatalf("the relay should be named, without an IP: %+v", local)
+	}
 	other := *local
 	other.Name, other.HostName, other.IPv4 = "900b", "derp-b.invalid", "192.0.2.9"
 	ipOnly := *local
-	ipOnly.HostName = ""
+	ipOnly.HostName, ipOnly.IPv4 = "", "127.0.0.1"
 	for _, nodes := range [][]*tailcfg.DERPNode{
 		{local, &other},
 		{&other, local},
@@ -780,7 +844,7 @@ func TestNodeListChangeKeepsTheClient(t *testing.T) {
 		}
 		c.Close()
 		if dl.client(peer) != old {
-			t.Fatalf("a second client was built for the node list %v", relayOf(tailcat.ConnInfo{Region: []*tailcfg.DERPRegion{&r}}))
+			t.Fatalf("a second client was built for the node list %v", relayOf(tailcat.ConnInfo{Region: []*tailcfg.DERPRegion{&r}}, nil, nil))
 		}
 		echo(t, a, sa, "still the one client")
 	}

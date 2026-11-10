@@ -10,8 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"reflect"
-	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,8 +63,21 @@ type Tailcat struct {
 	elapsed      func() time.Duration
 	dial         func(context.Context, *tailcatClient) (net.Conn, error)
 	closeTailcat func(io.Closer) error
+	// listenTailcat starts the server and listens on the tunnel port;
+	// tests wrap it.
+	listenTailcat func(context.Context, *tailcat.Server) (net.Listener, error)
 
-	mu       sync.Mutex
+	// relays is the relay policy (NET-5a) and the relays of the
+	// addresses dialled (see relay).
+	relays relays
+
+	mu sync.Mutex
+	// endpoints gives a friend's explicit addresses (NET-3), dialled
+	// directly; nil for none. port is the UDP port the server's engine
+	// binds, 0 for any (SetPort).
+	endpoints func(identity.NodeID) []netip.AddrPort
+	port      uint16
+
 	admit    func(identity.NodeID) bool
 	server   *tailcat.Server // set by Listen
 	clients  map[identity.NodeID]*tailcatClient
@@ -74,6 +85,7 @@ type Tailcat struct {
 	shutting map[*tailcatClient]bool // marked closed, Client.Close not yet returned
 	done     chan struct{}           // closed by Close
 	closed   bool
+	starting bool // Listen is starting the server, without mu
 }
 
 // tailcatClient is the client shared by every dial to one friend at one
@@ -85,6 +97,11 @@ type tailcatClient struct {
 	relay  relay         // relayOf the address it was built for
 	down   chan struct{} // closed once Client.Close has returned
 	active atomic.Int64  // Tailcat.elapsed when a connection last moved bytes
+
+	// eps are the explicit addresses given to the client's engine
+	// (NET-3), guarded by epsMu.
+	epsMu sync.Mutex
+	eps   []netip.AddrPort
 
 	refs    int  // open connections, dials in flight and a running check
 	conns   int  // open connections
@@ -128,12 +145,14 @@ func NewTailcat(id *identity.Identity, region *tailcfg.DERPRegion, log *slog.Log
 			return c.DialTCPPort(ctx, Port)
 		},
 		closeTailcat: io.Closer.Close,
+		relays:       relays{lookup: defaultLookup, now: time.Now},
 		clients:      map[identity.NodeID]*tailcatClient{},
 		retired:      map[*tailcatClient]bool{},
 		shutting:     map[*tailcatClient]bool{},
 		done:         make(chan struct{}),
 	}
 	t.check = t.dialCheck
+	t.listenTailcat = t.startServer
 	t.dialKeyFor = func(friend identity.NodeID) key.NodePrivate { return nodePrivate(id.DialKeyFor(friend)) }
 	return t, nil
 }
@@ -220,22 +239,29 @@ func (t *Tailcat) allow(k key.NodePublic) bool {
 	return fn != nil && fn(nodeIDOf(k))
 }
 
-// Listen starts the tailcat server and listens on Port.
+// Listen starts the tailcat server and listens on Port. It does not
+// hold Tailcat.mu while tailcat starts, listens or closes (#60): the
+// admission hook takes that lock.
 func (t *Tailcat) Listen(ctx context.Context) (net.Listener, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.admit == nil {
-		return nil, ErrNoAdmission
+	var refuse error
+	switch {
+	case t.admit == nil:
+		refuse = ErrNoAdmission
+	case t.closed:
+		refuse = net.ErrClosed
+	case t.server != nil || t.starting:
+		refuse = errors.New("transport: already listening")
+	case t.region == nil:
+		refuse = errors.New("transport: a dialer does not listen")
 	}
-	if t.closed {
-		return nil, net.ErrClosed
+	if refuse != nil {
+		t.mu.Unlock()
+		return nil, refuse
 	}
-	if t.server != nil {
-		return nil, errors.New("transport: already listening")
-	}
-	if t.region == nil {
-		return nil, errors.New("transport: a dialer does not listen")
-	}
+	t.starting = true
+	t.mu.Unlock()
+
 	s := &tailcat.Server{
 		Key:                 t.key,
 		DisablePresharedKey: true, // SEC-14: the address carries no secret
@@ -246,16 +272,78 @@ func (t *Tailcat) Listen(ctx context.Context) (net.Listener, error) {
 		ServedTCPPorts: []filter.PortRange{{First: Port, Last: Port}},
 		ServedUDPPorts: []filter.PortRange{},
 	}
+	ln, err := t.listenTailcat(ctx, s)
+	t.mu.Lock()
+	t.starting = false
+	closed := t.closed
+	if err == nil && !closed {
+		t.server = s
+	}
+	t.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	if closed { // Close ran meanwhile and did not see the server
+		ln.Close()
+		t.closeTailcat(s)
+		return nil, net.ErrClosed
+	}
+	return ln, nil
+}
+
+// startServer is the default listenTailcat: it starts s, binds its
+// engine to the configured UDP port, and listens on Port; on an error
+// it closes s.
+func (t *Tailcat) startServer(ctx context.Context, s *tailcat.Server) (net.Listener, error) {
 	if err := s.StartContext(ctx); err != nil {
+		t.closeTailcat(s)
 		return nil, fmt.Errorf("starting the tunnel: %w", err)
+	}
+	t.mu.Lock()
+	port := t.port
+	t.mu.Unlock()
+	if port != 0 {
+		if err := setEnginePort(s, port); err != nil {
+			t.log.Warn("transport: the tunnel's UDP port could not be set, so it uses one of its own; an explicit address naming tunnel.port does not reach it",
+				"port", port, "err", err)
+		}
 	}
 	ln, err := s.Listen(ctx, "tcp", fmt.Sprintf(":%d", Port))
 	if err != nil {
-		s.Close()
+		t.closeTailcat(s)
 		return nil, fmt.Errorf("listening on the tunnel port: %w", err)
 	}
-	t.server = s
 	return ln, nil
+}
+
+// SetRelays sets the node's relay set (NET-5) and whether a friend's
+// address may name a relay outside it (NET-5a, relays.accept_peer_hints).
+// Without a set, any relay an address names is dialled. Set it before
+// the first Dial.
+func (t *Tailcat) SetRelays(set RegionSource, acceptHints bool) {
+	t.relays.mu.Lock()
+	t.relays.set, t.relays.acceptHints = set, acceptHints
+	t.relays.cache, t.relays.mapAt = nil, time.Time{}
+	t.relays.mu.Unlock()
+}
+
+// SetEndpoints sets where a friend's explicit addresses come from
+// (NET-3): each is given to the friend's client as an address the
+// friend's engine listens on, so the client tries it directly at once.
+// fn is asked at each dial.
+func (t *Tailcat) SetEndpoints(fn func(identity.NodeID) []netip.AddrPort) {
+	t.mu.Lock()
+	t.endpoints = fn
+	t.mu.Unlock()
+}
+
+// SetPort binds the server's engine to a fixed UDP port (tunnel.port),
+// so a port forward can name it and a friend can give it as an
+// explicit address (NET-3); 0 is any port. Set it before Listen.
+func (t *Tailcat) SetPort(port uint16) {
+	t.mu.Lock()
+	t.port = port
+	t.mu.Unlock()
 }
 
 // Dial connects to peer's tunnel port at addr, through one client per
@@ -288,10 +376,19 @@ func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (
 	if got := nodeIDOf(ci.ServerPublic.NodePublic); got != peer {
 		return nil, fmt.Errorf("address belongs to node %s, not %s", got, peer)
 	}
-	relay := relayOf(ci)
+	relay, err := t.relays.relayFor(ctx, addr, ci)
+	if err != nil {
+		return nil, err
+	}
 	c, err := t.clientFor(ctx, peer, relay, addr)
 	if err != nil {
 		return nil, err
+	}
+	t.mu.Lock()
+	endpoints := t.endpoints
+	t.mu.Unlock()
+	if endpoints != nil {
+		t.direct(ctx, c, endpoints(peer))
 	}
 
 	conn, err := t.dial(ctx, c)
@@ -417,67 +514,6 @@ func (t *Tailcat) dialCheck(ctx context.Context, c *tailcatClient) error {
 		conn.Close()
 	}
 	return err
-}
-
-// relay names the DERP servers a client of an address may connect to:
-// "host:port" for each server, or "region:N" for a public region named
-// by ID only. tailcat's client connects to the first node of the
-// address's region that answers (derphttp's dialRegion), so which one
-// it uses is known only once it has, and tailcat does not report it.
-type relay []string
-
-// relayOf is the relay of an address: every node of its regions that
-// is not STUN-only, by host name and by each IP it gives, with the
-// DERP port (0 is 443). An address carries no region or node names
-// (tailcat strips them), and the rest of it (STUN ports, region IDs,
-// node order) can change without moving the friend to another relay.
-// The server key is the peer's and checked by Dial.
-func relayOf(ci tailcat.ConnInfo) relay {
-	var r relay
-	for _, reg := range ci.Region {
-		for _, n := range reg.Nodes {
-			if n.STUNOnly {
-				continue
-			}
-			port := n.DERPPort
-			if port == 0 {
-				port = 443
-			}
-			hosts := []string{strings.TrimSuffix(strings.ToLower(n.HostName), ".")}
-			for _, ip := range []string{n.IPv4, n.IPv6} {
-				if a, err := netip.ParseAddr(ip); err == nil {
-					hosts = append(hosts, a.String())
-				}
-			}
-			for _, h := range hosts {
-				if a, err := netip.ParseAddr(h); err == nil {
-					h = a.String()
-				}
-				if h != "" {
-					r = append(r, net.JoinHostPort(h, strconv.Itoa(port)))
-				}
-			}
-		}
-	}
-	if len(r) == 0 {
-		r = relay{fmt.Sprintf("region:%d", ci.RegionID)}
-	}
-	slices.Sort(r)
-	return slices.Compact(r)
-}
-
-// overlaps reports whether a client of one address and a client of the
-// other may connect to the same DERP server, and so count as one relay.
-// It errs towards yes: a client taken for another relay fails its
-// check and is replaced, while two clients with one key at one relay
-// stall each other (#52).
-func (r relay) overlaps(o relay) bool {
-	for _, e := range r {
-		if _, ok := slices.BinarySearch(o, e); ok {
-			return true
-		}
-	}
-	return false
 }
 
 // retireLocked takes c out of service: no new dial uses it, and it is
@@ -681,12 +717,19 @@ func (t *Tailcat) PathInfo(ctx context.Context, peer identity.NodeID) (Path, err
 	if err != nil {
 		return Path{}, err
 	}
-	return Path{
+	p := Path{
 		Direct:   r.Endpoint != "",
 		Endpoint: r.Endpoint,
-		Relay:    r.DERPRegionCode,
 		Latency:  time.Duration(r.LatencySeconds * float64(time.Second)),
-	}, nil
+	}
+	if !p.Direct {
+		// tailcat strips region codes from addresses: name the relay's
+		// servers instead.
+		if ci, err := tailcat.ParseAddr(c.Server); err == nil {
+			p.Relay = describeRelay(ci)
+		}
+	}
+	return p, nil
 }
 
 // Close stops the server and every client. It marks them closed under

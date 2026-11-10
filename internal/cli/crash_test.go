@@ -40,6 +40,10 @@ func (n *node) startProc(t *testing.T, addr string, logw io.Writer, crashAfterSt
 	}
 	cmd := exec.Command(exe, "serve", "--config", n.config, "--data-dir", n.data, "--endpoint-loopback", addr)
 	cmd.Env = append(os.Environ(), envExec+"=1", fmt.Sprintf("%s=%g", envCrashAfterStore, crashAfterStore))
+	// A daemon process has no test relay set (app.regions): its friends
+	// are on local relays of the test process, which only peer hints
+	// reach (NET-5a), and the hosted relays' map is never fetched.
+	cmd.Env = append(cmd.Env, "LENDISK_RELAYS_ACCEPT_PEER_HINTS=true", "LENDISK_RELAYS_TAILSCALE_BOOTSTRAP=false")
 	cmd.Env = append(cmd.Env, env...)
 	cmd.Stdout, cmd.Stderr = logw, logw
 	dieWithTest(cmd)

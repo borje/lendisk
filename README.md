@@ -54,8 +54,11 @@ export RESTIC_REPOSITORY=s3:http://127.0.0.1:9000/laptop
 restic init && restic backup ~
 ```
 
-Add a friend. Each of you runs a node; friends reach each other through
-public relays, so both need internet access but no open ports.
+Add a friend. Each of you runs a node; friends reach each other
+directly where their NATs allow, and through relays otherwise, so both
+need internet access but no open ports. `lendisk status` and
+`lendisk peer list` say which. To use only your own relay, run
+`lendisk relay` on a VPS and list its entry in `relays.list`.
 
 ```sh
 # on the friend's node: lend you 100G, print a single-use invite
@@ -149,6 +152,12 @@ if none exists.
 | `endpoint.loopback` | `127.0.0.1:9000` | the S3 endpoint for tools on this machine; loopback only |
 | `endpoint.listen` | none | S3 endpoints for other machines on your LAN, opt-in and repeatable: `address` or `interface` + `port`, `tls` = `generate` (default), `files` (with `cert`, `key`) or `off`. `lendisk endpoint cert` prints the generated certificate's fingerprint |
 | `tunnel.region` | nearest | the relay region in this node's address; changing it changes the address |
+| `tunnel.port` | `0` (any) | UDP port for direct paths, for a port forward; a friend gives `<your IP>:<port>` to `lendisk peer address` |
+| `relays.map_url` | none | a DERP map URL whose relays replace the project's relay map |
+| `relays.list` | none | self-hosted relays, repeatable, each the entry `lendisk relay` logs (`host=…,port=…,stun_port=…,cert=sha256-raw:…`); replaces the project's relay map |
+| `relays.tailscale_bootstrap` | `true` | also use Tailscale's hosted relays, as a last resort; `false` depends on no third-party relay |
+| `relays.accept_peer_hints` | `false` | dial a friend through the relay its address names even when it is not one of yours (a relay sees both IP addresses) |
+| `relay.hostname`, `relay.listen`, `relay.stun_port`, `relay.tls` | none, `:443`, `3478`, `self-signed` | for `lendisk relay`, a relay on your own VPS: `tls` is `self-signed` (pinned by the entry), `letsencrypt` or `files` (`relay.cert`, `relay.key`) |
 | `replication.copies` | `2` | how many friends hold each object of a bucket created without `--copies`; with 1, losing one friend loses data, and `bucket add` and `status` say so |
 | `replication.reroute_after` | `1h` | move unsent copies from a friend failing this long to another with room |
 | `replication.replace_after` | `168h` | a friend failing this long no longer counts as room for copies |

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -157,7 +158,7 @@ Becoming friends again before then, with a new invite, keeps both.`,
 			return a.runPeerRemove(cmd.Context(), args[0])
 		},
 	}
-	cmd.AddCommand(add, list, remove, a.peerQuotaCmd(), a.peerForwardCmd())
+	cmd.AddCommand(add, list, remove, a.peerQuotaCmd(), a.peerForwardCmd(), a.peerAddressCmd())
 	return cmd
 }
 
@@ -296,7 +297,7 @@ func (a *app) runPeerAdd(ctx context.Context, s, retention string) error {
 	}
 
 	req := control.RedeemRequest{Address: addr, Number: number, RetentionSeconds: int64(ret / time.Second)}
-	resp, timedOut, err := a.redeem(ctx, log, ik, id, them, inv.Address, req)
+	resp, timedOut, err := a.redeem(ctx, log, ik, id, them, inv.Address, req, func(dl *transport.Tailcat) { dl.SetRelays(a.relays(cfg, db), cfg.Relays.AcceptPeerHints.On()) })
 	var ce *control.CallError
 	switch {
 	case err != nil && len(earlier) > 0 && (timedOut || errors.As(err, &ce) && ce.Status < http.StatusInternalServerError):
@@ -362,12 +363,13 @@ const redeemInProgress = "a redeem of this invite is already in progress (anothe
 // by self binds that key and self's dial key (#69). timedOut reports that the call ran out of
 // time.
 func (a *app) redeem(ctx context.Context, log *slog.Logger, key, self *identity.Identity, them identity.NodeID,
-	address string, req control.RedeemRequest) (resp control.RedeemResponse, timedOut bool, err error) {
+	address string, req control.RedeemRequest, policy func(*transport.Tailcat)) (resp control.RedeemResponse, timedOut bool, err error) {
 	dl, err := transport.NewDialer(key, log)
 	if err != nil {
 		return resp, false, err
 	}
 	defer dl.Close()
+	policy(dl)
 	if err := req.Prove(self, them, key.NodeID()); err != nil {
 		return resp, false, err
 	}
@@ -411,6 +413,14 @@ type PeerJSON struct {
 	// Reachability is direct, relayed or offline, from the last quota
 	// call; unknown before the first, online if the path is not known.
 	Reachability string `json:"reachability"`
+	// PathRelay names the relay of a relayed path, PathEndpoint the
+	// friend's ip:port of a direct one, and PathCheckedAt when the
+	// daemon's disco ping last found it (NET-4). ExplicitAddresses are
+	// the friend's addresses dialled directly (NET-3).
+	PathRelay         string     `json:"path_relay,omitempty"`
+	PathEndpoint      string     `json:"path_endpoint,omitempty"`
+	PathCheckedAt     *time.Time `json:"path_checked_at,omitempty"`
+	ExplicitAddresses []string   `json:"explicit_addresses,omitempty"`
 	// LastSeen is when the friend last called or answered (RFC 3339);
 	// LastVerified since when every replica it holds of this node's
 	// buckets has passed verification (VER-1, VER-4, #27: the oldest of
@@ -477,7 +487,12 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 			PeerRetentionSeconds: int64(f.PeerRetention / time.Second),
 			Since:                f.CreatedAt.UTC(),
 			UseThere:             there, UseHere: here, Remaining: max(f.Quota()-there, 0),
-			NumberTold: f.ToldNumber == f.OwnNumber, Reachability: reachability(f), Protocol: f.PeerProtocol}
+			NumberTold: f.ToldNumber == f.OwnNumber, Reachability: reachability(f), Protocol: f.PeerProtocol,
+			PathRelay: f.PathRelay, PathEndpoint: f.PathEndpoint, ExplicitAddresses: f.ExplicitAddresses}
+		if !f.PathAt.IsZero() {
+			at := f.PathAt.UTC()
+			p.PathCheckedAt = &at
+		}
 		if !f.SeenAt.IsZero() {
 			seen := f.SeenAt.UTC()
 			p.LastSeen = &seen
@@ -540,7 +555,7 @@ func (a *app) runPeerList(ctx context.Context, asJSON bool) error {
 			verified = p.LastVerified.Format(time.RFC3339)
 		}
 		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.ID, formatSize(p.Quota), numbers,
-			humanSize(p.UseThere), humanSize(p.UseHere), humanSize(p.Remaining), p.Reachability, seen, verified, proto, repo,
+			humanSize(p.UseThere), humanSize(p.UseHere), humanSize(p.Remaining), cmp.Or(pathText(p.Reachability, p.PathRelay), p.Reachability), seen, verified, proto, repo,
 			formatDays(time.Duration(p.OwnRetentionSeconds)*time.Second), formatDays(time.Duration(p.PeerRetentionSeconds)*time.Second),
 			p.Since.Format(time.DateOnly))
 	}
@@ -567,7 +582,7 @@ func (a *app) openNode(ctx context.Context) (*config.Loaded, *slog.Logger, *stat
 // ownAddress is this node's address, choosing and saving the region if
 // init could not.
 func (a *app) ownAddress(ctx context.Context, cfg *config.Loaded, db *state.DB, id *identity.Identity) (string, error) {
-	region, _, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays())
+	region, _, err := transport.EnsureRegion(ctx, db, cfg.Tunnel.Region, a.relays(cfg, db))
 	if err != nil {
 		return "", fmt.Errorf("this node has no address yet, since no relay is reachable; try again online: %w", err)
 	}

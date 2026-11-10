@@ -1,7 +1,9 @@
 // Package transport owns the peer connection: the authenticated tunnel
-// every byte between friends travels in (NET-1), behind an interface
-// that a second implementation could meet (NET-8). Tailcat, over
-// Tailscale's tailcat, is the only implementation.
+// every byte between friends travels in (NET-1), direct where the NATs
+// allow and through a relay of the node's set otherwise (NET-2 to
+// NET-5a), behind an interface that a second implementation could meet
+// (NET-8). Tailcat, over Tailscale's tailcat, is the only
+// implementation.
 //
 // Rules a caller must keep:
 //
@@ -20,6 +22,10 @@
 //     is its dial key: resolve it with state.DB.TunnelPeer before acting
 //     for anyone, and admit with the same lookup. To drop a friend,
 //     Disconnect both its keys.
+//   - Give every transport that dials for the node its relay set and
+//     relays.accept_peer_hints with SetRelays before its first Dial:
+//     without one, any relay an address names is dialled (NET-5a).
+//     A friend's explicit addresses (NET-3) come in by SetEndpoints.
 //   - The address is a pure function of the identity key and the saved
 //     DERP region (SEC-14). EnsureRegion chooses the region once and
 //     saves it in lendisk.db; never pick one per start.

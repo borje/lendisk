@@ -56,7 +56,8 @@ type app struct {
 	// has none, with "" once it lends (PEER-9); and once `peer forward`
 	// listens, with its address, after it printed its lines (NET-7b).
 	serving func(addr string)
-	// regions offers the tunnel's relay regions; nil means the public map.
+	// regions offers the tunnel's relay regions; nil means the relay
+	// set the config names (NET-5).
 	regions transport.RegionSource
 	// afterStore is the capture crash-window hook (gateway.AfterStore);
 	// tests only.
@@ -200,7 +201,7 @@ func (a *app) rootCmd() *cobra.Command {
 	root.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return usageError{err} })
 	a.flags = config.RegisterFlags(root.PersistentFlags())
 	root.AddCommand(a.initCmd(), a.recoverCmd(), a.statusCmd(), a.serveCmd(), a.bucketCmd())
-	root.AddCommand(a.endpointCmd(), a.overflowCmd())
+	root.AddCommand(a.endpointCmd(), a.overflowCmd(), a.relayCmd())
 	root.AddCommand(a.inviteCmd(), a.peerCmd(), a.verifyCmd(), a.undeleteCmd(), a.recoverySheetCmd(), a.exportCmd(), a.importCmd())
 	usageArgs(root)
 	return root
@@ -316,7 +317,7 @@ func ensureDir(dir string) error {
 // data directory.
 func ownEntry(name string) bool {
 	switch name {
-	case "lendisk.toml", "identity.key", "endpoint.crt", "endpoint.key", "profiles", "store", "run", "locks":
+	case "lendisk.toml", "identity.key", "endpoint.crt", "endpoint.key", "profiles", "store", "run", "locks", "relay":
 		return true
 	}
 	return strings.HasPrefix(name, "lendisk.db")

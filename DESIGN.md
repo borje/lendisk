@@ -5340,13 +5340,105 @@ the handler's own reads and is never cancelled; nothing below
   v1 (Q-R), and DERP fallback; `PathInfo` is built on `Client.DiscoPing`,
   whose result names an endpoint only when the pong came over a direct
   path, and reports direct or relayed for `status`. `Client.Ping`
-  always measures the DERP path and is not used for this.
-- **NET-5** Relays are DERP servers. The project publishes a DERP map;
-  `relays.map_url` or `relays.list` replaces it; `lendisk relay` wraps
-  `tailscale.com/cmd/derper`. Tailscale's hosted DERP map may be
-  included as a last-resort bootstrap.
-- **NET-5a** `relays.accept_peer_hints` controls whether a peer's
-  `tc…` relay hints are merged into the node's DERP map.
+  always measures the DERP path and is not used for this. *Built
+  (#42):* tailcat admits a client by its meow ping, which travels over
+  the relay only, so a relay both nodes reach is needed once per client
+  even when the path then goes direct; once direct, the tunnel no longer
+  needs it (`TestNATOneSymmetricGoesDirectAndOutlivesTheRelay`), and with
+  no relay reachable at all no tunnel comes up, explicit address or not
+  (`TestNoReachableRelayNoTunnel`). Tailscale is the same without its
+  control plane. *The path keeper* (`cli.keepPaths`) disco-pings every
+  friend the daemon has a client for: every 30 s while relayed, since
+  each disco ping (with tailcat's TSMP nudge) also tries for a direct
+  path, which is NET-4's retry, and every 5 minutes while direct, and
+  stores the answer in `friendship` (`path`, `path_relay`,
+  `path_endpoint`, `path_at`, migration 43). A friend not dialled is not
+  probed, since the probe would build a client. `status` shows it per
+  friend (`places[].path`, `path_relay`, `path_endpoint`,
+  `path_checked_at`; text `, direct` or `, relayed via <relay>`, and a
+  `Paths:` list on a lender-only node), `peer list` in REACH and
+  `path_relay`, `path_endpoint`, `path_checked_at`. tailcat strips
+  region codes from addresses, so the relay is named by its servers
+  (host:port), not a code. The quota call still records the path it
+  saw, as before. *The NAT test (NET-2 AC):* tailcat builds magicsock
+  with no packet-listener hook (`wgengine.Config` has none, and
+  tailcat sets `ListenPort: 0`), so Tailscale's in-memory natlab cannot
+  be put under it, and natlab's vnet needs QEMU VMs; network namespaces
+  need privileges CI does not give. So the NATs are simulated at what
+  each node learns: with `TS_DEBUG_OMIT_LOCAL_ADDRS` a node advertises
+  only its STUN answers, and a node "behind a symmetric NAT" learns them
+  from `transporttest.Symmetric`, a STUN server that answers every
+  request with a fresh 127.0.0.1 port nothing listens on, as a symmetric
+  NAT's mapping for the STUN server does not reach the node from anyone
+  else. A node behind an endpoint-independent NAT learns its real
+  socket. One symmetric side goes direct (the symmetric side's pings
+  reach the other's STUN address, which answers the real source), both
+  symmetric stay relayed (`TestNATBothSymmetricFallBackToTheRelay`).
+  The gap: no packet filtering is simulated (a peer that learnt the
+  real port another way gets through), nor mapping timeouts,
+  hairpinning or port preservation; G-1 measures the real thing.
+- **NET-3** A friend's explicit addresses (`lendisk peer address
+  <friend> <ip:port>…`, `--clear`; `friendship.explicit_addresses`) are
+  given to the friend's tailcat client as its server's endpoints, as a
+  control plane's network map would: magicsock disco-pings them at
+  once, beside the call-me-maybe endpoints, and the first that answers
+  carries the tunnel (`TestExplicitAddressIsDialledDirectly`, both sides
+  symmetric). tailcat exposes neither this nor a fixed UDP port, so
+  `transport` reaches its backend's magicsock by reflection, each field
+  checked for its type; a tailcat whose internals changed logs a
+  warning and the friend is reached as before (`engine.go`). The
+  addresses are read at each dial, so a running daemon uses them from
+  its next one. A port forward needs a fixed port: `tunnel.port` binds
+  the node's engine to it (default 0, any port; Tailscale's 41641 is a
+  good choice). Addresses are IP literals: a dynamic DNS name would be
+  resolved at each dial, which is left for later.
+- **NET-5** Relays are DERP servers. The node's relay set
+  (`transport.RelaySet`) is the project's DERP map, shipped in the
+  binary (`transport/projectrelays.json`, empty while the project runs
+  no relay), unless `relays.map_url` (a DERP map URL, Tailscale's JSON
+  format) or `[[relays.list]]` (self-hosted relays, `host`, `port`,
+  `stun_port`, `cert`) is set: either replaces it, both are used
+  together, the list's regions numbered from 900 after the map's.
+  `relays.tailscale_bootstrap` (default true) adds the hosted map
+  tailcat publishes (Tailscale's relays) as a last resort: its regions
+  never take an ID of the node's own, and the address's region is
+  picked from them only when none of the own regions answers a latency
+  probe (`RelaySet.Pick`). Set false, the node depends on no third
+  party's relay. Fetched maps are kept in `lendisk.db` (`node`
+  `relays.map:<url>`, `transport.StoreMapCache`), so a node restarted
+  while a map's host is down still knows its set. Precedent: Syncthing
+  ships a default relay pool URL that any list replaces; Tailscale's
+  clients carry an embedded DERP map as a fallback to the control
+  plane's; Headscale lets the operator replace or extend the map by
+  URL or file. `lendisk relay` is derper's relay part in lendisk's
+  binary (`internal/relay`): `derpserver` at `/derp` with derper's probe
+  and `generate_204` handlers, a STUN server, HTTP/2 off, over TLS that
+  is `self-signed` (made once, kept in `<data_dir>/relay` at 0600, and
+  pinned by nodes with `cert = "sha256-raw:<hex>"`, tlsdial's own pin,
+  so an IP-only VPS needs no CA), `letsencrypt` (autocert, TLS-ALPN on
+  :443) or `files`. Settings are `[relay]` (`hostname`, `listen`
+  `:443`, `stun_port` 3478, `tls`, `cert`, `key`); it logs the
+  `relays.list` entry. It forwards for any key, as derper does without
+  `--verify-clients`, which needs a tailscaled. No mesh: a second relay
+  is a second list entry. `TestFriendsThroughASelfHostedRelayOnly`
+  befriends two nodes whose only relay it is.
+- **NET-5a** With `relays.accept_peer_hints = false` (the default) a
+  friend's address must name a relay of the set: `Tailcat.Dial`
+  refuses one that does not, before a client is built or the relay
+  dialled, with `transport.ErrRelayNotAllowed` naming the relay and the
+  two ways to allow it; `peer add` refuses an invite the same way. An
+  address shares a relay with the set when one of its nodes is a node
+  of a set region (relay identity, below). An address naming a hosted
+  region by ID only is resolved by tailcat against Tailscale's map, so
+  it is a peer hint. The set's map is read at most every 5 minutes, a
+  failure remembered for a minute, and a relay found outside it is
+  checked once more against a fresh read before it is refused. Since
+  tailcat's client reaches the server only through the server's own
+  region, a refused relay means no tunnel to that friend: hints decide
+  whether the friend can be reached at all, and the error says so.
+  With hints accepted, a set that cannot be read does not stop a dial.
+  The daemon, `peer add`, `peer forward` and `recover` all dial under
+  the policy.
 - **NET-6** The version is carried by the control API `version`
   endpoint; the S3 surface is governed by its own stability. The peer
   protocol version is `major.minor` (`control.Protocol`, now `0.1`);
@@ -5619,13 +5711,26 @@ the handler's own reads and is never cancelled; nothing below
   client of the same key to the same server stalls the first one's
   connections). The client is keyed by the friend and its relay, not
   by the address string. tailcat's client connects to the first node
-  of the address's region that answers, in order, and does not report
-  which, so `relayOf` names every DERP server the address could reach:
-  each node that is not STUN-only, by host name and by each IP it
-  gives, with its DERP port (0 is 443); an address naming a public
-  region by ID only gives that ID. tailcat strips region and node
-  names from an address. Two addresses are one relay when those sets
-  share a server, whatever the node order, so an address that keeps a
+  of the address's region that answers, and does not report which:
+  derphttp's `dialRegion` tries the nodes in order and takes the first
+  whose TCP connect succeeds within 1.5 s, before any TLS. So `relayOf`
+  names every DERP server the address could reach: each node that is
+  not STUN-only, by host name, by each IP it gives and by each IP its
+  host name resolves to (so two DNS names, or a name and its IP, for
+  one server are one relay), with its DERP port (0 is the scheme's: 443
+  over HTTPS, 3340 over plain HTTP with `TS_DEBUG_USE_DERP_HTTP`, as
+  derphttp dials); and the region of the node's relay set (NET-5) that
+  holds any of those servers. A meshed region's nodes forward to each
+  other, so a second client of the key on another of its nodes stalls
+  the first as on one server: two addresses with disjoint nodes of one
+  region of the set are one relay. tailcat strips region IDs, codes and
+  node names from an address, so the region is known only from the
+  set; a dialler with none (a test's) knows relays by their servers.
+  The names are resolved at the dial, within 2 s, and an address's
+  relay is reused for 10 minutes (#60 review, #42). An address naming
+  a hosted region by ID only gives that ID. Two addresses are one relay
+  when those sets share a server or a region, whatever the node order,
+  so an address that keeps a
   server of the client's (a re-encoded region, a node added or removed
   by a re-init or a #51 re-redeem with a newer DERP map) reuses the
   client, and nodes with no host name are told apart by IP. The match
@@ -5638,7 +5743,10 @@ the handler's own reads and is never cancelled; nothing below
   rather than a second one built. `Tailcat.Close` marks every client
   closed under its lock and closes them and the server after releasing
   it, since tailcat's shutdown may wait on the admission hook, which
-  takes that lock.
+  takes that lock. `Listen` likewise releases it while tailcat starts,
+  listens and, on an error, closes the server, marking the transport
+  as starting meanwhile; a `Close` that ran meanwhile closes what
+  `Listen` started (#60 review).
 - **Dialling a friend.** The replica client's HTTP transport uses the
   tailcat `Client.Dial` for that peer, on the dial key for it, as its dial
   function, so
@@ -5710,7 +5818,9 @@ the handler's own reads and is never cancelled; nothing below
   the key a connection authenticated with, a friend's dial key
   included, and callers resolve it with `state.DB.TunnelPeer`. The tunnel port, 9000, is a
   constant, not a setting, since friends dial it without being told.
-  `transport.NewDialer` is a dial-only transport with any key and no
+  `Tailcat` also takes the relay policy, explicit addresses and UDP
+  port (`SetRelays`, `SetEndpoints`, `SetPort`; NET-3, NET-5a), set
+  before use. `transport.NewDialer` is a dial-only transport with any key and no
   region, which never listens: `peer add` dials with the invite key
   through it. `serve` hands the tunnel listener to
   `bridge.ServeTunnel`. The tunnel listens before the gateway is
@@ -6009,8 +6119,10 @@ the handler's own reads and is never cancelled; nothing below
   timetable, `reroute_after` and `replace_after`, are `[replication]`;
   the cap is `[lending]` (`max_total`); network addresses for the
   endpoint are `[[endpoint.listen]]` entries (EP-17), none by default;
-  relays are `[relays]`, the address's bootstrap region `[tunnel]`
-  (`region`, SEC-14), alerts `[alerts]` (`command`, `webhook`,
+  relays are `[relays]` (`map_url`, `[[relays.list]]`,
+  `tailscale_bootstrap`, `accept_peer_hints`; NET-5, NET-5a) and
+  `lendisk relay`'s `[relay]`, the address's bootstrap region `[tunnel]`
+  (`region`, SEC-14, and `port`, NET-3), alerts `[alerts]` (`command`, `webhook`,
   `unreachable_after`) and metrics `[metrics]` (`listen`, OPS-4). There are no
   `[[peer]]` or `[[overflow]]` entries: `peer add`, `peer quota` and
   `overflow add` write `lendisk.db`.
