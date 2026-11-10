@@ -11,6 +11,12 @@ import (
 // window a day.
 func tombPool(t *testing.T, dir string) (*pool, string, int64) {
 	t.Helper()
+	return targetPool(t, dir, VersioningOff)
+}
+
+// targetPool is tombPool with the target's versioning as given.
+func targetPool(t *testing.T, dir, versioning string) (*pool, string, int64) {
+	t.Helper()
 	db, err := Open(context.Background(), dir, quiet)
 	if err != nil {
 		t.Fatal(err)
@@ -21,7 +27,7 @@ func tombPool(t *testing.T, dir string) (*pool, string, int64) {
 	p.db.splitTTL = -1
 	p.friend("B", 10)
 	o := Overflow{Name: "garage", Endpoint: "http://g", Bucket: "b", Prefix: "lendisk", MaxBytes: 100 * unit,
-		EnvPrefix: "LENDISK_OVERFLOW_GARAGE_", Retention: 24 * time.Hour, Versioning: VersioningOff, AddedAt: p.now}
+		EnvPrefix: "LENDISK_OVERFLOW_GARAGE_", Retention: 24 * time.Hour, Versioning: versioning, AddedAt: p.now}
 	if err := p.db.AddOverflow(context.Background(), o); err != nil {
 		t.Fatal(err)
 	}
@@ -355,4 +361,60 @@ func TestAVanishedRowsDeleteIsNotSentAtOnce(t *testing.T) {
 	if held, err := p.db.HoldOverflowDelete(context.Background(), target, del, p.now); err != nil || !held {
 		t.Fatalf("held %v, %v: the worker would send the delete at once", held, err)
 	}
+}
+
+// REPL-12, S3-4, RET-3 (#40 regression, the versioned twin of
+// TestAPrunedObjectsMetadataStaysWhileItsDeleteIsHeld): a versioned
+// target is sent a pruned object's delete at once, as a delete marker,
+// and keeps the version for its window, which an undelete brings back.
+// So the bucket's metadata stays there for that window: re-placement
+// does not delete it, and a metadata put meanwhile goes there too.
+func TestAPrunedObjectsMetadataStaysAtAVersionedTargetForItsWindow(t *testing.T) {
+	ctx := context.Background()
+	p, target, _ := targetPool(t, t.TempDir(), VersioningEnabled)
+	meta, _ := p.metaAt(target)
+	p.ack(target, meta)
+	del := p.del("r", "data/1", "data")
+	p.wantPlaces("delete of data/1", del, "B", target)
+	if held, err := p.db.HoldOverflowDelete(ctx, target, del, p.now); err != nil || held {
+		t.Fatalf("held %v, %v: a versioned target is sent the delete", held, err)
+	}
+	p.ack(target, del)
+	p.now = p.now.Add(24*time.Hour - time.Second)
+	if s := p.replace(); s.Dropping != 0 || s.Cancelled != 0 {
+		t.Fatalf("re-placement deleted the metadata at a versioned target inside the window of a pruned object's delete: %+v", s)
+	}
+	p.wantState(target, meta, PlacementAcked)
+	// A metadata put inside the window goes there too, and stays.
+	idx := p.put("r", "index/2", "metadata", 0.1)
+	p.wantPlaces("index/2", idx, "B", target)
+	p.ack(target, idx)
+	if s := p.replace(); s.Dropping != 0 || s.Cancelled != 0 {
+		t.Fatalf("re-placement deleted the metadata it was just given: %+v", s)
+	}
+}
+
+// #40: once a versioned target's window after a pruned object's delete
+// has passed, it holds no data of the bucket: its metadata goes, once,
+// and a metadata put after that is not sent there.
+func TestAVersionedTargetsMetadataGoesAfterTheWindow(t *testing.T) {
+	ctx := context.Background()
+	p, target, _ := targetPool(t, t.TempDir(), VersioningEnabled)
+	meta, _ := p.metaAt(target)
+	p.ack(target, meta)
+	del := p.del("r", "data/1", "data")
+	if _, err := p.db.HoldOverflowDelete(ctx, target, del, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.ack(target, del)
+	p.now = p.now.Add(24 * time.Hour)
+	if s := p.replace(); s.Dropping != 1 {
+		t.Fatalf("the metadata of a target past its window not dropped: %+v", s)
+	}
+	p.wantState(target, meta, PlacementDropping)
+	if s := p.replace(); s.Dropping != 0 || s.Placed != 0 {
+		t.Fatalf("a second pass moved the metadata again: %+v", s)
+	}
+	idx := p.put("r", "index/2", "metadata", 0.1)
+	p.wantPlaces("index/2", idx, "B")
 }

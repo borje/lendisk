@@ -474,7 +474,7 @@ func (db *DB) placeTx(ctx context.Context, tx *sql.Tx, seq int64, heal bool) err
 		targets, err = column(ctx, tx, `SELECT peer_key FROM friendship WHERE coalesce(address, '') != '' ORDER BY peer_key`)
 		if err == nil {
 			var held []string
-			held, err = overflowHolding(ctx, tx, bucket)
+			held, err = overflowHolding(ctx, tx, bucket, db.now().Unix())
 			targets = append(targets, held...)
 		}
 		targets = slices.DeleteFunc(targets, func(p string) bool { return slices.Contains(skip, p) })
