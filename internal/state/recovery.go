@@ -107,6 +107,12 @@ type Relist struct {
 	TriedAt       time.Time // the last failed attempt; zero if none
 	Error         string    // its failure
 	Failures      int64     // failed attempts in a row
+	// SettleError is why settling the ended list failed last time
+	// (SettleFailed, #72), at SettleTriedAt, SettleFailures times in a
+	// row.
+	SettleError    string
+	SettleTriedAt  time.Time
+	SettleFailures int64
 }
 
 // ErrNotConflict means ResolveKey was asked to settle a key that is not
@@ -182,7 +188,7 @@ func (db *DB) RelistFailed(ctx context.Context, place, bucket, msg string, now t
 // listed again without it. The place does not count as listed to its
 // end.
 func (db *DB) AbandonRelist(ctx context.Context, place, bucket string) error {
-	_, err := db.ExecContext(ctx, `UPDATE relist SET abandoned = 1, settled = NULL WHERE place = ? AND bucket = ?`,
+	_, err := db.ExecContext(ctx, `UPDATE relist SET abandoned = 1, settled = NULL, settle_after = NULL WHERE place = ? AND bucket = ?`,
 		place, bucket)
 	return err
 }
@@ -230,10 +236,16 @@ func pause(ctx context.Context) error {
 // in write transactions of SettleBatch keys or SettleBudget, and marks
 // each list settled: an abandoned list's keys, without its entries; a
 // finished list's metadata keys one place alone lists (the
-// lone-metadata rule counts the finished list now); and the keys a list
-// named while this node was writing them, once the write has ended
-// (VerdictWriting, #71). It resumes where a crash stopped it, so the
+// lone-metadata rule counts the finished list now), after the last one
+// a batch committed (settle_after, #72); and the keys a list named while
+// this node was writing them, once the write has ended (VerdictWriting,
+// #71). It resumes where a crash or the end of ctx stopped it, so the
 // lister calls it at the start of every round.
+//
+// A list whose settling fails (#72) is recorded (SettleFailed) and
+// skipped, so the lists after it still settle, and is tried again on
+// the next call; so is a batch of written keys that fails. The error
+// joins every such failure; ctx ending stops it at once.
 func (db *DB) SettleFinished(ctx context.Context) error {
 	type ended struct {
 		place, bucket string
@@ -257,48 +269,31 @@ func (db *DB) SettleFinished(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	var failed []error
 	for _, e := range es {
-		if e.abandoned {
-			for {
-				n, err := db.dropBatch(ctx, e.place, e.bucket)
-				if err != nil {
-					return err
-				}
-				if n == 0 {
-					break
-				}
-				if err := pause(ctx); err != nil {
-					return err
-				}
-			}
-		} else {
-			keys, err := column(ctx, db, `SELECT key FROM listed WHERE bucket = ? AND class IN ('metadata', 'snapshot') AND named = 0
-				GROUP BY key HAVING count(*) = 1 ORDER BY key`, e.bucket)
-			if err != nil {
-				return err
-			}
-			for len(keys) > 0 {
-				n, err := db.settleKeys(ctx, e.bucket, keys[:min(len(keys), SettleBatch)])
-				if err != nil {
-					return err
-				}
-				keys = keys[n:]
-				if err := pause(ctx); err != nil {
-					return err
-				}
-			}
+		err := db.settleList(ctx, e.place, e.bucket, e.abandoned)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		if _, err := db.ExecContext(ctx, `UPDATE relist SET settled = 1 WHERE place = ? AND bucket = ?`, e.place, e.bucket); err != nil {
-			return err
+		if err != nil {
+			err = fmt.Errorf("settling %s's list of %s: %w", e.place, e.bucket, err)
+			failed = append(failed, err)
+			if _, rerr := db.ExecContext(ctx, `UPDATE relist SET settle_error = ?, settle_tried_at = ?,
+				settle_failures = coalesce(settle_failures, 0) + 1 WHERE place = ? AND bucket = ?`,
+				err.Error(), db.now().Unix(), e.place, e.bucket); rerr != nil {
+				failed = append(failed, fmt.Errorf("recording that failure: %w", rerr))
+			}
 		}
 	}
 	// Keys a list named while this node was writing them, whose write
-	// has ended (#71).
+	// has ended (#71), a bucket's batch at a time after the last.
+	var afterBucket, afterKey string
 	for {
 		rows, err := db.QueryContext(ctx, `SELECT k.bucket, k.key FROM recovered_key k WHERE `+writeEnded+`
-			ORDER BY k.bucket, k.key LIMIT ?`, SettleBatch)
+			AND (k.bucket > ? OR k.bucket = ? AND k.key > ?) ORDER BY k.bucket, k.key LIMIT ?`,
+			afterBucket, afterBucket, afterKey, SettleBatch)
 		if err != nil {
-			return err
+			return errors.Join(append(failed, err)...)
 		}
 		var bucket string
 		var keys []string
@@ -306,7 +301,7 @@ func (db *DB) SettleFinished(ctx context.Context) error {
 			var b, k string
 			if err := rows.Scan(&b, &k); err != nil {
 				rows.Close()
-				return err
+				return errors.Join(append(failed, err)...)
 			}
 			if bucket == "" {
 				bucket = b
@@ -317,15 +312,126 @@ func (db *DB) SettleFinished(ctx context.Context) error {
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil || len(keys) == 0 {
-			return err
+			return errors.Join(append(failed, err)...)
 		}
-		if _, err := db.settleKeys(ctx, bucket, keys); err != nil {
-			return err
+		n, err := db.settleKeys(ctx, bucket, keys)
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
+		if err != nil {
+			// Left writing, so counted unsettled, and tried again.
+			failed = append(failed, fmt.Errorf("settling the keys of %s written since a list named them, %s to %s: %w",
+				bucket, keys[0], keys[len(keys)-1], err))
+			n = len(keys)
+		}
+		afterBucket, afterKey = bucket, keys[n-1]
 		if err := pause(ctx); err != nil {
 			return err
 		}
 	}
+}
+
+// settleList settles one ended list, a batch at a time, and marks it
+// settled, its failure cleared.
+func (db *DB) settleList(ctx context.Context, place, bucket string, abandoned bool) error {
+	if abandoned {
+		for {
+			n, err := db.dropBatch(ctx, place, bucket)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				break
+			}
+			if err := pause(ctx); err != nil {
+				return err
+			}
+		}
+	} else {
+		for {
+			n, err := db.loneBatch(ctx, place, bucket)
+			if err != nil {
+				return err
+			}
+			if n == 0 {
+				break
+			}
+			if err := pause(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	_, err := db.ExecContext(ctx, `UPDATE relist SET settled = 1, settle_after = NULL, settle_error = NULL,
+		settle_tried_at = NULL, settle_failures = NULL WHERE place = ? AND bucket = ?`, place, bucket)
+	return err
+}
+
+// loneBatch decides again up to SettleBatch of bucket's metadata keys
+// one place alone lists, after the last one place's finished list's
+// settling decided (settle_after), stopping once SettleBudget has
+// passed, and records the last it decided, in one transaction; n is
+// how many.
+func (db *DB) loneBatch(ctx context.Context, place, bucket string) (int, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var after string
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce(settle_after, '') FROM relist WHERE place = ? AND bucket = ?`,
+		place, bucket).Scan(&after); err != nil {
+		return 0, err
+	}
+	keys, err := column(ctx, tx, `SELECT key FROM listed WHERE bucket = ? AND key > ? AND class IN ('metadata', 'snapshot')
+		AND named = 0 GROUP BY key HAVING count(*) = 1 ORDER BY key LIMIT ?`, bucket, after, SettleBatch)
+	if err != nil || len(keys) == 0 {
+		return 0, err
+	}
+	done, err := listedPlaces(ctx, tx, bucket)
+	if err != nil {
+		return 0, err
+	}
+	p := prepared(tx)
+	start := time.Now()
+	n := 0
+	for _, k := range keys {
+		if err := db.settleKey(ctx, p, bucket, k, done); err != nil {
+			return 0, err
+		}
+		n++
+		if time.Since(start) >= SettleBudget {
+			break
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE relist SET settle_after = ? WHERE place = ? AND bucket = ?`,
+		keys[n-1], place, bucket); err != nil {
+		return 0, err
+	}
+	return n, tx.Commit()
+}
+
+// SettleFailed returns the ended lists whose settling failed last time
+// it was tried (#72), with the failure: each is tried again every round.
+func (db *DB) SettleFailed(ctx context.Context) ([]Relist, error) {
+	rows, err := db.QueryContext(ctx, `SELECT place, bucket, settle_error, coalesce(settle_failures, 0), settle_tried_at
+		FROM relist WHERE settled IS NULL AND settle_error IS NOT NULL ORDER BY place, bucket`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Relist
+	for rows.Next() {
+		var r Relist
+		var tried sql.NullInt64
+		if err := rows.Scan(&r.Place, &r.Bucket, &r.SettleError, &r.SettleFailures, &tried); err != nil {
+			return nil, err
+		}
+		if tried.Valid {
+			r.SettleTriedAt = time.Unix(tried.Int64, 0)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // writeEnded selects recovered keys k decided VerdictWriting whose
@@ -435,7 +541,7 @@ func (db *DB) RecordListed(ctx context.Context, place, bucket string, objs []Lis
 		done = 1
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE relist SET after = ?, seen = coalesce(seen, 0) + ?, pages = coalesce(pages, 0) + 1,
-		tried_at = NULL, error = NULL, failures = 0, done = ?, settled = NULL
+		tried_at = NULL, error = NULL, failures = 0, done = ?, settled = NULL, settle_after = NULL
 		WHERE place = ? AND bucket = ?`, next, seen, done, place, bucket); err != nil {
 		return c, err
 	}

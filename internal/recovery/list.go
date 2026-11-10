@@ -367,6 +367,11 @@ func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles 
 		if err != nil {
 			return false, err
 		}
+		// An oversized page fails the list, as any malformed answer does,
+		// before it counts toward the caps (#72).
+		if len(p.Objects) > gateway.MaxListPage {
+			return false, fmt.Errorf("the place's page holds %d keys, more than %d", len(p.Objects), gateway.MaxListPage)
+		}
 		seen += int64(len(p.Objects))
 		pages++
 		switch {
@@ -374,9 +379,6 @@ func (l *Lister) listOne(listCtx, ctx context.Context, r state.Relist, profiles 
 			return true, fmt.Errorf("the place lists more than %d keys; its list was abandoned", maxKeys)
 		case pages > maxPages:
 			return true, fmt.Errorf("the place's list runs to more than %d pages; it was abandoned", maxPages)
-		}
-		if len(p.Objects) > gateway.MaxListPage {
-			return false, fmt.Errorf("the place's page holds %d keys, more than %d", len(p.Objects), gateway.MaxListPage)
 		}
 		objs := make([]state.Listed, 0, len(p.Objects))
 		last := after

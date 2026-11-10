@@ -238,6 +238,21 @@ type StatusRecovery struct {
 	// (EP-8), the recovered objects one friend alone listed: nothing
 	// checked them. Encrypted tools check their own objects.
 	Unverified []StatusUnverified `json:"unverified"`
+	// SettleFailed are lists read to their end (or abandoned) whose
+	// keys could not be decided again (#72): each is tried again every
+	// round, and the lists after it settle meanwhile.
+	SettleFailed []StatusSettleFailed `json:"settle_failed"`
+}
+
+// StatusSettleFailed is one ended list whose settling failed.
+type StatusSettleFailed struct {
+	Place  string `json:"place"`
+	Bucket string `json:"bucket"`
+	Error  string `json:"error"`
+	// Failures counts the failed attempts in a row; TriedAt is the
+	// last (RFC 3339 UTC).
+	Failures int64  `json:"failures"`
+	TriedAt  string `json:"tried_at"`
 }
 
 // StatusConflict is one recovered object in conflict.
@@ -1090,6 +1105,15 @@ friend, or with no room in the pool), which status shows.`,
 					}
 				}
 			}
+			sfs, err := db.SettleFailed(cmd.Context())
+			if err != nil {
+				return err
+			}
+			st.Recovery.SettleFailed = []StatusSettleFailed{}
+			for _, f := range sfs {
+				st.Recovery.SettleFailed = append(st.Recovery.SettleFailed, StatusSettleFailed{Place: f.Place, Bucket: f.Bucket,
+					Error: f.SettleError, Failures: f.SettleFailures, TriedAt: f.SettleTriedAt.UTC().Format(time.RFC3339)})
+			}
 			if asJSON {
 				enc := json.NewEncoder(a.out)
 				enc.SetIndent("", "  ")
@@ -1276,6 +1300,12 @@ friend, or with no room in the pool), which status shows.`,
 			}
 			for _, u := range st.Recovery.Unverified {
 				fmt.Fprintf(a.out, "Recovery: %d objects of %s came from one friend alone, unverified\n", u.Objects, u.Bucket)
+			}
+			if n := len(st.Recovery.SettleFailed); n > 0 {
+				fmt.Fprintf(a.out, "Recovery: %d lists read whose objects could not be decided yet; tried again every round:\n", n)
+				for _, f := range st.Recovery.SettleFailed {
+					fmt.Fprintf(a.out, "  %s at %s (%d tries, last %s: %s)\n", f.Bucket, f.Place, f.Failures, textTime(f.TriedAt), f.Error)
+				}
 			}
 			if n := len(st.FormerFriends); n > 0 {
 				fmt.Fprintf(a.out, "Ended friendships: %d, replicas kept until the purge\n", n)

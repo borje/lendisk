@@ -207,6 +207,27 @@ func TestOversizedPageFailsTheList(t *testing.T) {
 	}
 }
 
+// #72: the page size is checked before the caps, so an oversized page
+// that also passes MaxKeys fails the list, as any oversized page does,
+// rather than abandoning it.
+func TestOversizedPageAtTheCapFailsTheList(t *testing.T) {
+	db, l := recovering(t, "generic", "B")
+	l.MaxKeys = gateway.MaxListPage
+	var objs []control.ListObject
+	for i := 0; i <= gateway.MaxListPage; i++ {
+		k := fmt.Sprintf("%05d", i)
+		objs = append(objs, control.ListObject{Key: k, Size: 1, SHA256: sum(k)})
+	}
+	l.Page = served(map[string][]control.ListObject{"B": objs})
+	rs, err := l.Round(t.Context())
+	if err != nil || len(rs) != 1 || rs[0].Err == nil || !strings.Contains(rs[0].Err.Error(), "page holds") {
+		t.Fatalf("round %+v %v", rs, err)
+	}
+	if rels, _ := db.Relists(t.Context()); len(rels) != 1 || rels[0].Failures != 1 {
+		t.Fatalf("the list was abandoned, not failed: %+v", rels)
+	}
+}
+
 // #29 re-review: rounds start at a different place each time, so places
 // that use every round's budget cannot keep the ones after them from
 // ever being listed.
