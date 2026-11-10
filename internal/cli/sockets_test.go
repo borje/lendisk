@@ -13,15 +13,15 @@ import (
 	"github.com/borje/lendisk/internal/store"
 )
 
-// sock is one of this process's IP sockets, from /proc.
+// sock is one of this process's sockets, from /proc.
 type sock struct {
-	proto  string // tcp or udp
-	local  string // host:port
+	proto  string // tcp, udp or unix
+	local  string // host:port, or a unix socket's path (empty if unnamed)
 	listen bool
 }
 
-// ownSockets lists the IP sockets this process holds, as `ss -lntup`
-// would for its PID (EP-5, SEC-8).
+// ownSockets lists the sockets this process holds, as `ss -lntup` and
+// `ss -lxp` would for its PID (EP-5, SEC-8).
 func ownSockets() ([]sock, error) {
 	fds, err := filepath.Glob("/proc/self/fd/*")
 	if err != nil {
@@ -56,7 +56,31 @@ func ownSockets() ([]sock, error) {
 		}
 		fh.Close()
 	}
-	return out, nil
+	// Unix sockets: Num RefCount Protocol Flags Type St Inode [Path].
+	// A listening one has __SO_ACCEPTCON (0x10000) in Flags.
+	fh, err := os.Open("/proc/self/net/unix")
+	if err != nil {
+		return nil, err
+	}
+	defer fh.Close()
+	sc := bufio.NewScanner(fh)
+	sc.Scan() // header
+	for sc.Scan() {
+		fields := strings.Fields(sc.Text())
+		if len(fields) < 7 || !inodes[fields[6]] {
+			continue
+		}
+		flags, err := strconv.ParseUint(fields[3], 16, 32)
+		if err != nil {
+			return nil, err
+		}
+		var path string
+		if len(fields) > 7 {
+			path = fields[7]
+		}
+		out = append(out, sock{proto: "unix", local: path, listen: flags&0x10000 != 0})
+	}
+	return out, sc.Err()
 }
 
 // parseProcAddr decodes /proc/net's "0100007F:2328" (little-endian words).

@@ -43,7 +43,7 @@ accept_peer_hints = false
 # directly by adding it to their peer record. Nothing to set on Dag's side.
 
 [lending]
-retention_min = "30d"
+# Retention is per friendship, offered with `invite --retention` (RET-1).
 max_total     = "600G"
 
 [replication]

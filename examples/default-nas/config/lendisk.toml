@@ -15,11 +15,21 @@
 # Each friendship's number is Anna's own; the smaller of the two sides'
 # numbers is the quota in force (LEND-8): lendisk peer quota <peer> <bytes>.
 
+# Lines commented out show a setting at its default, or one Anna does not
+# use; every setting lendisk has appears once in these examples.
+
 role = "full"
+# data_dir = "/var/lib/lendisk"   # lendisk.db, store/, run/: the compose data volume
 
 [endpoint]
-# S3 for backup tools on this host is always 127.0.0.1:9000 (EP-1, EP-5).
-# LAN addresses, if any, would be [[endpoint.listen]] entries (EP-17).
+# S3 for backup tools on this host (EP-1, EP-5); loopback only.
+# loopback = "127.0.0.1:9000"
+# Other machines on the LAN reach S3 through [[endpoint.listen]] entries
+# (EP-17): an address, or an interface and a port; TLS is generated
+# unless tls = "off" or "files" (with cert and key).
+# [[endpoint.listen]]
+# address = "192.168.1.10:9000"
+# tls     = "generate"
 
 [metrics]
 listen = "127.0.0.1:9101"   # Prometheus at /metrics (OPS-4); loopback only
@@ -38,24 +48,37 @@ bitrot_read_limit = "8M"     # VER-5: the sample's disk reads, bytes a second
 [tunnel]
 # The tunnel port is always 9000 inside WireGuard (lender-facing S3 + control API).
 region = "ams"               # DERP bootstrap region chosen at init; part of the address (SEC-14)
+# port = 41641               # NET-3: a fixed UDP port for a port forward; 0 picks any
 
 [relays]
+# NET-5: relays of her own replace the project's relay map; with any of
+# them, Tailscale's hosted relays are left out unless asked for.
 map_url           = "https://relays.lendisk.example/derpmap.json"
 accept_peer_hints = false    # NET-5a: only relays Anna configured may see her traffic
+# tailscale_bootstrap = true # also use Tailscale's hosted relays as a last resort
+# A relay a friend runs with `lendisk relay` (examples/relay-vps), its
+# entry as the relay logs it:
+# [[relays.list]]
+# host      = "relay.dag.example"
+# port      = 8443
+# stun_port = 3478
+# cert      = "sha256-raw:<64 hex digits from the relay's log>"
 
 [lending]
-retention_min = "30d"        # RET-1: borrowers may ask for longer, never shorter
+# Retention is per friendship, offered with `invite --retention` (RET-1).
 max_total     = "600G"       # LEND-1: cap on the sum of Anna's own numbers
 
 [replication]
 # Pacing (REPL-6, REPL-7) applies without a restart: the daemon looks
 # at this file every 10 s, and at once on SIGHUP (systemctl reload).
 upload_limit   = "20M"       # REPL-7: bytes a second replication sends, all friends together
+# download_limit = "50M"     # REPL-7: what fetching back from friends may use
 schedule       = "01:00-07:00, 12:00-13:00"   # when replication may send (local time)
 part_size      = "16M"       # REPL-6: larger objects go in parts and resume at the next part
 copies         = 2           # EP-6: for `bucket add` without --copies; the default
 reroute_after  = "1h"        # D6: unsent copies at a friend failing this long go elsewhere
 replace_after  = "168h"      # REPL-12: a friend silent this long is no longer room
+overflow_sample = "0.1"      # VER-2: % of the overflow target's bytes downloaded and checked a week
 
 # REPL-7: Björn is relayed through DERP; be gentle. A friend is named by
 # its node ID, as `lendisk peer list` shows it.
@@ -85,8 +108,10 @@ replace_after  = "168h"      # REPL-12: a friend silent this long is no longer r
 # OPS-3: the hook receives each alert as JSON on stdin. Uncomment once
 # the file exists: serve refuses to start otherwise. It must be an
 # absolute path to one executable file (chmod +x), with no arguments;
-# put arguments in the script. A shell script needs /bin/sh in the
-# image. For example /etc/lendisk/hooks/ntfy.sh:
+# put arguments in the script. The image has no shell (distroless), so
+# in a container the hook is a static program, or a script whose
+# interpreter you mount in; under systemd a shell script works. For
+# example /etc/lendisk/hooks/ntfy.sh:
 #   #!/bin/sh
 #   exec curl -fsS -H 'Title: lendisk alert' --data-binary @- https://ntfy.sh/your-topic
 # command = "/etc/lendisk/hooks/ntfy.sh"
@@ -95,3 +120,4 @@ unreachable_after = "24h"                 # OPS-2: the default
 
 [log]
 level = "info"               # OPS-5: structured, to stdout
+# format = "json"            # text (logfmt) by default

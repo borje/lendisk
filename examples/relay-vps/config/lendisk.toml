@@ -1,0 +1,23 @@
+# Dag · `lendisk relay` on a small VPS with a public IP (NET-5)
+#
+# A relay for the group, so their nodes depend on no relay run by a third
+# party. It needs no identity and keeps nothing but its certificate, in
+# <data_dir>/relay. It logs one entry at start; each friend adds it to
+# their [[relays.list]] (see examples/default-nas). Only [relay] and
+# data_dir matter to `lendisk relay`.
+
+data_dir = "/var/lib/lendisk"
+
+[relay]
+hostname  = "relay.dag.example"   # the name (or IP address) nodes reach this host by
+# Above 1023, so the relay needs no capability (OPS-7); the entry carries
+# the port. letsencrypt needs listen on port 443 instead.
+listen    = ":8443"
+stun_port = 3478                  # UDP: nodes learn their public address here; 0 for none
+tls       = "self-signed"         # pinned by the entry's cert field
+# With tls = "files", a certificate you manage, re-read at each connection:
+# cert = "/etc/lendisk/relay.crt"
+# key  = "/etc/lendisk/relay.key"
+
+[log]
+level = "info"

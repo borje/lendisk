@@ -23,30 +23,28 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/tools-cache
-          key: tools-kopia-0.23.1-duplicacy-3.3.0
+          key: tools-restic-0.19.1-kopia-0.23.1-duplicacy-3.3.0
       - name: backup tools for the end-to-end tests (EP-1, COMPAT-1)
         env:
           # Pinned releases, checked against the SHA-256 each project
-          # publishes (Kopia's checksums.txt; GitHub's asset digest for
-          # Duplicacy, which publishes none of its own).
-          KOPIA_VERSION: 0.23.1
-          KOPIA_SHA256: 416d0f84a3dbb321a8b2d8f0997b1a0a6e915babe79ee76fa6e4d2bd1e1c5178
+          # publishes (restic's SHA256SUMS, Kopia's checksums.txt;
+          # GitHub's asset digest for Duplicacy, which publishes none of
+          # its own). restic and Kopia are the latest releases, the
+          # first row of the compat matrix below.
           DUPLICACY_VERSION: 3.3.0
           DUPLICACY_SHA256: a2ac4db7018633b116506e081a029dd6635e9619cf24b85c33144640613416ee
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq restic rclone
+          sudo apt-get install -y -qq rclone
+          .github/install-tool.sh restic 0.19.1 f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c
+          .github/install-tool.sh kopia 0.23.1 416d0f84a3dbb321a8b2d8f0997b1a0a6e915babe79ee76fa6e4d2bd1e1c5178
           # Downloads are cached, so a GitHub release outage only matters
           # when the pinned versions change.
           mkdir -p ~/tools-cache && cd ~/tools-cache
-          [ -f kopia.tar.gz ] || curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o kopia.tar.gz "https://github.com/kopia/kopia/releases/download/v${KOPIA_VERSION}/kopia-${KOPIA_VERSION}-linux-x64.tar.gz"
-          echo "${KOPIA_SHA256}  kopia.tar.gz" | sha256sum -c -
-          tar xzf kopia.tar.gz -C "$RUNNER_TEMP"
-          sudo install -m 0755 "$RUNNER_TEMP/kopia-${KOPIA_VERSION}-linux-x64/kopia" /usr/local/bin/kopia
           [ -f duplicacy ] || curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o duplicacy "https://github.com/gilbertchen/duplicacy/releases/download/v${DUPLICACY_VERSION}/duplicacy_linux_x64_${DUPLICACY_VERSION}"
           echo "${DUPLICACY_SHA256}  duplicacy" | sha256sum -c -
           sudo install -m 0755 duplicacy /usr/local/bin/duplicacy
-          restic version; rclone version | head -1; aws --version; kopia --version; duplicacy 2>&1 | grep -A1 VERSION
+          rclone version | head -1; aws --version; duplicacy 2>&1 | grep -A1 VERSION
       - run: go vet ./...
       - run: go test -race -timeout 30m ./...
       - name: SEC-11 test build (admission admits everyone; the middleware alone refuses)
@@ -89,14 +87,76 @@ jobs:
         if: always()
         run: docker rm -f lendisk-ci-rustfs
 
+  # COMPAT-1: restic and Kopia at the latest release and the two minor
+  # releases before it, each latest patch, end to end through the S3
+  # endpoint: backup, check or verify, restore, replication to friends,
+  # restore through friends after recovery. Each row installs one
+  # pinned version (the SHA-256 is GitHub's asset digest, which matches
+  # the project's own checksum file) and runs that tool's tests without
+  # the race detector, which the test job already runs. Bump the rows
+  # when a tool releases: drop the oldest, add the new latest, and move
+  # the test job's pin to it.
+  compat:
+    name: compat (${{ matrix.tool }} ${{ matrix.version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { tool: restic, version: 0.19.1, sha256: f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c }
+          - { tool: restic, version: 0.18.1, sha256: 680838f19d67151adba227e1570cdd8af12c19cf1735783ed1ba928bc41f363d }
+          - { tool: restic, version: 0.17.3, sha256: 5097faeda6aa13167aae6e36efdba636637f8741fed89bbf015678334632d4d3 }
+          - { tool: kopia, version: 0.23.1, sha256: 416d0f84a3dbb321a8b2d8f0997b1a0a6e915babe79ee76fa6e4d2bd1e1c5178 }
+          - { tool: kopia, version: 0.22.3, sha256: d9e906e0813fc73addca7caa91c6ee33641e49e4fabe3462cd221445cc790c2d }
+          - { tool: kopia, version: 0.21.1, sha256: de47d6b8ae2dfd6199a81d428c9eaed58cfd96a167bdc20407d3264dd18d33ca }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: cached tool download
+        uses: actions/cache@v4
+        with:
+          path: ~/tools-cache
+          key: tools-${{ matrix.tool }}-${{ matrix.version }}
+      - name: ${{ matrix.tool }} ${{ matrix.version }}
+        run: .github/install-tool.sh ${{ matrix.tool }} ${{ matrix.version }} ${{ matrix.sha256 }}
+      - name: end-to-end tests
+        env:
+          TESTS: ${{ matrix.tool == 'restic'
+            && 'TestResticEndToEnd|TestReplicateResticBackupToFriend|TestResticRestoreThroughFriendsAfterRecovery|TestResticPruneTombstonesAtEveryFriend'
+            || 'TestKopiaEndToEnd|TestReplicateKopiaToFriend|TestKopiaFormat1RepositoryIsWarnedUntilUpgraded|TestKopiaOpensAnExportAsAFilesystemRepository' }}
+        run: go test -timeout 20m -v -run "$TESTS" ./internal/cli ./internal/export
+
+  # OPS-8 with real binaries: the previous release makes a node, this
+  # commit upgrades its state, and the previous release still runs on
+  # it. Until there is a release tag, the previous commit stands in.
+  downgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: upgrade and one-minor downgrade
+        run: |
+          prev=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || git rev-parse HEAD^)
+          echo "previous release: $prev"
+          .github/downgrade.sh "$prev"
+
+  # COMPAT-2, D2: one static binary per platform, packed with the
+  # systemd unit as a tarball, kept as a workflow artefact. Nothing is
+  # published.
   build:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
-          - { goarch: amd64 }
-          - { goarch: arm64 }
-          - { goarch: arm, goarm: "7" }
+          - { arch: amd64, goarch: amd64 }
+          - { arch: arm64, goarch: arm64 }
+          - { arch: armv7, goarch: arm, goarm: "7" }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -109,5 +169,48 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
           GOARM: ${{ matrix.goarm }}
         run: |
-          go build -trimpath -ldflags "-s -w -X github.com/borje/lendisk/internal/version.Version=${GITHUB_SHA::12}" -o lendisk ./cmd/lendisk
-          file lendisk
+          version=${GITHUB_SHA::12}
+          [ "$GITHUB_REF_TYPE" = tag ] && version=$GITHUB_REF_NAME
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          go build -trimpath -ldflags "-s -w -X github.com/borje/lendisk/internal/version.Version=$version" -o dist/linux-${{ matrix.arch }}/lendisk ./cmd/lendisk
+          file dist/linux-${{ matrix.arch }}/lendisk | tee /dev/stderr | grep -q 'statically linked'
+      - name: package
+        run: .github/package.sh "$VERSION" ${{ matrix.arch }} dist/linux-${{ matrix.arch }}/lendisk dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lendisk-linux-${{ matrix.arch }}
+          path: |
+            dist/linux-${{ matrix.arch }}/lendisk
+            dist/lendisk-*.tar.gz
+            dist/lendisk-*.tar.gz.sha256
+          if-no-files-found: error
+
+  # D2, OPS-7: the container image for amd64, arm64 and armv7 from the
+  # build job's binaries, kept as an OCI archive artefact (not pushed).
+  # The amd64 image is then run as the compose examples run it: an
+  # unprivileged user, every capability dropped, a read-only root.
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lendisk-linux-*
+          path: dist
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - name: build the image for every platform
+        run: |
+          chmod 0755 dist/linux-*/lendisk
+          docker buildx build --platform linux/amd64,linux/arm64,linux/arm/v7 \
+            --output type=oci,dest=lendisk-image.oci.tar .
+      - name: run it unprivileged with a read-only root
+        run: |
+          docker buildx build --platform linux/amd64 --load -t lendisk:ci .
+          .github/image-smoke.sh lendisk:ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lendisk-image
+          path: lendisk-image.oci.tar
+          if-no-files-found: error

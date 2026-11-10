@@ -1,0 +1,21 @@
+# Dag: a relay for the group on a VPS (NET-5). `lendisk relay` is the
+# same binary and image as the node; it needs no identity and no init.
+# Open TCP 8443 and UDP 3478 in the VPS firewall.
+
+services:
+  lendisk-relay:
+    image: ghcr.io/lendisk/lendisk:0.10
+    container_name: lendisk-relay
+    restart: unless-stopped
+    command: ["relay"]
+    network_mode: host
+    user: "1000:1000"
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs: [/tmp]
+    environment:
+      LENDISK_CONFIG: /etc/lendisk/lendisk.toml
+    volumes:
+      - ./config:/etc/lendisk
+      - ./data:/var/lib/lendisk   # relay/: the self-signed certificate the entry pins

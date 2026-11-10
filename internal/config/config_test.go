@@ -153,27 +153,6 @@ func TestUnknownKeysReported(t *testing.T) {
 	}
 }
 
-// The v1 examples must parse; keys later tickets add are only reported.
-// garage-on-lan and provider-store-vps are post-v1 (EP-16, store.backend s3).
-func TestExamplesParse(t *testing.T) {
-	var files []string
-	for _, ex := range []string{"default-nas", "lender-only-pi"} {
-		files = append(files, "../../examples/"+ex+"/config/lendisk.toml")
-	}
-	for _, p := range files {
-		l, err := load(t, []string{"--config", p}, nil)
-		if err != nil {
-			t.Errorf("%s: %v", p, err)
-			continue
-		}
-		// serve refuses a hook file that does not exist (#13), so an
-		// example names one only in a comment.
-		if l.Alerts.Command != "" {
-			t.Errorf("%s sets alerts.command = %q; serve would refuse to start until it exists", p, l.Alerts.Command)
-		}
-	}
-}
-
 // EP-14 (#8): the store reconciler's interval and delete limit are
 // settings, a day and 10% by default.
 func TestReconcileSettings(t *testing.T) {

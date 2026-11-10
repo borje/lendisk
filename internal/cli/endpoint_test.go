@@ -195,49 +195,90 @@ func TestAdminAndControlPathsRefused(t *testing.T) {
 	}
 }
 
-// EP-5 and SEC-8 AC: what `serve` opens is the loopback endpoint, as its
-// only TCP listener, and tailcat's UDP socket on all interfaces (NET-1),
-// nothing else. Sockets that exist before serve starts (the test relay in
-// this process) are not the daemon's.
-func TestOnlyLoopbackListener(t *testing.T) {
+// SEC-8 AC (#44), the listener audit, with and without an
+// endpoint.listen entry (EP-5, EP-17): what `serve` opens is, as TCP
+// listeners, the loopback endpoint and each configured endpoint.listen
+// address and nothing else; as datagram sockets, tailcat's on the
+// wildcard address (NET-1, one per address family); and as unix
+// sockets, the internal gw.sock alone. This is `ss -lntup` and `ss -lxp`
+// for the daemon. Sockets that exist before serve starts (the test relay
+// in this process) are not the daemon's; connections out are not
+// listeners.
+func TestListenerAuditShowsOnlyTheNamedSockets(t *testing.T) {
 	// Not parallel: it reads this process's sockets, which a parallel
 	// test would add to (see parallel_test.go).
-	n := newNode(t)
-	n.mustInit(t)
-	before, err := ownSockets()
-	if err != nil {
+	if _, err := ownSockets(); err != nil {
 		t.Skipf("cannot inspect sockets: %v", err)
 	}
-	d := n.serve(t)
-	after, _ := ownSockets()
-	old := map[sock]bool{}
-	for _, s := range before {
-		old[s] = true
-	}
-	var found bool
-	udp := 0
-	for _, s := range after {
-		if old[s] {
-			continue
-		}
-		switch {
-		case s.proto == "tcp" && s.listen && s.local == d.addr:
-			found = true
-		case s.proto == "tcp" && s.listen:
-			t.Errorf("unexpected TCP listener %s", s.local)
-		case s.proto == "udp":
-			host, _, _ := net.SplitHostPort(s.local)
-			if ip := net.ParseIP(host); ip == nil || !ip.IsUnspecified() {
-				t.Errorf("unexpected UDP socket %s", s.local)
+	ip := lanIP(t)
+	for _, tc := range []struct {
+		name   string
+		listen bool
+	}{{"loopback only", false}, {"with endpoint.listen", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := newNode(t)
+			n.mustInit(t)
+			var lan string
+			if tc.listen {
+				lan = freeAddr(t, ip)
+				n.listenOn(t, fmt.Sprintf("address = %q", lan))
 			}
-			udp++
-		}
-	}
-	if !found {
-		t.Errorf("endpoint %s not among the new listeners %v", d.addr, after)
-	}
-	if udp > 2 { // tailcat binds one socket per address family
-		t.Errorf("%d new UDP sockets, want tailcat's (at most one per family)", udp)
+			before, err := ownSockets()
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := n.serve(t)
+			after, err := ownSockets()
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := map[sock]bool{}
+			for _, s := range before {
+				old[s] = true
+			}
+			want := map[string]bool{d.addr: false}
+			if lan != "" {
+				want[lan] = false
+			}
+			udp, unix := 0, 0
+			for _, s := range after {
+				if old[s] {
+					continue
+				}
+				switch {
+				case s.proto == "tcp" && s.listen:
+					if _, ok := want[s.local]; !ok {
+						t.Errorf("unexpected TCP listener %s", s.local)
+					}
+					want[s.local] = true
+				case s.proto == "udp":
+					host, _, _ := net.SplitHostPort(s.local)
+					if ip := net.ParseIP(host); ip == nil || !ip.IsUnspecified() {
+						t.Errorf("unexpected UDP socket %s", s.local)
+					}
+					udp++
+				case s.proto == "unix" && s.listen:
+					if filepath.Base(s.local) != "gw.sock" {
+						t.Errorf("unexpected unix listener %q", s.local)
+					}
+					unix++
+				}
+			}
+			for addr, found := range want {
+				if !found {
+					t.Errorf("listener %s not among the new sockets %v", addr, after)
+				}
+			}
+			if udp == 0 || udp > 2 { // tailcat binds one socket per address family
+				t.Errorf("%d new UDP sockets, want tailcat's (one, at most one per family)", udp)
+			}
+			if unix != 1 {
+				t.Errorf("%d new unix listeners, want gw.sock alone", unix)
+			}
+			if st := n.status(); len(st.Endpoint.Listen) != len(want)-1 {
+				t.Errorf("status lists %d endpoint.listen addresses, want %d", len(st.Endpoint.Listen), len(want)-1)
+			}
+		})
 	}
 }
 

@@ -1,19 +1,28 @@
 # /etc/systemd/system/lendisk.service
 # The same daemon without Docker: one static binary, one unit (D2, COMPAT-2).
+# The release package holds the binary, this unit and lendisk.env.example:
 #
+#   install -m 0755 lendisk /usr/local/bin/lendisk
+#   install -m 0644 lendisk.service /etc/systemd/system/lendisk.service
 #   useradd --system --home /var/lib/lendisk --shell /usr/sbin/nologin lendisk
 #   install -d -m 0700 -o lendisk -g lendisk /etc/lendisk /var/lib/lendisk
-#   install -m 0600 -o root -g root lendisk.env /etc/lendisk.env
+#   install -m 0600 -o root -g root lendisk.env.example /etc/lendisk.env   # then fill it in
 #   sudo -u lendisk lendisk init --config /etc/lendisk/lendisk.toml
-#   systemctl enable --now lendisk
+#   systemctl daemon-reload && systemctl enable --now lendisk
+#
+# A store outside /var/lib/lendisk (store.path) also goes in
+# ReadWritePaths= below, with a drop-in: systemctl edit lendisk.
 
 [Unit]
 Description=lendisk: lend and borrow disk space for offsite backups
+Documentation=https://github.com/borje/lendisk
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+# OPS-7: an unprivileged system user, which owns the config and data
+# directories; the daemon needs no capability.
 User=lendisk
 Group=lendisk
 ExecStart=/usr/local/bin/lendisk serve --config /etc/lendisk/lendisk.toml
@@ -23,25 +32,51 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 
-# SEC-3: third-party credentials (overflow targets) come from a root-owned file the service
-# user cannot read; systemd injects them as environment variables.
+# SEC-3: third-party credentials (LENDISK_OVERFLOW_<NAME>_ACCESS_KEY and
+# _SECRET_KEY for each overflow target) come from a root-owned file the
+# service user cannot read; systemd reads it and passes them as
+# environment variables. The leading - lets a node with no overflow
+# target run without the file.
 EnvironmentFile=-/etc/lendisk.env
 
-# Hardening in the spirit of OPS-7 and SEC-8.
+# /var/lib/lendisk: lendisk.db, store/, run/. StateDirectory makes it
+# writable under ProtectSystem=strict and keeps it owned by the user.
+StateDirectory=lendisk
+StateDirectoryMode=0700
+# /etc/lendisk: the identity key and the generated endpoint certificate.
+ReadWritePaths=/etc/lendisk
+UMask=0077
+
+# Hardening (OPS-7, SEC-8): no privilege, no capability, a read-only
+# view of the system.
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/etc/lendisk /var/lib/lendisk
-PrivateTmp=true
-ProtectKernelTunables=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-LockPersonality=true
 CapabilityBoundingSet=
 AmbientCapabilities=
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# v1 does not use UPnP/NAT-PMP/PCP port mapping (DESIGN Q-R); if a later
-# release adds it (#46), AF_NETLINK may be needed here.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+# IP for the endpoint, the tunnel and overflow targets; unix for the
+# internal gw.sock; netlink to list the host's interfaces and
+# addresses, which the tunnel's direct paths and an `interface` entry of
+# endpoint.listen (EP-17) read.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

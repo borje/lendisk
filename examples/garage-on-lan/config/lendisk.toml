@@ -30,8 +30,6 @@ listen = "127.0.0.1:9101"   # Prometheus at /metrics (OPS-4); loopback only
 backend  = "s3"
 endpoint = "http://127.0.0.1:3900"   # Garage, published on the host's loopback
 region   = "garage"
-# access_key_env = "LENDISK_STORE_ACCESS_KEY"   # defaults; override only if you must
-# secret_key_env = "LENDISK_STORE_SECRET_KEY"
 
 [tunnel]
 # The tunnel port is always 9000 inside WireGuard.
@@ -42,7 +40,7 @@ map_url           = "https://relays.lendisk.example/derpmap.json"
 accept_peer_hints = false
 
 [lending]
-retention_min = "30d"
+# Retention is per friendship, offered with `invite --retention` (RET-1).
 max_total     = "600G"
 
 [replication]
