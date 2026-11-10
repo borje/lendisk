@@ -27,6 +27,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/borje/lendisk/internal/identity"
@@ -57,6 +59,33 @@ type Fetched struct {
 // manifest's friends are asked too. It fails only when no lender served
 // one.
 func Newest(ctx context.Context, addr string, fetch FetchFunc) (*manifest.Manifest, []Fetched, error) {
+	return (&Fetcher{Fetch: fetch}).Newest(ctx, addr)
+}
+
+// DefaultRetryFor bounds how long Fetcher asks one lender again whose
+// dial was refused or whose connection was reset (#107).
+const DefaultRetryFor = 30 * time.Second
+
+// Fetcher asks lenders for the node's manifest (Newest). A lender that
+// refuses the dial or resets the connection is asked again, after 1 s,
+// 2 s, 4 s and then every 8 s, for RetryFor in all, before Newest moves
+// on to the next lender or fails: a friend restarting its daemon
+// refuses for a moment, and that should not end a recovery. Any other
+// failure (no answer within the fetch's own timeout, refused for want
+// of a friendship, no manifest) is not asked again.
+type Fetcher struct {
+	Fetch FetchFunc
+	// RetryFor is DefaultRetryFor when zero; negative asks once.
+	RetryFor time.Duration
+	// Now and Sleep are the clock and the wait between tries; nil is
+	// the wall clock.
+	Now   func() time.Time
+	Sleep func(ctx context.Context, d time.Duration) error
+}
+
+// Newest is the package's Newest through f.
+func (f *Fetcher) Newest(ctx context.Context, addr string) (*manifest.Manifest, []Fetched, error) {
+	fetch := f.fetch
 	first, err := transport.KeyOf(addr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("the lender's address: %w", err)
@@ -92,6 +121,53 @@ func Newest(ctx context.Context, addr string, fetch FetchFunc) (*manifest.Manife
 		return nil, tried, tried[0].Err
 	}
 	return best, tried, nil
+}
+
+// fetch asks the lender at addr, again while it refuses or resets the
+// connection, for RetryFor at the most.
+func (f *Fetcher) fetch(ctx context.Context, addr string) (*manifest.Manifest, error) {
+	now, sleep := f.Now, f.Sleep
+	if now == nil {
+		now = time.Now
+	}
+	if sleep == nil {
+		sleep = sleepCtx
+	}
+	retryFor := cmp.Or(f.RetryFor, DefaultRetryFor)
+	start := now()
+	wait := time.Second
+	for {
+		m, err := f.Fetch(ctx, addr)
+		if err == nil || !refused(err) || now().Sub(start)+wait > retryFor {
+			return m, err
+		}
+		if sleep(ctx, wait) != nil {
+			return nil, err
+		}
+		wait = min(2*wait, 8*time.Second)
+	}
+}
+
+// refused reports whether err is a dial the lender refused or a
+// connection it reset. The tunnel's errors carry only their text
+// (gVisor's "connection was refused", "connection reset by peer").
+func refused(err error) bool {
+	if errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "connection was refused") || strings.Contains(s, "connection reset by peer")
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // Restored is what Restore wrote.

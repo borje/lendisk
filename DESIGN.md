@@ -1052,7 +1052,13 @@ upstream bucket is Q-V.
   serve an older copy, since the envelope binds node and format, not
   freshness, so `recovery.Newest` then asks every friend any fetched
   manifest names, the newest one's included, and keeps the highest
-  `seq`; each lender's answer is printed. `recovery.Restore` passes
+  `seq`; each lender's answer is printed. A lender that refuses the
+  dial or resets the connection, as one restarting its daemon does, is
+  asked again after 1, 2 and 4 s and then every 8 s, for
+  `recovery.DefaultRetryFor` (30 s) in all, before recovery moves on to
+  the next lender or fails (`recovery.Fetcher`, #107,
+  `TestARefusingLenderIsAskedAgainForABoundedTime`); any other failure
+  is not asked again. `recovery.Restore` passes
   that `seq` to `state.ContinueManifest` before the daemon first runs,
   so the version never goes back and later changes count on from it;
   restores each friendship with its terms and the friend's dial key
@@ -4793,7 +4799,19 @@ the handler's own reads and is never cancelled; nothing below
   (`TestABusyAnswerBeforeALargeBodyIsReadReachesTheBorrower`,
   `TestAQuotaAnswerBeforeALargeBodyIsReadReachesTheBorrower`; the test
   above sends 3 MiB). seed's `answered` does the same on the import
-  path (#36), where no bridge stands between. Once
+  path (#36), where no bridge stands between. The tunnel leg has the
+  same race (#107): net/http closes a connection whose request body
+  is unread 500 ms after the answer, and gVisor resets a connection
+  closed with unread data, so a borrower still writing the body, slow
+  to read the answer on a loaded machine, got `connection reset by
+  peer` in place of busy (Go's client returns whichever of the write
+  error and the answer it sees first). It is rare and costs only a
+  retry: the worker retries a network failure as it does busy. Open: a
+  lingering close (read and discard after the answer until the
+  borrower closes, bounded) removes the reset in a loopback test, but
+  over the tunnel it made the #93 test fail 2 runs in 15 under load
+  (borrower dials hanging until their timeout), against none of 15
+  without it, for reasons not yet found; it is not in. Once
   they have stored, the retry is answered 507 if it no longer
   fits. The check reads the counter under the same lock that admits the
   write. A completion is checked against the floor alone, for the size
@@ -4863,8 +4881,12 @@ the handler's own reads and is never cancelled; nothing below
   bound above holds for a paced body too
   (`TestABodyTricklingBesideABusyOneIsEndedByTheFloorRate`,
   `TestABodyTricklingBesideABusyOneIsEndedByTheStallBound`,
-  `TestALendWaitIsCreditedOnlyUpToTheBodysFairShare`). It changes
-  without a restart, like REPL-7's.
+  `TestALendWaitIsCreditedOnlyUpToTheBodysFairShare`). A body under
+  way that reads nothing (abandoned, its handler waiting on the store)
+  raises the others' share and never lowers it, so an honest body
+  beside it is credited its whole wait
+  (`TestAnHonestBodyBesideAnAbandonedOneIsCreditedItsWholeWait`, #107).
+  It changes without a restart, like REPL-7's.
 - **LEND-4** `Lending` hashes a borrower's body as it streams it to the
   backend (SHA-256) and compares with `x-amz-meta-lendisk-sha256` at
   the end of the stream: a mismatch fails that last read, so posix
