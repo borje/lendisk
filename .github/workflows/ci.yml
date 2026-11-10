@@ -28,7 +28,7 @@ jobs:
           out=$(gofmt -l cmd internal)
           if [ -n "$out" ]; then echo "not gofmt'ed:"; echo "$out"; exit 1; fi
       - name: cached tool downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/tools-cache
           key: tools-restic-0.19.1-kopia-0.23.1-duplicacy-3.3.0
@@ -130,7 +130,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: cached tool download
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/tools-cache
           key: tools-${{ matrix.tool }}-${{ matrix.version }}
@@ -191,7 +191,7 @@ jobs:
           file dist/linux-${{ matrix.arch }}/lendisk | tee /dev/stderr | grep -q 'statically linked'
       - name: package
         run: .github/package.sh "$VERSION" ${{ matrix.arch }} dist/linux-${{ matrix.arch }}/lendisk dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lendisk-linux-${{ matrix.arch }}
           path: |
@@ -209,12 +209,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: lendisk-linux-*
           path: dist
           merge-multiple: true
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: build the image for every platform
         run: |
           chmod 0755 dist/linux-*/lendisk
@@ -224,7 +224,7 @@ jobs:
         run: |
           docker buildx build --platform linux/amd64 --load -t lendisk:ci .
           .github/image-smoke.sh lendisk:ci
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lendisk-image
           path: lendisk-image.oci.tar
