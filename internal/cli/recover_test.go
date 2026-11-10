@@ -308,6 +308,16 @@ func TestRecoverRefusals(t *testing.T) {
 	if code, _, e := n.run("", "", "recover", "tcnot-an-address"); code != 2 {
 		t.Fatalf("damaged address: exit %d %s", code, e)
 	}
+	// One process dials with the node's keys (#69, #94): while `serve`
+	// or `peer forward` holds dial.lock here, recover is refused first.
+	release, err := takeDialLock(filepath.Dir(n.config), "testing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code, _, e := n.run("y\n"+testPhrase+"\n", "", "recover", addr); code != 1 || !strings.Contains(e, "stop it before recovering") {
+		t.Fatalf("recover while another process dials: exit %d %s", code, e)
+	}
+	release()
 	if code, _, e := n.run("\n", "", "recover", addr); code != 1 || !strings.Contains(e, "not confirmed") {
 		t.Fatalf("unconfirmed: exit %d %s", code, e)
 	}

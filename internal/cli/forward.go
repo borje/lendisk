@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/borje/lendisk/internal/bridge"
 	"github.com/borje/lendisk/internal/identity"
 	"github.com/borje/lendisk/internal/state"
 	"github.com/borje/lendisk/internal/transport"
@@ -23,7 +24,7 @@ import (
 
 // dialLock is the lock a process holds while it dials friends with this
 // node's dial keys: `serve` for its whole run, `peer forward` while it
-// forwards. Two processes dialling one friend with one key displace each
+// forwards, `recover` while it recovers (#94). Two processes dialling one friend with one key displace each
 // other at the relay and both stall (#69, DESIGN §3.7).
 const dialLock = "dial.lock"
 
@@ -31,8 +32,8 @@ const dialLock = "dial.lock"
 func takeDialLock(confDir, holder string) (func(), error) {
 	release, err := tryLock(confDir, dialLock)
 	if errors.Is(err, errLocked) {
-		return nil, fmt.Errorf("another lendisk process dials your friends with this node's keys (`lendisk serve` "+
-			"or `lendisk peer forward`); two at once stall each other at the relay, so stop it before %s", holder)
+		return nil, fmt.Errorf("another lendisk process dials your friends with this node's keys (`lendisk serve`, "+
+			"`lendisk peer forward` or `lendisk recover`); two at once stall each other at the relay, so stop it before %s", holder)
 	}
 	return release, err
 }
@@ -122,10 +123,9 @@ func (a *app) runPeerForward(cmd *cobra.Command, friend, listen string) error {
 	if a.serving != nil {
 		a.serving(ln.Addr().String())
 	}
-	fw := &forward{ln: ln, log: log, dialTimeout: a.redeemTimeout(),
+	fw := &forward{ln: ln, log: log, dialTimeout: a.redeemTimeout(), max: forwardConns,
 		dial: func(ctx context.Context) (net.Conn, error) { return dl.Dial(ctx, peer, f.Address) }}
-	fw.run(ctx)
-	return nil
+	return fw.run(ctx)
 }
 
 // loopbackOnly refuses an address that is not a loopback IP and port:
@@ -135,6 +135,8 @@ func loopbackOnly(addr string) error {
 	if err != nil {
 		return fmt.Errorf("%q is not an address: %w; give a loopback address such as 127.0.0.1:9100", addr, err)
 	}
+	// An IP literal only: 127.1 and localhost are names a resolver
+	// could map anywhere.
 	if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
 		return fmt.Errorf("%q is not a loopback address: the forward serves this machine only; give one such as 127.0.0.1:9100", addr)
 	}
@@ -176,6 +178,8 @@ func printForward(w io.Writer, addr, peer string, self *identity.Identity, secre
 	fmt.Fprintf(w, "The credential for this friend, computed now and written nowhere; paste it into the shell:\n\n")
 	fmt.Fprintf(w, "  export AWS_ACCESS_KEY_ID=%s\n", self.NodeID())
 	fmt.Fprintf(w, "  export AWS_SECRET_ACCESS_KEY=%s\n\n", secret)
+	fmt.Fprintf(w, "The leading space keeps a pasted secret out of the shell's history where the\n"+
+		"shell is set to (bash: HISTCONTROL=ignorespace; zsh: setopt HIST_IGNORE_SPACE).\n\n")
 	if len(held) == 0 {
 		fmt.Fprintf(w, "This friend holds none of your buckets yet.\n")
 		return
@@ -197,6 +201,15 @@ func printForward(w io.Writer, addr, peer string, self *identity.Identity, secre
 		"SHA-256, and keeps anything deleted through it as a tombstone.\n", held[0].Name)
 }
 
+// forwardConns is how many connections a forward splices at once
+// (#94). The friend's tunnel port admits 32 connections per friend
+// (bridge.DefaultConns), counted on the node ID its dial key resolves
+// to, and closes one over that unread; a forward splicing more would
+// only open tunnel connections the friend refuses. It is also more than
+// the tools need: rclone opens up to 12 (4 transfers, 8 checkers) and
+// restic 5.
+const forwardConns = bridge.DefaultConns
+
 // forward copies each connection accepted on ln into a new connection
 // to the friend (NET-7b). It adds nothing: the friend's gate and
 // lending store see the tool's requests as the tool sent them.
@@ -204,30 +217,76 @@ type forward struct {
 	ln          net.Listener
 	dial        func(context.Context) (net.Conn, error)
 	dialTimeout time.Duration
-	log         *slog.Logger
+	// max bounds the connections spliced at once; while it is reached,
+	// the forward accepts nothing and new connections wait in the
+	// listener's backlog.
+	max int
+	log *slog.Logger
 }
 
 // run serves until ctx ends, then closes the listener and every open
-// connection.
-func (f *forward) run(ctx context.Context) {
+// connection, and returns nil. An accept error that a moment may cure
+// (out of file descriptors or memory) is retried with a backoff, as
+// net/http's server does; any other ends the forward with that error.
+func (f *forward) run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	var wg sync.WaitGroup
-	defer wg.Wait()
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 	go func() {
 		<-ctx.Done()
 		f.ln.Close()
 	}()
+	slots := make(chan struct{}, max(f.max, 1))
+	var backoff time.Duration
 	for {
+		select {
+		case slots <- struct{}{}:
+		default:
+			f.log.Warn("the forward splices as many connections as it may; new ones wait until one ends", "max", cap(slots))
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return nil
+			}
+		}
 		c, err := f.ln.Accept()
 		if err != nil {
-			if ctx.Err() == nil {
-				f.log.Error("forward stopped accepting", "err", err)
+			<-slots
+			if ctx.Err() != nil {
+				return nil
 			}
-			return
+			if !temporaryAccept(err) {
+				return fmt.Errorf("the forward stopped accepting connections: %w; run `lendisk peer forward` again", err)
+			}
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+			f.log.Warn("the forward could not accept a connection; retrying", "err", err, "in", backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return nil
+			}
+			continue
 		}
-		wg.Go(func() { f.serve(ctx, c) })
+		backoff = 0
+		wg.Go(func() {
+			defer func() { <-slots }()
+			f.serve(ctx, c)
+		})
 	}
+}
+
+// temporaryAccept reports whether an accept error is one a moment may
+// cure: the process or system is out of descriptors, buffers or memory.
+func temporaryAccept(err error) bool {
+	for _, e := range []error{syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
 }
 
 // serve dials the friend for one accepted connection and splices the two.

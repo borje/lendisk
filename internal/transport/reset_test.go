@@ -82,3 +82,62 @@ func TestAResetThatFallsBackToACloseIsLogged(t *testing.T) {
 		t.Fatalf("a reset that fell back to a close was not logged:\n%s", s)
 	}
 }
+
+// #94: a tunnel connection half-closes. The friend reads the request
+// to EOF and still answers it, and the dialler reads the answer, as a
+// client that half-closes (nc -N) through `peer forward` does.
+func TestATunnelConnectionHalfCloses(t *testing.T) {
+	d := transporttest.Start(t)
+	srvID := newID(t)
+	srv := newTailcat(t, srvID, d)
+	srv.Admit(func(identity.NodeID) bool { return true })
+	l := listen(t, srv)
+	dl, err := NewDialer(newID(t), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dl.Close()
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	c, err := dl.Dial(ctx, srvID.NodeID(), srv.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(20 * time.Second))
+	if _, err := c.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	cw, ok := c.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatalf("a dialled %T cannot half-close", c)
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	var sc net.Conn
+	select {
+	case sc = <-l.conns:
+		defer sc.Close()
+	case <-ctx.Done():
+		t.Fatal("no connection accepted")
+	}
+	sc.SetDeadline(time.Now().Add(20 * time.Second))
+	req, err := io.ReadAll(sc)
+	if err != nil || string(req) != "request" {
+		t.Fatalf("the friend read %q, %v; want the request and EOF", req, err)
+	}
+	if _, err := sc.Write([]byte("answer")); err != nil {
+		t.Fatal(err)
+	}
+	sc.Close()
+	if got, err := io.ReadAll(c); err != nil || string(got) != "answer" {
+		t.Fatalf("after its half-close the dialler read %q, %v; want the answer", got, err)
+	}
+
+	a, _ := net.Pipe()
+	defer a.Close()
+	if err := (&tunnelConn{Conn: a}).CloseWrite(); err == nil {
+		t.Fatal("a connection that cannot half-close said it did")
+	}
+}

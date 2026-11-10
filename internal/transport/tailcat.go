@@ -649,6 +649,18 @@ func (tc *tunnelConn) Close() error {
 	return err
 }
 
+// CloseWrite half-closes the connection: the peer reads EOF while
+// this side still reads its answer. Embedding does not promote it, so
+// a splice (`peer forward`) passes a client's half-close on through it
+// (#94). A connection that cannot half-close is not closed; the error
+// says so and the caller decides.
+func (tc *tunnelConn) CloseWrite() error {
+	if cw, ok := tc.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return fmt.Errorf("transport: a %T cannot half-close", tc.Conn)
+}
+
 // Reset closes the connection with a TCP reset (linger 0), discarding
 // what it has not sent: the peer's next read fails at once, instead of
 // reading on what the tunnel still holds and then a FIN behind it. A

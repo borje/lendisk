@@ -6,8 +6,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"io/fs"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
@@ -17,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -47,7 +50,8 @@ func (n *node) forward(t *testing.T, peer string) *forwarding {
 		serving: func(addr string) { addrc <- addr }, regions: n.regions, dialTimeout: 30 * time.Second}
 	done := make(chan int, 1)
 	go func() {
-		done <- a.run([]string{"peer", "forward", peer, "127.0.0.1:0", "--config", n.config, "--data-dir", n.data})
+		done <- a.run([]string{"peer", "forward", peer, "127.0.0.1:0", "--config", n.config, "--data-dir", n.data,
+			"--log-level", "debug"})
 	}()
 	select {
 	case addr := <-addrc:
@@ -58,6 +62,14 @@ func (n *node) forward(t *testing.T, peer string) *forwarding {
 				cancel()
 				if code := <-done; code != 0 {
 					t.Errorf("peer forward exit %d: %s", code, errOut.String())
+				}
+				// NET-7a: the secret is printed once, on stdout, and
+				// never logged, even at debug.
+				_, secret, _ := strings.Cut(f.out, "export AWS_SECRET_ACCESS_KEY=")
+				secret, _, _ = strings.Cut(secret, "\n")
+				if secret == "" || strings.Contains(errOut.String(), secret) ||
+					strings.Count(f.out, secret) != 1 {
+					t.Errorf("the forward's secret %q is missing, logged or printed twice:\n%s\n%s", secret, f.out, errOut.String())
 				}
 			})
 		}
@@ -118,6 +130,7 @@ func shell(t *testing.T, dir string, env []string, lines ...string) string {
 type exchange struct {
 	method, target string
 	status         int
+	code           string // the S3 error code of a 4xx answer
 }
 
 // tap is a TCP relay in front of a forward that changes no byte: it
@@ -187,9 +200,14 @@ func (tp *tap) relay(c net.Conn, to string) {
 				}
 				return
 			}
-			io.Copy(io.Discard, resp.Body)
+			body, _ := io.ReadAll(resp.Body)
+			code := ""
+			if resp.StatusCode >= 400 {
+				_, code, _ = strings.Cut(string(body), "<Code>")
+				code, _, _ = strings.Cut(code, "</Code>")
+			}
 			tp.mu.Lock()
-			tp.seen = append(tp.seen, exchange{r.Method, r.URL.RequestURI(), resp.StatusCode})
+			tp.seen = append(tp.seen, exchange{r.Method, r.URL.RequestURI(), resp.StatusCode, code})
 			tp.mu.Unlock()
 		}
 	})
@@ -213,7 +231,9 @@ func (tp *tap) exchanges() []exchange {
 }
 
 // allAdmitted fails unless the tap saw requests and none was refused by
-// the gate (403): the tool sent only shapes NET-7's list admits.
+// the gate: 403 for a shape off NET-7's list, 400 InvalidArgument for an
+// object key it refuses (as Lending does, SEC-5). The tool sent only
+// shapes NET-7's list admits.
 func (tp *tap) allAdmitted(t *testing.T, tool string) {
 	t.Helper()
 	seen := tp.exchanges()
@@ -223,8 +243,8 @@ func (tp *tap) allAdmitted(t *testing.T, tool string) {
 	shapes := map[string]bool{}
 	for _, e := range seen {
 		shapes[e.method+" "+shape(e.target)] = true
-		if e.status == http.StatusForbidden {
-			t.Errorf("%s sent %s %s through the forward, refused", tool, e.method, e.target)
+		if e.status == http.StatusForbidden || e.status == http.StatusBadRequest && e.code == "InvalidArgument" {
+			t.Errorf("%s sent %s %s through the forward, refused %d %s", tool, e.method, e.target, e.status, e.code)
 		}
 	}
 	t.Logf("%s through the forward: %d requests, shapes %v", tool, len(seen), slices.Sorted(maps.Keys(shapes)))
@@ -288,7 +308,7 @@ func TestPeerForwardRefusesNonLoopbackAndStrangers(t *testing.T) {
 	parallel(t, 0)
 	n := friendNode(t)
 	stranger := newID(t).NodeID().String()
-	for _, addr := range []string{"0.0.0.0:9100", "192.168.1.10:9100", ":9100", "localhost:9100", "127.0.0.1"} {
+	for _, addr := range []string{"0.0.0.0:9100", "192.168.1.10:9100", ":9100", "localhost:9100", "127.1:9100", "127.0.0.1"} {
 		if code, _, errOut := n.run("", "", "peer", "forward", stranger, addr); code != 2 || !strings.Contains(errOut, "loopback") {
 			t.Errorf("forward on %s: exit %d %s", addr, code, errOut)
 		}
@@ -377,15 +397,25 @@ func TestPeerForwardRefusesPruneAndOffList(t *testing.T) {
 	// restic prune through the forward: B refuses its writes (each must
 	// carry its SHA-256, LEND-4), so prune cannot take its lock and
 	// removes nothing. restic retries a refused write for minutes, so it
-	// is stopped after a minute.
+	// is stopped once the tap has seen B refuse one.
 	bDir := filepath.Join(b.data, "store", gateway.LentName(f.aID.NodeID(), sealed))
 	lent := tree(t, bDir)
 	tp = newTap(t, fw.addr)
 	repo := "s3:http://" + tp.addr + "/" + sealed
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
 	prune := exec.CommandContext(ctx, "sh", "-ec", strings.Join(append(exports,
 		"exec "+restic+" -o s3.region=us-east-1 -r "+repo+" forget "+first+" --prune"), "\n"))
 	prune.Dir, prune.Env = t.TempDir(), env
+	refused := func() bool {
+		return slices.ContainsFunc(tp.exchanges(), func(e exchange) bool { return e.method == "PUT" && e.status == http.StatusBadRequest })
+	}
+	go func() {
+		for ctx.Err() == nil && !refused() {
+			time.Sleep(50 * time.Millisecond)
+		}
+		time.Sleep(time.Second) // let restic's retry show in the tap too
+		cancel()
+	}()
 	pruneOut, err := prune.CombinedOutput()
 	cancel()
 	if err == nil {
@@ -467,7 +497,231 @@ func TestPeerForwardRefusesPruneAndOffList(t *testing.T) {
 	if _, err := c.HeadBucket(t.Context(), &s3.HeadBucketInput{Bucket: aws.String(sealed)}); err != nil {
 		t.Fatalf("HeadBucket through the forward: %v", err)
 	}
+	// A client that half-closes after its request (nc -N) reads B's
+	// answer: the forward passes the half-close on through the tunnel
+	// instead of closing both ways (#94). Which answer is B's own:
+	// net/http cancels an in-flight request's context once it reads
+	// EOF, so B's bridge may answer 503 rather than the gate's 403
+	// (DESIGN §3.7).
+	if got := ask(t, fw.addr, "GET /"+sealed+"/config HTTP/1.1\r\nHost: lendisk\r\n\r\n"); !strings.HasPrefix(got, "HTTP/1.1 ") {
+		t.Errorf("a half-closing client through the forward read %q", got)
+	}
 	fw.stop()
+}
+
+// flakyListener fails its first Accepts with errs, then accepts.
+type flakyListener struct {
+	net.Listener
+	mu   sync.Mutex
+	errs []error
+}
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	if len(l.errs) > 0 {
+		err := l.errs[0]
+		l.errs = l.errs[1:]
+		l.mu.Unlock()
+		return nil, err
+	}
+	l.mu.Unlock()
+	return l.Listener.Accept()
+}
+
+// friendStub is a TCP server standing in for the friend: each
+// connection reads its request to EOF, then answers "answer:" and the
+// request, and closes. dials counts the forward's dials to it.
+type friendStub struct {
+	addr  string
+	mu    sync.Mutex
+	dials int
+}
+
+func newFriendStub(t *testing.T) *friendStub {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &friendStub{addr: ln.Addr().String()}
+	var wg sync.WaitGroup
+	t.Cleanup(func() { ln.Close(); wg.Wait() })
+	wg.Go(func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Go(func() {
+				defer c.Close()
+				req, _ := io.ReadAll(c)
+				c.Write(append([]byte("answer:"), req...))
+			})
+		}
+	})
+	return s
+}
+
+func (s *friendStub) dial(ctx context.Context) (net.Conn, error) {
+	s.mu.Lock()
+	s.dials++
+	s.mu.Unlock()
+	return (&net.Dialer{}).DialContext(ctx, "tcp", s.addr)
+}
+
+func (s *friendStub) dialled() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dials
+}
+
+// runForward runs fw until the test ends; done receives what run returned.
+func runForward(t *testing.T, fw *forward) (done chan error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	done = make(chan error, 1)
+	go func() { done <- fw.run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("the forward did not stop")
+		}
+	})
+	return done
+}
+
+// ask sends req to addr, half-closes, and returns the answer.
+func ask(t *testing.T, addr, req string) string {
+	t.Helper()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := c.Write([]byte(req)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(c)
+	if err != nil {
+		t.Fatalf("reading the answer to %q: %v", req, err)
+	}
+	return string(got)
+}
+
+// #94: an accept error a moment may cure (out of descriptors) is
+// retried, and the forward goes on serving; a client that half-closes
+// (nc -N) gets its answer through it. Any other accept error ends the
+// forward with that error, which the command exits non-zero on.
+func TestPeerForwardRetriesTemporaryAcceptErrorsAndHalfCloses(t *testing.T) {
+	parallel(t, 0)
+	friend := newFriendStub(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs syncBuffer
+	fl := &flakyListener{Listener: ln, errs: []error{
+		&net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.EMFILE)},
+		&net.OpError{Op: "accept", Net: "tcp", Err: os.NewSyscallError("accept4", syscall.ENFILE)},
+	}}
+	fw := &forward{ln: fl, dial: friend.dial, dialTimeout: 10 * time.Second, max: 4,
+		log: slog.New(slog.NewTextHandler(&logs, nil))}
+	done := runForward(t, fw)
+	if got := ask(t, ln.Addr().String(), "GET / HTTP/1.0\r\n\r\n"); got != "answer:GET / HTTP/1.0\r\n\r\n" {
+		t.Fatalf("a half-closing client through the forward read %q", got)
+	}
+	if !strings.Contains(logs.String(), "too many open files") {
+		t.Errorf("the retried accept error was not logged:\n%s", logs.String())
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("the forward stopped at a temporary accept error: %v", err)
+	default:
+	}
+
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := errors.New("listener broken")
+	fw2 := &forward{ln: &flakyListener{Listener: ln2, errs: []error{broken}}, dial: friend.dial,
+		dialTimeout: 10 * time.Second, max: 4, log: slog.New(slog.DiscardHandler)}
+	done2 := make(chan error, 1)
+	go func() { done2 <- fw2.run(t.Context()) }()
+	select {
+	case err := <-done2:
+		if !errors.Is(err, broken) {
+			t.Fatalf("the forward ended with %v; want the accept error", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the forward went on after an accept error it cannot retry")
+	}
+}
+
+// #94: the forward splices at most max connections at once, so a local
+// user cannot make the node's dial key open unbounded tunnel
+// connections; one more waits until one ends, then is served.
+func TestPeerForwardCapsConnections(t *testing.T) {
+	parallel(t, 0)
+	friend := newFriendStub(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs syncBuffer
+	fw := &forward{ln: ln, dial: friend.dial, dialTimeout: 10 * time.Second, max: 2,
+		log: slog.New(slog.NewTextHandler(&logs, nil))}
+	runForward(t, fw)
+	var open []net.Conn
+	for range 3 {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		open = append(open, c)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for friend.dialled() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := friend.dialled(); n != 2 {
+		t.Fatalf("with a cap of 2 and 3 clients the forward dialled the friend %d times", n)
+	}
+	if !strings.Contains(logs.String(), "new ones wait") {
+		t.Errorf("reaching the cap was not logged:\n%s", logs.String())
+	}
+	open[0].(*net.TCPConn).CloseWrite() // its splice ends once the friend answers
+	io.ReadAll(open[0])
+	for friend.dialled() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := friend.dialled(); n != 3 {
+		t.Fatalf("after one connection ended the waiting one was not served: %d dials", n)
+	}
+}
+
+// NET-7b (#94): the forward listens on any loopback IP literal, IPv6's
+// [::1] included; 127.1 and localhost are names, not literals, refused.
+func TestPeerForwardLoopbackLiterals(t *testing.T) {
+	parallel(t, 0)
+	for _, addr := range []string{"127.0.0.1:9100", "127.0.0.2:0", "[::1]:9100"} {
+		if err := loopbackOnly(addr); err != nil {
+			t.Errorf("%s refused: %v", addr, err)
+		}
+	}
+	for _, addr := range []string{"127.1:9100", "localhost:9100", "[::]:9100", "[::ffff:10.0.0.1]:9100"} {
+		if err := loopbackOnly(addr); err == nil {
+			t.Errorf("%s accepted", addr)
+		}
+	}
 }
 
 // hexSum is the SHA-256 of b in hex.
