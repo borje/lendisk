@@ -146,9 +146,10 @@ func (db *DB) NextPlacement(ctx context.Context, place string) (p Placement, ok 
 // verified (empty for a delete). Acknowledging again is harmless. A
 // dropping row's delete acknowledged leaves it drained (#26). A copy
 // re-placement placed in place of another (placement.replaces) makes
-// that other copy dropping once acknowledged, in the same transaction:
-// the object keeps the copies it had, and the drained place no longer
-// counts as holding it (REPL-13, REPL-11).
+// that other copy dropping once acknowledged, in the same transaction,
+// if the removal rule allows (mayRemove, removal.go): the object keeps
+// the copies it had, and the drained place no longer counts as holding
+// it (REPL-13, REPL-11).
 func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 string, now time.Time) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -166,15 +167,8 @@ func (db *DB) AckPlacement(ctx context.Context, place string, seq int64, sha256 
 // (ConfirmSeeded, #95), and reports whether it did.
 func (db *DB) ackPlacement(ctx context.Context, tx *sql.Tx, place string, seq int64, sha256 string, now time.Time, onlyQueued bool) (bool, error) {
 	if !onlyQueued {
-		r, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementDrained+`', acked_at = ?
-			WHERE place = ? AND seq = ? AND state = '`+PlacementDropping+`'`, now.Unix(), place, seq)
-		if err != nil {
-			return false, err
-		}
-		if n, err := r.RowsAffected(); err != nil {
-			return false, err
-		} else if n > 0 {
-			return true, nil
+		if drained, err := drainedAck(ctx, tx, place, seq, now); err != nil || drained {
+			return drained, err
 		}
 	}
 	var bucket, key, op, state string
@@ -211,61 +205,13 @@ func (db *DB) ackPlacement(ctx context.Context, tx *sql.Tx, place string, seq in
 		return false, err
 	}
 	if replaces.Valid && replaces.String != place {
-		keep, err := db.keepReplaced(ctx, tx, bucket, seq, replaces.String)
-		if err != nil {
+		// The copy it replaces goes now if the rule allows (#38 review,
+		// #96 review, #103); else a later pass drops it when it may.
+		if _, err := db.removeCopy(ctx, tx, removal{bucket: bucket, seq: seq, place: replaces.String}, db.now()); err != nil {
 			return false, err
-		}
-		if !keep {
-			if _, err := tx.ExecContext(ctx, markDropping, replaces.String, seq); err != nil {
-				return false, err
-			}
 		}
 	}
 	return true, nil
-}
-
-// keepReplaced reports whether the copy of row seq at replaced must stay
-// although its replacement was acknowledged (#38 review): without it
-// the object would have fewer than `copies` acknowledged copies at
-// intact places (in the pool, not removed, not gone past replace_after,
-// not a target being removed, its replica of the bucket not
-// unverified). That holds whatever replaced is: a copy moved from an
-// intact place, a target being removed (#96), or a drained place (a
-// friend gone or refusing, #103: its copy is the object's until enough
-// others are acknowledged). Re-placement then drops it when that is
-// safe (decide).
-func (db *DB) keepReplaced(ctx context.Context, tx *sql.Tx, bucket string, seq int64, replaced string) (bool, error) {
-	ps, err := poolPlaces(ctx, tx)
-	if err != nil {
-		return false, err
-	}
-	unverified, err := unverifiedAt(ctx, tx, bucket)
-	if err != nil {
-		return false, err
-	}
-	now := db.now()
-	intact := map[string]bool{}
-	for _, p := range ps {
-		if p.cond != ConditionRemoved && !p.gone(db, now) && !p.removing && !unverified[p.peer] {
-			intact[p.peer] = true
-		}
-	}
-	acked, err := column(ctx, tx, `SELECT place FROM placement WHERE seq = ? AND state = 'acked' AND place != ?`, seq, replaced)
-	if err != nil {
-		return false, err
-	}
-	n := 0
-	for _, a := range acked {
-		if intact[a] {
-			n++
-		}
-	}
-	var copies int
-	if err := tx.QueryRowContext(ctx, `SELECT coalesce((SELECT copies FROM buckets WHERE name = ?), ?)`,
-		bucket, DefaultCopies).Scan(&copies); err != nil {
-		return false, err
-	}
-	return n < copies, nil
 }
 
 // freeLatePut handles a put of size bytes (row seq) acknowledged after a

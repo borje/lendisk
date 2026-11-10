@@ -61,10 +61,37 @@ func (db *DB) RemoveOverflow(ctx context.Context, name string, keepData bool, no
 	}
 	place := OverflowPlace(name)
 	// Its unsent puts no sender took: the target never had them, and
-	// re-placement places the copies elsewhere.
-	if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementDropped+`'
-		WHERE place = ? AND state = 'queued' AND op = 'put' AND started_at IS NULL`, place); err != nil {
+	// re-placement places the copies elsewhere. The removal rule allows
+	// each (I1: unsent; I2: a target being removed is sent no more
+	// metadata).
+	rows, err := tx.QueryContext(ctx, `SELECT p.seq, p.bucket, q.class FROM placement p JOIN queue q ON q.seq = p.seq
+		WHERE p.place = ? AND p.state = 'queued' AND p.op = 'put' AND p.started_at IS NULL ORDER BY p.seq`, place)
+	if err != nil {
 		return err
+	}
+	var rs []removal
+	for rows.Next() {
+		r := removal{place: place}
+		if err := rows.Scan(&r.seq, &r.bucket, &r.class); err != nil {
+			rows.Close()
+			return err
+		}
+		rs = append(rs, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, r := range rs {
+		if ok, _, err := db.mayRemove(ctx, tx, r, now); err != nil {
+			return err
+		} else if !ok {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementDropped+`'
+			WHERE place = ? AND seq = ? AND state = 'queued' AND started_at IS NULL`, place, r.seq); err != nil {
+			return err
+		}
 	}
 	if keepData {
 		// The deletes held there are never sent: what they hold stays.
@@ -193,6 +220,18 @@ func (db *DB) dropOverflow(ctx context.Context, name string) (bool, error) {
 		return false, err
 	}
 	place := OverflowPlace(name)
+	// Its rows left are of objects no longer live (removable), and,
+	// removed with --keep-data, its acknowledged live metadata, which
+	// stays there out of lendisk's hands (I3).
+	var keep bool
+	if err := tx.QueryRowContext(ctx, `SELECT coalesce(keep_data, 0) FROM overflow WHERE name = ?`, name).Scan(&keep); err != nil {
+		return false, err
+	}
+	if keep {
+		if _, _, err := db.mayRemove(ctx, tx, removal{place: place, except: exceptKeepData}, db.now()); err != nil {
+			return false, err
+		}
+	}
 	for _, q := range []string{
 		`DELETE FROM placement WHERE place = ?`,
 		`DELETE FROM place_use WHERE place = ?`,

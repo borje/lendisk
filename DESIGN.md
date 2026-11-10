@@ -3342,13 +3342,63 @@ upstream bucket is Q-V.
     `placement.replaces` (schema 28), a drained copy it replaces;
     `placement.replaced_at` marks the row as re-placement's.
     `Reroute` carries both when it moves the row.
+  - *One removal rule (#103).* Whether a copy at a place may go is
+    decided in one function, `state.mayRemove` (`internal/state/removal.go`).
+    Every path that marks an acknowledged copy `dropping` goes through
+    `removeCopy`, which asks it; every path that takes an unsent copy
+    out of a FIFO asks it too (`cancelCopy`, or a bulk cancel that asks
+    per row); `removeCopy` and `drainedAck` (a `dropping` row's delete
+    acknowledged) are the only writers of `dropping` and `drained`. The
+    paths: `AckPlacement` (the copy a re-placed one replaces), `decide`'s
+    surplus, drain, split-move and drain-back drops and cancels,
+    `dropIdleMetadata`, `Reroute`'s moves and drops, `RemoveOverflow`'s
+    unsent puts, and, as named exceptions, `removeFriendship`,
+    `ForgetFormerFriend` and `dropOverflow`. Not removals of a copy: a
+    row of a version no longer live (`CancelPlacement` of a superseded
+    put, `placeTx` cancelling a deleted key's unsent puts), a delete's
+    or a seed's acknowledgement, and the metadata barrier (`Held`),
+    which only holds rows back. Its invariants:
+    - **I1:** after the removal, the object keeps at least `copies`
+      acknowledged copies at intact places: in the pool, not refusing
+      this node (condition `removed`), not gone past `replace_after`,
+      not an overflow target being removed, its replica of the bucket
+      not unverified. Removing an unsent copy never lowers that count;
+      a drained copy an unsent one would replace stays until another
+      replacement is acknowledged.
+    - **I2:** a bucket's metadata is never removed from a place that
+      still holds, or can still undelete, data of that bucket: at an
+      overflow target, `holdsLiveData` (a live copy, a data delete
+      queued and not sent, a held or denied tomb, a delete marker inside
+      its window); at a friend, never (every friend holds every bucket's
+      metadata, REPL-12, and keeps deleted data as tombs). Unsent
+      metadata at a target is cancelled only while the target holds no
+      data of the bucket, or while it is being removed (sent no more
+      metadata, #96).
+    - **I3:** the removals that go below `copies` are named exceptions
+      with their reason: the user lowering `copies` (I1 counts the
+      copies set now), `overflow remove --keep-data` (the target's rows
+      are forgotten with its data left there, `exceptKeepData`) and a
+      friend removed by the user (`exceptFriendRemoved`). Nothing else
+      bypasses I1.
+
+    `TestRemovalModel` (`internal/state/model_test.go`) checks I1 and I2
+    after every step of seeded random sequences driven through the real
+    code: captures, prunes and undeletes, friends and targets coming,
+    going, refusing, unverified and back, quota and `copies` changes,
+    seeds, re-placement passes, re-routing, the worker's sends and the
+    targets' tombs, against its own view of what each place holds (not
+    `holdsLiveData`'s). CI runs three seeds of 2000 steps; a failure
+    prints the steps and replays with `LENDISK_MODEL_SEED` and
+    `LENDISK_MODEL_STEPS`. Each of the four earlier bugs of this class
+    (#38's unchecked move, #40's versioned and tomb cases, #96's early
+    return), reintroduced alone, fails it.
   - *Dropping, only after the replacement.* An acknowledged copy at a
     drained place is marked `dropping` when its replacement is
     acknowledged, in the transaction that records the acknowledgement
     (`AckPlacement`), or by a pass that finds the object at `copies`
     acknowledged good copies. At the acknowledgement it is marked only
     while the object keeps `copies` acknowledged copies at intact
-    places without it, the drained place's copy included (#103: with
+    places without it (I1, `mayRemove`), the drained place's copy included (#103: with
     another friend gone meanwhile, the gone friend's copy stays until a
     pass drops it,
     `TestAGoneFriendsCopyStaysWhileItsReplacementLeavesTheObjectShort`).
@@ -7241,7 +7291,7 @@ of the `copies`, and the estimated cost (S3-7).
   (`drainAll`): each object it holds gets a copy at a friend or another
   target by D6's choice, and the target's copy is dropped only once the
   object has `copies` acknowledged copies without it, at the
-  acknowledgement of its replacement too (`keepReplaced` counts a
+  acknowledgement of its replacement too (`mayRemove`, I1, counts a
   removing target's copy like an intact one's, so a friend lost
   meanwhile never leaves the replacement alone,
   `TestARemovingTargetsCopyStaysWhileTheObjectNeedsIt`); copies with no
@@ -7329,7 +7379,7 @@ of the `copies`, and the estimated cost (S3-7).
   the fullest friend's (that copy is counted out as drained, and the
   new copy records which it replaces), which is deleted there once the
   target acknowledges and only while the object keeps `copies`
-  acknowledged copies at intact places (`keepReplaced`: not removed,
+  acknowledged copies at intact places (`mayRemove`, I1: not removed,
   gone or unverified; otherwise the next pass drops it when
   `decide`'s guard allows); the
   friend's room comes back when it purges the tomb after its retention
@@ -7423,7 +7473,7 @@ of the `copies`, and the estimated cost (S3-7).
   records the target it replaces (`placement.replaces`). The target's
   copy is marked dropping when that row is acknowledged
   (`AckPlacement`), and only while the object keeps `copies`
-  acknowledged copies at intact places without it (`keepReplaced`,
+  acknowledged copies at intact places without it (`mayRemove`, I1,
   #38 review; `TestADrainedTargetCopyStaysWhileTheObjectNeedsIt`);
   otherwise a later pass drops it when it may. While drain-back runs,
   a target copy a friend copy replaces is counted out; while it does

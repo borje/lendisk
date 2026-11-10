@@ -48,11 +48,15 @@ import (
 //     round gives each object with an acknowledged copy at an overflow
 //     target a friend copy in its place, oldest first, where a friend
 //     has room after every other copy is placed; the target's copy is
-//     deleted once that one is acknowledged (AckPlacement,
-//     keepReplaced). A drain-back copy is the lowest priority in its
+//     deleted once that one is acknowledged (AckPlacement). A drain-back copy is the lowest priority in its
 //     friend's FIFO and holds no metadata barrier (NextPlacement,
 //     Held). A target left with no data of a bucket has its metadata
 //     of the bucket deleted too (dropIdleMetadata).
+//
+// Every copy a pass or an acknowledgement drops or cancels goes through
+// the one removal rule, mayRemove (removal.go, I1 to I3): decide's
+// choices are written by removeCopy and cancelCopy, which ask it again
+// in the batch's transaction.
 //
 // Rules a caller must keep: the bytes of a new copy come only from the
 // node's store, as for any placement row (no lender forwards, PEER-11);
@@ -1247,7 +1251,7 @@ func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []
 				f.taken = capped(f.taken + bytes)
 				m.unsent[k] = 0
 			}
-			n, err := m.write(ctx, ptx, seq, op, o.rows, now)
+			n, err := m.write(ctx, ptx, bucket, seq, op, o.rows, now)
 			if err != nil {
 				return st, err
 			}
@@ -1289,8 +1293,10 @@ func (m *replacer) metadataOps(o robj) []rop {
 	return ops
 }
 
-// write applies op to row seq, returning how many rows it changed.
-func (m *replacer) write(ctx context.Context, tx *preparedTx, seq int64, op rop, rows []prow, now int64) (int64, error) {
+// write applies op to row seq of bucket, returning how many rows it
+// changed. A drop or a cancel goes through the removal rule (removeCopy,
+// cancelCopy).
+func (m *replacer) write(ctx context.Context, tx *preparedTx, bucket string, seq int64, op rop, rows []prow, now int64) (int64, error) {
 	var r sql.Result
 	var err error
 	switch op.kind {
@@ -1324,31 +1330,15 @@ func (m *replacer) write(ctx context.Context, tx *preparedTx, seq int64, op rop,
 			WHERE place = ?4 AND seq = ?5 AND state IN ('dropped', 'abandoned', 'drained')`,
 			nullStr(op.replaces), now, ObjectOverhead, op.place, seq)
 	case opDrop:
-		r, err = tx.ExecContext(ctx, markDropping, op.place, seq)
+		return m.db.removeCopy(ctx, tx, removal{bucket: bucket, seq: seq, place: op.place, class: "data"}, m.now)
 	case opCancel:
-		if r, err = tx.ExecContext(ctx, `UPDATE placement SET state = '`+PlacementAbandoned+`'
-			WHERE place = ? AND seq = ? AND state = 'queued' AND started_at IS NOT NULL`, op.place, seq); err != nil {
-			return 0, err
-		}
-		if n, err := r.RowsAffected(); err != nil || n > 0 {
-			return n, err
-		}
-		r, err = tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'`, op.place, seq)
+		return m.db.cancelCopy(ctx, tx, removal{bucket: bucket, seq: seq, place: op.place, class: "data"}, false, m.now)
 	}
 	if err != nil {
 		return 0, err
 	}
 	return r.RowsAffected()
 }
-
-// markDropping marks place ?1's acknowledged copy of row ?2 dropping,
-// only while it is the place's latest row of the key: a later row there
-// is ordered after the delete in its FIFO, but one acknowledged already
-// must not be deleted.
-const markDropping = `UPDATE placement SET state = '` + PlacementDropping + `'
-	WHERE place = ?1 AND seq = ?2 AND state = 'acked' AND op = 'put'
-	AND seq = (SELECT max(x.seq) FROM placement x
-		WHERE x.place = placement.place AND x.bucket = placement.bucket AND x.key = placement.key)`
 
 // dropIdleMetadata deletes bucket's metadata at each overflow target
 // that holds no data of it at the pass's now (holdsLiveData, #40): a
@@ -1357,7 +1347,8 @@ const markDropping = `UPDATE placement SET state = '` + PlacementDropping + `'
 // (scenario 12) and costs nothing. An acknowledged copy is marked
 // dropping (a delete in the target's FIFO, deleted the
 // retention-preserving way, S3-4); an unsent one is cancelled; one a
-// sender holds is left for the next pass.
+// sender holds is left for the next pass. Each goes through the removal
+// rule (removeCopy, cancelCopy: I2), which holdsLiveData decides here.
 func (m *replacer) dropIdleMetadata(ctx context.Context, bucket string) (ReplaceStats, error) {
 	var st ReplaceStats
 	var targets []string
@@ -1412,25 +1403,22 @@ func (m *replacer) dropIdleMetadata(ctx context.Context, bucket string) (Replace
 			return st, err
 		}
 		for _, r := range rs {
-			var res sql.Result
+			rm := removal{bucket: bucket, seq: r.seq, place: t, class: "metadata"}
 			switch {
 			case r.state == PlacementAcked:
-				if res, err = tx.ExecContext(ctx, markDropping, t, r.seq); err != nil {
+				n, err := m.db.removeCopy(ctx, tx, rm, m.now)
+				if err != nil {
 					return st, err
 				}
-				if n, _ := res.RowsAffected(); n > 0 {
-					st.Dropping++
-				}
+				st.Dropping += n
 			case r.taken || m.sending != nil && m.sending(t, r.seq):
 				m.skipped++
 			default:
-				if res, err = tx.ExecContext(ctx, `DELETE FROM placement WHERE place = ? AND seq = ? AND state = 'queued'
-					AND started_at IS NULL`, t, r.seq); err != nil {
+				n, err := m.db.cancelCopy(ctx, tx, rm, true, m.now)
+				if err != nil {
 					return st, err
 				}
-				if n, _ := res.RowsAffected(); n > 0 {
-					st.Cancelled++
-				}
+				st.Cancelled += n
 			}
 		}
 	}

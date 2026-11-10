@@ -127,7 +127,7 @@ func TestDrainBackEmptiesTheTargetOnceAFriendJoins(t *testing.T) {
 	}
 }
 
-// REPL-13, #38 review's guard (keepReplaced): a drain-back copy
+// REPL-13, #38 review's guard (mayRemove, I1): a drain-back copy
 // acknowledged at a friend does not delete the copy at the target while
 // the object would be left with fewer than copies acknowledged copies at
 // intact places: here the other friend's replica failed a challenge

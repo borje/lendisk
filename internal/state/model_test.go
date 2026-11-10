@@ -17,7 +17,8 @@ import (
 // through, each step driven through the real code (captures, the
 // worker's send as replica.Worker does it, Replace, Reroute, AckPlacement,
 // seeds, undelete, overflow targets and their tombs), checking after
-// every step, against what the model believes each place holds:
+// every step the invariants mayRemove keeps (removal.go, DESIGN §3.4)
+// against what the model believes each place holds:
 //
 //   - I1: a data copy acknowledged before the step and no longer after
 //     it (dropping, drained, gone) leaves its live object with at least
