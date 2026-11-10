@@ -98,6 +98,14 @@ func (a *app) runRecover(ctx context.Context, addr string, skip map[string]bool)
 	if err := ensureDir(cfg.DataDir); err != nil {
 		return fmt.Errorf("data directory: %w", err)
 	}
+	// One process dials friends with this node's keys (#69, #94): a
+	// `peer forward` or `serve` started meanwhile on this machine is
+	// refused, and recover is refused while one runs.
+	release, err := takeDialLock(confDir, "recovering")
+	if err != nil {
+		return err
+	}
+	defer release()
 	floor, _ := config.ParseFloor(cfg.Store.FreeSpaceFloor)
 	if err := a.checker().Prepare(cfg.StorePath(), floor); err != nil {
 		return err

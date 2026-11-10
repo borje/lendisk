@@ -5895,14 +5895,39 @@ the handler's own reads and is never cancelled; nothing below
   bucket and sign with the derived credential; the command prints the
   credential as `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` lines
   to paste into the shell, computed on demand (NET-7a) and never
-  written, and then, from the borrower's own map, one line per bucket
+  written (nor logged), with a line saying that a leading space keeps a
+  pasted secret out of shell history (`HISTCONTROL=ignorespace`,
+  `setopt HIST_IGNORE_SPACE`), and then, from the borrower's own map, one line per bucket
   held at that peer, e.g.
   `laptop  restic -r s3:http://127.0.0.1:9100/s4k2…`.
   *Built (#34, `cli.runPeerForward`):* `lendisk peer forward <node ID>
   <loopback IP:port>`; any address that is not a loopback IP literal is
-  a usage error (SEC-8). It dials with `transport.NewFriendDialer`, one
+  a usage error (SEC-8): `127.0.0.1:9100` and `[::1]:9100` are taken,
+  `127.1` and `localhost` are not, being names. It dials with
+  `transport.NewFriendDialer`, one
   tailcat dial per accepted connection, spliced byte for byte
-  (`cli.splice`); it adds, removes and rewrites nothing, so the
+  (`cli.splice`). A side that ends half-closes the other: the tunnel
+  connection's `CloseWrite` delegates to gVisor's (`tunnelConn` embeds
+  the conn, which does not promote it), so a client that half-closes
+  after its request (`nc -N`) still reads the friend's answer (#94).
+  That answer may be a 503: Go's `net/http` server on the friend's
+  tunnel port cancels an in-flight request's context when it reads
+  EOF, and the bridge's relationship lookup then fails ("cannot read
+  relationships"). Backup tools do not half-close; having the bridge
+  answer a half-closed request in full is a follow-up. It
+  splices at most 32 connections at once (`cli.forwardConns`); while
+  that many are open it accepts nothing and new ones wait in the
+  listener's backlog, so no local user can make the node's dial key
+  open unbounded tunnel connections. 32 is the friend's own bound,
+  `bridge.DefaultConns` per friend on the tunnel port, counted on the
+  node ID the dial key resolves to: a forward splicing more would only
+  open connections the friend closes unread, and rclone (4 transfers,
+  8 checkers) and restic (5 connections) need fewer. There is no idle
+  deadline of its own: the friend's tunnel server closes a connection
+  idle 5 minutes, which ends its splice. An accept error a moment may
+  cure (EMFILE, ENFILE, ENOBUFS, ENOMEM) is retried with a backoff from
+  5 ms to 1 s, as `net/http`'s server does; any other ends the command
+  with exit 1. It adds, removes and rewrites nothing, so the
   friend's gate, bridge and `Lending` see the tool's own requests. The
   buckets listed are those of the node's own map with an acknowledged
   placement at that friend (`state.DB.HeldAt`). Per bucket it prints
@@ -5926,9 +5951,10 @@ the handler's own reads and is never cancelled; nothing below
   front of the forward). *One dialling process (#69):* the forward
   dials with the node's dial key for that friend, as the daemon does,
   and two tailcat clients of one key at one relay stall each other. So
-  `serve` and `peer forward` both take `<config>/locks/dial.lock`
-  (flock, dropped by the kernel when the process ends), and whichever
-  comes second is refused, naming the other. Restoring straight from
+  `serve`, `peer forward` and `recover` all take
+  `<config>/locks/dial.lock` (flock, dropped by the kernel when the
+  process ends), and whichever comes second is refused, naming the
+  others (`recover` since #94). Restoring straight from
   friends thus means stopping `serve` meanwhile, as `recover` already
   asks. Precedent: Tailscale's `tailscale nc` and Syncthing's CLI ask
   the running daemon instead; lendisk has no daemon IPC beyond
