@@ -46,6 +46,21 @@ func TestScenarioOverflowRetentionAtAnUnversionedProvider(t *testing.T) {
 // held deletes come due (an 8 s window ran out on CI, 2026-11-10).
 const providerWindow = 30 * time.Second
 
+// replacedSince waits for n's daemon to finish a re-placement pass that
+// began after since (its passes run every envReplaceEvery).
+func replacedSince(t *testing.T, n *node, since time.Time) {
+	t.Helper()
+	db := openDB(t, n)
+	// done_at is in whole seconds: a pass done three seconds after
+	// since's second began, taking less than two, began after since.
+	after := since.Unix() + 3
+	within(t, 90*time.Second, "a re-placement pass", func() bool {
+		var done int64
+		err := db.QueryRow(`SELECT done_at FROM replace_pass WHERE id = 1`).Scan(&done)
+		return err == nil && done >= after
+	})
+}
+
 // providerFromEnv connects to the provider the variables with prefix
 // name, or skips.
 func providerFromEnv(t *testing.T, prefix, script string) *overflowtest.Server {
@@ -65,7 +80,9 @@ func providerFromEnv(t *testing.T, prefix, script string) *overflowtest.Server {
 // checksums and in full by download. An attacker's `restic forget
 // --prune` deletes everything: at a versioned target the keys are gone
 // (delete markers); at an unversioned one every key stays, the deletes
-// held, and status says "retention: client-side". `lendisk undelete`
+// held, and status says "retention: client-side"; at either, a
+// re-placement pass leaves the repository's config and keys there
+// (#40). `lendisk undelete`
 // brings the snapshot back at B and the target, and restic opens it.
 // At the unversioned target the deletes it cancelled are never sent,
 // past the window; a second prune's are sent once the window has
@@ -116,9 +133,23 @@ func scenarioOverflowRetention(t *testing.T, srv *overflowtest.Server, root stri
 	f.restic("forget", "--prune", id)
 	f.drain()
 	f.an.drained("b2", 90*time.Second)
+	// A re-placement pass runs before the undelete, and what it sends
+	// is sent: it must leave the bucket's metadata at the target while
+	// an undelete can still bring the data back there (#40), however
+	// slow the runner.
+	replacedSince(t, f.an, time.Now())
+	f.an.drained("b2", 90*time.Second)
 	after, err := srv.Keys(t.Context(), prefix)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, k := range overflowtest.SortedKeys(before) {
+		if rest := strings.TrimPrefix(k, prefix); rest == "config" || strings.HasPrefix(rest, "keys/") {
+			if _, ok := after[k]; !ok {
+				t.Fatalf("the repository's %s went from the target after the prune, which undelete does not bring back: %v",
+					rest, overflowtest.SortedKeys(after))
+			}
+		}
 	}
 	st := f.an.status()
 	o := st.Capacity.Overflow[0]

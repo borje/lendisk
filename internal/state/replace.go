@@ -559,7 +559,7 @@ func (m *replacer) bucket(ctx context.Context, bucket string, copies int) (Repla
 			m.metaPlaces = append(m.metaPlaces, f.peer)
 		}
 	}
-	held, err := overflowHolding(ctx, m.db, bucket)
+	held, err := overflowHolding(ctx, m.db, bucket, m.now.Unix())
 	if err != nil {
 		return st, err
 	}
@@ -1309,8 +1309,7 @@ const markDropping = `UPDATE placement SET state = '` + PlacementDropping + `'
 		WHERE x.place = placement.place AND x.bucket = placement.bucket AND x.key = placement.key)`
 
 // dropIdleMetadata deletes bucket's metadata at each overflow target
-// that holds, has queued or is deleting no copy of a live data object of
-// it (#40): a
+// that holds no data of it at the pass's now (holdsLiveData, #40): a
 // target holds the metadata only for the data it holds (REPL-12), so
 // once drain-back has moved its data copies back to friends it is empty
 // (scenario 12) and costs nothing. An acknowledged copy is marked
@@ -1340,7 +1339,7 @@ func (m *replacer) dropIdleMetadata(ctx context.Context, bucket string) (Replace
 	defer tx.Rollback()
 	for _, t := range targets {
 		var idle bool
-		if err := tx.QueryRowContext(ctx, `SELECT NOT `+holdsLiveData("?1", "?2"), t, bucket).Scan(&idle); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT NOT `+holdsLiveData("?1", "?2", "?3"), t, bucket, m.now.Unix()).Scan(&idle); err != nil {
 			return st, err
 		}
 		if !idle {

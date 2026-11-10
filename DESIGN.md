@@ -7094,9 +7094,24 @@ of the `copies`, and the estimated cost (S3-7).
   deletes are sent, and the undelete that restores the data finds the
   metadata beside it (#40 regression,
   `TestAPrunedObjectsMetadataStaysWhileItsDeleteIsHeld`,
-  `TestADeniedDeleteKeepsTheMetadataAtTheTarget`). A drained copy's
+  `TestADeniedDeleteKeepsTheMetadataAtTheTarget`). At a versioned
+  target, which is sent the delete at once as a delete marker with no
+  tomb, a data key's acknowledged delete counts likewise while its
+  `acked_at` is less than the target's `--retention` before the pass's
+  now (the lifecycle rule keeps the version that long, and undelete
+  copies it back): the condition takes now as a parameter, the
+  replacer's clock in a pass and the database clock in `placeTx`, so
+  the two agree and nothing ping-pongs; the first pass past the window
+  drops the metadata (passes run at least hourly). Before this a pass
+  between a prune and its undelete dropped `config` and `keys/` at a
+  versioned target, which undelete, skipping drains, never restored
+  (#40 regression on slow CI,
+  `TestAPrunedObjectsMetadataStaysAtAVersionedTargetForItsWindow`,
+  `TestAVersionedTargetsMetadataGoesAfterTheWindow`; the retention
+  scenario waits for a pass after the prune and checks the metadata
+  is still there). A drained copy's
   tomb does not count (the object moved to a friend), nor does a
-  delete's tomb of a key whose copy drained first
+  delete, held or sent, of a key whose copy drained first
   (`TestADeleteAfterDrainBackKeepsNoMetadataAtTheTarget`). A copy
   placed again at a place clears the `replaces` of the object's other
   rows naming that place, so a friend copy that once drained the

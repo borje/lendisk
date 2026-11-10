@@ -356,39 +356,49 @@ const splitKey = `SELECT coalesce((SELECT group_concat(peer_key || ':' || coales
 	coalesce((SELECT group_concat(name || ':' || max_bytes, ',') FROM overflow), '') || '|' ||
 	coalesce((SELECT group_concat(name || ':' || copies, ',') FROM buckets), '')`
 
-// overflowHolding lists the overflow targets that hold, have queued or
-// are deleting a copy of a live data object of bucket, in place order
-// (holdsLiveData).
-func overflowHolding(ctx context.Context, q querier, bucket string) ([]string, error) {
+// overflowHolding lists the overflow targets that hold data of bucket
+// at now, in place order (holdsLiveData).
+func overflowHolding(ctx context.Context, q querier, bucket string, now int64) ([]string, error) {
 	return column(ctx, q, `SELECT p FROM (SELECT '`+OverflowPrefix+`' || name AS p FROM overflow)
-		WHERE `+holdsLiveData("p", "?1")+` ORDER BY p`, bucket)
+		WHERE `+holdsLiveData("p", "?1", "?2")+` ORDER BY p`, bucket, now)
 }
 
 // holdsLiveData is the SQL condition that the overflow target place
-// holds data of bucket: it holds, has queued or is deleting a copy of a
-// live data object (the key's latest done write), or it still holds a
-// deleted one, a delete of the key held there as a client-side tomb
-// (S3-4: an undelete brings it back there, RET-3) or refused for want of
-// permission (S3-5). Then the bucket's metadata goes there
+// holds data of bucket at now (unix seconds): it holds, has queued or
+// is deleting a copy of a live data object (the key's latest done
+// write), or it still holds a deleted one that an undelete brings back
+// there (S3-4, RET-3): a delete of the key held there as a client-side
+// tomb or refused for want of permission (S3-5), or, at a versioned
+// target, sent there as a delete marker that the target acknowledged
+// less than its retention before now (its lifecycle rule keeps the
+// version that long). Then the bucket's metadata goes there
 // (overflowHolding, REPL-12), and otherwise it is dropped there
-// (dropIdleMetadata, #40). One condition for both, so the two never
-// place and drop the same metadata in turn (#40 review). A drained
-// copy's tomb counts only when refused: drain-back moved the object to
-// a friend, and no undelete restores it at the target; nor does a
-// delete's tomb whose key the target no longer held (its copy drained
-// first). place and bucket are SQL expressions.
-func holdsLiveData(place, bucket string) string {
+// (dropIdleMetadata, #40). One condition for both, at the same now, so
+// the two never place and drop the same metadata in turn (#40 review).
+// A drained copy's tomb counts only when refused: drain-back moved the
+// object to a friend, and no undelete restores it at the target; nor
+// does a delete, held or sent, of a key whose copy the target no longer
+// held (it drained first). place, bucket and now are SQL expressions.
+func holdsLiveData(place, bucket, now string) string {
+	// The target acknowledged a put of the delete's key t as its
+	// latest put before the delete: it held the version deleted.
+	const heldBefore = `EXISTS (SELECT 1 FROM placement h
+			WHERE h.place = t.place AND h.bucket = t.bucket AND h.key = t.key AND h.op = 'put'
+			AND h.state IN ('acked', 'abandoned')
+			AND h.seq = (SELECT max(x.seq) FROM placement x WHERE x.place = t.place AND x.bucket = t.bucket
+				AND x.key = t.key AND x.op = 'put' AND x.seq < t.seq))`
 	return `(EXISTS (SELECT 1 FROM placement h JOIN queue hq ON hq.seq = h.seq
 		WHERE h.place = ` + place + ` AND h.bucket = ` + bucket + ` AND h.op = 'put' AND hq.class = 'data'
 		AND h.state IN ('queued', 'acked', 'dropping')
 		AND NOT EXISTS (SELECT 1 FROM queue l WHERE l.bucket = hq.bucket AND l.key = hq.key AND l.seq > hq.seq AND l.state = 'done'))
 	OR EXISTS (SELECT 1 FROM overflow_tomb t JOIN queue tq ON tq.seq = t.seq
 		WHERE t.place = ` + place + ` AND t.bucket = ` + bucket + ` AND tq.class = 'data'
-		AND (t.denied_at IS NOT NULL OR t.drained IS NULL AND EXISTS (SELECT 1 FROM placement h
-			WHERE h.place = t.place AND h.bucket = t.bucket AND h.key = t.key AND h.op = 'put'
-			AND h.state IN ('acked', 'abandoned')
-			AND h.seq = (SELECT max(x.seq) FROM placement x WHERE x.place = t.place AND x.bucket = t.bucket
-				AND x.key = t.key AND x.op = 'put' AND x.seq < t.seq)))))`
+		AND (t.denied_at IS NOT NULL OR t.drained IS NULL AND ` + heldBefore + `))
+	OR EXISTS (SELECT 1 FROM placement t JOIN queue tq ON tq.seq = t.seq
+		JOIN overflow o ON '` + OverflowPrefix + `' || o.name = t.place
+		WHERE t.place = ` + place + ` AND t.bucket = ` + bucket + ` AND tq.class = 'data'
+		AND o.versioning = '` + VersioningEnabled + `' AND t.op = 'delete' AND t.state = 'acked'
+		AND t.acked_at + o.retention > ` + now + ` AND ` + heldBefore + `))`
 }
 
 // placeMetadata puts every live metadata object of bucket that place
