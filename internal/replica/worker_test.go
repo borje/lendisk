@@ -32,6 +32,9 @@ type place struct {
 	log  []string          // op bucket/key, in order
 	// fail, if set, answers instead of storing.
 	fail func(op, key string) error
+	// retryAfter, if set, is the Retry-After a put fail answers busy
+	// carries (#93).
+	retryAfter time.Duration
 	// hold, if set, blocks every request until closed; only those for
 	// holdKey, if that is set too.
 	hold                  chan struct{}
@@ -87,6 +90,9 @@ func (p *place) Put(ctx context.Context, o Object) error {
 	p.bytesRead += int64(len(b))
 	if p.fail != nil {
 		if err := p.fail("put", o.Key); err != nil {
+			if p.retryAfter > 0 && errors.Is(err, ErrBusy) {
+				noteRetryAfter(ctx, p.retryAfter) // as the HTTP transport does
+			}
 			return err
 		}
 	}

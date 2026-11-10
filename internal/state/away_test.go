@@ -303,3 +303,90 @@ func TestABusyFriendIsAwayOnlyOnceBusyForRerouteAfter(t *testing.T) {
 		t.Fatal("not away an hour after its last busy answer")
 	}
 }
+
+// #93: a friend's busy run is counted from its first busy answer after
+// an ok, not from its condition's since: a network error (or a probe's
+// answer) between busy answers does not restart it, so a friend that
+// slips one in now and then still counts as away once it has given no
+// ok for reroute_after. Only an ok answer ends the run.
+func TestABusyRunSurvivesInterleavedNetworkErrors(t *testing.T) {
+	ctx := context.Background()
+	p := newPool(t)
+	p.friend("B", 10)
+	p.friend("C", 10)
+	p.friend("D", 10)
+	p.bucket("laptop", 1)
+	d := p.put("laptop", "data/1", "data", 1)
+	for _, f := range p.places(d) {
+		p.ack(f, d)
+	}
+	m := p.put("laptop", "index/1", "metadata", 0.1) // B, C and D
+	p.ack("C", m)
+	p.ack("D", m)
+	del := p.del("laptop", "data/1", "data")
+	b := func() poolPlace {
+		t.Helper()
+		ps, err := poolPlaces(ctx, p.db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, pl := range ps {
+			if pl.peer == "B" {
+				return pl
+			}
+		}
+		t.Fatal("B not in the pool")
+		return poolPlace{}
+	}
+	busySince := func() time.Time {
+		t.Helper()
+		c, err := p.db.PlaceConditions(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c["B"].BusySince
+	}
+
+	p.answer("B", ConditionOK)
+	p.now = p.now.Add(time.Minute)
+	start := p.now
+	// Busy, then a network error (and a probe's answer, and another
+	// error), then busy again, … every 10 minutes.
+	for i := 0; p.now.Sub(start) < time.Hour; i++ {
+		if i%3 == 1 {
+			p.answer("B", ConditionRetrying)
+			if err := p.db.ProbeAnswered(ctx, "B", p.now); err != nil {
+				t.Fatal(err)
+			}
+			p.answer("B", ConditionRetrying)
+		} else {
+			p.answer("B", ConditionBusy)
+		}
+		if got := busySince(); !got.Equal(start) {
+			t.Fatalf("busy since %v after %v, want %v", got, p.now.Sub(start), start)
+		}
+		if b().reroutable(p.db, p.now) || !p.held(del) {
+			t.Fatalf("away after %v of busy answers and network errors", p.now.Sub(start))
+		}
+		p.now = p.now.Add(10 * time.Minute)
+	}
+	// An hour on: away whether its last answer was a network error or
+	// busy, but never gone.
+	for _, c := range []string{ConditionRetrying, ConditionBusy} {
+		p.answer("B", c)
+		if pl := b(); !pl.reroutable(p.db, p.now) || pl.gone(p.db, p.now) || p.held(del) {
+			t.Fatalf("busy and failing for %v, last %s: reroutable %t, gone %t", p.now.Sub(start), c,
+				pl.reroutable(p.db, p.now), pl.gone(p.db, p.now))
+		}
+	}
+	// An ok answer ends the run; the next busy answer starts another.
+	p.answer("B", ConditionOK)
+	if !busySince().IsZero() || b().reroutable(p.db, p.now) || !p.held(del) {
+		t.Fatalf("away after it answered ok: busy since %v", busySince())
+	}
+	p.now = p.now.Add(time.Minute)
+	p.answer("B", ConditionBusy)
+	if got := busySince(); !got.Equal(p.now) || b().reroutable(p.db, p.now) {
+		t.Fatalf("a new busy run: since %v, reroutable %t", got, b().reroutable(p.db, p.now))
+	}
+}

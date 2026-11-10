@@ -65,6 +65,9 @@ type app struct {
 	// beforeHash is the gateway's hook before a completed upload is
 	// hashed (gateway.BeforeHash); tests only.
 	beforeHash func()
+	// beforeRead runs before each read of a borrower's body
+	// (gateway.BeforeRead); tests only.
+	beforeRead func(key string, read int64)
 	// tuneBridge, if set, adjusts the bridge before it serves. Tests only.
 	tuneBridge func(*bridge.Bridge)
 	// tuneReplication, if set, adjusts the replication worker before it

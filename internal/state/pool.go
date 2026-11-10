@@ -127,6 +127,9 @@ type poolPlace struct {
 	// failing_since, or since if unset): the same as since unless it
 	// changed between retrying, quota and removed (#65).
 	failingAt time.Time
+	// busyAt is its first busy answer since its last ok (place.
+	// busy_since); zero if none (#93).
+	busyAt time.Time
 }
 
 func (p poolPlace) failing() bool {
@@ -135,7 +138,7 @@ func (p poolPlace) failing() bool {
 
 // unreachable: failing now, without an ok answer for reroute_after
 // (#65: a friend alternating between network errors and 507s is away
-// as long as it gives no ok), or busy for reroute_after on end
+// as long as it gives no ok), or busy without an ok for reroute_after
 // (busyForLong). A friend failing or busy for less is still counted
 // reachable: a blip is not an outage.
 func (p poolPlace) unreachable(db *DB, now time.Time) bool {
@@ -147,15 +150,19 @@ func (p poolPlace) unreachable(db *DB, now time.Time) bool {
 		p.busyForLong(db, now)
 }
 
-// busyForLong: it has answered 503 SlowDown (busy) and nothing else
-// for reroute_after. A busy answer is not a failure and moves last_ok
-// on, but an honest one lasts only while another write is in flight
-// there: one that lasts longer is a friend that is broken or holding
-// this node's copies back, and counts as unreachable (its unsent data
-// goes elsewhere, it no longer holds deletes) though never as gone,
-// since it keeps answering (#92).
+// busyForLong: it answers busy (503 SlowDown) or not at all now, and
+// has given no ok answer since its first busy one reroute_after ago. A
+// busy answer is not a failure and moves last_ok on, but an honest one
+// lasts only while another write is in flight there: one that lasts
+// longer is a friend that is broken or holding this node's copies
+// back, and counts as unreachable (its unsent data goes elsewhere, it
+// no longer holds deletes) though never as gone, since it keeps
+// answering (#92). The run counts from busy_since, which only an ok
+// answer clears, so a network error or a probe's answer between busy
+// answers does not restart it (#93).
 func (p poolPlace) busyForLong(db *DB, now time.Time) bool {
-	return p.cond == ConditionBusy && now.Sub(p.since) >= db.rerouteAfter()
+	return (p.cond == ConditionBusy || p.cond == ConditionRetrying) && !p.busyAt.IsZero() &&
+		now.Sub(p.busyAt) >= db.rerouteAfter()
 }
 
 // failingSince is when its run of failing answers began.
@@ -208,7 +215,7 @@ type querier interface {
 func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT x.place, x.overflow, x.quota,
 		coalesce(u.bytes, 0) + coalesce(fr.bytes, 0),
-		coalesce(c.condition, ''), coalesce(c.since, 0), c.last_ok, c.failing_since
+		coalesce(c.condition, ''), coalesce(c.since, 0), c.last_ok, c.failing_since, c.busy_since
 		FROM (SELECT f.peer_key AS place, 0 AS overflow,
 				min(coalesce(f.own_number, 0), coalesce(f.peer_number, 0)) AS quota
 				FROM friendship f WHERE coalesce(f.address, '') != ''
@@ -224,8 +231,8 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 	for rows.Next() {
 		var p poolPlace
 		var since int64
-		var lastOK, failing sql.NullInt64
-		if err := rows.Scan(&p.peer, &p.overflow, &p.quota, &p.use, &p.cond, &since, &lastOK, &failing); err != nil {
+		var lastOK, failing, busy sql.NullInt64
+		if err := rows.Scan(&p.peer, &p.overflow, &p.quota, &p.use, &p.cond, &since, &lastOK, &failing, &busy); err != nil {
 			return nil, err
 		}
 		p.since = time.Unix(since, 0)
@@ -234,6 +241,9 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 		}
 		if failing.Valid {
 			p.failingAt = time.Unix(failing.Int64, 0)
+		}
+		if busy.Valid {
+			p.busyAt = time.Unix(busy.Int64, 0)
 		}
 		out = append(out, p)
 	}

@@ -206,6 +206,48 @@ func TestAFriendBusyPastThresholdRaisesAlert(t *testing.T) {
 	}
 }
 
+// OPS-2 (#93): a network error between busy answers does not restart
+// the busy run: a friend that has answered only busy, or not at all,
+// since its first busy answer unreachable_after ago is alerted, as its
+// last answer was busy or a network error. An ok answer clears it.
+func TestABusyFriendWithInterleavedErrorsRaisesAlert(t *testing.T) {
+	db := openDB(t)
+	addFriend(t, db, "B")
+	t0 := time.Unix(1_800_000_000, 0)
+	c := &clock{t: t0}
+	s := &Service{DB: db, Log: quiet, Now: c.now, UnreachableAfter: 24 * time.Hour}
+	answer := func(cond string, at time.Time) {
+		t.Helper()
+		if err := db.SetPlaceCondition(t.Context(), "B", cond, cond+": x", at); err != nil {
+			t.Fatal(err)
+		}
+		c.set(at)
+		if err := s.evaluate(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conds := []string{state.ConditionBusy, state.ConditionRetrying}
+	i := 0
+	for at := t0; at.Before(t0.Add(24 * time.Hour)); at = at.Add(20 * time.Minute) {
+		answer(conds[i%2], at)
+		i++
+		if as := active(t, db); len(as) != 0 {
+			t.Fatalf("alerted after %v busy and failing: %v", at.Sub(t0), as)
+		}
+	}
+	for _, cond := range conds {
+		answer(cond, t0.Add(24*time.Hour))
+		a, ok := active(t, db)["friend_unreachable:B"]
+		if !ok || !strings.Contains(a.Message, "busy") || !strings.Contains(a.Message, t0.UTC().Format(time.RFC3339)) {
+			t.Fatalf("busy and failing for 24 h, last %s: %+v", cond, active(t, db))
+		}
+	}
+	answer(state.ConditionOK, t0.Add(25*time.Hour))
+	if as := active(t, db); len(as) != 0 {
+		t.Fatalf("not cleared: %v", as)
+	}
+}
+
 // PEER-5, OPS-2 (#83): a friend that keeps refusing this node as no
 // friend of it (its place `removed`) has probably ended the friendship
 // without this node hearing: friend_refuses says so and how to end it

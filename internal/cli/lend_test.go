@@ -13,7 +13,9 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,6 +103,114 @@ func TestLenderPolicyAsTheBorrowerSeesIt(t *testing.T) {
 	sealed := aws.String(bID.SealedName("laptop"))
 	if _, err := cb.PutObject(ctx, &s3.PutObjectInput{Bucket: sealed, Key: aws.String("data/four"), Body: strings.NewReader("x")}); s3Code(err) != "InvalidRequest" {
 		t.Fatalf("a put without the hash: %v", err)
+	}
+}
+
+// #93 (#89, LEND-2), end to end: B's replica client abandons a send to
+// A that A's store stopped reading mid-body; its reset reaches A's
+// gateway through the tunnel and the bridge, so A's Lending.reserve
+// gives back what it held for the write within seconds of the store
+// reading again, though the store reads slowly: B's next write, which
+// fits A's quota alone but not beside the abandoned one, is asked to
+// wait (503 SlowDown) only until then. With a plain close A read on
+// what the tunnel held of the body (2.6 to 6.4 MB measured) at the
+// store's pace first; with the reset it reads 0.5 to 2.2 MB, what had
+// already passed the tunnel. The bound is loose enough for the race
+// detector, so this shows the release end to end; the sharp test of
+// the reset is replica's TestAnAbandonedSendResetsItsConnection.
+func TestALenderFreesAnAbandonedSendsReservationWithinSeconds(t *testing.T) {
+	serving(t, 0)
+	a, b := friendNode(t), friendNode(t)
+	resume := make(chan struct{})
+	var once sync.Once
+	resumed := func() { once.Do(func() { close(resume) }) }
+	// A's store stops reading the big object after its first MiB, then
+	// reads it at 512 KiB/s: the megabytes the tunnel held of the body
+	// would take it many seconds.
+	var mu sync.Mutex
+	last := int64(-1)
+	a.beforeRead = func(key string, read int64) {
+		if key != "data/big" || read < 1<<20 {
+			return
+		}
+		<-resume
+		mu.Lock()
+		d := time.Duration(0)
+		if last >= 0 {
+			d = time.Duration(read-last) * time.Second / (512 << 10)
+		}
+		last = read
+		mu.Unlock()
+		time.Sleep(d)
+	}
+	serve := a.serveLogged()
+	var stopped sync.Once
+	var logs string
+	stop := func() string {
+		resumed() // A stops only once its store reads again
+		stopped.Do(func() { logs = serve() })
+		return logs
+	}
+	t.Cleanup(func() { stop() })
+	const quota = 64<<20 + 64<<10
+	s := a.invite("--quota", strconv.Itoa(quota))
+	if code, _, errOut := b.run("\n", "", "peer", "add", s); code != 0 {
+		t.Fatalf("peer add: %d %s", code, errOut)
+	}
+	aAddr := a.status().Node.Address
+	aKey, err := transport.KeyOf(aAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bID := b.identity()
+	dl, err := transport.NewDialer(bID, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dl.Close() })
+	f, err := replica.NewFriend(bID, aKey, aAddr, dl.Dial, replica.Options{DialTimeout: 20 * time.Second, StallTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(key string, body []byte) error {
+		ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+		defer cancel()
+		return f.Put(ctx, replica.Object{Bucket: "laptop", Key: key, Size: int64(len(body)), SHA256: sha256Hex(body),
+			Body: bytes.NewReader(body)})
+	}
+	big := make([]byte, 64<<20)
+	if err := put("data/big", big); err == nil || !strings.Contains(err.Error(), "no progress") {
+		t.Fatalf("a send A's store stopped reading: %v", err)
+	}
+	// 64 KiB fits the quota alone, not beside the 64 MiB A still holds
+	// (each object costs 4 KiB besides). It is small enough that the
+	// bridge has passed it all on when the gateway answers 503 unread: a
+	// larger body would break the bridge's write to the gateway's
+	// socket, and B would get "gateway unavailable" instead.
+	next := bytes.Repeat([]byte("n"), 64<<10)
+	if err := put("data/next", next); !errors.Is(err, replica.ErrBusy) {
+		t.Fatalf("a write beside the abandoned one, while A's store stalls: %v\n%s", err, stop())
+	}
+	resumed()
+	start := time.Now()
+	for {
+		err := put("data/next", next)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, replica.ErrBusy) {
+			t.Fatalf("the next write after the abandoned one: %v\n%s", err, stop())
+		}
+		if time.Since(start) > 10*time.Second {
+			t.Fatalf("A still holds the abandoned send's reservation %v after its store reads again: %v\n%s", time.Since(start), err, stop())
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	mu.Lock()
+	t.Logf("released %v after A's store read again, at byte %d", time.Since(start), last)
+	mu.Unlock()
+	if got := lentObjects(t, a, bID, "laptop"); len(got) != 1 || got["data/next"] == "" {
+		t.Fatalf("A holds %v; want data/next alone", got)
 	}
 }
 

@@ -2685,7 +2685,7 @@ upstream bucket is Q-V.
   answering `503 SlowDown` is `busy`, an answer like `ok`, for a
   while: an honest one lasts only while another write is in flight
   there. *Decision (#92 review):* a friend `busy` and nothing else for
-  `reroute_after` on end (its `since` older) counts as unreachable
+  `reroute_after` on end counts as unreachable
   (`poolPlace.busyForLong`): its unsent data goes elsewhere and it no
   longer holds deletes, so a broken or hostile friend cannot hold
   copies back for ever by answering `SlowDown`. It is never gone,
@@ -2693,8 +2693,15 @@ upstream bucket is Q-V.
   `alerts.unreachable_after` (24 h) busy it raises
   `friend_unreachable`, its message saying it answers busy
   (`TestABusyFriendIsAwayOnlyOnceBusyForRerouteAfter`,
-  `TestAFriendBusyPastThresholdRaisesAlert`). An
-  ok answer ends the stretch. An
+  `TestAFriendBusyPastThresholdRaisesAlert`). Only an
+  ok answer ends the stretch. *Decision (#93):* the stretch counts
+  from `place.busy_since`, its first busy answer since its last ok,
+  not from the condition's `since`: a network error or a probe's
+  answer between busy answers does not restart it, so a friend that
+  slips one in now and then cannot dodge the bound. It applies while
+  the last answer is `busy` or `retrying`
+  (`TestABusyRunSurvivesInterleavedNetworkErrors`,
+  `TestABusyFriendWithInterleavedErrorsRaisesAlert`). An
   unreachable friend with room is still chosen
   when the reachable ones are not enough; a gone one is not.
   *Away is a run of failing answers, not one condition (#65, from the
@@ -2956,11 +2963,14 @@ upstream bucket is Q-V.
   `condition` (`ok`, `retrying`, `quota`, `removed`, `busy` when it
   answered `503 SlowDown` (#92), and `store` while
   it waits because this node's store cannot be read), `detail`, `since`,
-  `failing_since` (the start of its run of failing answers, #65) and
+  `failing_since` (the start of its run of failing answers, #65),
+  `busy_since` (its first busy answer since its last ok, kept through
+  failures and probes' answers and cleared only by ok; migration 44,
+  #93) and
   `last_ok`, D6's last-reachable time: its last acknowledgement,
   answered probe or busy answer. `busy` is not failing: it sets
   `last_ok` and clears `failing_since` as `ok` does, and is away only
-  once it lasts `reroute_after` (above); `status` shows it as "busy (it asks
+  once `busy_since` is `reroute_after` old (above); `status` shows it as "busy (it asks
   to send again shortly)", `status --json` as `state: "busy"` (a new
   value, no new field). A sender whose FIFO is empty,
   including at daemon start, sets `store` back to `ok` without touching
@@ -3440,7 +3450,10 @@ upstream bucket is Q-V.
   until its stall bound (2 minutes) ended the body. With the reset the
   friend reads only what had reached it, then fails
   (`TestAnAbandonedSendResetsItsConnection`,
-  `TestARetryAfterAnAbandonedSendSucceeds`). The connection is
+  `TestARetryAfterAnAbandonedSendSucceeds`; end to end through the
+  tunnel, the bridge and `Lending.reserve`, with the lender's store
+  stalled by the test hook `gateway.Gateway.BeforeRead`:
+  `TestALenderFreesAnAbandonedSendsReservationWithinSeconds`, #93). The connection is
   forgotten once the transport puts it back in its pool (the trace's
   `PutIdleConn`) or the request has returned, so a stall noticed on
   the last slow read never resets a connection another request may
@@ -3489,7 +3502,17 @@ upstream bucket is Q-V.
   a friend briefly busy behind another borrower's writes is neither
   unreachable nor rerouted nor alerted as `friend_unreachable`; one
   busy for `reroute_after` on end is, see §3.4 Reachability;
-  `TestABusyFriendIsRetriedWithoutFailing`). Only `SlowDown` is busy:
+  `TestABusyFriendIsRetriedWithoutFailing`). *Decision (#93):* a busy
+  answer's `Retry-After` (seconds or an HTTP date) replaces the
+  backoff for that wait, capped by `max_backoff`; the backoff doubles
+  as before for the next answer without one. minio-go keeps no
+  response header in its `ErrorResponse`, so each client's transport
+  (`replica.hinting`) notes a 503's `Retry-After` in the request's
+  context, where the worker put a hint around its send
+  (`withRetryHint`; `TestABusyAnswersRetryAfterIsNoted`,
+  `TestABusyFriendsRetryAfterIsHonouredUpToMaxBackoff`). The tunnel's
+  cap of requests in flight sends `Retry-After: 1`; the gateway's
+  `errInFlight` sends none. Only `SlowDown` is busy:
   the lender's other 503s (`ServiceUnavailable`: a gateway still
   starting, relationships it cannot read) say it is failing and stay
   `retrying` (`TestFriendRefusalsAreDistinct`). A probe answered
@@ -4381,7 +4404,18 @@ the handler's own reads and is never cancelled; nothing below
   borrower abandoned holds its reservation until its body ends), so
   a 507, which pauses the borrower for quota for an hour, would be
   wrong for them (`TestAWriteThatFitsButForWritesInFlightIsRetried`).
-  Once they have stored, the retry is answered 507 if it no longer
+  End to end, a send the borrower abandoned gives its reservation
+  back within seconds of the lender's store reading again, and the
+  next write is answered `SlowDown` only until then
+  (`TestALenderFreesAnAbandonedSendsReservationWithinSeconds`, #93).
+  *Open (#93):* the gateway answers these refusals before reading the
+  body and closes the connection, so for a body larger than what
+  `gw.sock` buffers (a few hundred KiB) the bridge's write of the rest
+  fails (`broken pipe`) about half the time and the borrower gets the
+  bridge's `503 ServiceUnavailable` "gateway unavailable", a network
+  failure, instead of `SlowDown` (seen in the test above with a 3 MiB
+  body; a `507` is answered the same way, so likely the same). Once
+  they have stored, the retry is answered 507 if it no longer
   fits. The check reads the counter under the same lock that admits the
   write. A completion is checked against the floor alone, for the size
   of its parts: posix assembles the object in a staging file while the

@@ -513,3 +513,56 @@ func TestARetryAfterAnAbandonedSendSucceeds(t *testing.T) {
 		time.Sleep(200 * time.Millisecond)
 	}
 }
+
+// #93, LEND-2: a friend's 503 SlowDown reaches the worker as ErrBusy,
+// and its Retry-After, in seconds or as a date, is noted for the
+// worker's wait; one without it, or another answer's, notes nothing.
+func TestABusyAnswersRetryAfterIsNoted(t *testing.T) {
+	self := newID(t)
+	var mu sync.Mutex
+	var answer func(w http.ResponseWriter)
+	f, _ := tunnelLender(t, self, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		if strings.Count(strings.Trim(r.URL.Path, "/"), "/") == 0 { // bucket create
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		answer(w)
+	}))
+	date := time.Now().Add(30 * time.Second).UTC().Format(http.TimeFormat)
+	for _, tc := range []struct {
+		name     string
+		header   string
+		status   int
+		code     string
+		min, max time.Duration
+	}{
+		{"seconds", "7", 503, "SlowDown", 7 * time.Second, 7 * time.Second},
+		{"a date", date, 503, "SlowDown", 20 * time.Second, 31 * time.Second},
+		{"none", "", 503, "SlowDown", 0, 0},
+		{"not busy", "7", 500, "InternalError", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			answer = func(w http.ResponseWriter) {
+				if tc.header != "" {
+					w.Header().Set("Retry-After", tc.header)
+				}
+				s3Error(w, tc.status, tc.code)
+			}
+			mu.Unlock()
+			ctx, after := withRetryHint(t.Context())
+			body := []byte("x")
+			sum := sha256.Sum256(body)
+			err := f.Put(ctx, Object{Bucket: "laptop", Key: "data/1", Size: 1, SHA256: hex.EncodeToString(sum[:]),
+				Body: bytes.NewReader(body)})
+			if errors.Is(err, ErrBusy) != (tc.code == "SlowDown") {
+				t.Fatalf("answered %d %s: %v", tc.status, tc.code, err)
+			}
+			if d := after(); d < tc.min || d > tc.max {
+				t.Fatalf("Retry-After %q noted as %v", tc.header, d)
+			}
+		})
+	}
+}
