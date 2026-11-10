@@ -3378,8 +3378,39 @@ upstream bucket is Q-V.
       with their reason: the user lowering `copies` (I1 counts the
       copies set now), `overflow remove --keep-data` (the target's rows
       are forgotten with its data left there, `exceptKeepData`) and a
-      friend removed by the user (`exceptFriendRemoved`). Nothing else
-      bypasses I1.
+      friendship ended, by the user or by the friend (`byPeer`,
+      `exceptFriendRemoved`). Nothing else bypasses I1. The calls that
+      name an exception (`removeFriendship`, `ForgetFormerFriend`,
+      `dropOverflow`) and those for unsent data rows (`applyReroute`,
+      `RemoveOverflow`) always return true: they record the decision
+      and enforce nothing, as removing an unsent copy, or one at a
+      former friend or a target being removed (not intact places),
+      never lowers the count I1 keeps.
+
+    *Checked again before the delete goes (#104).* A copy is marked
+    `dropping` when I1 holds, but its delete is sent later, when its
+    place's FIFO reaches it; another holder lost meanwhile (gone,
+    refusing, unverified) would leave the object short when it lands.
+    So `StartPlacement` asks the rule again (`checkDrop`) in the
+    transaction that takes a `dropping` row to send, at every try: a
+    refused drop is `acked` again (back in `place_use`, out of
+    `place_freed`) and not sent. Each re-placement pass does the same
+    for an object with a `dropping` copy and fewer than `copies`
+    acknowledged copies at intact places (`dropShort`, `checkDrops`),
+    before it decides, so the copy counts again and only what is still
+    missing is placed (a replacement for a gone copy among them). The
+    pass skips a delete a sender is sending: a delete on its way cannot
+    be recalled, and if the holder is lost while it is, the object is
+    short until the pass places a new copy. A delete whose earlier try
+    failed is checked again: a failed try most likely never reached the
+    place (drain-back from a target unreachable for days is the case
+    this is for); one that landed with its answer lost leaves a copy
+    counted that the place keeps only as a tomb, until a challenge of
+    that replica finds it missing (VER-1). The named exceptions mark no
+    copy `dropping`, so this check never stands in their way
+    (`TestADroppingCopyIsNotDeletedOnceAnotherHolderIsLost`,
+    `TestARetriedDropIsCheckedAgain`,
+    `TestAPassKeepsARefusedDropAndPlacesItsReplacementAgain`).
 
     `TestRemovalModel` (`internal/state/model_test.go`) checks I1 and I2
     after every step of seeded random sequences driven through the real
@@ -3391,7 +3422,10 @@ upstream bucket is Q-V.
     prints the steps and replays with `LENDISK_MODEL_SEED` and
     `LENDISK_MODEL_STEPS`. Each of the four earlier bugs of this class
     (#38's unchecked move, #40's versioned and tomb cases, #96's early
-    return), reintroduced alone, fails it.
+    return), reintroduced alone, fails it. I1 is also checked as a
+    `dropping` copy's delete is sent and as it turns `drained` (#104):
+    without `checkDrop`, each of CI's seeds fails it (seed 6 at step
+    490, 8 at 1337, 5 at 1956).
   - *Dropping, only after the replacement.* An acknowledged copy at a
     drained place is marked `dropping` when its replacement is
     acknowledged, in the transaction that records the acknowledgement
@@ -3412,7 +3446,8 @@ upstream bucket is Q-V.
     A `dropping` row is in its place's FIFO as a delete of the key at
     the row's sequence (`NextPlacement` takes the lower of the queued
     and dropping heads; index `placement_dropping`): any later write of
-    the key there comes after it. The sender takes, sends and
+    the key there comes after it. The sender takes (asking the rule
+    again, `checkDrop` above), sends and
     acknowledges it like any delete, which leaves the row `drained`:
     the lender keeps the bytes as a tomb for the window (RET-1), and a
     later write of the key there names that version (`ReplacedHash`,
