@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -1091,9 +1092,24 @@ func (m *replacer) overflowFor(ctx context.Context, bucket string, o robj, at ma
 // are, and writes the changes, in one short transaction under the
 // bucket's lock (and the pass's lock, when set). meta: they are
 // metadata objects, placed at every friend with an address lacking
-// them.
-func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []int64, meta bool) (ReplaceStats, error) {
-	var st ReplaceStats
+// them. A batch that fails is rolled back, and so is what it counted
+// in memory (#91): the room it took at each place, the metadata it
+// marked sent and the copies it left, so the rest of the pass sees the
+// room it would have used.
+func (m *replacer) apply(ctx context.Context, bucket string, copies int, seqs []int64, meta bool) (st ReplaceStats, err error) {
+	taken := make(map[*rfriend]int64, len(m.order))
+	for _, f := range m.order {
+		taken[f] = f.taken
+	}
+	unsent, skipped := maps.Clone(m.unsent), m.skipped
+	defer func() {
+		if err != nil {
+			for f, n := range taken {
+				f.taken = n
+			}
+			m.unsent, m.skipped = unsent, skipped
+		}
+	}()
 	if m.db.beforeApply != nil {
 		m.db.beforeApply(bucket, meta) // tests only
 	}

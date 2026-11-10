@@ -147,6 +147,30 @@ func TestBelowCopiesIsRecordedWhenABatchFails(t *testing.T) {
 	}
 }
 
+// REPL-13 (#91): a batch that fails is rolled back, and the room it
+// counted at a friend is given back for the rest of the pass: a bucket
+// that sorts after a failing one is placed there in the same pass.
+func TestAFailedBatchGivesItsRoomBackForTheRestOfThePass(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.bucket("a", 2)
+	p.bucket("b", 2)
+	a1 := p.put("a", "data/1", "data", 4)
+	b1 := p.put("b", "data/1", "data", 4)
+	p.friend("C", 5) // room for one of the two
+	if _, err := p.db.Exec(`CREATE TRIGGER fail BEFORE INSERT ON placement
+		WHEN NEW.place = 'C' AND NEW.seq IN (SELECT seq FROM queue WHERE bucket = 'a')
+		BEGIN SELECT RAISE(ABORT, 'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.db.Replace(ctx, nil, nil); err == nil {
+		t.Fatal("no error from bucket a's failing batch")
+	}
+	p.wantPlaces("a/data/1", a1, "B")
+	p.wantPlaces("b/data/1", b1, "B", "C")
+}
+
 // replace runs one re-placement pass and fails the test on an error.
 func (p *pool) replace() ReplaceStats {
 	p.t.Helper()
