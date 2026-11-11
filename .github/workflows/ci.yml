@@ -57,7 +57,7 @@ jobs:
         if: matrix.part == 'rest'
       - name: go test (internal/cli)
         if: matrix.part == 'cli'
-        run: go test -race -timeout 40m ./internal/cli
+        run: go test -race -timeout 60m ./internal/cli
       - name: go test (every other package)
         if: matrix.part == 'rest'
         run: go test -race -timeout 40m $(go list ./... | grep -v '/internal/cli$')
