@@ -4143,9 +4143,28 @@ upstream bucket is Q-V.
   stuck open or stat goroutine is left behind until the disk answers,
   as a read is; a file it then opens is closed there, and one opened
   just as the sender stops is closed by the sender. Closing a file is
-  not guarded (a regular file's close does not wait for a stuck read),
-  and each stalled attempt leaves a goroutine and its thread behind, so
-  a disk wedged for weeks piles them up (#67). A body that ends before the row's size
+  not guarded (a regular file's close does not wait for a stuck read).
+  Calls do not pile up on a wedged disk (#67): while any call the
+  stall rule left behind (open, stat or read) has not returned, the
+  store is wedged (`replica.storeGate`, one per worker) and no new
+  call goes into it. The next open or stat waits for the stuck call to
+  return, up to `StoreStall` or until the sender stops (so shutdown
+  never waits on the disk), then fails as `store` with "… did not
+  return and still has not" without touching the disk; a read due
+  meanwhile ends its body at once with the same error. The place stays
+  `store` and backs off as above; when the stuck call returns the gate
+  opens and the next attempt goes through. So a disk hung for weeks
+  holds at most the calls under way when it hung (one per sender), not
+  one goroutine and thread per retry. Healthy calls are not serialised:
+  the gate only refuses while a call is stuck. Only the worker's calls
+  share the gate (its sends, parts, re-hashes and the stat that tells a
+  missing object from a missing store). `status` reads the database,
+  not the store, so it is answered while the disk hangs and shows the
+  places' `store`. The gateway, `verify` (§3.6) and the capacity and
+  quota checks (statfs) call the store synchronously and wait for it,
+  never leaving a call behind, so they cannot pile up threads and keep
+  no gate: a hung disk holds each of them in its call (a gateway
+  request's caller times out and retries as with any S3 store). A body that ends before the row's size
   (the file truncated under the sender) is the store's failure too,
   not the friend's: the read ends with "the object ended after n of
   size bytes" and the place shows `store`; the next try sees the size

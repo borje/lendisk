@@ -128,6 +128,9 @@ type Worker struct {
 	// stat stats a bucket's directory in the store; nil means os.Stat.
 	// Tests set it to hang.
 	stat func(name string) (fs.FileInfo, error)
+	// gate keeps calls from piling onto a wedged store: none is started
+	// while one left behind by the stall rule has not returned (#67).
+	gate storeGate
 
 	// flight guards sending: the row each sender has taken from its FIFO
 	// and not yet recorded the outcome of, which re-routing skips (a send
@@ -1580,7 +1583,7 @@ func (w *Worker) openCaptured(ctx context.Context, p state.Placement) (io.Reader
 		fi    fs.FileInfo
 		doing string // what failed: "opening" or "stating"
 	}
-	o, err := storeCall(ctx, w.storeStall(), "opening and stating "+p.Bucket+"/"+p.Key, func() (opened, error) {
+	o, err := storeCall(ctx, &w.gate, w.storeStall(), "opening and stating "+p.Bucket+"/"+p.Key, func() (opened, error) {
 		f, err := w.openFile(filepath.Join(w.StoreDir, p.Bucket, name))
 		if err != nil {
 			return opened{doing: "opening"}, err
@@ -1680,7 +1683,7 @@ func (c *ctxReader) Read(p []byte) (int, error) {
 // store disk that is not mounted. A stat that does not return within
 // Worker.StoreStall is the store's failure too (#63).
 func (w *Worker) storeReadable(ctx context.Context, bucket string) error {
-	fi, err := storeCall(ctx, w.storeStall(), "stating it", func() (fs.FileInfo, error) {
+	fi, err := storeCall(ctx, &w.gate, w.storeStall(), "stating the bucket's directory", func() (fs.FileInfo, error) {
 		return w.statFile(filepath.Join(w.StoreDir, bucket))
 	}, nil)
 	if ctx.Err() != nil {
@@ -1707,8 +1710,14 @@ func fileKind(fi os.FileInfo) string {
 // saying what did not return, and one still blocked when ctx ends does
 // not hold up the sender's stop (#63). The goroutine stuck in such a
 // call is left behind until the disk answers; drop, if set, then
-// releases what it returned.
-func storeCall[T any](ctx context.Context, stall time.Duration, what string, call func() (T, error), drop func(T)) (T, error) {
+// releases what it returned. While a call left behind has not returned,
+// no new call is started: storeCall waits for it up to stall, then
+// fails without calling (gate, #67).
+func storeCall[T any](ctx context.Context, gate *storeGate, stall time.Duration, what string, call func() (T, error), drop func(T)) (T, error) {
+	var zero T
+	if err := gate.pass(ctx, stall); err != nil {
+		return zero, err
+	}
 	type result struct {
 		v   T
 		err error
@@ -1729,12 +1738,14 @@ func storeCall[T any](ctx context.Context, stall time.Duration, what string, cal
 	case <-ctx.Done():
 		err = ctx.Err()
 	}
+	returned := gate.stuckCall(what)
 	go func() {
-		if r := <-ch; r.err == nil && drop != nil {
+		r := <-ch
+		returned()
+		if r.err == nil && drop != nil {
 			drop(r.v)
 		}
 	}()
-	var zero T
 	return zero, err
 }
 
@@ -1747,6 +1758,8 @@ func storeCall[T any](ctx context.Context, stall time.Duration, what string, cal
 // Cancelling a put's context is not enough: net/http does not return
 // while the request body's Read is blocked. The goroutine stuck in such
 // a read is left behind until the disk answers; its bytes are dropped.
+// While any call into the store is left behind, no read is started: the
+// body ends with the store's error (gate, #67).
 func (w *Worker) storeReader(body io.Reader, size int64) *localReader {
 	stall := w.storeStall()
 	pr, pw := io.Pipe()
@@ -1755,14 +1768,22 @@ func (w *Worker) storeReader(body io.Reader, size int64) *localReader {
 		buf := make([]byte, 32<<10)
 		var read int64
 		for {
+			if err := w.gate.wedged(); err != nil {
+				l.fail(err)
+				pw.CloseWithError(err)
+				return
+			}
+			stuck := make(chan func(), 1)
 			t := time.AfterFunc(stall, func() {
+				stuck <- w.gate.stuckCall("a read of the object")
 				err := fmt.Errorf("a read did not return for %v", stall)
 				l.fail(err)
 				pw.CloseWithError(err)
 			})
 			n, err := body.Read(buf)
 			if !t.Stop() {
-				return // the stall ended the body
+				(<-stuck)() // the read returned at last
+				return      // the stall ended the body
 			}
 			read += int64(n)
 			if err == io.EOF && read < size {
