@@ -6492,31 +6492,77 @@ the handler's own reads and is never cancelled; nothing below
   function, so
   replication traffic enters the tunnel from inside the process. No
   listener is opened on the borrower's side for replication.
-- **A borrower's dials that time out (#109, open).** Under load a
-  borrower's tailcat client can lose every new dial to a friend until
-  the client is replaced, while its open connections carry on: the
-  #93 test's 20 s dial timeout (CI at 78326b6, and the lingering close
-  tried in #107). Measured with debug logging in tailscale's netstack:
-  a TCP segment with the borrower's own address as its source and the
-  lender's tunnel address and port as its destination arrives at the
-  borrower from its WireGuard peer, the lender (where it comes from on
-  the lender is not found: not from the lender's gVisor stack). No
-  endpoint takes it, and tailscale's netstack, which registers a
-  packet's foreign destination on its NIC for subnet routing before
-  its forwarder declines the packet (`wrapTCPProtocolHandler`), never
-  removes that address again (only an accepted connection does). The
-  borrower now owns the lender's address: it answers the stray
-  segment with a reset from it, and its next SYNs to the lender leave
-  from it, which the lender's WireGuard drops ("disallowed source
-  address"), so the dial waits out its timeout. The transport's check
-  of a client whose dial failed replaces it once its connections have
-  been quiet for `quietFor` (§3.7 "A restarted friend"), so the stall
-  lasts a dial timeout or two after the transfers in flight end. Under
-  `GOMAXPROCS=2` and eight busy loops the #93 test met it in about 1
-  run in 20; traffic after an answer (a lingering close on the lender)
-  made it most runs. Fixing it means replacing a client whose dials
-  find no SYN-ACK sooner, or tailscale releasing the address; neither
-  is in.
+- **A borrower's dials that time out (#109, #111).** Under load a
+  borrower's tailcat client could lose every new dial to a friend
+  until the client was replaced, while its open connections carried
+  on: the #93 test's 20 s dial timeout (CI at 78326b6, and the
+  lingering close tried in #107). Measured in #109 with debug logging
+  in tailscale's netstack: a TCP segment with the borrower's own
+  address as its source and the lender's tunnel address and port as
+  its destination reaches the borrower's client stack. No endpoint
+  takes it, and tailscale's netstack, which registers a packet's
+  foreign destination on its NIC for subnet routing before its
+  forwarder declines the packet (`wrapTCPProtocolHandler`,
+  `addSubnetAddress`), never removes that address again (only a
+  forwarded connection's close does). The client now owns the
+  lender's address: it answers the stray segment with a reset from
+  it, and gVisor picks it as the source of its next SYNs to the lender
+  (RFC 6724 prefers the destination address itself), which the
+  lender's WireGuard drops ("disallowed source address"), so each
+  dial waits out its timeout. The transport's check replaced such a
+  client only once its connections had been quiet for `quietFor`
+  (§3.7 "A restarted friend"). Under `GOMAXPROCS=2` and eight busy
+  loops the #93 test met it in about 1 run in 20; traffic after an
+  answer (a lingering close on the lender) made it most runs.
+
+  Where the segment comes from is not known, and the fix does not
+  depend on it (#111). It is not the client's WireGuard inbound path:
+  a segment of that shape written into the client's `tstun.Wrapper`
+  as WireGuard does is dropped by the client's packet filter, its
+  destination not being local, and leaves the NIC unchanged
+  (measured). *Built (#111, `Tailcat.dropStray`):* before each dial
+  and each check of a client the transport removes from the client's
+  gVisor stack every address in tailcat's `fd7a:115c:a1e0::/48` but the
+  client's own (`dropStrayAddresses`, which reaches the stack and the
+  client's address in tailcat's backend by reflection, as NET-3's explicit
+  addresses do, and only once tailcat has marked the client up), and
+  logs each removal at info. A tailcat client forwards nothing and has
+  no use for another tunnel address, and the connections open through
+  it are bound to its own address, so the removal touches no
+  transfer. netstack's count for the address stays at 1, so a later
+  stray segment to it does not put it back. A dial issued after a
+  stray address appears goes out from the client's own address; one in
+  flight when it appears fails at its timeout, its failure starts a
+  check, and the check and the next dial find the address gone: the
+  client recovers within one dial timeout, is not replaced, and its
+  transfers go on (`TestADialAfterAStrayFriendAddressReachesTheFriend`
+  puts the friend's address on the stack as netstack does, shows a
+  dial through the client alone failing, and the transport's next dial
+  reaching the friend through the same client while an open
+  connection keeps moving;
+  `TestARestartedFriendIsReachedDespiteAStrayAddress` shows a client
+  holding one still reaches a friend that restarted). Every dial to a friend goes
+  through `Tailcat.Dial` (replication, the reachability probe, the
+  quota exchange, the manifest push, verify, undelete, recovery, `peer
+  forward`), so all of them are covered. Under `GOMAXPROCS=2` and eight
+  busy loops on the dev box the #93 test passed 100 runs in 100 with
+  the fix; without it it also passed 100 in 100, and in 80 of those runs,
+  instrumented, no dial took over 3 s: after #109 the state no longer
+  shows there, so the load runs show no regression, not the cure,
+  which the deterministic test shows. A tailcat
+  whose internals have changed gives a warning, once per transport,
+  and the client is replaced by its failed checks as before.
+  *Rejected:* replacing the client at a dial timeout without waiting
+  for `quietFor`. Two clients of one key at one relay stall each other,
+  so the old client must close, cutting every transfer through it, and
+  the new one costs a WireGuard handshake; and a dial's timeout says
+  little about the client (the caller's context, a relay blip). Binding
+  each dial to the client's own address (netstack's
+  `DialContextTCPWithBind`) would bypass tailcat's dial path and still
+  leave the client answering for the friend's address. Patching
+  tailscale's netstack not to register foreign addresses on a stack
+  that does not route subnets is the cleaner cure, but needs a fork;
+  `dropStray` stays harmless if tailscale does that.
 - **NET-7b** `peer forward` opens a listener on the loopback address
   the user names, for as long as the command runs, and copies each
   accepted connection into a tailcat dial to the friend's tunnel port,
