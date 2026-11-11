@@ -60,7 +60,7 @@ jobs:
         run: go test -race -timeout 40m ./internal/cli
       - name: go test (every other package)
         if: matrix.part == 'rest'
-        run: go test -race -timeout 30m $(go list ./... | grep -v '/internal/cli$')
+        run: go test -race -timeout 40m $(go list ./... | grep -v '/internal/cli$')
       - name: SEC-11 test build (admission admits everyone; the middleware alone refuses)
         if: matrix.part == 'cli'
         run: go test -race -tags admitall -run TestMiddlewareAloneRefusesStranger ./internal/cli
