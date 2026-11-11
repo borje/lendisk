@@ -25,16 +25,34 @@ func (h *harness) settling(settle time.Duration, c *fakeNow) *reconciler {
 }
 
 // appendTo appends b to key's file in bucket's directory, as a copy in
-// progress goes on writing it.
+// progress goes on writing it. Like edit, it moves the modification
+// time on as a later write would see it: the kernel stamps a write with
+// its coarse clock, which within one tick of an earlier write (or of a
+// time edit moved on) is the same or earlier, and a file of the verified
+// inode and modification time with another size is rot, not an edit
+// (#114).
 func (h *harness) appendTo(bucket, key string, b []byte) {
 	h.t.Helper()
-	f, err := os.OpenFile(filepath.Join(h.store, bucket, filepath.FromSlash(key)), os.O_WRONLY|os.O_APPEND, 0)
+	p := filepath.Join(h.store, bucket, filepath.FromSlash(key))
+	fi, err := os.Stat(p)
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	defer f.Close()
-	if _, err := f.Write(b); err != nil {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
 		h.t.Fatal(err)
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		h.t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		h.t.Fatal(err)
+	}
+	if after, _ := os.Stat(p); after != nil && !after.ModTime().After(fi.ModTime()) {
+		if err := os.Chtimes(p, fi.ModTime(), fi.ModTime().Add(time.Millisecond)); err != nil {
+			h.t.Fatal(err)
+		}
 	}
 }
 
