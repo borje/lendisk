@@ -10,6 +10,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"maps"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/versity/versitygw/backend/posix"
 	"github.com/versity/versitygw/s3api/middlewares"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
@@ -963,11 +966,11 @@ func (l *Lending) uploadPartLent(ctx context.Context, peer, sealed string, in *s
 	if err != nil {
 		return nil, err
 	}
-	if lerr := lockAll(); lerr != nil {
-		return nil, errInternal
-	}
 	if l.afterPartStored != nil {
 		l.afterPartStored(int32(number), b.n)
+	}
+	if lerr := lockAll(); lerr != nil {
+		return nil, errInternal
 	}
 	delta, err := l.DB.SettleLentPart(context.Background(), peer, u.UploadID, int32(number), b.n)
 	if errors.Is(err, state.ErrNotFound) {
@@ -1290,8 +1293,10 @@ func (l *Lending) reconcileOne(ctx context.Context, peer string) error {
 // object and open upload's overhead, the objects' bytes and the parts'.
 // An upload with no part for AbandonAfter (posix's Initiated, which each
 // part refreshes) is aborted, not counted, and its row dropped; each
-// kept upload's row is set to its parts. A row whose upload the store
-// no longer has is dropped; nothing else drops one.
+// kept upload's row is set to its parts. An upload a crash left hidden
+// mid-completion counts the same, and is removed once still for
+// AbandonAfter (midCompletion). A row whose upload the store no longer
+// has is dropped; nothing else drops one.
 func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 	id, err := identity.ParseNodeID(peer)
 	if err != nil {
@@ -1363,6 +1368,11 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 			}
 			keyMarker, idMarker = res.NextKeyMarker, res.NextUploadIDMarker
 		}
+		n, err := l.midCompletion(ctx, peer, bucket, cutoff, live)
+		if err != nil {
+			return 0, err
+		}
+		total += n
 	}
 	// Tombstoned objects count as they did live (RET-1); posix lists
 	// nothing under .lendisk.
@@ -1381,6 +1391,117 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 		}
 	}
 	return total, nil
+}
+
+// inProgressSuffix ends the name posix gives an upload's directory
+// while it completes it: <bucket>/.sgwtmp/multipart/<sha256 of the
+// key>/<upload ID>.<claim token>.inprogress (versitygw's posix.go,
+// inProgressSuffix).
+const inProgressSuffix = ".inprogress"
+
+// midCompletion sums the uploads of bucket that posix hid mid-completion
+// and that a crash left so (#66): ListMultipartUploads skips them, yet
+// their parts are on disk. The caller holds peer's pub lock
+// exclusively, and a completion holds it shared until the store
+// answers, so every such directory seen here is a crash's (or a failed
+// rename back's), never a completion running now. Each counts as an
+// open upload: its overhead and its parts, and its row, if it has one,
+// is kept and set to them. Once the directory has been still for
+// AbandonAfter (its change time, which the hiding rename sets) it is
+// removed, as an abandoned upload is aborted: no S3 call can read, list,
+// complete or abort it, and its bytes are either a copy of the object
+// it was linked into or an object whose completion the borrower never
+// had acknowledged, so its replication sends it again (DESIGN §3
+// LEND-1).
+func (l *Lending) midCompletion(ctx context.Context, peer, bucket string, cutoff time.Time, live map[string]bool) (int64, error) {
+	if l.StoreDir == "" {
+		return 0, nil
+	}
+	root := filepath.Join(l.StoreDir, bucket, filepath.FromSlash(posix.MetaTmpMultipartDir))
+	objs, err := os.ReadDir(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var total int64
+	for _, obj := range objs {
+		if !obj.IsDir() {
+			continue
+		}
+		objDir := filepath.Join(root, obj.Name())
+		ups, err := os.ReadDir(objDir)
+		if err != nil {
+			return 0, err
+		}
+		for _, up := range ups {
+			if !up.IsDir() || !strings.HasSuffix(up.Name(), inProgressSuffix) {
+				continue
+			}
+			dir := filepath.Join(objDir, up.Name())
+			uid, _, _ := strings.Cut(up.Name(), ".")
+			fi, err := os.Lstat(dir)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				return 0, err
+			}
+			if changeTime(fi).Before(cutoff) {
+				l.log().Warn("lending: removing a borrower's upload left mid-completion by a crash", "peer", peer,
+					"bucket", bucket, "upload", uid, "since", changeTime(fi))
+				if err := os.RemoveAll(dir); err != nil {
+					return 0, err
+				}
+				os.Remove(objDir) // the key's directory, if no other upload of it is open
+				l.dropUpload(uid)
+				continue
+			}
+			ps, err := partsOnDisk(dir)
+			if err != nil {
+				return 0, err
+			}
+			total += itemOverhead
+			for _, n := range ps {
+				total += n
+			}
+			if _, err := l.DB.GetLentUpload(ctx, uid); err == nil {
+				live[uid] = true
+				if err := l.DB.SetLentUploadParts(ctx, uid, ps); err != nil {
+					return 0, err
+				}
+			} else if !errors.Is(err, state.ErrNotFound) {
+				return 0, err
+			}
+		}
+	}
+	return total, nil
+}
+
+// partsOnDisk reads the parts in an upload's directory: posix names
+// each by its number.
+func partsOnDisk(dir string) (map[int32]int64, error) {
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	ps := map[int32]int64{}
+	for _, e := range es {
+		n, err := strconv.ParseInt(e.Name(), 10, 32)
+		if err != nil || !e.Type().IsRegular() {
+			continue
+		}
+		fi, err := e.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		ps[int32(n)] = fi.Size()
+	}
+	return ps, nil
 }
 
 // reconcileLoop reconciles every borrower at start, whenever it was

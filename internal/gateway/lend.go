@@ -85,8 +85,11 @@ type Lending struct {
 	BeforeRead func(key string, read int64)
 	// Tests only: beforeComplete runs just before a borrower's upload is
 	// completed in the store; afterList when a reconcile has listed a
-	// borrower and not yet set its count; afterPartStored when a part is
-	// stored and not yet counted.
+	// borrower and not yet set its count; afterPartStored when the store
+	// has published a part, before the request takes the locks it counts
+	// the part under (uploadPartLent holds them already, from the body's
+	// end), so a test can let a re-send of the part store and settle
+	// there.
 	beforeComplete   func()
 	afterList        func()
 	afterPartStored  func(part int32, size int64)
