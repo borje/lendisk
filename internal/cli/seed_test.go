@@ -184,7 +184,16 @@ func TestScenarioSeedAFriendFromADisk(t *testing.T) {
 	for {
 		st := an.status()
 		if st.Seeds[0].Confirmed == 4 {
-			if q := an.place(bKey).Queue.Objects; st.Seeds[0].Outcome == "" && q != 6 {
+			// The queue and the seed's outcome from one status (#110):
+			// read apart, the seed can end between them and the queue
+			// start to drain.
+			q := int64(-1)
+			for _, p := range st.Places {
+				if p.Place == bKey {
+					q = p.Queue.Objects
+				}
+			}
+			if st.Seeds[0].Outcome == "" && q != 6 {
 				t.Fatalf("queued at B while the seed holds: %d, want the 2 refused and 4 metadata", q)
 			}
 			break
