@@ -82,12 +82,16 @@ func TestASIGHUPDuringStartUpReloadsTheRatesAndDoesNotKill(t *testing.T) {
 	an := friendNode(t)
 	a := newProcNode(t, an, envStartHold+"=2s")
 	a.p = a.startProc(t, a.addr, a.logw, 0, a.env...)
-	time.Sleep(500 * time.Millisecond) // well into the hold after lendisk.db opens
+	log := func() string { b, _ := os.ReadFile(a.logf); return string(b) }
+	for deadline := time.Now().Add(time.Minute); !strings.Contains(log(), startHeld); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) || a.p.exited() {
+			t.Fatalf("the daemon never reached its start-up hold:\n%s", log())
+		}
+	}
 	if err := a.p.cmd.Process.Signal(syscall.SIGHUP); err != nil {
 		t.Fatal(err)
 	}
 	a.p.waitListening(t, a.addr, a.logf)
-	log := func() string { b, _ := os.ReadFile(a.logf); return string(b) }
 	for deadline := time.Now().Add(time.Minute); !strings.Contains(log(), "why=SIGHUP"); time.Sleep(100 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("a SIGHUP during start-up was not reloaded")

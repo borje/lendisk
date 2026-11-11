@@ -83,6 +83,9 @@ const (
 	// envStartHold holds the daemon's start-up once lendisk.db is open
 	// (a Go duration, #87).
 	envStartHold = "LENDISK_TEST_START_HOLD"
+	// startHeld is the line the daemon prints when its start-up hold
+	// begins.
+	startHeld = "test: start-up held"
 	// envBitrotEvery is the bit-rot sampler's time between steps (a Go
 	// duration, #31).
 	envBitrotEvery = "LENDISK_TEST_BITROT_EVERY"
@@ -148,7 +151,12 @@ func TestMain(m *testing.M) {
 			a.reloadEvery = d
 		}
 		if d, err := time.ParseDuration(os.Getenv(envStartHold)); err == nil {
-			a.afterOpen = func() { time.Sleep(d) }
+			a.afterOpen = func() {
+				// The test signals once it reads this, not after a guess
+				// at how long a loaded runner takes to get here (#87).
+				os.Stdout.WriteString(startHeld + "\n")
+				time.Sleep(d)
+			}
 		}
 		if d, err := time.ParseDuration(os.Getenv(envBitrotEvery)); err == nil {
 			a.tuneSample = func(s *gateway.SampleSettings) { s.Every = d }
