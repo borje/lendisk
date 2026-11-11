@@ -4837,14 +4837,35 @@ the handler's own reads and is never cancelled; nothing below
   object linked just before a crash is verified without waiting for a
   retry (`TestObjectLinkedBeforeACrashHashCheckedByTheReconcile`).
   *Decision (#113):* a row is dropped unverified by nothing. An object
-  that cannot be read, an upload ID that cannot be read (the reconcile
-  cannot tell whether the upload linked the object), and a failed
-  object that cannot be removed each keep the row, and a hidden
-  leftover beside them, past `AbandonAfter` too, for the next reconcile
+  that cannot be read and a failed object that cannot be removed each
+  keep the row, and a hidden leftover beside them, past `AbandonAfter`
+  too, for the next reconcile
   (`TestAnUnreadableLinkedObjectKeepsItsRowAndLeftover`,
-  `TestAnUnreadableUploadIDKeepsTheRow`,
   `TestAFailedRemovalKeepsTheRowForTheNextReconcile`); a completion
-  whose failed object cannot be removed keeps its row the same way. A
+  whose failed object cannot be removed keeps its row the same way.
+  *Decision (#115):* an upload ID that cannot be read (a corrupt
+  `mp-metadata` attribute) is settled by the hash the object declares
+  in its own metadata, which is what HEAD answers: every upload's
+  object carries the hash its create declared, so a row whose upload
+  is gone and which declares that hash is the one that may have linked
+  it, and one declaring another was not. The reconcile (`declares`)
+  hashes such an object as `landed` does, so the row goes once the
+  object is verified or removed; a hidden leftover beside it is not
+  proven a copy without the upload ID, and falls to the `AbandonAfter`
+  rule. A request (`vouchUnread`) verifies it as that row's upload
+  (`verifyLanded`); with no such row (only live uploads of the key, or
+  rows of another hash) it hashes the object against its declared hash
+  and answers for it on a match, and removes it on a mismatch, so HEAD
+  answers 404 and the borrower sends it again. So a live upload of the
+  key, a rewrite in parts say, is never held up by the attribute, and
+  no object is removed but on a full read that does not match
+  (`TestACorruptUploadIDOnAVerifiedObjectDoesNotBlockALiveUploadOfTheKey`,
+  `TestACorruptUploadIDOnARottedObjectRemovesItSoTheBorrowerSendsItAgain`,
+  `TestAnUnreadableUploadIDIsSettledByTheDeclaredHash`). Such a request
+  hashes the object each time while a row of the key stands, since
+  nothing records the check; that needs a corrupt attribute and an
+  upload of the key at once. An object with no declared hash is not
+  answered for (500). A
   failed object that a rewrite in parts published moves the version it
   replaced back from its tomb (`undoRewrite`: the key's newest tomb, a
   rewrite's, of the marked hash, made since the upload began), as
@@ -4873,9 +4894,40 @@ the handler's own reads and is never cancelled; nothing below
   attribute read, a verified multipart object one more indexed lookup,
   and only the first request after a crash hashes
   (`TestOnlyAnUnverifiedObjectIsHashedOnHeadAndOnlyOnce`). An object
-  that cannot be read or removed, or whose upload ID cannot be read
-  while the borrower has a row for its key, answers 500, so the
-  borrower retries rather than acknowledging. End to end, a borrower's
+  that cannot be read or removed answers 500, so the borrower retries
+  rather than acknowledging. *Decision (#115):* a retried completion
+  whose own object fails its hash answers `NoSuchUpload`, not
+  `BadDigest`: the fault is the lender's, and `BadDigest` would have the
+  borrower refuse the place (`replica.ErrRejected`), where
+  `NoSuchUpload` sends it to its #87 HEAD, which finds the key empty,
+  and it sends the object again
+  (`TestARetriedCompletionWhoseObjectFailsItsHashAnswersNoSuchUpload`;
+  `replica.Worker` lists the parts first and so meets the HEAD path
+  anyway). *Decision (#115):* an upload is settled in one transaction
+  (`state.SettleLentUpload`, `Lending.settle`): its row is dropped and
+  the usage moved by what the object adds less what the row counted,
+  together. A failure moves nothing and keeps the row, and a row
+  already gone moves nothing, so a verification whose row could not be
+  dropped is counted once, by the check the kept row brings next
+  (`TestAVerificationWhoseRowCannotBeDroppedCountsTheObjectOnce`); the
+  completion, `verifyLanded` and the aborts of "the same object again"
+  settle so. The reconcile, which recomputes the sum, still drops rows
+  alone. *Decision (#115):* an upload the reconcile lists but whose
+  parts the store answers `NoSuchUpload` for (posix hid it to complete
+  it in between) is not live: its row is left to the check of rows
+  whose upload is gone, which verifies an object it linked
+  (`TestAnUploadGoneBeforeItsPartsAreListedIsCheckedAsGone`); its
+  hidden directory, if any, is counted by `midCompletion`. *Known race
+  (#115, not fixed):* `vouch` reads the upload ID and the row without
+  the key's lock, and HEAD and a put read the key after it, unlocked
+  (`Lending.HeadObject`, `putLent`'s `existing`). A completion of the
+  same key that links its object between the two is answered for by
+  that HEAD or put from its declared hash before the completion hashes
+  it. It needs two concurrent operations on one key by one borrower,
+  which `replica.Worker` serialises, so it never sends them; it
+  predates #113, and a failed object is still removed by its
+  completion, so only an acknowledgement taken in that window is
+  wrong. End to end, a borrower's
   replication worker whose object went bad on the lender's disk before
   a crash between link and hash sends it again
   (`TestABorrowerRetryingAfterALenderCrashSendsABadObjectAgain`); HEAD,

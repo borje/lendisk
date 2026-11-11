@@ -342,7 +342,7 @@ func TestRetriedCompletionSettlesTheLeftover(t *testing.T) {
 	sent := []byte("sent instead")
 	id, parts = l.uploadParts("data/bad", []byte("declared"), sent)
 	hidden = l.linkedThenCrashed("data/bad", id, parts)
-	if err := l.complete("data/bad", id, parts...); code(err) != "BadDigest" {
+	if err := l.complete("data/bad", id, parts...); code(err) != "NoSuchUpload" { // #115
 		t.Fatalf("the retried completion of a bad object: %v", err)
 	}
 	l.wantThere(hidden, "the leftover of an object that failed its hash")

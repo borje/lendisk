@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -375,36 +374,6 @@ func TestAnUnreadableLinkedObjectKeepsItsRowAndLeftover(t *testing.T) {
 	l.wantGone(hidden, "the leftover of a verified object")
 	l.wantNoRow(*id)
 	l.wantUsage(ov + ov + int64(len(body)))
-}
-
-// LEND-4 (#113): a row whose object's upload ID cannot be read is kept,
-// and the object is not answered for, until the attribute reads again.
-func TestAnUnreadableUploadIDKeepsTheRow(t *testing.T) {
-	l, crash := crashingLender(t, nil)
-	id := l.crashedCompletion(crash, "data/mp", []byte("declared"), []byte("sent instead"))
-	obj, attr := filepath.Join(l.dir, "data", "mp"), "user."+mpMetaAttr
-	good := make([]byte, 4096)
-	n, err := syscall.Getxattr(obj, attr, good)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := syscall.Setxattr(obj, attr, []byte("not upload metadata"), 0); err != nil {
-		t.Fatal(err)
-	}
-	l.reconcileNow()
-	l.wantRow(id)
-	if _, _, err := l.head("data/mp"); status(err) != 500 {
-		t.Fatalf("HEAD of an object whose upload cannot be told: %v", err)
-	}
-
-	if err := syscall.Setxattr(obj, attr, good[:n], 0); err != nil {
-		t.Fatal(err)
-	}
-	l.reconcileNow()
-	l.wantNoRow(id)
-	if _, ok := l.stored("data/mp"); ok {
-		t.Fatal("the object that failed its hash is kept")
-	}
 }
 
 // LEND-4 (#113): an object that fails its hash and cannot be removed
