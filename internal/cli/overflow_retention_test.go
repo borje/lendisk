@@ -43,8 +43,10 @@ func TestScenarioOverflowRetentionAtAnUnversionedProvider(t *testing.T) {
 
 // providerWindow is the retention window of every retention scenario:
 // long enough that a slow or loaded runner checks the target before the
-// held deletes come due (an 8 s window ran out on CI, 2026-11-10).
-const providerWindow = 30 * time.Second
+// held deletes come due (an 8 s window ran out on CI, 2026-11-10; a
+// 30 s one twice on 2026-11-11, the prune to the check and to the
+// undelete's claim taking 48-49 s).
+const providerWindow = 2 * time.Minute
 
 // replacedSince waits for n's daemon to finish a re-placement pass that
 // began after since (its passes run every envReplaceEvery).
