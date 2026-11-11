@@ -199,6 +199,63 @@ func TestTheDaemonFoldsTheOffsiteWatermarksChanges(t *testing.T) {
 	}
 }
 
+// #118: the daemon checks the stored queue sums against the rows at
+// start and then every TallyEvery, repairs a bucket's that drifted
+// (here by hand) and logs it as a warning naming the bucket: the
+// repository size the quota exchange tells friends is right again.
+func TestTheDaemonRepairsADriftedQueueTallyAndWarns(t *testing.T) {
+	parallel(t, 0)
+	o := newOffsiteNode(t, "laptop", "restic")
+	o.ack(o.put("laptop", "data/1", "data", 1000))
+	ctx := t.Context()
+	want, err := o.db.RepositorySize(ctx)
+	if err != nil || want != 1000 {
+		t.Fatalf("repository size %d, want 1000 (%v)", want, err)
+	}
+	if _, err := o.db.Exec(`UPDATE queue_tally SET live_data_bytes = live_data_bytes + 5000 WHERE bucket = 'laptop'`); err != nil {
+		t.Fatal(err)
+	}
+	var log syncBuffer
+	ctx, cancel := context.WithCancel(ctx)
+	stopped := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-stopped })
+	go func() {
+		defer close(stopped)
+		(&offsiteFolder{DB: o.db, Every: 10 * time.Millisecond, TallyEvery: 10 * time.Millisecond,
+			Log: slog.New(slog.NewTextHandler(&log, nil))}).Run(ctx)
+	}()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		got, err := o.db.RepositorySize(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == want && strings.Contains(log.String(), "level=WARN") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("repository size %d, want %d; log:\n%s", got, want, log.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if l := log.String(); !strings.Contains(l, "stored queue sums differed") || !strings.Contains(l, "bucket=laptop") ||
+		strings.Count(l, "level=WARN") != 1 {
+		t.Fatalf("the repair's log:\n%s", l)
+	}
+	// Skewed again: the next check, TallyEvery later, repairs it too.
+	if _, err := o.db.Exec(`UPDATE queue_tally SET live_data_bytes = 0 WHERE bucket = 'laptop'`); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(10 * time.Second); strings.Count(log.String(), "level=WARN") < 2; {
+		if time.Now().After(deadline) {
+			t.Fatalf("not repaired again; log:\n%s", log.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got, err := o.db.RepositorySize(ctx); err != nil || got != want {
+		t.Fatalf("repository size %d, want %d (%v)", got, want, err)
+	}
+}
+
 // REPL-4, REPL-11 (#20): for restic, status names the latest snapshot
 // and whether it is offsite at the bucket's copies, by restic's short ID;
 // while the next one is on its way it says what it waits for, and names

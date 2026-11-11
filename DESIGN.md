@@ -2963,7 +2963,16 @@ upstream bucket is Q-V.
   delete there (a put a delete cancels leaves the count with its row).
   SQLite triggers on `placement` keep it as rows are
   inserted, acknowledged, refused, re-queued, cancelled and moved, so
-  placing an object reads one row per friend. A put acknowledged after
+  placing an object reads one row per friend. *Whatever the writer's
+  conflict policy (#117, schema 55):* SQLite hands the writing
+  statement's `ON CONFLICT` policy to every statement inside its
+  triggers, so the triggers' `INSERT OR IGNORE` of a place's row
+  failed an upsert or an `OR FAIL`/`OR ABORT` write on `placement` or
+  `overflow_tomb` with `UNIQUE constraint failed: place_use.place`,
+  and an `OR REPLACE` one replaced the place's count with 0. Schema 55
+  inserts the row only where it is missing (`WHERE NOT EXISTS`), which
+  meets no conflict, so any writer's policy leaves the count right
+  (`TestPlaceUseIsKeptWhateverTheWritersConflictPolicy`). A put acknowledged after
   a delete of its key was placed at the place (a send in flight, #21)
   landed there, and the lender counts it and then its tomb until the
   purge: it keeps its size, and `AckPlacement` adds that size to the
@@ -4777,9 +4786,10 @@ upstream bucket is Q-V.
     and `OLD`). No `BEFORE` triggers: they fire for a row its writer's
     `OR IGNORE` then skips. Each trigger statement updates the
     bucket's row or inserts it `WHERE NOT EXISTS`, so it meets no
-    conflict. A `REPLACE` deleting a queue row would fire no delete
-    trigger (recursive triggers are off), but `seq` is the only key and
-    no writer names one. The migration fills it from the rows.
+    conflict. A `REPLACE` deleting a queue row on a taken `seq` fires
+    the delete trigger, since `Open` turns recursive triggers on (#118,
+    below). The migration fills it from the rows, and the daemon repairs
+    any drift hourly (#118, below).
   - *Stored by the fold: `below_short`, `below_basis.through`,
     `held_basis`* (`internal/state/belowstore.go`). `BelowCopies`' rows
     (a live put fewer than copies of whose placement rows are queued or
@@ -4836,6 +4846,74 @@ upstream bucket is Q-V.
   million objects, which also reads the below rows and each place's
   first acknowledgement, took 18.7 s instead of 10.2 s, in a read
   transaction and batches as before.
+
+  *Hardening (#118).* `queue_tally` steers decisions, not only
+  `status`: `RepositoryUse` feeds the overflow split and drain and
+  capacity, `RepositorySize` the quota exchange. So:
+  - *Drift is repaired* (`internal/state/tally.go`,
+    `RepairQueueTally`). The daemon's offsite folder checks at its
+    first tick and then hourly (`tallyCheckEvery`): it reads the stored
+    tallies and recomputes them from the rows (each key's latest done
+    row by `queue_key`, the done rows by bucket) in one read
+    transaction, and corrects each bucket that differs by the
+    difference, in one short write transaction. Every write between the
+    read and the correction went through the triggers, which added it
+    to stored and true alike, so the stored tally plus the difference is
+    the rows' as of the correction: no read ever sees a stale value
+    written back, and a bucket without drift is not written. Each
+    corrected bucket is logged as a warning with both tallies
+    (`TestADriftedQueueTallyIsRepairedKeepingTheWritesMeanwhile`, which
+    commits writes between the read and the correction: writing the
+    computed value instead of the difference fails it;
+    `TestTheDaemonRepairsADriftedQueueTallyAndWarns`). Drift can come
+    only from outside the triggers: a manual SQL fix, a `REPLACE` by a
+    connection without recursive triggers (an older lendisk), or a
+    migration that rebuilds `queue` and drops its triggers, which the
+    `state` package comment now forbids without creating them again and
+    refilling what they keep. On a million objects the check reads for
+    1.8 s, once an hour.
+  - *`REPLACE` fires delete triggers.* `Open` sets
+    `recursive_triggers`, so a `REPLACE` that deletes a row on a taken
+    key (`queue.seq`, `placement`'s and `overflow_tomb`'s place and
+    seq) fires its delete triggers: `queue_tally`, `place_use`,
+    `place_freed` and the offsite marks drop the row as for a `DELETE`
+    (`TestAReplaceOntoATakenKeyCountsTheRowItDeletes`: without the
+    pragma each case leaves the tally or `place_use` counting the
+    deleted row, and the queue cases leave its key unmarked, so the
+    stored rows outlive their put and the next fold fails on a
+    duplicate). No writer does this today. With the pragma on, a
+    trigger that writes its own table (or one whose triggers write it
+    back) would fire itself: none writes a table that has triggers
+    (`TestNoTriggerWritesATableThatHasTriggers` reads them from the
+    schema). No writer uses `REPLACE` on those tables, so nothing else
+    changes; `TestQueueTallyEqualsTheRowsWhateverWritesThem` now also
+    replaces and renumbers onto taken `seq`s.
+  - *The upgrade's cost.* Migration 54 fills `queue_tally` with a
+    correlated `NOT EXISTS` over every done put, inside the migration's
+    transaction: 2.0 s for a million objects on the development
+    machine (migration 56's index 0.34 s), once, while `lendisk serve`
+    starts and before it serves; on a Raspberry Pi expect several
+    times that. Not batched: nothing else runs during migration
+    (`TestTheUpgradeAndTallyCheckOfAMillionObjectBucket`, run with
+    `LENDISK_BIG_UPGRADE=1000000`).
+  - *The daemon's other reads of every row.* `DroppedBelowCopies` (the
+    `copies_dropped` alert) reads the puts of dropped copies by a new
+    partial index, `placement_dropped` (schema 56), and counts those
+    live and below copies as before: 4.3 s → 0.17 s on a million
+    objects with ten thousand dropped. `DueReplicas` (every 5 s) reads
+    the replica's FIFO by the partial indexes of `queued` and `dropping`
+    rows instead of every copy at the place: 1.1 s → 0.3 ms. Both equal
+    the queries they replaced in `sameStatusReads`, so after every step
+    of the randomised tests (`droppedBelowFull`, `dueReplicasFull`);
+    `TestAReplicaWaitsForTheCopiesDroppingThere` covers the dropping
+    term, which no test did. Left as they were: `OverflowHolds` (a
+    target's live data copies; cheap only with another stored sum),
+    `DueReplicas`' first-acknowledgement term (only for a replica never
+    answered whose FIFO is not empty), and the per-capture read the
+    #116 measurement found. `PlaceStats`' `EXISTS` stops at the place's
+    first row with a queue row; no writer deletes queue rows and keeps
+    their placement rows (a re-upload's pending row and dropped
+    captures have none, recovery deletes both), so it reads one row.
 
 
   *What `status` names (REPL-4, REPL-11).* Under each bucket, and in
@@ -5931,7 +6009,8 @@ the handler's own reads and is never cancelled; nothing below
     metadata alike. Daily, from the replica's last answer
     (`replica_check.checked_at`, schema 29; `state.DB.DueReplicas`,
     looked at every 5 s; a replica with rows of the bucket `queued` or
-    `dropping` there waits until its FIFO is empty, so a backup in
+    `dropping` there, read by their partial indexes (#118), waits until
+    its FIFO is empty, so a backup in
     progress is not slowed by its challenge, but only until it is more
     than a day (`state.Overdue`) past due, counted from its last answer
     or, never answered, from its first acknowledgement: then it is
@@ -7109,7 +7188,8 @@ the handler's own reads and is never cancelled; nothing below
     #19);
   - `copies_dropped`, subject the bucket: live objects below `copies`
     with a copy dropped at a full or gone friend (§3.4,
-    `state.DB.DroppedBelowCopies`, #19), until written again or
+    `state.DB.DroppedBelowCopies`, #19, read by the dropped copies'
+    partial index since #118), until written again or
     re-placed (#26). It raises at once: the worker calls `Alerted` when
     it drops one. A deficit from placement (the pool had no room for
     `copies` when the object was captured) shows in `status` as bytes

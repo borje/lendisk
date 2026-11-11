@@ -1191,6 +1191,50 @@ var migrations = []Migration{
 		Version: 54, Compat: 1, Release: "0.1",
 		SQL: migration54(),
 	},
+	{
+		Version: 55, Compat: 1, Release: "0.1",
+		SQL: `
+		-- place_use's triggers whatever the writer's conflict policy
+		-- (#117). SQLite hands the outer statement's ON CONFLICT policy
+		-- to every statement inside a trigger, so the INSERT OR IGNORE
+		-- that created a place's row failed an upsert or an OR FAIL or
+		-- OR ABORT write on placement or overflow_tomb ("UNIQUE
+		-- constraint failed: place_use.place"), and an OR REPLACE one
+		-- replaced the place's count with 0. The row is now inserted
+		-- only where missing (WHERE NOT EXISTS), which meets no
+		-- conflict, so no policy applies. Same counts as schemas 12 and
+		-- 41.
+		DROP TRIGGER place_use_insert;
+		CREATE TRIGGER place_use_insert AFTER INSERT ON placement
+		WHEN NEW.state IN ('queued', 'acked') BEGIN
+			INSERT INTO place_use (place, bytes) SELECT NEW.place, 0
+				WHERE NOT EXISTS (SELECT 1 FROM place_use WHERE place = NEW.place);
+			UPDATE place_use SET bytes = bytes + coalesce(NEW.size, 0) WHERE place = NEW.place;
+		END;
+		DROP TRIGGER place_use_update;
+		CREATE TRIGGER place_use_update AFTER UPDATE OF place, state, size ON placement BEGIN
+			UPDATE place_use SET bytes = bytes - coalesce(OLD.size, 0)
+				WHERE place = OLD.place AND OLD.state IN ('queued', 'acked');
+			INSERT INTO place_use (place, bytes) SELECT NEW.place, 0
+				WHERE NOT EXISTS (SELECT 1 FROM place_use WHERE place = NEW.place);
+			UPDATE place_use SET bytes = bytes + coalesce(NEW.size, 0)
+				WHERE place = NEW.place AND NEW.state IN ('queued', 'acked');
+		END;
+		DROP TRIGGER overflow_tomb_insert;
+		CREATE TRIGGER overflow_tomb_insert AFTER INSERT ON overflow_tomb BEGIN
+			INSERT INTO place_use (place, bytes) SELECT NEW.place, 0
+				WHERE NOT EXISTS (SELECT 1 FROM place_use WHERE place = NEW.place);
+			UPDATE place_use SET bytes = bytes + NEW.size WHERE place = NEW.place;
+		END;`,
+	},
+	{
+		Version: 56, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The copies dropped at a full or gone friend (#118): the
+		-- copies-dropped alert (DroppedBelowCopies) reads the puts they
+		-- are of from here, not every live put.
+		CREATE INDEX placement_dropped ON placement (seq) WHERE state = 'dropped';`,
+	},
 }
 
 // migration54 is schema 54's SQL (#116): what status sums over every
@@ -1211,9 +1255,9 @@ var migrations = []Migration{
 // nothing; there are no BEFORE triggers, which would fire for it. Each
 // statement updates the bucket's row, or inserts it when missing
 // (WHERE NOT EXISTS), and so meets no conflict. A REPLACE that deletes
-// a queue row would fire no delete trigger (recursive_triggers is
-// off), but none can happen: the only key is seq, AUTOINCREMENT, which
-// no writer names. The table is filled from the rows as they are.
+// a queue row on a taken seq fires the delete trigger: Open turns
+// recursive_triggers on (#118). The table is filled from the rows as
+// they are; the daemon repairs any drift (RepairQueueTally, #118).
 //
 // below_short stores BelowCopies' rows (each live put that fewer than
 // copies places hold or will hold) as of the places and copies in

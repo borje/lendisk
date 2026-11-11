@@ -400,15 +400,24 @@ func seedNote(ctx context.Context, db *state.DB, bucket string) (string, error) 
 // changes into what it stores (#81).
 const offsiteFoldEvery = 10 * time.Second
 
+// tallyCheckEvery is how often the daemon checks the stored queue sums
+// against the rows (#118).
+const tallyCheckEvery = time.Hour
+
 // offsiteFolder is the daemon's fold of the stored offsite watermark
 // (REPL-11, #81): every Every it stores the short puts of the keys
 // changed since, so `status` reads them rather than every put. A read
 // is correct without it, only slower; a failed fold is logged and
-// tried again at the next tick.
+// tried again at the next tick. At its first tick, then every
+// TallyEvery (zero: tallyCheckEvery), it checks the stored queue sums
+// (queue_tally) against the rows and repairs any drift, logged as a
+// warning (#118): they steer overflow, capacity and the quota
+// exchange, and nothing else would correct them.
 type offsiteFolder struct {
-	DB    *state.DB
-	Every time.Duration
-	Log   *slog.Logger
+	DB         *state.DB
+	Every      time.Duration
+	TallyEvery time.Duration
+	Log        *slog.Logger
 }
 
 // Run folds at once, then every Every, until ctx ends.
@@ -417,16 +426,41 @@ func (f *offsiteFolder) Run(ctx context.Context) {
 	if every <= 0 {
 		every = offsiteFoldEvery
 	}
+	tallyEvery := f.TallyEvery
+	if tallyEvery <= 0 {
+		tallyEvery = tallyCheckEvery
+	}
 	t := time.NewTicker(every)
 	defer t.Stop()
+	var checked time.Time
 	for {
 		if err := f.DB.FoldOffsite(ctx); err != nil && ctx.Err() == nil {
 			f.Log.Error("offsite: storing the watermark's changes failed; status reads them afresh meanwhile", "err", err)
+		}
+		if checked.IsZero() || time.Since(checked) >= tallyEvery {
+			checked = time.Now()
+			f.checkTally(ctx)
 		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
+	}
+}
+
+// checkTally repairs the stored queue sums where they drifted from the
+// rows, and says so.
+func (f *offsiteFolder) checkTally(ctx context.Context) {
+	drift, err := f.DB.RepairQueueTally(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			f.Log.Error("queue: checking the stored queue sums against the rows failed; checking again later", "err", err)
+		}
+		return
+	}
+	for _, d := range drift {
+		f.Log.Warn("queue: a bucket's stored queue sums differed from its rows; repaired",
+			"bucket", d.Bucket, "stored", fmt.Sprintf("%+v", d.Stored), "rows", fmt.Sprintf("%+v", d.Computed))
 	}
 }

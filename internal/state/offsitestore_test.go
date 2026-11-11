@@ -96,15 +96,23 @@ func (p *pool) fold() {
 // points. The removal model (TestRemovalModel) checks the same after
 // each of its steps, through the rest of the real writers.
 func TestStoredWatermarkEqualsTheComputedOne(t *testing.T) {
+	var withDropped atomic.Int64
+	t.Cleanup(func() {
+		if withDropped.Load() == 0 && !t.Failed() {
+			t.Error("no step had a copy dropped below copies: the test does not compare DroppedBelowCopies (#118)")
+		}
+	})
 	for seed := uint64(1); seed <= 4; seed++ {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
 			t.Parallel()
-			storedWatermarkRun(t, seed, 400)
+			withDropped.Add(int64(storedWatermarkRun(t, seed, 400)))
 		})
 	}
 }
 
-func storedWatermarkRun(t *testing.T, seed uint64, steps int) {
+// storedWatermarkRun runs seed's steps and returns how many of them
+// left copies dropped below copies.
+func storedWatermarkRun(t *testing.T, seed uint64, steps int) (withDropped int) {
 	p := newPool(t)
 	p.db.ReplaceAfter = 7 * 24 * time.Hour
 	ctx := context.Background()
@@ -322,12 +330,19 @@ func storedWatermarkRun(t *testing.T, seed uint64, steps int) {
 			from := max(0, len(log)-30)
 			t.Fatalf("seed %d step %d: %s\nlast steps:\n%v", seed, step, diff, log[from:])
 		}
+		if d, err := p.db.DroppedBelowCopies(ctx); err != nil {
+			t.Fatal(err)
+		} else if len(d) > 0 {
+			withDropped++
+		}
 	}
 	if usedStored < steps/2 || usedStoredBelow < steps/2 {
 		t.Fatalf("the stored rows were read in %d and %d of %d reads: the test compares the full computation with itself",
 			usedStored, usedStoredBelow, 2*steps)
 	}
-	t.Logf("%d of %d reads used the stored rows, %d the stored below rows", usedStored, 2*steps, usedStoredBelow)
+	t.Logf("%d of %d reads used the stored rows, %d the stored below rows; %d steps had copies dropped below copies",
+		usedStored, 2*steps, usedStoredBelow, withDropped)
+	return withDropped
 }
 
 // REPL-11 (#81): a fold that read before a key changed clears only the

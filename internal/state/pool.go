@@ -1077,8 +1077,13 @@ func (db *DB) GonePlaces(ctx context.Context, now time.Time) (map[string]time.Ti
 // with a copy dropped at a full or gone friend (Reroute): data held at
 // fewer places for want of room (alert.KindCopiesDropped). Writing the
 // key again, or re-placement (#26), clears it.
+//
+// It reads the puts the dropped copies are of, by their partial index
+// (schema 56, #118), and counts those that are live and below copies
+// as below does: it costs the dropped copies, not every live put.
 func (db *DB) DroppedBelowCopies(ctx context.Context) (map[string]BelowStat, error) {
-	return db.below(ctx, `AND EXISTS (SELECT 1 FROM placement p WHERE p.seq = q.seq AND p.state = '`+PlacementDropped+`')`)
+	return db.below(ctx, `AND q.seq IN (SELECT seq FROM placement INDEXED BY placement_dropped
+		WHERE state = '`+PlacementDropped+`')`)
 }
 
 // PlaceUse returns the borrower's count of what each place holds or

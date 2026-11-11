@@ -505,6 +505,14 @@ func TestOffsiteOfALargeBucketIsFast(t *testing.T) {
 // straight to the tables; then one more data object, still queued,
 // whose sequence it returns.
 func (p *pool) largeBucket(objects int) int64 {
+	p.t.Helper()
+	p.largeRows(objects)
+	return p.put("laptop", "data/last", "data", 1)
+}
+
+// largeRows is largeBucket but its last object: the friends, the
+// bucket and the rows, as any schema since 12 holds them.
+func (p *pool) largeRows(objects int) {
 	t := p.t
 	t.Helper()
 	ctx := context.Background()
@@ -540,7 +548,6 @@ func (p *pool) largeBucket(objects int) int64 {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	return p.put("laptop", "data/last", "data", 1)
 }
 
 // REPL-4, REPL-11 (#20): Offsite names the latest snapshot key at or
