@@ -4806,13 +4806,63 @@ the handler's own reads and is never cancelled; nothing below
   counts each as an open upload (its overhead and its part files) and
   keeps and resets its row, so the borrower is never undercounted for
   bytes on the lender's disk. Once the directory's change time (set by
-  the hiding rename) is `AbandonAfter` old it is removed and its row
-  dropped, as an abandoned upload is aborted, since its bytes are
-  garbage: no S3 call can list, read, complete or abort it (a retried
-  completion is answered from the directory's name alone), and its
-  parts are either a copy of the object already linked or the bytes of
-  a completion the borrower never had acknowledged, which its
+  the hiding rename; on non-Linux builds its modification time, which
+  the last part written into it set, not the rename) is `AbandonAfter`
+  old it is removed and its row dropped, as an abandoned upload is
+  aborted, since its bytes are garbage: no S3 call can list, read,
+  complete or abort it (posix answers a retried completion with the
+  same parts from the directory's name alone, a 200 with no object; in
+  lendisk the retry then fails its hash read with a 500, the row is
+  dropped, and a further retry gets `NoSuchUpload`), and its parts are
+  either a copy of the object already linked or the bytes of a
+  completion the borrower never had acknowledged, which its
   replication sends again (`TestUploadLeftMidCompletionCountedThenRemoved`).
+  *Decision (#112):* a leftover is removed at once only on proof that
+  it is a copy: its row names this bucket and a key whose directory it
+  is in, the object at that key carries its upload ID, and the object
+  hashes to the hash the upload declared. The reconcile then drops the
+  row and charges the object alone, not it twice for a week
+  (`TestLinkedLeftoverHashCheckedAndRemovedAtOnce`, which also shows a
+  sibling upload of the key surviving); a completion retried over such
+  a leftover verifies the object (`verifyLanded`) and removes it the
+  same way (`TestRetriedCompletionSettlesTheLeftover`). If the object
+  does not match, the leftover is not deleted on that evidence: it is
+  kept and counted, the mismatch logged at warn, and the object
+  removed (and taken out of the sum) as a failed completion's would be,
+  so the borrower, which never had the completion acknowledged, sends
+  it again; the leftover then falls to the `AbandonAfter` rule
+  (`TestLinkedLeftoverFailingItsHashKeptAndObjectDropped`). An object
+  that cannot be read leaves all as it is until the next reconcile. A
+  row whose upload the store no longer lists is likewise hashed before
+  it is dropped when the upload assembled the object at its key, so an
+  object linked just before a crash is verified without waiting for a
+  retry (`TestObjectLinkedBeforeACrashHashCheckedByTheReconcile`). A
+  completion that fails after posix's stub answer counts what stays on
+  disk of its upload (`Lending.leftBehind`) instead of freeing it all
+  (`TestFailedCompletionLeftoverStaysCounted`); a leftover with no row
+  is counted as one with a row (`TestFreshLeftoverWithoutARowCounted`).
+  A key's directory, or `.sgwtmp` itself, that cannot be read is
+  skipped with a warning and the rest of the reconcile runs
+  (`TestUnreadableKeyDirectorySkipped`). Named temp files are reconciled
+  too: where `O_TMPFILE` is unavailable posix writes a put's, a
+  completion's or a part's bytes to `os.CreateTemp(dir, "<sha256 hex>.")`,
+  named `<64 hex>.<decimal uint32>`, in `.sgwtmp/` or in the key's
+  directory, and a crash leaves it. Holding the publication lock
+  exclusively, the only operation that can own one is a write whose
+  body is still streaming, and posix holds that file open from its
+  creation until it publishes (which starts only once the body ended,
+  under the publication lock shared) or removes it. So the reconcile
+  reads the files this process holds open (`/proc/self/fd`, by device
+  and inode) after listing each directory, skips those, and counts the
+  others' bytes; one whose change time is `AbandonAfter` old is removed
+  (`TestCrashLeftTempFilesCountedThenRemoved`). Off Linux, where the
+  open files are not read, temp files are left alone. Nothing is
+  touched outside `.sgwtmp` and `.sgwtmp/multipart/<key>/` of a lent
+  bucket, only those names, and never through a symlink: a directory
+  must be one itself (`Lstat`), a temp file a regular file, and
+  `RemoveAll` unlinks a symlink inside without following it. Hashing
+  under the exclusive lock holds the borrower's publications for the
+  read, which happens only after a crash.
   `lending.max_total` bounds the sum of the node's own numbers;
   `peer quota`, `invite` and `peer add` refuse a value that would
   exceed it (LEND-8, §3.2); unset, it is the store's filesystem size less
