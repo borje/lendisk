@@ -545,7 +545,11 @@ func TestStoredOffsiteOfAMillionObjectBucketIsFast(t *testing.T) {
 // REPL-11 (#81 review): the offsite read of a quiet bucket, written
 // before a busy one's many rows, finds its latest, next and last fully
 // placed writes by its own rows (queue_bucket_seq), not by walking the
-// busy bucket's: it takes less than one plain scan of the queue.
+// busy bucket's: it takes less than one plain scan of the queue. The
+// busy bucket has 50,000 rows with or without -race: with 5,000 the
+// read's own cost under -race matched a scan (CI at 9740485).
+const quietBusyRows = 50_000
+
 func TestAQuietBucketsOffsiteDoesNotWalkABusyOnesRows(t *testing.T) {
 	p := newPool(t)
 	ctx := context.Background()
@@ -556,10 +560,14 @@ func TestAQuietBucketsOffsiteDoesNotWalkABusyOnesRows(t *testing.T) {
 	p.bucket("busy", 2)
 	if _, err := p.db.ExecContext(ctx, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
 		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
-		SELECT 'busy', 'data/' || i, 'put', 'data', 'done', 1000, 'h' || i, 0 FROM n`, settleKeys/4); err != nil {
+		SELECT 'busy', 'data/' || i, 'put', 'data', 'done', 1000, 'h' || i, 0 FROM n`, quietBusyRows); err != nil {
 		t.Fatal(err)
 	}
-	p.fold()
+	// Only the quiet bucket is folded: its read is what is measured, and
+	// folding the busy one's rows under -race took most of a minute.
+	if err := p.db.foldBucket(ctx, "quiet"); err != nil {
+		t.Fatal(err)
+	}
 	took, yard := time.Duration(1<<62), time.Duration(1<<62)
 	for range 3 {
 		start := time.Now()
@@ -575,7 +583,7 @@ func TestAQuietBucketsOffsiteDoesNotWalkABusyOnesRows(t *testing.T) {
 			t.Fatalf("the quiet bucket: %+v", o)
 		}
 	}
-	t.Logf("the quiet bucket's offsite read took %v; a scan of the queue's %d rows %v", took, settleKeys/4+1, yard)
+	t.Logf("the quiet bucket's offsite read took %v; a scan of the queue's %d rows %v", took, quietBusyRows+1, yard)
 	if took > yard {
 		t.Fatalf("the quiet bucket's offsite read took %v, more than a scan of the queue (%v)", took, yard)
 	}
