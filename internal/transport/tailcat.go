@@ -72,6 +72,8 @@ type Tailcat struct {
 	// addresses dialled (see relay).
 	relays relays
 
+	strayOnce sync.Once // warns once that dropStray cannot work
+
 	mu sync.Mutex
 	// endpoints gives a friend's explicit addresses (NET-3), dialled
 	// directly; nil for none. port is the UDP port the server's engine
@@ -404,6 +406,7 @@ func (t *Tailcat) Dial(ctx context.Context, peer identity.NodeID, addr string) (
 		t.direct(ctx, c, t.endpointsOf(ctx, peer.String(), endpoints(peer)))
 	}
 
+	t.dropStray(c)
 	conn, err := t.dial(ctx, c)
 	if err == nil {
 		t.mu.Lock()
@@ -485,6 +488,7 @@ func (t *Tailcat) clientFor(ctx context.Context, peer identity.NodeID, relay rel
 func (t *Tailcat) probe(stop context.Context, c *tailcatClient) {
 	var dead *tailcatClient
 	for {
+		t.dropStray(c)
 		ctx, cancel := context.WithTimeout(stop, t.probeTimeout)
 		err := t.check(ctx, c)
 		cancel()
@@ -518,6 +522,27 @@ func (t *Tailcat) probe(stop context.Context, c *tailcatClient) {
 	t.mu.Unlock()
 	dead.shut()
 	last.shut()
+}
+
+// dropStray removes from c's stack any tunnel address that is not its
+// own (#111, dropStrayAddresses), before each dial and each check: a
+// stray address takes every new dial's SYNs, which the friend drops.
+// The dial that met it fails at its timeout and the next one goes
+// through, without replacing the client, so the transfers it carries
+// go on. A tailcat whose internals changed is warned of once; the
+// client is then replaced by its failed checks as before.
+func (t *Tailcat) dropStray(c *tailcatClient) {
+	dropped, err := dropStrayAddresses(c.Client)
+	if err != nil {
+		t.strayOnce.Do(func() {
+			t.log.Warn("transport: stray tunnel addresses cannot be removed from a client; a friend's dials that meet one time out until the client is replaced",
+				"peer", c.peer.String(), "err", err)
+		})
+	}
+	for _, a := range dropped {
+		t.log.Info("transport: removed a stray address from the tunnel to a friend; it would have taken the friend's dials",
+			"peer", c.peer.String(), "addr", a.String())
+	}
 }
 
 // dialCheck is the default check: a dial through c.
