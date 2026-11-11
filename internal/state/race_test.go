@@ -32,3 +32,11 @@ const (
 	offsiteLimit   = 0
 	offsiteFactor  = 8 // it measures under 3 with or without -race
 )
+
+// foldHold and foldWait bound the full-fold test: a loaded CI runner
+// under the race detector stretched one step past the budget to a
+// 530 ms batch (7974d73), so the bound is the settle test's second.
+const (
+	foldHold = time.Second
+	foldWait = 1500 * time.Millisecond
+)

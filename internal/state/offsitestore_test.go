@@ -437,10 +437,10 @@ func TestAFullFoldKeepsWritersMoving(t *testing.T) {
 	t.Logf("a full fold of %d objects took %v in %d batches, the longest %v; the longest write beside it waited %v",
 		objects, took, batches, longest, time.Duration(worst.Load()))
 	// A batch ends after the row that passes the budget.
-	if longest > 500*time.Millisecond {
-		t.Fatalf("a fold's write transaction held the lock %v, over twice SettleBudget (0.25 s)", longest)
+	if longest > foldHold {
+		t.Fatalf("a fold's write transaction held the lock %v, over %v", longest, foldHold)
 	}
-	if w := time.Duration(worst.Load()); w > 750*time.Millisecond {
+	if w := time.Duration(worst.Load()); w > foldWait {
 		t.Fatalf("a write waited %v while the fold took %v", w, took)
 	}
 	var n int
