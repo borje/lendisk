@@ -1099,11 +1099,11 @@ func TestHungStoreReadIsTheStoresFault(t *testing.T) {
 	if len(logs.alerts("store")) == 0 {
 		t.Fatal("not alerted")
 	}
-	// The sender is not stuck behind the hung read: the object is sent
-	// while that read still blocks.
+	// Once the hung read returns, the store is called again and the
+	// object is sent (#67).
 	hung.Store(false)
-	fx.drained("B")
 	close(release)
+	fx.drained("B")
 	// The condition is reset after the FIFO drains, not with it.
 	waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
 }
@@ -1141,8 +1141,8 @@ func TestHungReHashIsTheStoresFault(t *testing.T) {
 	}
 	hung.Store(0)
 	reject.Store(false)
-	fx.drained("B")
 	close(release)
+	fx.drained("B")
 	// The condition is reset after the FIFO drains, not with it.
 	waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
 }
@@ -1180,58 +1180,64 @@ func TestHungStoreReadDoesNotHangTheRealClient(t *testing.T) {
 	if c := fx.condition(place); !strings.Contains(c.Detail, "did not return") {
 		t.Fatalf("condition %+v", c)
 	}
-	// The sender is free while the hung read still blocks: once the
-	// disk answers new reads, the object is sent.
+	// Once the disk answers the hung read, the object is sent.
 	hung.Store(false)
+	unhang()
 	fx.drained(place)
 	// The condition is reset after the FIFO drains, not with it.
 	waitFor(t, "ok", func() bool { return fx.condition(place).Condition == state.ConditionOK })
-	unhang()
 }
 
-// statHungFile is a store file whose Stat blocks until release is closed.
+// statHungFile is a store file whose Stat blocks in block.
 type statHungFile struct {
 	fs.File
-	entered func()
-	release chan struct{}
+	block func()
 }
 
 func (f *statHungFile) Stat() (fs.FileInfo, error) {
-	f.entered()
-	<-f.release
+	f.block()
 	return nil, errors.New("released")
 }
 
+// readHungFile is a store file whose reads block in block.
+type readHungFile struct {
+	fs.File
+	block func()
+}
+
+func (f *readHungFile) Read([]byte) (int, error) {
+	f.block()
+	return 0, errors.New("released")
+}
+
 // storeHang makes one of the store calls made before an object is read
-// block, while hung is set, until release is closed: opening the object,
-// stating it, or stating its bucket's directory (reached when opening
-// fails). entered is called when a call blocks.
+// block in block while hung is set: opening the object, stating it, or
+// stating its bucket's directory (reached when opening fails).
 type storeHang struct {
 	name string
-	set  func(w *Worker, hung *atomic.Bool, entered func(), release chan struct{})
+	set  func(w *Worker, hung *atomic.Bool, block func())
 }
 
 var storeHangs = []storeHang{
-	{"opening the object", func(w *Worker, hung *atomic.Bool, entered func(), release chan struct{}) {
+	{"opening the object", func(w *Worker, hung *atomic.Bool, block func()) {
 		w.open = func(name string) (fs.File, error) {
 			if hung.Load() {
-				entered()
-				<-release
+				block()
 				return nil, errors.New("released")
 			}
 			return os.Open(name)
 		}
 	}},
-	{"stating the object", func(w *Worker, hung *atomic.Bool, entered func(), release chan struct{}) {
+	{"stating the object", func(w *Worker, hung *atomic.Bool, block func()) {
 		w.open = func(name string) (fs.File, error) {
 			f, err := os.Open(name)
 			if err != nil || !hung.Load() {
 				return f, err
 			}
-			return &statHungFile{File: f, entered: entered, release: release}, nil
+			return &statHungFile{File: f, block: block}, nil
 		}
 	}},
-	{"stating the bucket", func(w *Worker, hung *atomic.Bool, entered func(), release chan struct{}) {
+	{"stating the bucket", func(w *Worker, hung *atomic.Bool, block func()) {
 		w.open = func(name string) (fs.File, error) {
 			if hung.Load() {
 				return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.EIO}
@@ -1240,8 +1246,7 @@ var storeHangs = []storeHang{
 		}
 		w.stat = func(name string) (fs.FileInfo, error) {
 			if hung.Load() {
-				entered()
-				<-release
+				block()
 				return nil, errors.New("released")
 			}
 			return os.Stat(name)
@@ -1251,8 +1256,8 @@ var storeHangs = []storeHang{
 
 // REPL-3, OPS-1 (#63): opening or stating an object, or stating its
 // bucket's directory, that never returns is bounded like a read: the
-// place shows store, the failure is alerted, and the sender is not stuck
-// behind the disk.
+// place shows store, the failure is alerted, and once the disk answers
+// the object is sent.
 func TestHungStoreOpenOrStatIsTheStoresFault(t *testing.T) {
 	for _, h := range storeHangs {
 		t.Run(h.name, func(t *testing.T) {
@@ -1261,11 +1266,13 @@ func TestHungStoreOpenOrStatIsTheStoresFault(t *testing.T) {
 			logs := fx.logTo()
 			fx.write("laptop", "data/1", "one")
 			release := make(chan struct{})
+			var once sync.Once
+			unhang := func() { once.Do(func() { close(release) }) }
 			var hung atomic.Bool
 			hung.Store(true)
-			h.set(fx.w, &hung, func() {}, release)
+			h.set(fx.w, &hung, func() { <-release })
 			fx.run()
-			t.Cleanup(func() { close(release) }) // runs before the worker stops
+			t.Cleanup(unhang) // runs before the worker stops
 			waitFor(t, "store", func() bool { return fx.condition("B").Condition == state.ConditionStore })
 			if c := fx.condition("B"); !strings.Contains(c.Detail, "did not return") {
 				t.Fatalf("condition %+v", c)
@@ -1274,6 +1281,7 @@ func TestHungStoreOpenOrStatIsTheStoresFault(t *testing.T) {
 				t.Fatal("not alerted")
 			}
 			hung.Store(false)
+			unhang()
 			fx.drained("B")
 			waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
 		})
@@ -1298,7 +1306,8 @@ func TestHungStoreOpenOrStatDoesNotBlockShutdown(t *testing.T) {
 				case entered <- struct{}{}:
 				default:
 				}
-			}, release)
+				<-release
+			})
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
 			go func() { defer close(done); fx.w.Run(ctx) }()
@@ -1314,6 +1323,87 @@ func TestHungStoreOpenOrStatDoesNotBlockShutdown(t *testing.T) {
 				t.Fatal("the worker did not stop while a store call blocked")
 			}
 		})
+	}
+}
+
+// REPL-3, OPS-1 (#67): a store call that never returns is not followed
+// by another: across many retry rounds no new call goes into the store
+// while it is stuck, so one goroutine at most is stuck there, not one
+// per round. The place stays store meanwhile, and once the call returns
+// the object is sent.
+func TestStuckStoreCallIsNotRepeatedAcrossRetries(t *testing.T) {
+	hangs := append(append([]storeHang{}, storeHangs...), storeHang{"reading the object",
+		func(w *Worker, hung *atomic.Bool, block func()) {
+			w.open = func(name string) (fs.File, error) {
+				f, err := os.Open(name)
+				if err != nil || !hung.Load() {
+					return f, err
+				}
+				return &readHungFile{File: f, block: block}, nil
+			}
+		}})
+	for _, h := range hangs {
+		t.Run(h.name, func(t *testing.T) {
+			fx := newFixture(t, "B")
+			fx.w.StoreStall = 10 * time.Millisecond
+			fx.write("laptop", "data/1", "one")
+			release := make(chan struct{})
+			var once sync.Once
+			unhang := func() { once.Do(func() { close(release) }) }
+			var hung atomic.Bool
+			hung.Store(true)
+			var calls, stuck, most atomic.Int32
+			h.set(fx.w, &hung, func() {
+				calls.Add(1)
+				n := stuck.Add(1)
+				for m := most.Load(); n > m && !most.CompareAndSwap(m, n); m = most.Load() {
+				}
+				<-release
+				stuck.Add(-1)
+			})
+			fx.run()
+			t.Cleanup(unhang) // runs before the worker stops
+			waitFor(t, "store", func() bool { return fx.condition("B").Condition == state.ConditionStore })
+			// Some fifty more rounds, each a stall and a backoff (≤30 ms).
+			time.Sleep(1500 * time.Millisecond)
+			if calls.Load() != 1 || most.Load() != 1 || stuck.Load() != 1 {
+				t.Fatalf("%d calls made into the hung store, at most %d stuck at once, %d stuck now; want 1, 1, 1",
+					calls.Load(), most.Load(), stuck.Load())
+			}
+			// The retries were made, and held back by the stuck call.
+			if c := fx.condition("B"); c.Condition != state.ConditionStore || !strings.Contains(c.Detail, "still has not") {
+				t.Fatalf("condition %+v while the store call is stuck", c)
+			}
+			hung.Store(false)
+			unhang()
+			fx.drained("B")
+			waitFor(t, "ok", func() bool { return fx.condition("B").Condition == state.ConditionOK })
+		})
+	}
+}
+
+// REPL-3, OPS-1 (#67): a store call held back by a stuck one gives up
+// as soon as its sender stops, so stopping the daemon never waits on a
+// wedged disk.
+func TestHeldBackStoreCallEndsWithItsSender(t *testing.T) {
+	var g storeGate
+	returned := g.stuckCall("opening laptop/data/1")
+	defer returned()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- g.pass(ctx, time.Hour) }()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("pass = %v, want the sender's cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a held-back store call did not end with its sender")
+	}
+	returned()
+	if err := g.pass(t.Context(), time.Hour); err != nil {
+		t.Fatalf("the store is still held back after its stuck call returned: %v", err)
 	}
 }
 
