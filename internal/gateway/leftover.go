@@ -150,9 +150,13 @@ func (l *Lending) midCompletion(ctx context.Context, peer string, id identity.No
 //     drops the object, as a completion would; the directory is kept and
 //     counted, and the borrower sends it again: no request answers for
 //     the object before the lender verified it (vouch, #113). An object
-//     that cannot be read or removed, or whose upload ID cannot be read,
-//     leaves everything as it is, past AbandonAfter too, until a
-//     reconcile can tell.
+//     that cannot be read or removed leaves everything as it is, past
+//     AbandonAfter too, until a reconcile can tell.
+//   - If the object's upload ID cannot be read, the row is judged by
+//     its trusted hash (unreadRow, #115): settled (verified, proven
+//     another upload's, or failed and removed) it is dropped, but that
+//     proves nothing of the directory, which falls to the next rule;
+//     otherwise both are kept.
 //   - Otherwise, once the directory has been still for AbandonAfter
 //     (its change time: the hiding rename sets it on Linux) it is
 //     removed, as an abandoned upload is aborted.
@@ -180,9 +184,21 @@ func (l *Lending) hiddenUpload(ctx context.Context, peer string, id identity.Nod
 	if !verified[uid] && hasRow && LentName(id, row.Sealed) == bucket && keyDirName(row.Key) == filepath.Base(keyDir) {
 		linked, err := l.linkedBy(bucket, row.Key, uid)
 		if err != nil {
-			l.log().Warn("lending: the upload ID of an object a hidden upload may have assembled cannot be read; keeping both",
-				"peer", peer, "bucket", bucket, "key", row.Key, "upload", uid, "err", err)
-			kept = true
+			// Judged by a trusted hash alone (#115): settled, the
+			// directory is not proven a copy of the object without the
+			// upload ID, and falls to the abandon rule.
+			delta, drop := l.unreadRow(ctx, peer, bucket, row)
+			total += delta
+			switch {
+			case !drop:
+				kept = true
+			case delta < 0:
+				l.dropUpload(uid)
+				hasRow, bad = false, true
+			default:
+				l.dropUpload(uid)
+				hasRow = false
+			}
 		} else if linked {
 			delta, v := l.landed(ctx, peer, bucket, row)
 			total += delta

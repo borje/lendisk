@@ -988,7 +988,8 @@ func TestCompletionRefusedWhenAPutLandsFirst(t *testing.T) {
 
 // LEND-4: an upload completed in the store but never verified (a crash
 // came between) is verified when its completion is retried: a mismatch
-// is removed and refused.
+// is removed and answered NoSuchUpload, so the borrower sends it again
+// (#115).
 func TestRetriedCompletionVerifiedAfterACrash(t *testing.T) {
 	l := lendTo(t, 1<<30, nil)
 	ctx := context.Background()
@@ -1010,7 +1011,7 @@ func TestRetriedCompletionVerifiedAfterACrash(t *testing.T) {
 	if _, _, err := be.CompleteMultipartUpload(ctx, in); err != nil {
 		t.Fatal(err)
 	}
-	if err := l.complete("data/k", id, cp); code(err) != "BadDigest" {
+	if err := l.complete("data/k", id, cp); code(err) != "NoSuchUpload" { // #115
 		t.Fatalf("the retried completion: %v", err)
 	}
 	if _, ok := l.stored("data/k"); ok {

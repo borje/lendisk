@@ -1020,8 +1020,14 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 	// An object at the key that an upload linked before a crash, never
 	// verified, is verified first (#113): this upload's (a retried
 	// completion) or another's, whose declared hash would otherwise
-	// answer for it.
-	if linked, err := l.vouchLocked(ctx, peer, sealed, bucket, key); err != nil && (err != errBadDigest || linked == uploadID) {
+	// answer for it. This upload's own object failing its hash after a
+	// crash is the lender's to answer for, not the borrower's bytes: it
+	// answers NoSuchUpload, so the borrower asks for the key (#87), finds
+	// it gone and sends it again, where BadDigest would have it refuse
+	// the place (replica.ErrRejected) (#115).
+	if linked, err := l.vouchLocked(ctx, peer, sealed, bucket, key); err == errBadDigest && linked == uploadID {
+		return none, "", errNoSuchUpload
+	} else if err != nil && err != errBadDigest {
 		return none, "", err
 	}
 	u, uerr := l.upload(ctx, peer, sealed, key, in.UploadId)
@@ -1078,8 +1084,7 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		if err := l.Next.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: in.Bucket, Key: in.Key, UploadId: in.UploadId}); err != nil {
 			return none, "", err
 		}
-		l.count(peer, -(parts + itemOverhead))
-		l.dropUpload(uploadID)
+		l.settle(peer, uploadID, -itemOverhead)
 		etag, err := l.revive(ctx, bucket, *tomb)
 		if err != nil {
 			return none, "", err
@@ -1091,8 +1096,7 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		if err := l.Next.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{Bucket: in.Bucket, Key: in.Key, UploadId: in.UploadId}); err != nil {
 			return none, "", err
 		}
-		l.count(peer, -(parts + itemOverhead))
-		l.dropUpload(uploadID)
+		l.settle(peer, uploadID, -itemOverhead)
 		etag := old.etag
 		return s3response.CompleteMultipartUploadResult{Bucket: in.Bucket, Key: in.Key, ETag: &etag}, "", nil
 	}
@@ -1151,8 +1155,7 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		}
 		undo()
 		// What the store left of the upload stays counted (#112).
-		l.count(peer, l.leftBehind(bucket, key, uploadID)-(parts+itemOverhead))
-		l.dropUpload(uploadID)
+		l.settle(peer, uploadID, l.leftBehind(bucket, key, uploadID)-itemOverhead)
 		if err != nil {
 			l.log().Error("lending: reading a completed upload to verify it failed; removed it", "bucket", bucket, "key", key, "err", err)
 			return none, "", errInternal
@@ -1164,8 +1167,7 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 			l.log().Warn("lending: marking a rewrite's tombstone kept failed; the next start settles it", "bucket", bucket, "key", key, "err", err)
 		}
 	}
-	l.count(peer, n-parts)
-	l.dropUpload(uploadID)
+	l.settle(peer, uploadID, n)
 	return res, ver, nil
 }
 
@@ -1228,19 +1230,47 @@ func (l *Lending) verifyLanded(ctx context.Context, peer, bucket, key string, u 
 			return errInternal
 		}
 		l.undoRewrite(ctx, bucket, u)
-		l.count(peer, l.leftBehind(bucket, key, u.UploadID)-(u.Counted+itemOverhead))
-		l.dropUpload(u.UploadID)
+		l.settle(peer, u.UploadID, l.leftBehind(bucket, key, u.UploadID)-itemOverhead)
 		return errBadDigest
 	}
-	l.dropUpload(u.UploadID)
+	if !l.settle(peer, u.UploadID, old.size) {
+		// Verified, but still recorded: the next check hashes it again
+		// and counts it then, once (#115).
+		return nil
+	}
 	for _, dir := range l.hiddenDirs(bucket, key, u.UploadID) {
 		if !l.removeHidden(peer, bucket, u.UploadID, dir, "its object is linked and verified") {
 			l.count(peer, l.leftBehind(bucket, key, u.UploadID)) // what stays on disk stays counted
 			break
 		}
 	}
-	l.count(peer, old.size-u.Counted)
 	return nil
+}
+
+// settle forgets upload uploadID, finished, and moves peer's counter by
+// add less the part bytes its row counted, together (SettleLentUpload):
+// a row that survives a failure has counted nothing, so the next check
+// of it counts once, and a row already settled counts nothing (#115).
+// It reports whether the row is gone. The caller holds the borrower's
+// pub lock shared.
+func (l *Lending) settle(peer, uploadID string, add int64) bool {
+	u := l.use(peer)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.loadLocked(peer, u); err != nil {
+		l.log().Error("lending: reading the borrower's usage failed; the upload stays recorded, to settle later", "peer", peer, "err", err)
+		return false
+	}
+	delta, err := l.DB.SettleLentUpload(context.Background(), peer, uploadID, add)
+	if errors.Is(err, state.ErrNotFound) {
+		return true
+	}
+	if err != nil {
+		l.log().Warn("lending: settling a finished upload failed; it stays recorded, to settle later", "upload", uploadID, "err", err)
+		return false
+	}
+	u.used = max(u.used+delta, 0)
+	return true
 }
 
 func (l *Lending) dropUpload(uploadID string) {
@@ -1335,9 +1365,11 @@ func (l *Lending) reconcileOne(ctx context.Context, peer string) error {
 // kept upload's row is set to its parts. What a crash left under
 // .sgwtmp is counted, and removed when garbage (midCompletion). A row
 // whose upload the store no longer has is dropped, its object hashed
-// first if the upload assembled the one at its key (landed); one whose
-// object cannot be read or removed, or whose upload ID cannot be read,
-// is kept to try again (#113). Nothing else drops one.
+// first if the upload assembled the one at its key (landed), or, when
+// the object's upload ID cannot be read, judged by the row's hash
+// (unreadRow, #115); one whose object cannot be read or removed, or
+// that no trusted hash settles, is kept to try again (#113). Nothing
+// else drops one.
 func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 	id, err := identity.ParseNodeID(peer)
 	if err != nil {
@@ -1400,7 +1432,13 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 					continue
 				}
 				ps, err := l.parts(ctx, bucket, k, uid)
-				if err != nil && !isCode(err, "NoSuchUpload") {
+				if isCode(err, "NoSuchUpload") {
+					// Gone since the listing (posix hid it to complete
+					// it): not live, so its row is left to the check
+					// below, which verifies an object it linked (#115).
+					continue
+				}
+				if err != nil {
 					return 0, err
 				}
 				live[uid] = true
@@ -1436,8 +1474,13 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 		bucket := LentName(id, r.Sealed)
 		linked, err := l.linkedBy(bucket, r.Key, r.UploadID)
 		if err != nil {
-			l.log().Warn("lending: the upload ID of an object a borrower's upload may have assembled cannot be read; keeping its row",
-				"peer", peer, "bucket", bucket, "key", r.Key, "upload", r.UploadID, "err", err)
+			// The upload ID cannot tell: only a trusted hash settles
+			// the row (unreadRow, #115).
+			n, drop := l.unreadRow(ctx, peer, bucket, r)
+			total += n
+			if drop {
+				l.dropUpload(r.UploadID)
+			}
 			continue
 		}
 		if linked {

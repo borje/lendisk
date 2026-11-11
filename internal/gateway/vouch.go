@@ -66,20 +66,7 @@ func (l *Lending) vouchLocked(ctx context.Context, peer, sealed, bucket, key str
 	}
 	uid, err := l.Uploads.UploadID(bucket, key)
 	if err != nil {
-		// The object may be one a recorded upload of this key linked:
-		// it cannot be answered for until its attribute reads.
-		us, rerr := l.DB.LentUploads(ctx, peer)
-		if rerr != nil {
-			return "", errInternal
-		}
-		for _, u := range us {
-			if u.Sealed == sealed && u.Key == key {
-				l.log().Warn("lending: the upload ID of an object a borrower's upload may have assembled cannot be read; not answering for it",
-					"peer", peer, "bucket", bucket, "key", key, "err", err)
-				return "", errInternal
-			}
-		}
-		return "", nil
+		return l.vouchUnread(ctx, peer, sealed, bucket, key, err)
 	}
 	if uid == "" {
 		return "", nil
@@ -102,6 +89,21 @@ func (l *Lending) vouchLocked(ctx context.Context, peer, sealed, bucket, key str
 		l.afterVouchRead()
 	}
 	return uid, l.verifyLanded(ctx, peer, bucket, key, u, old)
+}
+
+// rowsOfKey lists peer's recorded uploads of key in sealed.
+func (l *Lending) rowsOfKey(ctx context.Context, peer, sealed, key string) ([]state.LentUpload, error) {
+	us, err := l.DB.LentUploads(ctx, peer)
+	if err != nil {
+		return nil, err
+	}
+	var out []state.LentUpload
+	for _, u := range us {
+		if u.Sealed == sealed && u.Key == key {
+			out = append(out, u)
+		}
+	}
+	return out, nil
 }
 
 // linkedRow reads the row of upload uid if it is peer's upload of key

@@ -4837,14 +4837,51 @@ the handler's own reads and is never cancelled; nothing below
   object linked just before a crash is verified without waiting for a
   retry (`TestObjectLinkedBeforeACrashHashCheckedByTheReconcile`).
   *Decision (#113):* a row is dropped unverified by nothing. An object
-  that cannot be read, an upload ID that cannot be read (the reconcile
-  cannot tell whether the upload linked the object), and a failed
-  object that cannot be removed each keep the row, and a hidden
-  leftover beside them, past `AbandonAfter` too, for the next reconcile
+  that cannot be read and a failed object that cannot be removed each
+  keep the row, and a hidden leftover beside them, past `AbandonAfter`
+  too, for the next reconcile
   (`TestAnUnreadableLinkedObjectKeepsItsRowAndLeftover`,
-  `TestAnUnreadableUploadIDKeepsTheRow`,
   `TestAFailedRemovalKeepsTheRowForTheNextReconcile`); a completion
-  whose failed object cannot be removed keeps its row the same way. A
+  whose failed object cannot be removed keeps its row the same way.
+  *Decision (#115):* an object whose upload ID cannot be read (a
+  corrupt `mp-metadata` attribute) is judged only by a hash
+  `lendisk.db` holds (`judgeUnread`, unread.go). The hash in the
+  object's own metadata is untrusted then: it sits in the same damaged
+  xattrs. The trusted hashes are those of rows of the key whose upload
+  the store no longer has (a live upload has linked nothing). Bytes
+  that hash to such a row's hash are verified as that upload's object.
+  Bytes that hash to their declared hash, a well-formed one, are an
+  object verified when it was stored; a row of another hash did not
+  link it, since an upload's object declares the hash its create did.
+  Bytes that differ, read the same twice, from a declared hash that a
+  row also holds are that upload's failed object, and are removed, so
+  the borrower sends them again. Anything else is never removed: it is
+  logged with `alert=true`, recorded as a friend's rotten object
+  (`state.Rot`, `lent_bitrot`) and alerted exactly as the bit-rot
+  sampler does (§3.6, VER-5, "A friend's object"), and not answered for
+  (500). Each object is hashed once while its file's identity (inode,
+  size, modification time) is unchanged, however many requests ask.
+  A request (`vouchUnread`) settles the row it verified as the
+  object, and the row of a removed object, but does not move a
+  rewrite's replaced version back (`undoRewrite`): matched by hash
+  alone, the row is not proven the upload that linked the object, nor
+  the tomb its rewrite's. Such a row may be another upload of the same
+  object, aborted as "the same object again" with its row left by a
+  crash; it is then counted as the object, an overcount, never an
+  under-, which the next reconcile corrects. The reconcile
+  (`unreadRow`) drops a row only on those same verdicts, and keeps it
+  (and a hidden leftover beside it) otherwise; a hidden leftover beside
+  a row it drops is not proven a copy without the upload ID, and falls
+  to the `AbandonAfter` rule. So a live upload of the key, a rewrite in
+  parts say, is held up only by an object no trusted hash vouches for,
+  which is alerted; no object is removed but on a trusted hash's
+  mismatch read twice; no row is dropped unverified
+  (`TestACorruptUploadIDOnAVerifiedObjectDoesNotBlockALiveUploadOfTheKey`,
+  `TestARottedObjectWithACorruptUploadIDIsRecordedAndKept`,
+  `TestAnUnreadableUploadIDIsSettledOnlyByATrustedHash`,
+  `TestARowMatchedOnlyByHashIsSettledWithoutUndoingARewrite`). With no
+  row of the key at all, nothing unverified can have linked the object,
+  and it is answered for unread, as before. A
   failed object that a rewrite in parts published moves the version it
   replaced back from its tomb (`undoRewrite`: the key's newest tomb, a
   rewrite's, of the marked hash, made since the upload began), as
@@ -4873,9 +4910,40 @@ the handler's own reads and is never cancelled; nothing below
   attribute read, a verified multipart object one more indexed lookup,
   and only the first request after a crash hashes
   (`TestOnlyAnUnverifiedObjectIsHashedOnHeadAndOnlyOnce`). An object
-  that cannot be read or removed, or whose upload ID cannot be read
-  while the borrower has a row for its key, answers 500, so the
-  borrower retries rather than acknowledging. End to end, a borrower's
+  that cannot be read or removed answers 500, so the borrower retries
+  rather than acknowledging. *Decision (#115):* a retried completion
+  whose own object fails its hash answers `NoSuchUpload`, not
+  `BadDigest`: the fault is the lender's, and `BadDigest` would have the
+  borrower refuse the place (`replica.ErrRejected`), where
+  `NoSuchUpload` sends it to its #87 HEAD, which finds the key empty,
+  and it sends the object again
+  (`TestARetriedCompletionWhoseObjectFailsItsHashAnswersNoSuchUpload`;
+  `replica.Worker` lists the parts first and so meets the HEAD path
+  anyway). *Decision (#115):* an upload is settled in one transaction
+  (`state.SettleLentUpload`, `Lending.settle`): its row is dropped and
+  the usage moved by what the object adds less what the row counted,
+  together. A failure moves nothing and keeps the row, and a row
+  already gone moves nothing, so a verification whose row could not be
+  dropped is counted once, by the check the kept row brings next
+  (`TestAVerificationWhoseRowCannotBeDroppedCountsTheObjectOnce`); the
+  completion, `verifyLanded` and the aborts of "the same object again"
+  settle so. The reconcile, which recomputes the sum, still drops rows
+  alone. *Decision (#115):* an upload the reconcile lists but whose
+  parts the store answers `NoSuchUpload` for (posix hid it to complete
+  it in between) is not live: its row is left to the check of rows
+  whose upload is gone, which verifies an object it linked
+  (`TestAnUploadGoneBeforeItsPartsAreListedIsCheckedAsGone`); its
+  hidden directory, if any, is counted by `midCompletion`. *Known race
+  (#115, not fixed):* `vouch` reads the upload ID and the row without
+  the key's lock, and HEAD and a put read the key after it, unlocked
+  (`Lending.HeadObject`, `putLent`'s `existing`). A completion of the
+  same key that links its object between the two is answered for by
+  that HEAD or put from its declared hash before the completion hashes
+  it. It needs two concurrent operations on one key by one borrower,
+  which `replica.Worker` serialises, so it never sends them; it
+  predates #113, and a failed object is still removed by its
+  completion, so only an acknowledgement taken in that window is
+  wrong. End to end, a borrower's
   replication worker whose object went bad on the lender's disk before
   a crash between link and hash sends it again
   (`TestABorrowerRetryingAfterALenderCrashSendsABadObjectAgain`); HEAD,
@@ -6082,7 +6150,10 @@ the handler's own reads and is never cancelled; nothing below
     `alert=true`, recorded with the friend and its sealed bucket, and
     alerted (`lent_bitrot`, §3.8). The object is left as it is
     (`TestRottenLentObjectIsAlertedOnly`); the record ends when the
-    friend deletes or replaces it. Tombs are not sampled: a rotten tomb
+    friend deletes or replaces it. A request or reconcile that meets a
+    friend's object whose upload ID cannot be read, and which no hash
+    in `lendisk.db` vouches for, records and alerts it the same way and
+    leaves it (§3.5 LEND-1, #115). Tombs are not sampled: a rotten tomb
     an undelete brings back fails the borrower's verification as any
     rotten object does.
   - *Decision (#31): the lender does not tell the friend.* It cannot

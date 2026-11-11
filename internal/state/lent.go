@@ -174,6 +174,41 @@ func (db *DB) DropLentUpload(ctx context.Context, uploadID string) error {
 	return tx.Commit()
 }
 
+// SettleLentUpload forgets a finished upload and moves peer's usage by
+// add less the part bytes its row counted, in one transaction, and
+// returns that change. Settling is idempotent: a row already gone
+// returns ErrNotFound and moves nothing, and a failure moves nothing
+// and keeps the row, so an upload is never counted twice (#115).
+func (db *DB) SettleLentUpload(ctx context.Context, peer, uploadID string, add int64) (int64, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var counted int64
+	err = tx.QueryRowContext(ctx, `SELECT counted FROM lent_upload WHERE upload_id = ? AND peer_key = ?`, uploadID, peer).Scan(&counted)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM lent_part WHERE upload_id = ?`, uploadID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM lent_upload WHERE upload_id = ?`, uploadID); err != nil {
+		return 0, err
+	}
+	delta := add - counted
+	if delta != 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO lent_usage (peer_key, bytes) VALUES (?, MAX(?, 0))
+			ON CONFLICT (peer_key) DO UPDATE SET bytes = MAX(bytes + ?, 0)`, peer, delta, delta); err != nil {
+			return 0, err
+		}
+	}
+	return delta, tx.Commit()
+}
+
 // LentBucket is a bucket a borrower created on this node (PEER-8): the
 // borrower's node ID and the bucket's sealed name (SEC-16).
 type LentBucket struct {
