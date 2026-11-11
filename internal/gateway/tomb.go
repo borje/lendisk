@@ -151,6 +151,15 @@ func (l *Lending) deleteLent(ctx context.Context, peer, sealed string, in *s3.De
 		return nil, errInternal
 	}
 	defer unlock()
+	pub := &published{u: l.use(peer)}
+	pub.take()
+	defer pub.release()
+	// A tomb holds only verified bytes, so a revival never answers for
+	// an object an upload linked before a crash: it is verified first,
+	// and one that fails is removed outright (#113).
+	if _, err := l.vouchLocked(ctx, peer, sealed, bucket, key); err != nil && err != errBadDigest {
+		return nil, err
+	}
 	old, has, err := l.existing(ctx, bucket, key)
 	if err != nil {
 		return nil, errInternal
@@ -165,9 +174,6 @@ func (l *Lending) deleteLent(ctx context.Context, peer, sealed string, in *s3.De
 	if err != nil {
 		return nil, errInternal
 	}
-	pub := &published{u: l.use(peer)}
-	pub.take()
-	defer pub.release()
 	now := l.now()
 	tomb, err := l.tombName(bucket, key, now)
 	if err != nil {

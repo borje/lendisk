@@ -148,10 +148,11 @@ func (l *Lending) midCompletion(ctx context.Context, peer string, id identity.No
 //     hash the upload declared. A match proves the directory a copy of
 //     the object: it is removed at once and the row dropped. A mismatch
 //     drops the object, as a completion would; the directory is kept and
-//     counted. The borrower sends it again only if it never acknowledged
-//     it: one that acknowledged it from its declared hash after a
-//     NoSuchUpload (#87) learns of the loss only from verify (#113).
-//     An object that cannot be read leaves everything as it is.
+//     counted, and the borrower sends it again: no request answers for
+//     the object before the lender verified it (vouch, #113). An object
+//     that cannot be read or removed, or whose upload ID cannot be read,
+//     leaves everything as it is, past AbandonAfter too, until a
+//     reconcile can tell.
 //   - Otherwise, once the directory has been still for AbandonAfter
 //     (its change time: the hiding rename sets it on Linux) it is
 //     removed, as an abandoned upload is aborted.
@@ -175,16 +176,24 @@ func (l *Lending) hiddenUpload(ctx context.Context, peer string, id identity.Nod
 		return 0, err
 	}
 	var total int64
-	bad := false
-	if !verified[uid] && hasRow && LentName(id, row.Sealed) == bucket && keyDirName(row.Key) == filepath.Base(keyDir) &&
-		l.linkedBy(bucket, row.Key, uid) {
-		delta, v := l.landed(ctx, peer, bucket, row)
-		total += delta
-		switch v {
-		case landedGood:
-			verified[uid] = true
-		case landedBad:
-			hasRow, bad = false, true // dropped; the directory is not removed on that evidence
+	bad, kept := false, false
+	if !verified[uid] && hasRow && LentName(id, row.Sealed) == bucket && keyDirName(row.Key) == filepath.Base(keyDir) {
+		linked, err := l.linkedBy(bucket, row.Key, uid)
+		if err != nil {
+			l.log().Warn("lending: the upload ID of an object a hidden upload may have assembled cannot be read; keeping both",
+				"peer", peer, "bucket", bucket, "key", row.Key, "upload", uid, "err", err)
+			kept = true
+		} else if linked {
+			delta, v := l.landed(ctx, peer, bucket, row)
+			total += delta
+			switch v {
+			case landedGood:
+				verified[uid] = true
+			case landedBad:
+				hasRow, bad = false, true // dropped; the directory is not removed on that evidence
+			case landedKept:
+				kept = true // never removed unverified (#113)
+			}
 		}
 	}
 	switch {
@@ -192,7 +201,7 @@ func (l *Lending) hiddenUpload(ctx context.Context, peer string, id identity.Nod
 		if l.removeHidden(peer, bucket, uid, dir, "its object is linked and verified") {
 			return total, nil
 		}
-	case !bad && changeTime(fi).Before(cutoff):
+	case !bad && !kept && changeTime(fi).Before(cutoff):
 		if l.removeHidden(peer, bucket, uid, dir, "still for the abandon period") {
 			if hasRow {
 				l.dropUpload(uid)
@@ -233,42 +242,49 @@ func (l *Lending) removeHidden(peer, bucket, uid, dir, why string) bool {
 }
 
 // linkedBy reports whether the object at key was assembled by upload
-// uid.
-func (l *Lending) linkedBy(bucket, key, uid string) bool {
+// uid; an error (errUploadUnreadable) means it cannot be told.
+func (l *Lending) linkedBy(bucket, key, uid string) (bool, error) {
 	if l.Uploads == nil {
-		return false
+		return false, nil
 	}
 	got, err := l.Uploads.UploadID(bucket, key)
-	return err == nil && got == uid
+	return err == nil && got == uid, err
 }
 
 type landing int
 
 const (
-	landedUnread landing = iota // the object could not be read; nothing changed
-	landedGood                  // it hashed to the declared hash; the row is dropped
-	landedBad                   // it did not; it is removed and the row dropped
+	landedKept landing = iota // the object could not be read, or failed and could not be removed; nothing changed
+	landedGood                // it hashed to the declared hash; the row is dropped
+	landedBad                 // it did not; it is removed and the row dropped
 )
 
 // landed hashes the object that upload u assembled before a crash
 // (linkedBy holds), for the reconcile. On a mismatch the object is
-// removed, and the returned delta takes it out of the listing's sum.
+// removed, a rewrite's replaced version moved back (undoRewrite, as a
+// completion does), and the returned delta takes the object out of the
+// listing's sum; the moved-back version was counted as a tomb. The row
+// is dropped only once the object is verified or gone (#113).
 func (l *Lending) landed(ctx context.Context, peer, bucket string, u state.LentUpload) (int64, landing) {
 	n, got, err := l.hashStored(ctx, bucket, u.Key)
 	if err != nil {
 		l.log().Warn("lending: reading an object a crash left unverified failed; trying again at the next reconcile",
 			"peer", peer, "bucket", bucket, "key", u.Key, "err", err)
-		return 0, landedUnread
+		return 0, landedKept
 	}
-	l.dropUpload(u.UploadID)
 	if got == u.SHA256 {
+		l.dropUpload(u.UploadID)
 		return 0, landedGood
 	}
 	l.log().Warn("lending: an object a crash left unverified does not match its declared hash; removed it so the borrower sends it again",
 		"peer", peer, "bucket", bucket, "key", u.Key, "upload", u.UploadID)
 	if !l.remove(bucket, u.Key) {
-		return 0, landedBad
+		l.log().Warn("lending: keeping the row of an object that failed its hash and could not be removed; trying again at the next reconcile",
+			"peer", peer, "bucket", bucket, "key", u.Key, "upload", u.UploadID)
+		return 0, landedKept
 	}
+	l.undoRewrite(ctx, bucket, u)
+	l.dropUpload(u.UploadID)
 	return -(n + itemOverhead), landedBad
 }
 

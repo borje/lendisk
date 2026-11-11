@@ -99,6 +99,13 @@ type Lending struct {
 	// into its tomb and the new one is not yet published; an error fails
 	// the rewrite there, as the store failing would.
 	afterRewriteMove func() error
+	// afterCompleteLink runs when the store has linked a completed
+	// upload's object and the completion has not yet hashed it; an
+	// error stops it there as a crash would, the row kept (#113).
+	afterCompleteLink func() error
+	// afterVouchRead runs when vouch has read an unverified upload's row
+	// and its object, and not yet hashed it (#113).
+	afterVouchRead func()
 	// afterUndeleteKey runs when undelete has handled a key; afterReviveLink
 	// when a revival has linked a tomb back and not yet unlinked it, an
 	// error stopping it there as a crash would.
@@ -309,12 +316,16 @@ func (l *Lending) now() time.Time {
 }
 
 // isCode reports whether err is the store's S3 error code: an APIError,
-// or a BucketError (posix answers a bucket already there with one, #75).
+// a BucketError (posix answers a bucket already there with one, #75), or
+// a NoSuchUploadError (posix's ListParts and completion of an upload it
+// no longer has, #113).
 func isCode(err error, code string) bool {
 	switch e := err.(type) {
 	case s3err.APIError:
 		return e.Code == code
 	case s3err.BucketError:
+		return e.Code == code
+	case s3err.NoSuchUploadError:
 		return e.Code == code
 	}
 	return false
@@ -561,6 +572,13 @@ func (l *Lending) ListParts(ctx context.Context, in *s3.ListPartsInput) (s3respo
 	c := *in
 	c.Bucket = b
 	res, err := l.Next.ListParts(ctx, &c)
+	if peer, ok := borrower(ctx); ok && isCode(err, "NoSuchUpload") {
+		// The borrower asks next whether the key holds the object (#87):
+		// one an upload linked before a crash is verified first (#113).
+		if _, verr := l.vouch(ctx, peer.String(), deref(in.Bucket), *b, deref(in.Key)); verr != nil && verr != errBadDigest {
+			return s3response.ListPartsResult{}, verr
+		}
+	}
 	res.Bucket = sealedOf(ctx, res.Bucket)
 	return res, err
 }
@@ -617,6 +635,14 @@ func (l *Lending) HeadObject(ctx context.Context, in *s3.HeadObjectInput) (*s3.H
 	}
 	c := *in
 	c.Bucket = b
+	if peer, ok := borrower(ctx); ok {
+		// A borrower takes the hash HEAD answers as the object's (#87):
+		// one an upload linked before a crash is verified first, and
+		// answers 404 if it failed (#113).
+		if _, err := l.vouch(ctx, peer.String(), deref(in.Bucket), *b, deref(in.Key)); err != nil && err != errBadDigest {
+			return nil, err
+		}
+	}
 	return l.Next.HeadObject(ctx, &c)
 }
 
