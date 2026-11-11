@@ -350,15 +350,16 @@ func TestScenarioFriendOfflineForThreeDays(t *testing.T) {
 
 // REPL-1, REPL-5, REPL-11 (#20 review): a pack uploaded as a multipart
 // upload is answered before lendisk has hashed it and completed its
-// queue row (#49); here each such hash is held back four seconds, and
-// the tool writes the index and snapshot meanwhile. status --wait still
+// queue row (#49); here each such hash is held back fifteen seconds
+// (four were too few for a loaded CI runner to write the index and
+// snapshot in, e63591c), and the tool writes them meanwhile. status --wait still
 // returns only once the pack is at two friends: a pending pack holds
 // the watermark and the metadata barrier. restic 0.19.1 sends no
 // multipart upload (§3.3), so a stock S3 client writes the backup in
 // restic's layout to the restic bucket, between real daemons.
 func TestStatusWaitWaitsForAMultipartPack(t *testing.T) {
 	parallel(t, 4)
-	f := newFourFriends(t, envHashDelay+"=4s")
+	f := newFourFriends(t, envHashDelay+"=15s")
 	ctx := t.Context()
 	cl := s3client(f.a.addr, f.creds)
 	bucket := aws.String("laptop")
