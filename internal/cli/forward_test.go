@@ -499,11 +499,12 @@ func TestPeerForwardRefusesPruneAndOffList(t *testing.T) {
 	}
 	// A client that half-closes after its request (nc -N) reads B's
 	// answer: the forward passes the half-close on through the tunnel
-	// instead of closing both ways (#94). Which answer is B's own:
-	// net/http cancels an in-flight request's context once it reads
-	// EOF, so B's bridge may answer 503 rather than the gate's 403
-	// (DESIGN §3.7).
-	if got := ask(t, fw.addr, "GET /"+sealed+"/config HTTP/1.1\r\nHost: lendisk\r\n\r\n"); !strings.HasPrefix(got, "HTTP/1.1 ") {
+	// instead of closing both ways (#94), and it is B's real answer: the
+	// half-close cancels nothing at B's bridge (#101), so the unsigned
+	// request gets the tunnel's 403, not a 503 from a cancelled
+	// relationship lookup.
+	if got := ask(t, fw.addr, "GET /"+sealed+"/config HTTP/1.1\r\nHost: lendisk\r\n\r\n"); !strings.HasPrefix(got, "HTTP/1.1 403 ") ||
+		!strings.Contains(got, "must be signed") {
 		t.Errorf("a half-closing client through the forward read %q", got)
 	}
 	fw.stop()
