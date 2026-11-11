@@ -187,7 +187,9 @@ func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 // is more than Overdue past due (from its last answer, or, never
 // answered, from its first acknowledgement), when it is challenged
 // anyway, so a FIFO that never empties (a friend at quota, a slow
-// uplink) does not starve it (#27 review).
+// uplink) does not starve it (#27 review). The FIFO is read by the
+// partial indexes of queued and dropping rows, not every copy the place
+// holds (#118).
 func (db *DB) DueReplicas(ctx context.Context, now time.Time, every, retry time.Duration) ([]ReplicaKey, error) {
 	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name FROM `+replicaPlaces+` f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
@@ -195,8 +197,10 @@ func (db *DB) DueReplicas(ctx context.Context, now time.Time, every, retry time.
 		AND (c.checked_at IS NULL OR c.checked_at <= ?1) AND (c.error_at IS NULL OR c.error_at <= ?2)
 		AND EXISTS (SELECT 1 FROM placement p
 			WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state = 'acked' AND p.op = 'put')
-		AND (NOT EXISTS (SELECT 1 FROM placement p
-				WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state IN ('queued', 'dropping'))
+		AND (NOT EXISTS (SELECT 1 FROM placement p INDEXED BY placement_queued
+				WHERE p.place = f.peer_key AND p.state = 'queued' AND p.bucket = b.name)
+			AND NOT EXISTS (SELECT 1 FROM placement p INDEXED BY placement_dropping
+				WHERE p.place = f.peer_key AND p.state = 'dropping' AND p.bucket = b.name)
 			OR c.checked_at <= ?3
 			OR c.checked_at IS NULL AND `+heldSince+` <= ?4)
 		ORDER BY b.name, f.peer_key`, now.Add(-every).Unix(), now.Add(-retry).Unix(),

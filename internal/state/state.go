@@ -11,6 +11,21 @@
 // minor's last schema: add tables and nullable columns, never drop or
 // repurpose. A migration that cannot be written that way raises Compat, and
 // may do so only in the release after the one whose schema it locks out.
+//
+// Trigger rule. Triggers on queue, placement and overflow_tomb keep
+// queue_tally, place_use, place_freed and the offsite marks
+// (offsite_dirty) in every writer's transaction; readers trust them. A
+// migration that rebuilds one of those tables (create, copy, drop,
+// rename) drops its triggers with it: it must create them again and
+// refill what they keep from the rows, as migrations 12, 26, 53 and 54
+// fill them, in the same migration. The daemon repairs queue_tally
+// drift hourly (RepairQueueTally), but nothing else is checked. A
+// trigger names no conflict policy and must meet no conflict (insert
+// where missing, WHERE NOT EXISTS): the writer's policy overrides the
+// trigger's own (#117). Open turns recursive_triggers on, so a REPLACE
+// that deletes a row fires the delete triggers (#118), and a trigger
+// that writes its own table (or one whose triggers write it back) fires
+// itself again: none does.
 package state
 
 import (
@@ -80,6 +95,9 @@ type DB struct {
 	// them held the write lock. Tests only.
 	betweenFoldBatches func()
 	foldTook           func(time.Duration)
+	// beforeTallyRepair, if set, runs between RepairQueueTally's read
+	// and its write (#118). Tests only.
+	beforeTallyRepair func()
 
 	// snap, on a Snapshot, is the read transaction every query goes
 	// through.
@@ -183,7 +201,13 @@ func open(ctx context.Context, dataDir string, ms []Migration, log *slog.Logger)
 	// another connection commits in between (#47). Every write
 	// transaction is short (no I/O but SQLite's own inside one), so the
 	// timeout is a queue of writers, not a held lock.
-	dsn := "file:" + path + "?_txlock=immediate&_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
+	//
+	// recursive_triggers is on so that a REPLACE that deletes a row to
+	// make room fires the table's delete triggers (#118): without it
+	// SQLite deletes the row silently, and queue_tally, place_use and the
+	// offsite marks keep counting it. No trigger writes a table that has
+	// triggers, so none recurses (the package comment's trigger rule).
+	dsn := "file:" + path + "?_txlock=immediate&_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)&_pragma=recursive_triggers(1)"
 	sqldb, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

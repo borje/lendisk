@@ -57,6 +57,42 @@ func repositoryUseFull(ctx context.Context, db *DB) (RepositoryUse, error) {
 	return u, err
 }
 
+// droppedBelowFull is DroppedBelowCopies as it read every live put
+// before #118.
+func droppedBelowFull(ctx context.Context, db *DB) (map[string]BelowStat, error) {
+	return db.below(ctx, `AND EXISTS (SELECT 1 FROM placement p WHERE p.seq = q.seq AND p.state = '`+PlacementDropped+`')`)
+}
+
+// dueReplicasFull is DueReplicas as it read every copy at the place
+// before #118, at every and retry of a day and an hour.
+func dueReplicasFull(ctx context.Context, db *DB, now time.Time) ([]ReplicaKey, error) {
+	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name FROM `+replicaPlaces+` f CROSS JOIN buckets b
+		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
+		WHERE coalesce(f.address, '') != '' AND c.unverified_at IS NULL
+		AND (c.checked_at IS NULL OR c.checked_at <= ?1) AND (c.error_at IS NULL OR c.error_at <= ?2)
+		AND EXISTS (SELECT 1 FROM placement p
+			WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state = 'acked' AND p.op = 'put')
+		AND (NOT EXISTS (SELECT 1 FROM placement p
+				WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state IN ('queued', 'dropping'))
+			OR c.checked_at <= ?3
+			OR c.checked_at IS NULL AND `+heldSince+` <= ?4)
+		ORDER BY b.name, f.peer_key`, now.Add(-24*time.Hour).Unix(), now.Add(-time.Hour).Unix(),
+		now.Add(-24*time.Hour-Overdue).Unix(), now.Add(-Overdue).Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReplicaKey
+	for rows.Next() {
+		var k ReplicaKey
+		if err := rows.Scan(&k.Place, &k.Bucket); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
 func placeStatsFull(ctx context.Context, db *DB, now time.Time) (map[string]PlaceStat, error) {
 	rows, err := db.QueryContext(ctx, `SELECT p.place,
 		count(*) FILTER (WHERE p.state = 'queued'),
@@ -178,6 +214,20 @@ func sameStatusReads(db *DB, now time.Time) (storedBelow int, diff string, err e
 	if want, err := view.below(ctx, ""); err != nil || differs("below copies", below, want) {
 		return 0, diff, err
 	}
+	dropped, err := view.DroppedBelowCopies(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	if want, err := droppedBelowFull(ctx, view); err != nil || differs("dropped below copies", dropped, want) {
+		return 0, diff, err
+	}
+	due, err := view.DueReplicas(ctx, now, 24*time.Hour, time.Hour)
+	if err != nil {
+		return 0, "", err
+	}
+	if want, err := dueReplicasFull(ctx, view, now); err != nil || differs("due replicas", due, want) {
+		return 0, diff, err
+	}
 	places, err := belowPlaces(ctx, view)
 	if err != nil {
 		return 0, "", err
@@ -230,9 +280,9 @@ func sameStatusReads(db *DB, now time.Time) (storedBelow int, diff string, err e
 // pending puts and deletes of keys in two buckets, with and without a
 // size, settled, resized, reclassed, moved to another key or bucket,
 // renumbered and deleted, written under OR IGNORE (skipped on a taken
-// seq) and OR REPLACE, so no writer, today's or an older lendisk's,
-// can leave it wrong. A tally changed by hand is caught (the check is
-// not vacuous).
+// seq) and OR REPLACE (deleting the row on a taken seq, which fires
+// the delete trigger since #118), so no writer can leave it wrong.
+// A tally changed by hand is caught (the check is not vacuous).
 func TestQueueTallyEqualsTheRowsWhateverWritesThem(t *testing.T) {
 	ctx := context.Background()
 	db, err := Open(ctx, t.TempDir(), slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -274,7 +324,7 @@ func TestQueueTallyEqualsTheRowsWhateverWritesThem(t *testing.T) {
 		b, k := pick(buckets...), fmt.Sprintf("k%d", r.IntN(8))
 		var q string
 		args := []any{}
-		switch n := r.IntN(13); n {
+		switch n := r.IntN(14); n {
 		case 0, 1, 2:
 			q = `INSERT INTO queue (bucket, key, op, class, state, size, created_at) VALUES (?, ?, ?, ?, ?, ?, 1)`
 			args = []any{b, k, pick("put", "put", "delete"), pick("data", "metadata", "snapshot"), pick("done", "pending"), size()}
@@ -311,6 +361,16 @@ func TestQueueTallyEqualsTheRowsWhateverWritesThem(t *testing.T) {
 			q = `UPDATE queue SET state = 'pending' WHERE seq = (SELECT seq FROM queue WHERE state = 'done' ORDER BY random() LIMIT 1)`
 		case 11:
 			q = `DELETE FROM queue WHERE seq = (SELECT seq FROM queue ORDER BY random() LIMIT 1)`
+		case 13:
+			// REPLACE onto a taken seq deletes that row (#118).
+			q = `INSERT OR REPLACE INTO queue (seq, bucket, key, op, class, state, size, created_at)
+				VALUES ((SELECT seq FROM queue ORDER BY random() LIMIT 1), ?, ?, ?, 'data', ?, ?, 1)`
+			args = []any{b, k, pick("put", "delete"), pick("done", "pending"), size()}
+			if r.IntN(2) == 0 {
+				q = `UPDATE OR REPLACE queue SET seq = (SELECT seq FROM queue ORDER BY random() LIMIT 1)
+					WHERE seq = (SELECT seq FROM queue ORDER BY random() LIMIT 1)`
+				args = nil
+			}
 		case 12:
 			// Columns no contribution reads.
 			if seq, ok := anySeq(); ok {

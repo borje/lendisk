@@ -1227,6 +1227,14 @@ var migrations = []Migration{
 			UPDATE place_use SET bytes = bytes + NEW.size WHERE place = NEW.place;
 		END;`,
 	},
+	{
+		Version: 56, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The copies dropped at a full or gone friend (#118): the
+		-- copies-dropped alert (DroppedBelowCopies) reads the puts they
+		-- are of from here, not every live put.
+		CREATE INDEX placement_dropped ON placement (seq) WHERE state = 'dropped';`,
+	},
 }
 
 // migration54 is schema 54's SQL (#116): what status sums over every
@@ -1247,9 +1255,9 @@ var migrations = []Migration{
 // nothing; there are no BEFORE triggers, which would fire for it. Each
 // statement updates the bucket's row, or inserts it when missing
 // (WHERE NOT EXISTS), and so meets no conflict. A REPLACE that deletes
-// a queue row would fire no delete trigger (recursive_triggers is
-// off), but none can happen: the only key is seq, AUTOINCREMENT, which
-// no writer names. The table is filled from the rows as they are.
+// a queue row on a taken seq fires the delete trigger: Open turns
+// recursive_triggers on (#118). The table is filled from the rows as
+// they are; the daemon repairs any drift (RepairQueueTally, #118).
 //
 // below_short stores BelowCopies' rows (each live put that fewer than
 // copies places hold or will hold) as of the places and copies in

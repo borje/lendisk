@@ -378,6 +378,39 @@ func TestAStarvedReplicaIsChallengedOnceOverdue(t *testing.T) {
 	}
 }
 
+// VER-1 (#27 review, #118): a copy re-placement is deleting at a place
+// (dropping) is in the place's FIFO like a queued one: the replica
+// waits for it before its challenge, and is due once it is drained.
+func TestAReplicaWaitsForTheCopiesDroppingThere(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.bucket("laptop", 1)
+	due := func() bool {
+		t.Helper()
+		ks, err := p.db.DueReplicas(ctx, p.now, 24*time.Hour, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(ks) == 1
+	}
+	a := p.put("laptop", "data/a", "data", 0.1)
+	b := p.put("laptop", "data/b", "data", 0.1)
+	p.ackAll(a)
+	p.ackAll(b)
+	if !due() {
+		t.Fatal("not due with an empty FIFO")
+	}
+	mustExec(t, p.db, `UPDATE placement SET state = 'dropping' WHERE place = 'B' AND seq = ?`, b)
+	if due() {
+		t.Fatal("due while a copy is dropping there")
+	}
+	mustExec(t, p.db, `UPDATE placement SET state = 'drained' WHERE place = 'B' AND seq = ?`, b)
+	if !due() {
+		t.Fatal("not due once the copy is drained")
+	}
+}
+
 // VER-1 (#27 review): an object is still challengeable at a place while
 // the place's row of it is acked and it is its key's latest done write;
 // not once deleted, written again, or dropped there.
