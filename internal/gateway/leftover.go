@@ -147,8 +147,10 @@ func (l *Lending) midCompletion(ctx context.Context, peer string, id identity.No
 //     came after posix published it), the object is hashed against the
 //     hash the upload declared. A match proves the directory a copy of
 //     the object: it is removed at once and the row dropped. A mismatch
-//     drops the object, as a completion would, so the borrower, never
-//     acknowledged, sends it again; the directory is kept and counted.
+//     drops the object, as a completion would; the directory is kept and
+//     counted. The borrower sends it again only if it never acknowledged
+//     it: one that acknowledged it from its declared hash after a
+//     NoSuchUpload (#87) learns of the loss only from verify (#113).
 //     An object that cannot be read leaves everything as it is.
 //   - Otherwise, once the directory has been still for AbandonAfter
 //     (its change time: the hiding rename sets it on Linux) it is

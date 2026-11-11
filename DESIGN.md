@@ -4829,8 +4829,12 @@ the handler's own reads and is never cancelled; nothing below
   does not match, the leftover is not deleted on that evidence: it is
   kept and counted, the mismatch logged at warn, and the object
   removed (and taken out of the sum) as a failed completion's would be,
-  so the borrower, which never had the completion acknowledged, sends
-  it again; the leftover then falls to the `AbandonAfter` rule
+  so a borrower that never had the completion acknowledged sends it
+  again. A borrower that met NoSuchUpload on its retry and acknowledged
+  the object from its declared hash (#87) is not told: until #113 the
+  lender verifies only in the reconcile, so the loss shows only to
+  verify (VER-1, VER-1a). It was a corrupt copy either way; the
+  leftover then falls to the `AbandonAfter` rule
   (`TestLinkedLeftoverFailingItsHashKeptAndObjectDropped`). An object
   that cannot be read leaves all as it is until the next reconcile. A
   row whose upload the store no longer lists is likewise hashed before
