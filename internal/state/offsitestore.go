@@ -119,7 +119,9 @@ const dirtyKeys = `SELECT key FROM offsite_dirty WHERE bucket = ?1 AND id <= ?4`
 // FoldOffsite stores, for every bucket, the short puts of the keys
 // changed since the last fold, and clears their marks (#81); a bucket
 // never stored, or whose pool or copies changed since, is stored in
-// full. The daemon calls it every few seconds; a read is correct
+// full. It stores BelowCopies' rows from the same read and on the same
+// marks (belowstore.go, #116), in full when their own basis is not
+// this fold's. The daemon calls it every few seconds; a read is correct
 // without it, only slower the more keys are marked. A bucket whose
 // fold fails is skipped; the others are folded, and the errors joined.
 //
@@ -161,6 +163,14 @@ type fold struct {
 	copies  int
 	rows    []short
 	keys    []string // the keys marked, when not full
+	// The below rows (belowstore.go), stored with them on the same
+	// marks: all of the bucket's when belowFull, else belowKeys'.
+	belowFull   bool
+	belowPlaces string
+	below       []belowRow
+	belowKeys   []string
+	through     int64           // the latest done put (latestPut)
+	held        map[string]held // by place (heldOf)
 }
 
 func (db *DB) foldBucket(ctx context.Context, bucket string) error {
@@ -191,7 +201,7 @@ var errFoldStale = errors.New("another fold claimed the bucket")
 // claim) leaves the marks and, if full, the emptied basis: the next
 // fold reads again.
 func (db *DB) writeFold(ctx context.Context, bucket string, f fold) error {
-	if !f.full && f.mark == 0 {
+	if !f.full && !f.belowFull && f.mark == 0 {
 		return nil
 	}
 	var claim int64
@@ -209,9 +219,25 @@ func (db *DB) writeFold(ctx context.Context, bucket string, f fold) error {
 		if f.full {
 			holders = "" // no pool's: until the last batch
 		}
-		_, err := tx.ExecContext(ctx, `INSERT INTO offsite_basis (bucket, holders, copies, folds) VALUES (?, ?, ?, ?)
+		if _, err := tx.ExecContext(ctx, `INSERT INTO offsite_basis (bucket, holders, copies, folds) VALUES (?, ?, ?, ?)
 			ON CONFLICT (bucket) DO UPDATE SET holders = excluded.holders, copies = excluded.copies, folds = excluded.folds`,
-			bucket, holders, f.copies, claim)
+			bucket, holders, f.copies, claim); err != nil {
+			return err
+		}
+		// The below rows' basis follows the claim when they are stored
+		// by key (their marked keys are read afresh meanwhile), and is
+		// emptied until the last batch when they are stored in full.
+		q := `UPDATE below_basis SET folds = ?2 WHERE bucket = ?1`
+		if f.belowFull {
+			q = `DELETE FROM below_basis WHERE bucket = ?1`
+		}
+		if _, err := tx.ExecContext(ctx, q, bucket, claim); err != nil {
+			return err
+		}
+		// The stored held follow the claim: what changed since is
+		// marked until the last batch.
+		_, err := tx.ExecContext(ctx, `UPDATE held_basis SET folds = ? WHERE bucket = ? AND folds = ?`,
+			claim, bucket, f.folds)
 		return err
 	})
 	if errors.Is(err, errFoldStale) {
@@ -224,8 +250,29 @@ func (db *DB) writeFold(ctx context.Context, bucket string, f fold) error {
 	// has more.
 	keys, rows := f.keys, f.rows
 	cleared := !f.full
+	belowKeys, below := f.belowKeys, f.below
+	belowCleared := !f.belowFull
 	step := func(tx *sql.Tx) (bool, error) {
 		switch {
+		case !belowCleared:
+			r, err := tx.ExecContext(ctx, `DELETE FROM below_short WHERE rowid IN
+				(SELECT rowid FROM below_short WHERE bucket = ? LIMIT 500)`, bucket)
+			if err != nil {
+				return false, err
+			}
+			n, err := r.RowsAffected()
+			belowCleared = err == nil && n == 0
+			return true, err
+		case len(belowKeys) > 0:
+			_, err := tx.ExecContext(ctx, `DELETE FROM below_short WHERE bucket = ? AND key = ?`, bucket, belowKeys[0])
+			belowKeys = belowKeys[1:]
+			return true, err
+		case len(below) > 0:
+			b := below[0]
+			_, err := tx.ExecContext(ctx, `INSERT INTO below_short (bucket, key, seq, size) VALUES (?, ?, ?, ?)`,
+				bucket, b.key, b.seq, b.size)
+			below = below[1:]
+			return true, err
 		case !cleared:
 			r, err := tx.ExecContext(ctx, `DELETE FROM offsite_short WHERE rowid IN
 				(SELECT rowid FROM offsite_short WHERE bucket = ? LIMIT 500)`, bucket)
@@ -251,6 +298,21 @@ func (db *DB) writeFold(ctx context.Context, bucket string, f fold) error {
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE offsite_basis SET holders = ? WHERE bucket = ?`, f.holders, bucket); err != nil {
 			return false, err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO below_basis (bucket, places, copies, folds, through) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (bucket) DO UPDATE SET places = excluded.places, copies = excluded.copies, folds = excluded.folds,
+				through = excluded.through`,
+			bucket, f.belowPlaces, f.copies, claim, f.through); err != nil {
+			return false, err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM held_basis WHERE bucket = ?`, bucket); err != nil {
+			return false, err
+		}
+		for p, h := range f.held {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO held_basis (bucket, place, acked_at, seq, folds) VALUES (?, ?, ?, ?, ?)`,
+				bucket, p, h.at, h.seq, claim); err != nil {
+				return false, err
+			}
 		}
 		_, err := tx.ExecContext(ctx, `DELETE FROM offsite_dirty WHERE bucket = ? AND id <= ?`, bucket, f.mark)
 		return false, err
@@ -330,13 +392,24 @@ func (db *DB) readFold(ctx context.Context, bucket string) (fold, error) {
 		return f, err
 	}
 	f.full = !holders.Valid || holders.String != f.holders || copies.Int64 != int64(f.copies)
+	marked, err := keysOf(ctx, view, `SELECT key FROM offsite_dirty WHERE bucket = ? AND id <= ?`, bucket, f.mark)
+	if err != nil {
+		return f, err
+	}
+	if err := readBelowFold(ctx, view, bucket, &f, marked); err != nil {
+		return f, err
+	}
+	if f.through, err = view.latestPut(ctx, bucket, math.MaxInt64, f.mark); err != nil {
+		return f, err
+	}
+	if err := readHeldFold(ctx, view, bucket, &f); err != nil {
+		return f, err
+	}
 	if f.full {
 		f.rows, err = doneShorts(ctx, view, bucket, f.copies, f.holders, "")
 		return f, err
 	}
-	if f.keys, err = keysOf(ctx, view, `SELECT key FROM offsite_dirty WHERE bucket = ? AND id <= ?`, bucket, f.mark); err != nil {
-		return f, err
-	}
+	f.keys = marked
 	f.rows, err = doneShorts(ctx, view, bucket, f.copies, f.holders, dirtyKeys, f.mark)
 	return f, err
 }

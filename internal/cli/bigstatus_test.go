@@ -14,12 +14,15 @@ import (
 	"github.com/borje/lendisk/internal/state"
 )
 
-// REPL-11 (#81): `status` on a bucket of a million objects reads the
-// offsite watermark in well under a second, once the daemon has folded
-// the bucket's offsite changes; it logs what each of status's other
-// reads of the database takes, and the whole command. Seeding a million
-// rows takes a while and some 300 MB of disk, so the test runs only
-// with LENDISK_BIG_STATUS set to the number of objects:
+// REPL-11, OPS-1 (#81, #116): `status` on a bucket of a million objects
+// answers in well under a second once the daemon has folded the
+// bucket's changes: every read it takes of the database costs what is
+// not done (queued, refused, short, marked since the fold) or reads a
+// stored sum, not every row. It logs what each of those reads takes,
+// the best of two in one snapshot as status takes them, and the whole
+// command, the best of two. Seeding a million rows takes a while and
+// some 500 MB of disk, so the test runs only with LENDISK_BIG_STATUS
+// set to the number of objects:
 //
 //	LENDISK_BIG_STATUS=1000000 go test -run TestStatusOfAMillionObjectBucket -v ./internal/cli
 func TestStatusOfAMillionObjectBucket(t *testing.T) {
@@ -79,28 +82,28 @@ func TestStatusOfAMillionObjectBucket(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("the daemon's first fold took %v", time.Since(folded))
-	// Each of status's reads of the database, timed in one snapshot as
-	// status takes them: the offsite one is #81's, the others are what
-	// is left of status's cost on a large bucket.
+	// Each of status's reads of the database that read every row
+	// before (#81's offsite one, and #116's), timed in one snapshot as
+	// status takes them.
 	db.ReplaceAfter = 7 * 24 * time.Hour
 	view, done, err := db.Snapshot(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var offsite time.Duration
+	b, err := view.GetBucket(ctx, "laptop")
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := profile.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slow := map[string]time.Duration{}
 	for _, r := range []struct {
 		name string
 		read func() error
 	}{
 		{"offsite", func() error {
-			b, err := view.GetBucket(ctx, "laptop")
-			if err != nil {
-				return err
-			}
-			profiles, err := profile.Load("")
-			if err != nil {
-				return err
-			}
 			off, err := offsiteStatus(ctx, view, b, profiles.Get(b.Profile))
 			if err == nil && !off.Complete {
 				err = fmt.Errorf("not complete: %+v", off)
@@ -108,20 +111,31 @@ func TestStatusOfAMillionObjectBucket(t *testing.T) {
 			return err
 		}},
 		{"queue", func() error { _, err := view.QueueStats(ctx); return err }},
-		{"below copies", func() error { _, err := view.BelowCopies(ctx); return err }},
+		{"below copies", func() error {
+			below, err := view.BelowCopies(ctx)
+			if err == nil && len(below) != 0 {
+				err = fmt.Errorf("below copies: %+v", below)
+			}
+			return err
+		}},
 		{"replacing", func() error { _, err := view.Replacing(ctx); return err }},
 		{"replicas", func() error { _, err := replicaStatus(ctx, view); return err }},
 		{"places", func() error { _, err := places(ctx, view, time.Now()); return err }},
+		{"capacity", func() error { _, err := (&app{}).capacityStatus(ctx, view, 2, time.Now()); return err }},
+		{"lending", func() error { _, err := view.LentNumbers(ctx, time.Now(), ""); return err }},
 	} {
-		start := time.Now()
-		if err := r.read(); err != nil {
-			t.Fatalf("%s: %v", r.name, err)
-		}
-		took := time.Since(start)
-		if r.name == "offsite" {
-			offsite = took
+		took := time.Duration(1 << 62)
+		for range 2 {
+			start := time.Now()
+			if err := r.read(); err != nil {
+				t.Fatalf("%s: %v", r.name, err)
+			}
+			took = min(took, time.Since(start))
 		}
 		t.Logf("%s: %v", r.name, took)
+		if took > 100*time.Millisecond {
+			slow[r.name] = took
+		}
 	}
 	done()
 	if err := db.Close(); err != nil {
@@ -135,10 +149,13 @@ func TestStatusOfAMillionObjectBucket(t *testing.T) {
 		took = min(took, time.Since(start))
 	}
 	t.Logf("status over %d objects took %v", objects, took)
-	if len(st.Buckets) != 1 || !st.Buckets[0].Offsite.Complete {
+	if len(st.Buckets) != 1 || !st.Buckets[0].Offsite.Complete || st.Buckets[0].Queue.Objects != int64(objects+objects/10+1201) {
 		t.Fatalf("status: %+v", st.Buckets)
 	}
-	if offsite > 100*time.Millisecond {
-		t.Fatalf("status's offsite read took %v, want well under a second", offsite)
+	if len(slow) > 0 {
+		t.Errorf("status's reads took longer than 100 ms: %v", slow)
+	}
+	if took > 500*time.Millisecond {
+		t.Errorf("status over %d objects took %v, want well under a second", objects, took)
 	}
 }

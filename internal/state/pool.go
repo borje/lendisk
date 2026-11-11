@@ -1116,10 +1116,17 @@ type BelowStat struct {
 // lacks room for, refusals, copies dropped at a friend gone past
 // replace_after (REPL-4), and copies at a friend removed since (PEER-5,
 // #25), until re-placement (#26). Buckets with none are absent.
+//
+// It reads what the daemon's fold stored, with the keys changed since
+// computed afresh (belowstore.go, #116), and every live put of a bucket
+// whose places or copies differ from what was stored; either way it
+// equals below.
 func (db *DB) BelowCopies(ctx context.Context) (map[string]BelowStat, error) {
-	return db.below(ctx, "")
+	return db.storedBelow(ctx)
 }
 
+// below is BelowCopies computed from every live put, with and narrowing
+// the puts counted.
 func (db *DB) below(ctx context.Context, and string) (map[string]BelowStat, error) {
 	rows, err := db.QueryContext(ctx, `SELECT q.bucket, count(*), coalesce(sum(q.size), 0) FROM queue q
 		WHERE q.state = 'done' AND q.op = 'put'

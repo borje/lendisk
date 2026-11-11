@@ -155,7 +155,7 @@ func storedWatermarkRun(t *testing.T, seed uint64, steps int) {
 	var pending []int64
 	var stale *fold
 	var staleBucket string
-	usedStored := 0
+	usedStored, usedStoredBelow := 0, 0
 	// Between a fold's claim and its batches, the read is still the
 	// computed one.
 	p.db.betweenFoldBatches = func() {
@@ -163,6 +163,9 @@ func storedWatermarkRun(t *testing.T, seed uint64, steps int) {
 			if _, diff, err := sameOffsite(p.db, b, 0); err != nil || diff != "" {
 				t.Errorf("mid-fold: %s %v", diff, err)
 			}
+		}
+		if _, diff, err := sameStatusReads(p.db, p.now); err != nil || diff != "" {
+			t.Errorf("mid-fold: %s %v", diff, err)
 		}
 	}
 	for step := 1; step <= steps; step++ {
@@ -308,11 +311,23 @@ func storedWatermarkRun(t *testing.T, seed uint64, steps int) {
 				t.Fatalf("seed %d step %d: %s\nlast steps:\n%v", seed, step, diff, log[from:])
 			}
 		}
+		// Status's other reads (#116), below copies among them from the
+		// rows the same folds stored.
+		n, diff, err := sameStatusReads(p.db, p.now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		usedStoredBelow += n
+		if diff != "" {
+			from := max(0, len(log)-30)
+			t.Fatalf("seed %d step %d: %s\nlast steps:\n%v", seed, step, diff, log[from:])
+		}
 	}
-	if usedStored < steps/2 {
-		t.Fatalf("the stored rows were read in %d of %d reads: the test compares the full computation with itself", usedStored, 2*steps)
+	if usedStored < steps/2 || usedStoredBelow < steps/2 {
+		t.Fatalf("the stored rows were read in %d and %d of %d reads: the test compares the full computation with itself",
+			usedStored, usedStoredBelow, 2*steps)
 	}
-	t.Logf("%d of %d reads used the stored rows", usedStored, 2*steps)
+	t.Logf("%d of %d reads used the stored rows, %d the stored below rows", usedStored, 2*steps, usedStoredBelow)
 }
 
 // REPL-11 (#81): a fold that read before a key changed clears only the

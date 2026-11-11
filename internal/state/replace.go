@@ -334,15 +334,18 @@ type ReplacingStat struct {
 // Replacing returns each bucket's re-placement in progress; buckets with
 // none are absent. Only friends count: a removed friend's moved copies
 // are kept there until its purge, and nothing waits to delete them.
+// It reads the queued and dropping rows by their partial indexes, not
+// every row (#116).
 func (db *DB) Replacing(ctx context.Context) (map[string]ReplacingStat, error) {
-	rows, err := db.QueryContext(ctx, `SELECT p.bucket,
-		count(*) FILTER (WHERE p.state = 'queued'),
-		coalesce(sum(q.size) FILTER (WHERE p.state = 'queued'), 0),
-		count(*) FILTER (WHERE p.state = 'dropping')
-		FROM placement p JOIN queue q ON q.seq = p.seq
-		WHERE (p.state = 'dropping' OR p.state = 'queued' AND p.replaced_at IS NOT NULL)
-		AND p.place IN (SELECT peer_key FROM friendship UNION ALL `+overflowPlaces+`)
-		GROUP BY p.bucket`)
+	rows, err := db.QueryContext(ctx, `SELECT bucket, sum(queued), sum(bytes), sum(dropping) FROM (
+			SELECT p.bucket, 1 AS queued, coalesce(q.size, 0) AS bytes, 0 AS dropping
+			FROM placement p INDEXED BY placement_queued JOIN queue q ON q.seq = p.seq
+			WHERE p.state = 'queued' AND p.replaced_at IS NOT NULL
+			AND p.place IN (SELECT peer_key FROM friendship UNION ALL `+overflowPlaces+`)
+			UNION ALL
+			SELECT p.bucket, 0, 0, 1 FROM placement p INDEXED BY placement_dropping JOIN queue q ON q.seq = p.seq
+			WHERE p.state = 'dropping' AND p.place IN (SELECT peer_key FROM friendship UNION ALL `+overflowPlaces+`))
+		GROUP BY bucket`)
 	if err != nil {
 		return nil, err
 	}

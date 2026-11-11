@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"math"
 	"slices"
 	"time"
 )
@@ -231,15 +232,26 @@ func (db *DB) offsite(ctx context.Context, bucket string, target int64, full boo
 		o.shorts = nil // whichever way they were read
 	}
 	o = o.For(target)
-	if o.Snapshot, err = db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND seq <= ? AND `+live,
+	if o.Snapshot, err = db.write(ctx, snapshotFrom, snapshotPut+` AND bucket = ? AND seq <= ? AND `+live,
 		bucket, o.Watermark); err != nil {
 		return o, err
 	}
-	if o.LatestSnapshot, err = db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND `+live, bucket); err != nil {
+	if o.LatestSnapshot, err = db.write(ctx, snapshotFrom, snapshotPut+` AND bucket = ? AND `+live, bucket); err != nil {
 		return o, err
 	}
-	if o.Through, err = db.write(ctx, `queue q INDEXED BY queue_bucket_seq`, `q.bucket = ? AND q.op = 'put' AND q.seq <= ?`, bucket, o.Watermark); err != nil {
+	// From what the fold stored (latestPut, #116): the walk back would
+	// read every delete after the put, a prune's worth.
+	through, err := db.latestPut(ctx, bucket, o.Watermark, math.MaxInt64)
+	if full {
+		through, err = db.latestPutWalked(ctx, bucket, o.Watermark)
+	}
+	if err != nil {
 		return o, err
+	}
+	if through > 0 {
+		if o.Through, err = db.write(ctx, `queue q`, `q.seq = ?`, through); err != nil {
+			return o, err
+		}
 	}
 	var at int64
 	err = db.QueryRowContext(ctx, `SELECT seq, key, created_at FROM queue INDEXED BY queue_bucket_seq
@@ -316,9 +328,9 @@ func (s *Shortfall) add(r short) {
 // Seq is 0 when there is none.
 func (db *DB) LatestSnapshotWrite(ctx context.Context, bucket string, seq int64) (Write, error) {
 	if seq <= 0 {
-		return db.write(ctx, `queue q`, snapshotPut+` AND bucket = ?`, bucket)
+		return db.write(ctx, snapshotFrom, snapshotPut+` AND bucket = ?`, bucket)
 	}
-	return db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND seq <= ?`, bucket, seq)
+	return db.write(ctx, snapshotFrom, snapshotPut+` AND bucket = ? AND seq <= ?`, bucket, seq)
 }
 
 // LatestWrite is bucket's latest done write, put or delete; Seq is 0
@@ -336,6 +348,12 @@ const live = `NOT EXISTS (SELECT 1 FROM queue l
 // queue_metadata instead of every row of the bucket (#20, CI under
 // -race).
 const snapshotPut = `q.class IN ('metadata', 'snapshot') AND q.class = 'snapshot' AND q.op = 'put'`
+
+// snapshotFrom reads snapshotPut's rows by queue_metadata by name: with
+// a bound on seq, SQLite prefers queue_bucket_seq (two terms to its
+// one) and walks every row of the bucket below the bound, a prune's
+// deletes and all (#116).
+const snapshotFrom = `queue q INDEXED BY queue_metadata`
 
 // write returns the latest done queue row q of from matching where.
 // From names the index to read: queue_bucket_seq walks the bucket's
@@ -379,7 +397,9 @@ func (db *DB) fullShorts(ctx context.Context, bucket string, copies int, holders
 // sequence: a pending put has no placement yet (#20 review), so it is
 // always short, and is never stored.
 func (db *DB) withPending(ctx context.Context, bucket string, done []short) ([]short, error) {
-	rows, err := db.QueryContext(ctx, `SELECT seq, unmatchable IS NOT NULL FROM queue
+	// By the partial index of pending rows: the bucket's own index
+	// would walk every row of it (#116).
+	rows, err := db.QueryContext(ctx, `SELECT seq, unmatchable IS NOT NULL FROM queue INDEXED BY queue_pending
 		WHERE state = 'pending' AND bucket = ? AND op = 'put'`, bucket)
 	if err != nil {
 		return nil, err
