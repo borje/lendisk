@@ -344,6 +344,32 @@ func TestUndeleteAtAVersionedTargetKeepsAPutInFlight(t *testing.T) {
 	}
 }
 
+// A put queued there of the very bytes being brought back (the node
+// re-sends a key another friend's undelete just restored here) is no
+// newer version: the target's copy comes back and is counted, not
+// reported kept (CI at 20e7ee2: "this node keeps its own version (X);
+// the friend's (X) is not counted").
+func TestUndeleteAtAVersionedTargetRestoresAKeyQueuedWithTheSameBytes(t *testing.T) {
+	db, r, ft, _ := targetNode(t, state.VersioningEnabled, packA, packB)
+	ctx := context.Background()
+	ft.restoring = func(key string) {
+		if key != packA {
+			return
+		}
+		seqs, err := db.BeginCaptures(ctx, []state.Capture{{Bucket: "laptop", Key: packB, Op: state.OpPut, Class: "data"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.FinishPut(ctx, seqs[0], int64(len(bodyOf(packB))), hash(bodyOf(packB))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, res := runUndelete(t, db, r, time.Time{})
+	if fr := res.Friends[0]; len(ft.restored) != 2 || fr.KeptCount != 0 || fr.Restored != 2 {
+		t.Fatalf("restored %v, result %+v", ft.restored, fr)
+	}
+}
+
 // #39 review: a key with a drained copy's held delete, already due, and
 // a later delete's, inside the window: undelete claims both, brings the
 // key back, and neither is ever sent.

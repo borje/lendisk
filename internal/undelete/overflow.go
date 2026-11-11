@@ -3,6 +3,7 @@ package undelete
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/borje/lendisk/internal/control"
@@ -251,11 +252,14 @@ func (r *Runner) undeleteTarget(ctx context.Context, tg target, q state.Undelete
 				// A put of the key queued or in flight there is a newer
 				// version: copying the old one over it could undo it
 				// (#39 review). It is kept, as a friend's newer version is.
+				// A put of the very bytes being brought back (this node
+				// re-sending a key another place's undelete restored
+				// here) is no newer version: the copy goes ahead.
 				ours, busy, err := r.DB.PutInFlight(ctx, place, q.Bucket, c.obj.Key)
 				if err != nil {
 					return err
 				}
-				if busy {
+				if busy && !strings.EqualFold(ours, c.obj.SHA256) {
 					fr.KeptCount++
 					if len(fr.Kept) < MaxNamed {
 						fr.Kept = append(fr.Kept, state.KeptVersion{Key: c.obj.Key, SHA256: c.obj.SHA256, Ours: ours})
