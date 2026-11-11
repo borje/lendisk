@@ -137,7 +137,7 @@ func (db *DB) SetLentUploadParts(ctx context.Context, uploadID string, parts map
 
 // LentUploads lists peer's recorded uploads.
 func (db *DB) LentUploads(ctx context.Context, peer string) ([]LentUpload, error) {
-	rows, err := db.QueryContext(ctx, `SELECT upload_id, sealed, key, sha256, created_at, counted FROM lent_upload
+	rows, err := db.QueryContext(ctx, `SELECT upload_id, sealed, key, sha256, created_at, counted, replaces FROM lent_upload
 		WHERE peer_key = ? ORDER BY upload_id`, peer)
 	if err != nil {
 		return nil, err
@@ -147,10 +147,12 @@ func (db *DB) LentUploads(ctx context.Context, peer string) ([]LentUpload, error
 	for rows.Next() {
 		u := LentUpload{Peer: peer}
 		var created int64
-		if err := rows.Scan(&u.UploadID, &u.Sealed, &u.Key, &u.SHA256, &created, &u.Counted); err != nil {
+		var replaces sql.NullString
+		if err := rows.Scan(&u.UploadID, &u.Sealed, &u.Key, &u.SHA256, &created, &u.Counted, &replaces); err != nil {
 			return nil, err
 		}
 		u.CreatedAt = time.Unix(created, 0)
+		u.Replaces = replaces.String
 		out = append(out, u)
 	}
 	return out, rows.Err()

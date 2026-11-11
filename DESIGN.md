@@ -4829,18 +4829,65 @@ the handler's own reads and is never cancelled; nothing below
   does not match, the leftover is not deleted on that evidence: it is
   kept and counted, the mismatch logged at warn, and the object
   removed (and taken out of the sum) as a failed completion's would be,
-  so a borrower that never had the completion acknowledged sends it
-  again. A borrower that met NoSuchUpload on its retry and acknowledged
-  the object from its declared hash (#87) is not told: until #113 the
-  lender verifies only in the reconcile, so the loss shows only to
-  verify (VER-1, VER-1a). It was a corrupt copy either way; the
-  leftover then falls to the `AbandonAfter` rule
-  (`TestLinkedLeftoverFailingItsHashKeptAndObjectDropped`). An object
-  that cannot be read leaves all as it is until the next reconcile. A
+  so the borrower sends it again; the leftover then falls to the
+  `AbandonAfter` rule
+  (`TestLinkedLeftoverFailingItsHashKeptAndObjectDropped`). A
   row whose upload the store no longer lists is likewise hashed before
   it is dropped when the upload assembled the object at its key, so an
   object linked just before a crash is verified without waiting for a
-  retry (`TestObjectLinkedBeforeACrashHashCheckedByTheReconcile`). A
+  retry (`TestObjectLinkedBeforeACrashHashCheckedByTheReconcile`).
+  *Decision (#113):* a row is dropped unverified by nothing. An object
+  that cannot be read, an upload ID that cannot be read (the reconcile
+  cannot tell whether the upload linked the object), and a failed
+  object that cannot be removed each keep the row, and a hidden
+  leftover beside them, past `AbandonAfter` too, for the next reconcile
+  (`TestAnUnreadableLinkedObjectKeepsItsRowAndLeftover`,
+  `TestAnUnreadableUploadIDKeepsTheRow`,
+  `TestAFailedRemovalKeepsTheRowForTheNextReconcile`); a completion
+  whose failed object cannot be removed keeps its row the same way. A
+  failed object that a rewrite in parts published moves the version it
+  replaced back from its tomb (`undoRewrite`: the key's newest tomb, a
+  rewrite's, of the marked hash, made since the upload began), as
+  `completeLent` does, rather than leave the key empty
+  (`TestAFailedRewriteFoundAfterACrashMovesTheReplacedVersionBack`).
+  The reconcile reads the tombstone count before it lists, so a version
+  moved back is counted once. *Decision (#113):* no request answers
+  for an object an unverified row linked. After NoSuchUpload a
+  borrower acknowledges the object if HEAD answers its hash (#87), and
+  HEAD answers the declared hash copied into the object's metadata,
+  not one taken from its bytes; so a corrupt copy would be counted
+  intact toward I1 (`state.mayRemove`), and removed by the reconcile
+  from under it. `Lending.vouch` runs before a borrower's HEAD of the
+  key, a `ListParts` the store answers NoSuchUpload, a completion (this
+  upload's retry or another's: "the same object again" answers from the
+  stored copy), a put (the same hash answers from it), and a delete (a
+  tomb holds only verified bytes, so no revival, `putOverTomb`, a
+  completion's or `undelete`'s, answers for unverified ones). It reads
+  the object's upload-ID attribute and, for a multipart object, its row
+  by upload ID; only when the row is this borrower's upload of this key
+  does it take the key's lock and the publication lock shared, read
+  both again, and verify as `verifyLanded` does: verified, the row is
+  dropped and the object counted; failed, the object is removed (the
+  rewrite undone), the row dropped, and HEAD answers 404, so the
+  borrower's #87 check sends it again. A put's object pays one
+  attribute read, a verified multipart object one more indexed lookup,
+  and only the first request after a crash hashes
+  (`TestOnlyAnUnverifiedObjectIsHashedOnHeadAndOnlyOnce`). An object
+  that cannot be read or removed, or whose upload ID cannot be read
+  while the borrower has a row for its key, answers 500, so the
+  borrower retries rather than acknowledging. End to end, a borrower's
+  replication worker whose object went bad on the lender's disk before
+  a crash between link and hash sends it again
+  (`TestABorrowerRetryingAfterALenderCrashSendsABadObjectAgain`); HEAD,
+  `ListParts` and each write are tested alone
+  (`TestHeadVerifiesAnObjectLinkedBeforeACrash`,
+  `TestListPartsNoSuchUploadVerifiesTheLinkedObject`,
+  `TestNoWriteIsAnsweredFromAnObjectLinkedBeforeACrash`). A completion
+  takes the publication lock before it reads its row or the key, so a
+  reconcile cannot settle the upload between the read and the count
+  (`TestARetriedCompletionRacingAReconcileCountsTheObjectOnce`, through
+  the `afterVouchRead` hook, which starts a reconcile there). `isCode`
+  reads posix's `NoSuchUploadError` too, which `ListParts` answers. A
   completion that fails after posix's stub answer counts what stays on
   disk of its upload (`Lending.leftBehind`) instead of freeing it all
   (`TestFailedCompletionLeftoverStaysCounted`); a leftover with no row

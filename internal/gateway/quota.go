@@ -612,6 +612,11 @@ func (l *Lending) putLent(ctx context.Context, peer, sealed string, in s3respons
 	if in.ContentLength != nil && *in.ContentLength > 0 {
 		size = *in.ContentLength
 	}
+	// A put of the same hash is answered from the stored object: it
+	// must be one the lender verified (#113).
+	if _, err := l.vouch(ctx, peer, sealed, *in.Bucket, key); err != nil && err != errBadDigest {
+		return none, err
+	}
 	b := l.body(key, in.Body, size)
 	old, has, err := l.existing(ctx, *in.Bucket, key)
 	if err != nil {
@@ -1007,6 +1012,18 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		return none, "", errInternal
 	}
 	defer unlock()
+	// The row and the key are read under the pub lock, so a reconcile
+	// cannot settle the upload between a read and its count (#113).
+	pub := &published{u: l.use(peer)}
+	pub.take()
+	defer pub.release()
+	// An object at the key that an upload linked before a crash, never
+	// verified, is verified first (#113): this upload's (a retried
+	// completion) or another's, whose declared hash would otherwise
+	// answer for it.
+	if linked, err := l.vouchLocked(ctx, peer, sealed, bucket, key); err != nil && (err != errBadDigest || linked == uploadID) {
+		return none, "", err
+	}
 	u, uerr := l.upload(ctx, peer, sealed, key, in.UploadId)
 	if uerr != nil && uerr != errNoSuchUpload {
 		return none, "", uerr
@@ -1015,18 +1032,10 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 	if err != nil {
 		return none, "", errInternal
 	}
-	pub := &published{u: l.use(peer)}
-	pub.take()
-	defer pub.release()
 	if has && l.Uploads != nil {
 		if id, err := l.Uploads.UploadID(bucket, key); err == nil && id == uploadID {
-			// This upload is the stored object: a retried completion.
-			if uerr == nil {
-				// Completed before a crash and not verified yet.
-				if bad := l.verifyLanded(ctx, peer, bucket, key, u, old); bad != nil {
-					return none, "", bad
-				}
-			}
+			// This upload is the stored object, verified: a retried
+			// completion, answered by the store.
 			return l.Next.CompleteMultipartUpload(ctx, in)
 		}
 	}
@@ -1127,9 +1136,19 @@ func (l *Lending) completeLent(ctx context.Context, peer, sealed string, in *s3.
 		undo()
 		return res, ver, err
 	}
+	if l.afterCompleteLink != nil {
+		if err := l.afterCompleteLink(); err != nil {
+			return none, "", errInternal // as a crash: linked, unverified, the row kept
+		}
+	}
 	n, got, err := l.hashStored(ctx, bucket, key)
 	if err != nil || got != u.SHA256 {
-		l.remove(bucket, key)
+		if !l.remove(bucket, key) {
+			// The row stays, so the object is checked again before the
+			// borrower can take it as stored (vouch) and by the
+			// reconcile (#113).
+			return none, "", errInternal
+		}
 		undo()
 		// What the store left of the upload stays counted (#112).
 		l.count(peer, l.leftBehind(bucket, key, uploadID)-(parts+itemOverhead))
@@ -1187,23 +1206,33 @@ func (l *Lending) tombForRewrite(ctx context.Context, peer, sealed, bucket, key 
 }
 
 // verifyLanded hashes an object that upload u completed before a crash;
-// on a mismatch it is removed and errBadDigest returned. u is settled
-// and counted either way, except when the object cannot be read now.
-// A directory of u that the crash left hidden mid-completion is removed
-// once the object is verified, being a copy of it, and stays counted
-// otherwise (#112). The caller holds the key's lock and the borrower's
-// pub lock.
+// on a mismatch it is removed (a rewrite's replaced version moved back,
+// undoRewrite) and errBadDigest returned. u is settled and counted
+// either way, except when the object cannot be read or removed now:
+// then nothing changes, the row is kept to check again, and
+// errInternal returned. A directory of u that the crash left hidden
+// mid-completion is removed once the object is verified, being a copy
+// of it, and stays counted otherwise (#112). The caller holds the key's
+// lock and the borrower's pub lock, and read u under them.
 func (l *Lending) verifyLanded(ctx context.Context, peer, bucket, key string, u state.LentUpload, old storedObject) error {
 	_, got, err := l.hashStored(ctx, bucket, key)
 	if err != nil {
+		l.log().Warn("lending: reading an object a crash left unverified failed; not answering for it", "peer", peer,
+			"bucket", bucket, "key", key, "err", err)
 		return errInternal
 	}
-	l.dropUpload(u.UploadID)
 	if got != u.SHA256 {
-		l.remove(bucket, key)
+		l.log().Warn("lending: an object a crash left unverified does not match its declared hash; removed it so the borrower sends it again",
+			"peer", peer, "bucket", bucket, "key", key, "upload", u.UploadID)
+		if !l.remove(bucket, key) {
+			return errInternal
+		}
+		l.undoRewrite(ctx, bucket, u)
 		l.count(peer, l.leftBehind(bucket, key, u.UploadID)-(u.Counted+itemOverhead))
+		l.dropUpload(u.UploadID)
 		return errBadDigest
 	}
+	l.dropUpload(u.UploadID)
 	for _, dir := range l.hiddenDirs(bucket, key, u.UploadID) {
 		if !l.removeHidden(peer, bucket, u.UploadID, dir, "its object is linked and verified") {
 			l.count(peer, l.leftBehind(bucket, key, u.UploadID)) // what stays on disk stays counted
@@ -1306,8 +1335,9 @@ func (l *Lending) reconcileOne(ctx context.Context, peer string) error {
 // kept upload's row is set to its parts. What a crash left under
 // .sgwtmp is counted, and removed when garbage (midCompletion). A row
 // whose upload the store no longer has is dropped, its object hashed
-// first if the upload assembled the one at its key; nothing else drops
-// one.
+// first if the upload assembled the one at its key (landed); one whose
+// object cannot be read or removed, or whose upload ID cannot be read,
+// is kept to try again (#113). Nothing else drops one.
 func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 	id, err := identity.ParseNodeID(peer)
 	if err != nil {
@@ -1319,7 +1349,15 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 	}
 	cutoff := l.now().Add(-l.abandonAfter())
 	live := map[string]bool{}
-	var total int64
+	// Tombstoned objects count as they did live (RET-1); posix lists
+	// nothing under .lendisk. Read first: a rewrite's replaced version
+	// moved back below (undoRewrite) is then counted once, as a tomb,
+	// whether or not its bucket was listed yet.
+	n, tb, err := l.DB.TombstoneUsage(ctx, peer)
+	if err != nil {
+		return 0, err
+	}
+	total := tb + n*itemOverhead
 	for _, b := range bs {
 		total += itemOverhead
 		bucket := LentName(id, b.Sealed)
@@ -1385,13 +1423,6 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 		}
 		total += n
 	}
-	// Tombstoned objects count as they did live (RET-1); posix lists
-	// nothing under .lendisk.
-	n, tb, err := l.DB.TombstoneUsage(ctx, peer)
-	if err != nil {
-		return 0, err
-	}
-	total += tb + n*itemOverhead
 	rows, err := l.DB.LentUploads(ctx, peer)
 	if err != nil {
 		return 0, err
@@ -1403,11 +1434,17 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 		// An object the upload assembled before a crash, never verified,
 		// is verified now (#112); otherwise the upload is gone.
 		bucket := LentName(id, r.Sealed)
-		if l.linkedBy(bucket, r.Key, r.UploadID) {
+		linked, err := l.linkedBy(bucket, r.Key, r.UploadID)
+		if err != nil {
+			l.log().Warn("lending: the upload ID of an object a borrower's upload may have assembled cannot be read; keeping its row",
+				"peer", peer, "bucket", bucket, "key", r.Key, "upload", r.UploadID, "err", err)
+			continue
+		}
+		if linked {
 			n, v := l.landed(ctx, peer, bucket, r)
 			total += n
-			if v == landedUnread {
-				continue // kept, to try again
+			if v == landedKept {
+				continue // to try again
 			}
 		}
 		l.dropUpload(r.UploadID)
