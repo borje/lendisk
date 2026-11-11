@@ -275,8 +275,6 @@ func (db *DB) RecordRestored(ctx context.Context, place, bucket string, request 
 			r.Kept = append(r.Kept, KeptVersion{Key: o.Key, SHA256: o.SHA256, Ours: sha.String})
 			continue
 		case err == nil && op == OpPut:
-			// No upsert: place_use's triggers insert OR IGNORE, which an
-			// upsert's own conflict handling overrides.
 			if _, err := p.ExecContext(ctx, `UPDATE placement SET state = 'acked', sha256 = ?, acked_at = ?, size = ?
 				WHERE seq = ? AND place = ? AND state IN ('queued', 'refused', 'dropped', 'abandoned')`,
 				o.SHA256, now, o.Size+ObjectOverhead, seq, place); err != nil {

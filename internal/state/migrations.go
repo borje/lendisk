@@ -1191,6 +1191,42 @@ var migrations = []Migration{
 		Version: 54, Compat: 1, Release: "0.1",
 		SQL: migration54(),
 	},
+	{
+		Version: 55, Compat: 1, Release: "0.1",
+		SQL: `
+		-- place_use's triggers whatever the writer's conflict policy
+		-- (#117). SQLite hands the outer statement's ON CONFLICT policy
+		-- to every statement inside a trigger, so the INSERT OR IGNORE
+		-- that created a place's row failed an upsert or an OR FAIL or
+		-- OR ABORT write on placement or overflow_tomb ("UNIQUE
+		-- constraint failed: place_use.place"), and an OR REPLACE one
+		-- replaced the place's count with 0. The row is now inserted
+		-- only where missing (WHERE NOT EXISTS), which meets no
+		-- conflict, so no policy applies. Same counts as schemas 12 and
+		-- 41.
+		DROP TRIGGER place_use_insert;
+		CREATE TRIGGER place_use_insert AFTER INSERT ON placement
+		WHEN NEW.state IN ('queued', 'acked') BEGIN
+			INSERT INTO place_use (place, bytes) SELECT NEW.place, 0
+				WHERE NOT EXISTS (SELECT 1 FROM place_use WHERE place = NEW.place);
+			UPDATE place_use SET bytes = bytes + coalesce(NEW.size, 0) WHERE place = NEW.place;
+		END;
+		DROP TRIGGER place_use_update;
+		CREATE TRIGGER place_use_update AFTER UPDATE OF place, state, size ON placement BEGIN
+			UPDATE place_use SET bytes = bytes - coalesce(OLD.size, 0)
+				WHERE place = OLD.place AND OLD.state IN ('queued', 'acked');
+			INSERT INTO place_use (place, bytes) SELECT NEW.place, 0
+				WHERE NOT EXISTS (SELECT 1 FROM place_use WHERE place = NEW.place);
+			UPDATE place_use SET bytes = bytes + coalesce(NEW.size, 0)
+				WHERE place = NEW.place AND NEW.state IN ('queued', 'acked');
+		END;
+		DROP TRIGGER overflow_tomb_insert;
+		CREATE TRIGGER overflow_tomb_insert AFTER INSERT ON overflow_tomb BEGIN
+			INSERT INTO place_use (place, bytes) SELECT NEW.place, 0
+				WHERE NOT EXISTS (SELECT 1 FROM place_use WHERE place = NEW.place);
+			UPDATE place_use SET bytes = bytes + NEW.size WHERE place = NEW.place;
+		END;`,
+	},
 }
 
 // migration54 is schema 54's SQL (#116): what status sums over every

@@ -2963,7 +2963,16 @@ upstream bucket is Q-V.
   delete there (a put a delete cancels leaves the count with its row).
   SQLite triggers on `placement` keep it as rows are
   inserted, acknowledged, refused, re-queued, cancelled and moved, so
-  placing an object reads one row per friend. A put acknowledged after
+  placing an object reads one row per friend. *Whatever the writer's
+  conflict policy (#117, schema 55):* SQLite hands the writing
+  statement's `ON CONFLICT` policy to every statement inside its
+  triggers, so the triggers' `INSERT OR IGNORE` of a place's row
+  failed an upsert or an `OR FAIL`/`OR ABORT` write on `placement` or
+  `overflow_tomb` with `UNIQUE constraint failed: place_use.place`,
+  and an `OR REPLACE` one replaced the place's count with 0. Schema 55
+  inserts the row only where it is missing (`WHERE NOT EXISTS`), which
+  meets no conflict, so any writer's policy leaves the count right
+  (`TestPlaceUseIsKeptWhateverTheWritersConflictPolicy`). A put acknowledged after
   a delete of its key was placed at the place (a send in flight, #21)
   landed there, and the lender counts it and then its tomb until the
   purge: it keeps its size, and `AckPlacement` adds that size to the
