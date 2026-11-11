@@ -45,7 +45,8 @@ func TestGenericBucketRefusedWithoutNoEncryptionFlag(t *testing.T) {
 // profile, so the generic lines tell rclone users to copy by download
 // and re-upload and not to update modtimes in place, say why, and say
 // that --backup-dir and --suffix, which rclone allows only with a
-// server-side copy, cannot be used; at add and at show.
+// server-side copy, cannot be used, with a dated prefix as the way to
+// keep old versions (#77); at add and at show.
 func TestGenericLinesGiveRcloneFlags(t *testing.T) {
 	parallel(t, 0)
 	n := newNode(t)
@@ -53,7 +54,7 @@ func TestGenericLinesGiveRcloneFlags(t *testing.T) {
 	_, added, _ := n.run("", "", "bucket", "add", "tools", "--profile", "generic", "--i-understand-no-encryption")
 	_, shown, _ := n.run("", "", "bucket", "show", "tools")
 	for name, out := range map[string]string{"add": added, "show": shown} {
-		for _, want := range []string{"--disable Copy,Move", "--no-update-modtime", "server-side cop", "--backup-dir"} {
+		for _, want := range []string{"--disable Copy,Move", "--no-update-modtime", "server-side cop", "--backup-dir", "dated prefix"} {
 			if !strings.Contains(out, want) {
 				t.Errorf("bucket %s lacks %q:\n%s", name, want, out)
 			}

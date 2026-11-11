@@ -2088,8 +2088,13 @@ upstream bucket is Q-V.
   copy gets the 501 and rclone neither overwrites nor deletes
   anything. Either way the bucket is unchanged, never half-synced
   (`TestRcloneBackupDirRefusedWithoutHarm`), and the lines say these
-  two flags cannot be used. Whether to capture copies for generic
-  buckets after all, so that `--backup-dir` works, is #77.
+  two flags cannot be used. *Decision (#77, 2026-11-11):* copies stay
+  refused on generic buckets too, for v1. Generic buckets are outside
+  the trust guarantee and few tools need copies; capturing them would
+  mean reading back and hashing each copied object. The lines and the
+  README give the workaround, a dated destination prefix per run
+  (`rclone sync src remote:bucket/2026-11-11/`), and capturing copies
+  is revisited if users ask for it.
   *Measured (EP-2 AC):* `TestCaptureOverhead` in `internal/gateway`
   (opt-in, `LENDISK_OVERHEAD_MB`; `LENDISK_OVERHEAD_TOOL=restic|kopia`,
   default each installed tool as a subtest) times `restic backup` or

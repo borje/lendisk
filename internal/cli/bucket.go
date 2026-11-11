@@ -443,7 +443,8 @@ func toolLines(w io.Writer, b state.Bucket, where, url, cacert string, existing 
 		fmt.Fprintf(w, "\nThe key cannot create buckets; for rclone set no_check_bucket = true.\n")
 		fmt.Fprintf(w, "For rclone also pass --disable Copy,Move --no-update-modtime: lendisk refuses server-side copies,\n"+
 			"so rclone must re-upload instead of copying or moving and leave stored modtimes alone.\n"+
-			"rclone's --backup-dir and --suffix need a server-side copy and cannot be used here.\n")
+			"rclone's --backup-dir and --suffix need a server-side copy and cannot be used here;\n"+
+			"to keep old versions, sync each run to a dated prefix (remote:bucket/2026-11-11/) instead.\n")
 	}
 }
 
