@@ -223,36 +223,66 @@ func heldDrift(ctx context.Context, view *DB) ([]TallyDrift, heldFix, error) {
 	if err != nil {
 		return nil, fix, err
 	}
-	computed, err := read(`SELECT place, count(*), coalesce(sum(size), 0) FROM (` + overflowLiveRows + `) GROUP BY place`)
+	// The copies that count, in one pass, each looked up among the stored
+	// copies by its key (place, seq): per target, how many and their
+	// bytes, and how many have no stored copy alike. Both sides are unique
+	// by place and seq, so when every copy that counts is stored alike
+	// and a target stores as many as count, its stored copies are
+	// exactly the rows' (#120: the hourly check walked the copies that
+	// count three times, 1.8 s -> 5.8 s on a million objects).
+	computed := map[string]TargetHeld{}
+	unalike := false
+	err = eachRow(ctx, view, `SELECT r.place, count(*), coalesce(sum(r.size), 0),
+			count(*) FILTER (WHERE s.seq IS NULL OR s.bucket IS NOT r.bucket OR s.key IS NOT r.key OR s.size IS NOT r.size)
+		FROM (`+overflowLiveRows+`) r LEFT JOIN overflow_live s ON s.place = r.place AND s.seq = r.seq
+		GROUP BY r.place`, func(rows *sql.Rows) error {
+		var place string
+		var h TargetHeld
+		var n int64
+		if err := rows.Scan(&place, &h.Objects, &h.Bytes, &n); err != nil {
+			return err
+		}
+		computed[place] = h
+		unalike = unalike || n > 0
+		return nil
+	})
 	if err != nil {
 		return nil, fix, err
 	}
-	// The stored copies the rows lack, and the rows' copies not stored
-	// as they are.
+	for p, s := range sums {
+		unalike = unalike || s.Objects != computed[p].Objects
+	}
+	for p, c := range computed {
+		unalike = unalike || c.Objects != sums[p].Objects
+	}
+	// Only then: the stored copies the rows lack, and the rows' copies
+	// not stored as they are.
 	const cols = `SELECT place, seq, bucket, key, size`
 	copies := map[string]map[int64]bool{}
 	keys := map[[2]string]bool{}
-	err = eachRow(ctx, view, `SELECT place, seq, bucket, key FROM (`+cols+` FROM overflow_live
+	if unalike {
+		err = eachRow(ctx, view, `SELECT place, seq, bucket, key FROM (`+cols+` FROM overflow_live
 			EXCEPT `+cols+` FROM (`+overflowLiveRows+`))
 		UNION ALL SELECT place, seq, bucket, key FROM (`+cols+` FROM (`+overflowLiveRows+`)
 			EXCEPT `+cols+` FROM overflow_live)`, func(rows *sql.Rows) error {
-		var place string
-		var seq int64
-		var bucket, key sql.NullString
-		if err := rows.Scan(&place, &seq, &bucket, &key); err != nil {
-			return err
-		}
-		if copies[place] == nil {
-			copies[place] = map[int64]bool{}
-		}
-		copies[place][seq] = true
-		k := [2]string{bucket.String, key.String}
-		if !keys[k] {
-			keys[k] = true
-			fix.keys = append(fix.keys, k)
-		}
-		return nil
-	})
+			var place string
+			var seq int64
+			var bucket, key sql.NullString
+			if err := rows.Scan(&place, &seq, &bucket, &key); err != nil {
+				return err
+			}
+			if copies[place] == nil {
+				copies[place] = map[int64]bool{}
+			}
+			copies[place][seq] = true
+			k := [2]string{bucket.String, key.String}
+			if !keys[k] {
+				keys[k] = true
+				fix.keys = append(fix.keys, k)
+			}
+			return nil
+		})
+	}
 	if err != nil {
 		return nil, fix, err
 	}
@@ -290,7 +320,7 @@ func (f heldFix) apply(ctx context.Context, tx *sql.Tx) error {
 			return err
 		}
 	}
-	for _, stmts := range []func(bucket, key, cond string) []string{overflowKeyDrop, overflowKeyAdd} {
+	for _, stmts := range []func(bucket, key, cond string) []string{overflowKeyDrop, overflowKeyAdd58} {
 		for _, k := range f.keys {
 			for _, s := range stmts("?1", "?2", "") {
 				if _, err := tx.ExecContext(ctx, s, k[0], k[1]); err != nil {

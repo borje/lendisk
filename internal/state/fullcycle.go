@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"slices"
 	"time"
 )
 
@@ -42,38 +43,72 @@ const cyclePlaces = `(SELECT peer_key, address, NULL AS cycle FROM friendship
 // that acknowledged objects of the bucket, not marked unverified, no
 // error within retry, and waiting while the replica's FIFO is busy until
 // more than Overdue past due), each a slice every after the last
-// (cycle_at), or at once when it never had one.
+// (cycle_at), or at once when it never had one. As DueReplicas, it reads
+// the FIFO by the partial indexes of queued and dropping rows, and the
+// first acknowledgement of a replica that never had a slice and whose
+// FIFO is busy from what the offsite fold stored (heldOf, #120); only
+// such a replica needs it, and then the whole answer is read in one
+// read transaction unless db is already a Snapshot.
 func (db *DB) DueCycles(ctx context.Context, now time.Time, every, retry time.Duration) ([]FullCycle, error) {
 	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name, coalesce(f.cycle, 0), coalesce(c.cycle_after, 0),
-		c.cycle_started_at, coalesce(c.cycle_checked, 0), coalesce(c.cycle_skipped, 0)
+		c.cycle_started_at, coalesce(c.cycle_checked, 0), coalesce(c.cycle_skipped, 0),
+		c.cycle_at IS NULL AND `+fifoBusy+`
 		FROM `+cyclePlaces+` f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
 		WHERE coalesce(f.address, '') != '' AND c.unverified_at IS NULL
 		AND (c.cycle_at IS NULL OR c.cycle_at <= ?1) AND (c.error_at IS NULL OR c.error_at <= ?2)
 		AND EXISTS (SELECT 1 FROM placement p
 			WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state = 'acked' AND p.op = 'put')
-		AND (NOT EXISTS (SELECT 1 FROM placement p
-				WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state IN ('queued', 'dropping'))
-			OR c.cycle_at <= ?3
-			OR c.cycle_at IS NULL AND `+heldSince+` <= ?4)
+		AND (NOT `+fifoBusy+` OR c.cycle_at <= ?3 OR c.cycle_at IS NULL)
 		ORDER BY b.name, f.peer_key`, now.Add(-every).Unix(), now.Add(-retry).Unix(),
-		now.Add(-every-Overdue).Unix(), now.Add(-Overdue).Unix())
+		now.Add(-every-Overdue).Unix())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []FullCycle
+	var busy []bool
 	for rows.Next() {
 		var c FullCycle
 		var cycle int64
 		var started sql.NullInt64
-		if err := rows.Scan(&c.Place, &c.Bucket, &cycle, &c.After, &started, &c.Checked, &c.Skipped); err != nil {
+		var b bool
+		if err := rows.Scan(&c.Place, &c.Bucket, &cycle, &c.After, &started, &c.Checked, &c.Skipped, &b); err != nil {
 			return nil, err
 		}
 		c.Cycle, c.StartedAt = time.Duration(cycle)*time.Second, timeOf(started)
-		out = append(out, c)
+		out, busy = append(out, c), append(busy, b)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if !slices.Contains(busy, true) {
+		return out, nil
+	}
+	if db.snap == nil {
+		view, done, err := db.Snapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer done()
+		return view.DueCycles(ctx, now, every, retry)
+	}
+	// Never sliced, busy: due a day after its first acknowledgement.
+	var due []FullCycle
+	for i, c := range out {
+		if busy[i] {
+			ok, err := db.heldOverdue(ctx, c.Place, c.Bucket, now)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+		}
+		due = append(due, c)
+	}
+	return due, nil
 }
 
 // ChallengeableAfter returns how many objects a challenge may name at

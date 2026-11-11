@@ -4946,7 +4946,8 @@ upstream bucket is Q-V.
     queue write runs the recompute only while some placement row or
     stored copy is at a target (`anyOverflowCopy`, two index probes),
     so a node without overflow pays nothing more, and one with it a
-    few index look-ups by the key per version of it at each target. The migration
+    few index look-ups by the key per version of it at each target (per
+    live version since schema 58, #120). The migration
     fills both from the rows. `RepairQueueTally` checks them too, in the
     same read transaction: a target's stored copies against the copies
     that count (`EXCEPT` both ways), its total against the stored
@@ -4961,9 +4962,8 @@ upstream bucket is Q-V.
     `heldOf`, as `ReplicaChecks` does. The query flags the replicas it
     is for (never answered, FIFO busy); only when one is flagged does
     `DueReplicas` read again in one read transaction and keep those a
-    day past their first acknowledgement. `DueCycles` keeps the old
-    term (its FIFO read too): it runs after the daily challenges, not
-    every 5 s.
+    day past their first acknowledgement. `DueCycles` kept the old
+    term (its FIFO read too) until #120 (below).
   - *The per-capture read* was `unsentMetadata`, the bucket's live
     metadata a friend lacks, asked for each friend `choose` weighs
     (and `placeMetadata`'s list for a target given its first copy). Its
@@ -4992,6 +4992,62 @@ upstream bucket is Q-V.
   opening took 0.7 s (a cold cache and the split's first read). Cost:
   migration 57 takes 2.9 s once; the hourly check 1.8 s → 5.8 s, the
   difference the target's copies compared both ways.
+
+  *Full-cycle due dates, the hourly check and a hot key's writes
+  (#120).* Three costs #119 left:
+  - *`DueCycles`* reads as `DueReplicas` does: the FIFO by the partial
+    indexes of `queued` and `dropping` rows (`fifoBusy`, shared), and a
+    replica that never had a slice and whose FIFO is busy is flagged by
+    the query and kept only once its first acknowledgement, from the
+    fold (`heldOverdue`, over `heldOf`), is a day old, the whole answer
+    then in one read transaction. `sameStatusReads` compares it with the
+    query it replaced (`dueCyclesFull`, the old `heldSince` term now
+    only there), so after every step of the randomised tests;
+    `TestAStarvedFullCycleStartsADayAfterItsFirstAcknowledgement`
+    covers the never-sliced busy replica after a fold. On the million
+    objects, B busy and never sliced: 0.81 s → 0.71 ms.
+  - *The hourly check's holds part* walks the copies that count once,
+    not three times: one pass groups them per target (count, bytes)
+    and looks each up among the stored copies by `(place, seq)`
+    (`LEFT JOIN overflow_live`), counting those with no stored copy
+    alike. Both sides are unique by place and seq, so when that count is
+    0 and each target stores as many copies as count, the stored copies
+    are exactly the rows'; only otherwise does the check run the
+    `EXCEPT` both ways to name the drifted keys, as before. A drift that
+    keeps every count and total (a stored copy under another key, bytes
+    moved between copies) is still found
+    (`TestAnOverflowHoldDriftThatKeepsTheTotalsIsStillRepaired`), and
+    `TestOverflowHoldsEqualTheRowsWhateverWritesThem` now checks the
+    stored copies, not only their totals, after every step. On the
+    million objects the check is 5.8 s → 3.5 s: the holds' part 1.9 s
+    (the copies' join with `queue` 0.25 s, each copy's `liveQ` probe
+    about 0.95 s, the look-up of its stored copy about 0.6 s), the
+    queue tallies' 1.7 s as before #119. Not back to 2 s: what is left is
+    one exact pass over the target's copies, which nothing cheaper
+    replaces without giving up exactness. A known cost, recorded as
+    such: on a Raspberry Pi 4 expect several times the development
+    machine's, some 10–20 s of one core an hour at a million objects
+    (estimated, not measured; the measurement belongs to the
+    small-hardware benchmarks, #45).
+  - *A hot key's writes.* With a copy at an overflow target, schema
+    57's queue triggers recomputed a key's copies from every version of
+    it (the recompute reads the key's rows by `queue_key` and probes
+    each one's copies and `liveQ`), so a generic S3 key overwritten
+    very often got slower to write. Schema 58 recreates the three queue
+    triggers (`internal/state/overflowlive58.go`, `overflowKeyAdd58`)
+    reading only the key's rows from its latest done write on (`q.seq
+    >=` the key's newest done row, found by `queue_key` from the top):
+    an earlier row has a later done write, so it is not live and no
+    copy of it counts. Same rows, same `WHEN`; the placement triggers
+    and the drops are unchanged, and `RepairQueueTally` recomputes with
+    the new statements. `TestAWriteToAKeyReadsItsVersionsOnlyFromTheLatestDoneOne`
+    reads the triggers from the schema and the recompute's plan
+    (`SEARCH q USING INDEX queue_key (bucket=? AND key=? AND seq>?)`);
+    the randomised test fails if the bound drops the latest done row.
+    `TestAWriteToAKeyOfManyVersionsCostsAsAFreshKeys`
+    (`LENDISK_BIG_VERSIONS=100000`): a write (and its copy) to a key of
+    100,000 versions, each copied to a target, 143 ms → 1.5 ms, a fresh
+    key's 1.4 ms; migration 58 takes 6 ms on the million objects.
 
 
   *What `status` names (REPL-4, REPL-11).* Under each bucket, and in

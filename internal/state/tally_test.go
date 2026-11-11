@@ -152,11 +152,61 @@ func TestADriftedOverflowHoldIsRepairedKeepingTheWritesMeanwhile(t *testing.T) {
 	}
 }
 
-// #118, #119: what the upgrade to schema 54 (queue_tally's fill), 55,
-// 56 and 57 (the overflow holds' fill) costs a million-object bucket,
-// once, inside each migration's transaction; then what the daemon's
-// hourly tally check costs, and DroppedBelowCopies, DueReplicas and
-// OverflowHolds against the reads they replaced, and a capture. A
+// #120: the hourly check compares a target's stored copies with the
+// copies that count in full only when a cheap pass finds them unalike
+// (counts per target, each copy that counts looked up by place and
+// seq); a drift that keeps every count and total (a stored copy under
+// another key, bytes moved from one copy to another) is still found
+// and corrected.
+func TestAnOverflowHoldDriftThatKeepsTheTotalsIsStillRepaired(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.bucket("laptop", 2)
+	p.friend("B", 100)
+	s3 := p.overflow("s3", 100)
+	d1 := p.put("laptop", "data/1", "data", 1)
+	d2 := p.put("laptop", "data/2", "data", 1)
+	if !slices.Contains(p.places(d1), s3) || !slices.Contains(p.places(d2), s3) {
+		t.Fatalf("data at %v and %v, want a copy at %s each", p.places(d1), p.places(d2), s3)
+	}
+	for _, drift := range []string{
+		`UPDATE overflow_live SET key = 'data/elsewhere' WHERE place = ?1 AND seq = min(?2, ?3)`,
+		`UPDATE overflow_live SET size = size + CASE seq WHEN ?2 THEN 1 ELSE -1 END WHERE place = ?1 AND seq IN (?2, ?3)`,
+	} {
+		before, err := p.db.OverflowHolds(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustExec(t, p.db, drift, s3, d1, d2)
+		if h, err := p.db.OverflowHolds(ctx); err != nil || !reflect.DeepEqual(h, before) {
+			t.Fatalf("%s: the totals changed: %+v, before %+v (%v)", drift, h, before, err)
+		}
+		got, err := p.db.RepairQueueTally(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].Place != s3 || got[0].Copies == 0 || got[0].StoredHeld != got[0].ComputedHeld {
+			t.Fatalf("%s: drift reported %+v", drift, got)
+		}
+		if _, diff, err := sameStatusReads(p.db, p.now); err != nil || diff != "" {
+			t.Fatalf("%s: after the repair: %s %v", drift, diff, err)
+		}
+		if got, err := p.db.RepairQueueTally(ctx); err != nil || len(got) != 0 {
+			t.Fatalf("%s: a repaired hold: drift %+v (%v)", drift, got, err)
+		}
+	}
+	var n int
+	if err := p.db.QueryRow(`SELECT count(*) FROM overflow_live WHERE key = 'data/elsewhere'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("%d copies left under the wrong key (%v)", n, err)
+	}
+}
+
+// #118, #119, #120: what the upgrade to schema 54 (queue_tally's fill),
+// 55, 56, 57 (the overflow holds' fill) and 58 costs a million-object
+// bucket, once, inside each migration's transaction; then what the
+// daemon's hourly tally check costs, and DroppedBelowCopies,
+// DueReplicas, DueCycles and OverflowHolds against the reads they
+// replaced, and a capture. A
 // hundredth of the data has a copy dropped, and D's copies (two thirds
 // of the data) are at an overflow target. Opt-in, as
 // TestStoredOffsiteOfAMillionObjectBucketIsFast:
@@ -215,6 +265,16 @@ func TestTheUpgradeAndTallyCheckOfAMillionObjectBucket(t *testing.T) {
 		}
 		return err
 	})
+	// #120: of which the overflow holds' part.
+	timed("the holds' part of the check", func() error {
+		view, done, err := db.Snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		defer done()
+		_, _, err = heldDrift(ctx, view)
+		return err
+	})
 	var got, want map[string]BelowStat
 	timed("DroppedBelowCopies", func() (err error) { got, err = db.DroppedBelowCopies(ctx); return err })
 	timed("DroppedBelowCopies as before #118", func() (err error) { want, err = droppedBelowFull(ctx, db); return err })
@@ -248,6 +308,16 @@ func TestTheUpgradeAndTallyCheckOfAMillionObjectBucket(t *testing.T) {
 	timed("DueReplicas, B busy, as before #119", func() (err error) { dueWas, err = dueReplicasFull(ctx, db, later); return err })
 	if !reflect.DeepEqual(due, dueWas) || !slices.Contains(due, ReplicaKey{Place: "B", Bucket: "laptop"}) {
 		t.Errorf("DueReplicas %+v, before %+v", due, dueWas)
+	}
+	// #120: DueCycles likewise, B never sliced.
+	var cycles, cyclesWas []FullCycle
+	timed("DueCycles, B busy and never sliced", func() (err error) {
+		cycles, err = db.DueCycles(ctx, later, 24*time.Hour, time.Hour)
+		return err
+	})
+	timed("DueCycles, B busy, as before #120", func() (err error) { cyclesWas, err = dueCyclesFull(ctx, db, later); return err })
+	if !reflect.DeepEqual(cycles, cyclesWas) || !slices.ContainsFunc(cycles, func(c FullCycle) bool { return c.Place == "B" }) {
+		t.Errorf("DueCycles %+v, before %+v", cycles, cyclesWas)
 	}
 	// #119: a capture's metadata reads: one put, finished and placed.
 	before := strings.Replace(unsentMetadataSQL, " INDEXED BY queue_metadata", "", 1)

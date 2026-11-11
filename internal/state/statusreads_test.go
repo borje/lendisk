@@ -93,6 +93,48 @@ func dueReplicasFull(ctx context.Context, db *DB, now time.Time) ([]ReplicaKey, 
 	return out, rows.Err()
 }
 
+// heldSince is the first acknowledgement still held at f.peer_key of
+// bucket b.name (unix seconds), NULL when it holds none, from every
+// copy at the place: what DueReplicas (#119) and DueCycles (#120) read
+// before the fold's value (heldOf).
+const heldSince = `(SELECT min(h.acked_at) FROM placement h
+	WHERE h.place = f.peer_key AND h.bucket = b.name AND h.state = 'acked' AND h.op = 'put')`
+
+// dueCyclesFull is DueCycles as it read every copy at the place before
+// #120, at every and retry of a day and an hour.
+func dueCyclesFull(ctx context.Context, db *DB, now time.Time) ([]FullCycle, error) {
+	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name, coalesce(f.cycle, 0), coalesce(c.cycle_after, 0),
+		c.cycle_started_at, coalesce(c.cycle_checked, 0), coalesce(c.cycle_skipped, 0)
+		FROM `+cyclePlaces+` f CROSS JOIN buckets b
+		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
+		WHERE coalesce(f.address, '') != '' AND c.unverified_at IS NULL
+		AND (c.cycle_at IS NULL OR c.cycle_at <= ?1) AND (c.error_at IS NULL OR c.error_at <= ?2)
+		AND EXISTS (SELECT 1 FROM placement p
+			WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state = 'acked' AND p.op = 'put')
+		AND (NOT EXISTS (SELECT 1 FROM placement p
+				WHERE p.place = f.peer_key AND p.bucket = b.name AND p.state IN ('queued', 'dropping'))
+			OR c.cycle_at <= ?3
+			OR c.cycle_at IS NULL AND `+heldSince+` <= ?4)
+		ORDER BY b.name, f.peer_key`, now.Add(-24*time.Hour).Unix(), now.Add(-time.Hour).Unix(),
+		now.Add(-24*time.Hour-Overdue).Unix(), now.Add(-Overdue).Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FullCycle
+	for rows.Next() {
+		var c FullCycle
+		var cycle int64
+		var started sql.NullInt64
+		if err := rows.Scan(&c.Place, &c.Bucket, &cycle, &c.After, &started, &c.Checked, &c.Skipped); err != nil {
+			return nil, err
+		}
+		c.Cycle, c.StartedAt = time.Duration(cycle)*time.Second, timeOf(started)
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func placeStatsFull(ctx context.Context, db *DB, now time.Time) (map[string]PlaceStat, error) {
 	rows, err := db.QueryContext(ctx, `SELECT p.place,
 		count(*) FILTER (WHERE p.state = 'queued'),
@@ -197,7 +239,7 @@ func overflowHoldsFull(ctx context.Context, db *DB) (map[string]OverflowHold, er
 }
 
 // sameStatusReads compares, in one snapshot, each of status's reads
-// that #116 and #119 stored or indexed with its computation from every row.
+// that #116, #119 and #120 stored or indexed with its computation from every row.
 // storedBelow counts the buckets whose below rows came from the stored
 // ones; diff is "" when everything agrees.
 func sameStatusReads(db *DB, now time.Time) (storedBelow int, diff string, err error) {
@@ -254,6 +296,13 @@ func sameStatusReads(db *DB, now time.Time) (storedBelow int, diff string, err e
 		return 0, "", err
 	}
 	if want, err := dueReplicasFull(ctx, view, now); err != nil || differs("due replicas", due, want) {
+		return 0, diff, err
+	}
+	cycles, err := view.DueCycles(ctx, now, 24*time.Hour, time.Hour)
+	if err != nil {
+		return 0, "", err
+	}
+	if want, err := dueCyclesFull(ctx, view, now); err != nil || differs("due cycles", cycles, want) {
 		return 0, diff, err
 	}
 	holds, err := view.OverflowHolds(ctx)
@@ -506,6 +555,16 @@ func TestOverflowHoldsEqualTheRowsWhateverWritesThem(t *testing.T) {
 		}
 		if _, diff, err := sameStatusReads(db, time.Now()); err != nil || diff != "" {
 			t.Fatalf("step %d (%s %v): %s %v", step, q, args, diff, err)
+		}
+		// The stored copies too, not only their totals (#120).
+		view, done, err := db.Snapshot(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		drift, _, err := heldDrift(ctx, view)
+		done()
+		if err != nil || len(drift) != 0 {
+			t.Fatalf("step %d (%s %v): stored copies drifted: %+v %v", step, q, args, drift, err)
 		}
 		var some bool
 		if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM overflow_live)`).Scan(&some); err != nil {

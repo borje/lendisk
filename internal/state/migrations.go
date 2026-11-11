@@ -1239,6 +1239,42 @@ var migrations = []Migration{
 		Version: 57, Compat: 1, Release: "0.1",
 		SQL: migration57(),
 	},
+	{
+		Version: 58, Compat: 1, Release: "0.1",
+		SQL: migration58(),
+	},
+}
+
+// migration58 is schema 58's SQL (#120): schema 57's queue triggers
+// again, each key's copies recomputed from its latest done write on
+// (overflowKeyAdd58), so a write to a key overwritten many times no
+// longer reads every version of it at every target. Same rows, same
+// WHEN; the placement triggers are unchanged. Once released, never
+// change it.
+func migration58() string {
+	recompute := func(stmts ...[]string) string {
+		var all []string
+		for _, s := range stmts {
+			all = append(all, s...)
+		}
+		return "\n\t\t\t" + strings.Join(all, ";\n\t\t\t") + ";"
+	}
+	drop := func(row, cond string) []string { return overflowKeyDrop(row+".bucket", row+".key", cond) }
+	add := func(row, cond string) []string { return overflowKeyAdd58(row+".bucket", row+".key", cond) }
+	moved := `(OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key)`
+	return `
+		DROP TRIGGER overflow_live_queue_insert;
+		DROP TRIGGER overflow_live_queue_update;
+		DROP TRIGGER overflow_live_queue_delete;
+		CREATE TRIGGER overflow_live_queue_insert AFTER INSERT ON queue WHEN ` + anyOverflowCopy + ` BEGIN` +
+		recompute(drop("NEW", ""), add("NEW", "")) + `
+		END;
+		CREATE TRIGGER overflow_live_queue_update AFTER UPDATE OF seq, bucket, key, class, state, size ON queue WHEN ` + anyOverflowCopy + ` BEGIN` +
+		recompute(drop("OLD", ""), drop("NEW", moved), add("OLD", ""), add("NEW", moved)) + `
+		END;
+		CREATE TRIGGER overflow_live_queue_delete AFTER DELETE ON queue WHEN ` + anyOverflowCopy + ` BEGIN` +
+		recompute(drop("OLD", ""), add("OLD", "")) + `
+		END;`
 }
 
 // migration57 is schema 57's SQL (#119): each overflow target's live

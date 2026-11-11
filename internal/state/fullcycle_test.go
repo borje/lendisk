@@ -171,3 +171,50 @@ func TestATargetsFullCycleIsOptIn(t *testing.T) {
 		t.Fatalf("due once off again: %+v", cs)
 	}
 }
+
+// VER-1a (#105, #120): a replica that never had a slice and whose FIFO
+// never empties gets its first slice a day after its first
+// acknowledgement still held, as the daily challenge does; the time is
+// the one the offsite fold stored, read in one read transaction.
+func TestAStarvedFullCycleStartsADayAfterItsFirstAcknowledgement(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 10)
+	p.bucket("laptop", 1)
+	due := func() bool {
+		t.Helper()
+		cs, err := p.db.DueCycles(ctx, p.now, 24*time.Hour, time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(cs) == 1
+	}
+	a := p.put("laptop", "data/a", "data", 0.1)
+	p.ackAll(a)
+	p.put("laptop", "data/b", "data", 0.1) // stays queued
+	if err := p.db.FoldOffsite(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if due() {
+		t.Fatal("due while replicating, just acknowledged")
+	}
+	p.now = p.now.Add(24*time.Hour - time.Minute)
+	if due() {
+		t.Fatal("due while replicating, under a day after the first acknowledgement")
+	}
+	p.now = p.now.Add(2 * time.Minute)
+	if !due() {
+		t.Fatal("never sliced, a day after the first acknowledgement: not due")
+	}
+	if err := p.db.SaveCycle(ctx, FullCycle{ReplicaKey: ReplicaKey{Place: "B", Bucket: "laptop"}}, p.now); err != nil {
+		t.Fatal(err)
+	}
+	p.now = p.now.Add(36 * time.Hour)
+	if due() {
+		t.Fatal("due half a day overdue while replicating")
+	}
+	p.now = p.now.Add(12*time.Hour + time.Minute)
+	if !due() {
+		t.Fatal("not due more than a day overdue")
+	}
+}
