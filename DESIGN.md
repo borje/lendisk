@@ -4683,7 +4683,13 @@ upstream bucket is Q-V.
     acknowledgements, sends started, cancels, refusals, re-routing,
     re-placement's drops and drains, friend and target removal, seeds,
     undelete, reconcile, recovery); a trigger cannot miss one, nor a
-    write by an older lendisk after a downgrade;
+    write by an older lendisk after a downgrade. Each mark is deleted
+    and inserted again (`AUTOINCREMENT`), naming no conflict policy and
+    meeting no conflict, so a writer's `OR IGNORE`, `OR REPLACE` or
+    upsert still renews it (from the #81 review:
+    `TestAMarkIsRenewedWhateverTheWritersConflictPolicy`). The marking
+    costs bulk writes: abandoning 200,000 recovered keys took 25 s
+    instead of 17 s;
   - a read takes the stored rows of keys not marked and computes the
     marked keys' puts afresh (and the pending puts, never stored), so it
     equals the full read at every commit, folded or not. The holders
@@ -4692,15 +4698,25 @@ upstream bucket is Q-V.
     holders or copies differ from the basis does the full read;
   - the daemon folds every 10 s (`offsiteFolder`, `FoldOffsite`): per
     bucket it reads the marked keys' rows in a read transaction, then
-    in a short write transaction replaces their stored rows and clears
-    the marks it read. Marks are `INSERT OR REPLACE` with an
-    `AUTOINCREMENT` id, so a key changed after the read has a newer
-    mark and stays marked; a fold whose read predates another fold's
-    write (`offsite_basis.folds` moved) writes nothing, since that one
+    writes them in transactions of `SettleBudget` (0.25 s),
+    `SettlePause` apart, as settling does, so the gateway's captures
+    wait one batch at most. The first claims the bucket
+    (`offsite_basis.folds`); every batch checks the claim, and a fold
+    whose read predates another's claim writes nothing, since that one
     may have cleared marks of changes this read did not see
-    (`TestAFoldKeepsTheMarksOfChangesAfterItsRead`). A bucket without a
-    basis, or whose holders or copies changed, is stored in full, read
-    outside the write lock (9 s for a million objects).
+    (`TestAFoldKeepsTheMarksOfChangesAfterItsRead`). The last batch
+    clears the marks the read saw; a key changed after the read has a
+    newer mark and stays marked. Between batches nothing overclaims:
+    an incremental fold's keys stay marked until the last batch, and a
+    full one (a bucket without a basis, or whose holders or copies
+    changed: the first fold after the upgrade, which reads 9 s for a
+    million objects) empties the basis's holders in its claim, which
+    then match no pool, so every read does the full read until the
+    last batch stores them (from the #81 review: one transaction held
+    the lock 0.93 s for 100,000 short rows, some 13 s for a million;
+    `TestAFullFoldKeepsWritersMoving`). A bucket whose fold fails is
+    logged and the others folded
+    (`TestAFailingBucketDoesNotStopTheFoldOfTheOthers`).
 
   A deleted or rewritten object leaves its old put short for good, as
   many as there are live objects in a pruned repository, but a put
@@ -4710,7 +4726,12 @@ upstream bucket is Q-V.
   they are (`next = 0`), and while `w` comes out below the bound it read
   for, reads the rows superseded above `w` again (index
   `offsite_short_next`): each round reads the backlog above `w`, not
-  the history. `Offsite` keeps only those rows either way.
+  the history. `Offsite` keeps only those rows either way. Its latest,
+  next and last fully placed writes walk the bucket's own rows by the
+  index `queue_bucket_seq` (schema 53), not the queue backwards, so a
+  quiet bucket behind another's million writes costs no more than a
+  busy one (from the #81 review:
+  `TestAQuietBucketsOffsiteDoesNotWalkABusyOnesRows`).
 
   Evidence: `TestStoredWatermarkEqualsTheComputedOne` compares the
   stored read with the full one after every step of random puts,
@@ -4719,7 +4740,7 @@ upstream bucket is Q-V.
   marked unmatchable, friends failing, gone, added and refusing, copies
   changed, and folds at random points, some with steps between their
   read and write; the removal model (`TestRemovalModel`, §3.4) checks
-  the same every few of its steps, through the rest of the writers
+  the same every 50 of its steps and at its end, through the rest of the writers
   (seeds, undelete, overflow targets). Weakening the `queue` or
   `placement` update trigger fails them. On a million objects at two
   of three friends, a tenth deleted, the read takes 1 ms from the

@@ -189,7 +189,8 @@ func (db *DB) offsite(ctx context.Context, bucket string, target int64, full boo
 	}
 	o := Offsite{Copies: DefaultCopies}
 	if err := db.QueryRowContext(ctx, `SELECT coalesce((SELECT copies FROM buckets WHERE name = ?1), ?2),
-		coalesce((SELECT seq FROM queue WHERE +bucket = ?1 AND state = 'done' ORDER BY seq DESC LIMIT 1), 0)`,
+		coalesce((SELECT seq FROM queue INDEXED BY queue_bucket_seq WHERE bucket = ?1 AND state = 'done'
+			ORDER BY seq DESC LIMIT 1), 0)`,
 		bucket, DefaultCopies).Scan(&o.Copies, &o.Latest); err != nil {
 		return o, err
 	}
@@ -230,19 +231,19 @@ func (db *DB) offsite(ctx context.Context, bucket string, target int64, full boo
 		o.shorts = nil // whichever way they were read
 	}
 	o = o.For(target)
-	if o.Snapshot, err = db.write(ctx, snapshotPut+` AND bucket = ? AND seq <= ? AND `+live,
+	if o.Snapshot, err = db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND seq <= ? AND `+live,
 		bucket, o.Watermark); err != nil {
 		return o, err
 	}
-	if o.LatestSnapshot, err = db.write(ctx, snapshotPut+` AND bucket = ? AND `+live, bucket); err != nil {
+	if o.LatestSnapshot, err = db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND `+live, bucket); err != nil {
 		return o, err
 	}
-	if o.Through, err = db.write(ctx, `+q.bucket = ? AND q.op = 'put' AND q.seq <= ?`, bucket, o.Watermark); err != nil {
+	if o.Through, err = db.write(ctx, `queue q INDEXED BY queue_bucket_seq`, `q.bucket = ? AND q.op = 'put' AND q.seq <= ?`, bucket, o.Watermark); err != nil {
 		return o, err
 	}
 	var at int64
-	err = db.QueryRowContext(ctx, `SELECT seq, key, created_at FROM queue WHERE seq > ? AND +bucket = ?
-		ORDER BY seq LIMIT 1`, o.Watermark, bucket).Scan(&o.Next.Seq, &o.Next.Key, &at)
+	err = db.QueryRowContext(ctx, `SELECT seq, key, created_at FROM queue INDEXED BY queue_bucket_seq
+		WHERE bucket = ? AND seq > ? ORDER BY seq LIMIT 1`, bucket, o.Watermark).Scan(&o.Next.Seq, &o.Next.Key, &at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, nil
 	}
@@ -315,15 +316,15 @@ func (s *Shortfall) add(r short) {
 // Seq is 0 when there is none.
 func (db *DB) LatestSnapshotWrite(ctx context.Context, bucket string, seq int64) (Write, error) {
 	if seq <= 0 {
-		return db.write(ctx, snapshotPut+` AND bucket = ?`, bucket)
+		return db.write(ctx, `queue q`, snapshotPut+` AND bucket = ?`, bucket)
 	}
-	return db.write(ctx, snapshotPut+` AND bucket = ? AND seq <= ?`, bucket, seq)
+	return db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND seq <= ?`, bucket, seq)
 }
 
 // LatestWrite is bucket's latest done write, put or delete; Seq is 0
 // when there is none.
 func (db *DB) LatestWrite(ctx context.Context, bucket string) (Write, error) {
-	return db.write(ctx, `+q.bucket = ?`, bucket)
+	return db.write(ctx, `queue q INDEXED BY queue_bucket_seq`, `q.bucket = ?`, bucket)
 }
 
 // live keeps queue rows q that are their key's latest done write.
@@ -336,14 +337,15 @@ const live = `NOT EXISTS (SELECT 1 FROM queue l
 // -race).
 const snapshotPut = `q.class IN ('metadata', 'snapshot') AND q.class = 'snapshot' AND q.op = 'put'`
 
-// write returns the latest done queue row q matching where. A where
-// that writes the bucket term as +q.bucket walks the queue backwards
-// by sequence and stops at the first match, rather than reading and
-// sorting every row of the bucket.
-func (db *DB) write(ctx context.Context, where string, args ...any) (Write, error) {
+// write returns the latest done queue row q of from matching where.
+// From names the index to read: queue_bucket_seq walks the bucket's
+// rows backwards by sequence and stops at the first match, rather than
+// reading and sorting every row of the bucket, or walking every other
+// bucket's rows written since (#81 review).
+func (db *DB) write(ctx context.Context, from, where string, args ...any) (Write, error) {
 	var w Write
 	var at int64
-	err := db.QueryRowContext(ctx, `SELECT q.seq, q.key, q.created_at FROM queue q
+	err := db.QueryRowContext(ctx, `SELECT q.seq, q.key, q.created_at FROM `+from+`
 		WHERE q.state = 'done' AND `+where+` ORDER BY q.seq DESC LIMIT 1`, args...).Scan(&w.Seq, &w.Key, &at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Write{}, nil

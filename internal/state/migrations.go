@@ -1115,10 +1115,15 @@ var migrations = []Migration{
 		-- that changes it, whichever code (or older lendisk) writes;
 		-- readers compute a marked key's puts afresh, and the daemon's
 		-- fold (FoldOffsite) stores them and clears the marks it read. A
-		-- mark's id grows on every change (INSERT OR REPLACE with
+		-- mark's id grows on every change (deleted and inserted again,
 		-- AUTOINCREMENT), so a fold clears only marks no later change
-		-- renewed. A bucket without a basis, or whose pool or copies
-		-- differ from it, is computed in full.
+		-- renewed; the trigger names no conflict policy and meets no
+		-- conflict, so the writer's own (OR IGNORE, an upsert) changes
+		-- nothing. A bucket without a basis, or whose pool or copies
+		-- differ from it, is computed in full; holders '' matches no
+		-- pool, while a full fold writes. queue_bucket_seq finds a
+		-- bucket's latest and next writes without walking other
+		-- buckets' rows.
 		CREATE TABLE offsite_short (
 			bucket    TEXT NOT NULL,
 			key       TEXT NOT NULL,
@@ -1134,11 +1139,12 @@ var migrations = []Migration{
 		);
 		CREATE INDEX offsite_short_key ON offsite_short (bucket, key);
 		CREATE INDEX offsite_short_next ON offsite_short (bucket, next);
+		CREATE INDEX queue_bucket_seq ON queue (bucket, seq);
 		CREATE TABLE offsite_basis (
 			bucket  TEXT PRIMARY KEY,
 			holders TEXT NOT NULL,    -- JSON: the places counted as holders
 			copies  INTEGER NOT NULL,
-			folds   INTEGER NOT NULL  -- folds written: a fold read before another was written writes nothing
+			folds   INTEGER NOT NULL  -- folds claimed: a fold read before another claimed writes nothing
 		);
 		CREATE TABLE offsite_dirty (
 			id     INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1147,24 +1153,36 @@ var migrations = []Migration{
 			UNIQUE (bucket, key)
 		);
 		CREATE TRIGGER offsite_queue_insert AFTER INSERT ON queue BEGIN
-			INSERT OR REPLACE INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+			DELETE FROM offsite_dirty WHERE bucket = NEW.bucket AND key = NEW.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
 		END;
 		CREATE TRIGGER offsite_queue_update AFTER UPDATE ON queue BEGIN
-			INSERT OR REPLACE INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
-			INSERT OR REPLACE INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+			DELETE FROM offsite_dirty WHERE bucket = NEW.bucket AND key = NEW.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+			DELETE FROM offsite_dirty WHERE bucket = OLD.bucket AND key = OLD.key
+				AND (OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key);
+			INSERT INTO offsite_dirty (bucket, key) SELECT OLD.bucket, OLD.key
+				WHERE OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key;
 		END;
 		CREATE TRIGGER offsite_queue_delete AFTER DELETE ON queue BEGIN
-			INSERT OR REPLACE INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
+			DELETE FROM offsite_dirty WHERE bucket = OLD.bucket AND key = OLD.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
 		END;
 		CREATE TRIGGER offsite_placement_insert AFTER INSERT ON placement BEGIN
-			INSERT OR REPLACE INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+			DELETE FROM offsite_dirty WHERE bucket = NEW.bucket AND key = NEW.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
 		END;
 		CREATE TRIGGER offsite_placement_update AFTER UPDATE ON placement BEGIN
-			INSERT OR REPLACE INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
-			INSERT OR REPLACE INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+			DELETE FROM offsite_dirty WHERE bucket = NEW.bucket AND key = NEW.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+			DELETE FROM offsite_dirty WHERE bucket = OLD.bucket AND key = OLD.key
+				AND (OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key);
+			INSERT INTO offsite_dirty (bucket, key) SELECT OLD.bucket, OLD.key
+				WHERE OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key;
 		END;
 		CREATE TRIGGER offsite_placement_delete AFTER DELETE ON placement BEGIN
-			INSERT OR REPLACE INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
+			DELETE FROM offsite_dirty WHERE bucket = OLD.bucket AND key = OLD.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
 		END;`,
 	},
 }

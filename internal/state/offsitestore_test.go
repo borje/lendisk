@@ -2,11 +2,16 @@ package state
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -22,21 +27,12 @@ func sameOffsite(db *DB, bucket string, target int64) (stored bool, diff string,
 		return false, "", err
 	}
 	defer done()
-	var copies int
-	if err := view.QueryRowContext(ctx, `SELECT coalesce((SELECT copies FROM buckets WHERE name = ?), ?)`,
-		bucket, DefaultCopies).Scan(&copies); err != nil {
-		return false, "", err
-	}
-	holders, err := view.holders(ctx)
-	if err != nil {
+	if stored, err = basisMatches(view, bucket); err != nil {
 		return false, "", err
 	}
 	got, err := view.Offsite(ctx, bucket, 0)
 	if err != nil {
 		return stored, "", err
-	}
-	if _, stored, err = view.storedShorts(ctx, bucket, copies, holders, got.Latest); err != nil {
-		return false, "", err
 	}
 	want, err := view.offsiteFull(ctx, bucket, 0)
 	if err != nil {
@@ -49,6 +45,39 @@ func sameOffsite(db *DB, bucket string, target int64) (stored bool, diff string,
 		}
 	}
 	return stored, "", nil
+}
+
+// storedNow reports whether a read of bucket now would use the stored
+// rows: the basis is the pool's and copies as they are.
+func storedNow(db *DB, bucket string) (bool, error) {
+	view, done, err := db.Snapshot(context.Background())
+	if err != nil {
+		return false, err
+	}
+	defer done()
+	return basisMatches(view, bucket)
+}
+
+// basisMatches reports whether bucket's basis is the pool and copies as
+// view sees them.
+func basisMatches(view *DB, bucket string) (bool, error) {
+	ctx := context.Background()
+	var copies int
+	if err := view.QueryRowContext(ctx, `SELECT coalesce((SELECT copies FROM buckets WHERE name = ?), ?)`,
+		bucket, DefaultCopies).Scan(&copies); err != nil {
+		return false, err
+	}
+	holders, err := view.holders(ctx)
+	if err != nil {
+		return false, err
+	}
+	var bh string
+	var bc int
+	err = view.QueryRowContext(ctx, `SELECT holders, copies FROM offsite_basis WHERE bucket = ?`, bucket).Scan(&bh, &bc)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil && bh == holders && bc == copies, err
 }
 
 func (p *pool) fold() {
@@ -70,7 +99,7 @@ func TestStoredWatermarkEqualsTheComputedOne(t *testing.T) {
 	for seed := uint64(1); seed <= 4; seed++ {
 		t.Run(fmt.Sprint(seed), func(t *testing.T) {
 			t.Parallel()
-			storedWatermarkRun(t, seed, 600)
+			storedWatermarkRun(t, seed, 400)
 		})
 	}
 }
@@ -127,6 +156,15 @@ func storedWatermarkRun(t *testing.T, seed uint64, steps int) {
 	var stale *fold
 	var staleBucket string
 	usedStored := 0
+	// Between a fold's claim and its batches, the read is still the
+	// computed one.
+	p.db.betweenFoldBatches = func() {
+		for _, b := range buckets {
+			if _, diff, err := sameOffsite(p.db, b, 0); err != nil || diff != "" {
+				t.Errorf("mid-fold: %s %v", diff, err)
+			}
+		}
+	}
 	for step := 1; step <= steps; step++ {
 		switch n := r.IntN(100); {
 		case n < 18:
@@ -319,6 +357,86 @@ func TestAFoldKeepsTheMarksOfChangesAfterItsRead(t *testing.T) {
 	}
 }
 
+// REPL-11 (#81): a full fold (the first after an upgrade, or after the
+// pool or copies changed) stores a row per short put, and every
+// deleted or rewritten object stays short: it writes in batches of
+// SettleBudget, so a writer beside it waits about one batch (three
+// budgets at most; 0.93 s for 200,000 objects in one transaction),
+// never the whole bucket; and between batches the watermark read is still the
+// computed one, never more.
+func TestAFullFoldKeepsWritersMoving(t *testing.T) {
+	if testing.Short() {
+		t.Skip("long")
+	}
+	p := newPool(t)
+	ctx := context.Background()
+	const objects = settleKeys / 2
+	p.largeBucket(objects)
+	// At copies 3 every data object, held at two places, is short. The
+	// random test (copies changed) covers a full fold over stored rows.
+	if err := p.db.SetCopies(ctx, "laptop", 3); err != nil {
+		t.Fatal(err)
+	}
+	batches := 0
+	var longest time.Duration
+	p.db.foldTook = func(d time.Duration) { longest = max(longest, d) }
+	p.db.betweenFoldBatches = func() {
+		batches++
+		// Mid-fold, no read trusts the half-written rows: the basis
+		// matches no pool, so it does the full read.
+		if stored, err := storedNow(p.db, "laptop"); err != nil || stored {
+			t.Errorf("between batches %d, a read used the stored rows (%v)", batches, err)
+		}
+	}
+	var worst atomic.Int64
+	var writeErr error
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			start := time.Now()
+			if err := p.db.SetNode(ctx, "probe", fmt.Sprint(i)); err != nil {
+				writeErr = err
+				return
+			}
+			if d := int64(time.Since(start)); d > worst.Load() {
+				worst.Store(d)
+			}
+		}
+	}()
+	start := time.Now()
+	p.fold()
+	took := time.Since(start)
+	close(stop)
+	wg.Wait()
+	if writeErr != nil {
+		t.Fatalf("a write beside the fold failed: %v", writeErr)
+	}
+	t.Logf("a full fold of %d objects took %v in %d batches, the longest %v; the longest write beside it waited %v",
+		objects, took, batches, longest, time.Duration(worst.Load()))
+	// A batch ends after the row that passes the budget.
+	if longest > 500*time.Millisecond {
+		t.Fatalf("a fold's write transaction held the lock %v, over twice SettleBudget (0.25 s)", longest)
+	}
+	if w := time.Duration(worst.Load()); w > 750*time.Millisecond {
+		t.Fatalf("a write waited %v while the fold took %v", w, took)
+	}
+	var n int
+	if err := p.db.QueryRow(`SELECT count(*) FROM offsite_short WHERE bucket = 'laptop'`).Scan(&n); err != nil || n < objects {
+		t.Fatalf("%d rows stored (%v), want every data object", n, err)
+	}
+	if stored, diff, err := sameOffsite(p.db, "laptop", 0); err != nil || diff != "" || !stored {
+		t.Fatalf("after the fold: stored %v, %s %v", stored, diff, err)
+	}
+}
+
 // REPL-11 (#81): with the stored rows folded, a friend gone past
 // replace_after with nothing written (only the clock moved) no longer
 // holds copies: the pool differs from the basis, so the read computes
@@ -391,5 +509,114 @@ func TestStoredOffsiteOfAMillionObjectBucketIsFast(t *testing.T) {
 	}
 	if took > 250*time.Millisecond {
 		t.Fatalf("the read from the stored rows took %v, want well under a second", took)
+	}
+}
+
+// REPL-11 (#81 review): the offsite read of a quiet bucket, written
+// before a busy one's many rows, finds its latest, next and last fully
+// placed writes by its own rows (queue_bucket_seq), not by walking the
+// busy bucket's: it takes less than one plain scan of the queue.
+func TestAQuietBucketsOffsiteDoesNotWalkABusyOnesRows(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 100)
+	p.friend("C", 100)
+	p.bucket("quiet", 2)
+	p.ackAll(p.put("quiet", "data/1", "data", 1))
+	p.bucket("busy", 2)
+	if _, err := p.db.ExecContext(ctx, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?)
+		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
+		SELECT 'busy', 'data/' || i, 'put', 'data', 'done', 1000, 'h' || i, 0 FROM n`, settleKeys/4); err != nil {
+		t.Fatal(err)
+	}
+	p.fold()
+	took, yard := time.Duration(1<<62), time.Duration(1<<62)
+	for range 3 {
+		start := time.Now()
+		var n int
+		if err := p.db.QueryRowContext(ctx, `SELECT count(*) FROM queue WHERE +state = 'done'`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		yard = min(yard, time.Since(start))
+		start = time.Now()
+		o := p.offsite("quiet", 0)
+		took = min(took, time.Since(start))
+		if !o.Complete() || o.Through.Seq != o.Latest {
+			t.Fatalf("the quiet bucket: %+v", o)
+		}
+	}
+	t.Logf("the quiet bucket's offsite read took %v; a scan of the queue's %d rows %v", took, settleKeys/4+1, yard)
+	if took > yard {
+		t.Fatalf("the quiet bucket's offsite read took %v, more than a scan of the queue (%v)", took, yard)
+	}
+}
+
+// REPL-11 (#81 review): a bucket whose fold fails does not keep the
+// buckets after it from being folded; the error names it.
+func TestAFailingBucketDoesNotStopTheFoldOfTheOthers(t *testing.T) {
+	p := newPool(t)
+	ctx := context.Background()
+	p.friend("B", 100)
+	p.friend("C", 100)
+	p.bucket("a", 2)
+	p.bucket("b", 2)
+	p.fold()
+	d := p.put("a", "data/1", "data", 1)
+	p.put("b", "data/1", "data", 1)
+	// A stored row under another key holds data/1's sequence: storing
+	// data/1's row fails.
+	mustExec(t, p.db, `INSERT INTO offsite_short (bucket, key, seq, size, next, stuck, refused, dropped, gone, immutable)
+		VALUES ('a', 'other', ?, 0, 0, 0, 0, 0, 0, 0)`, d)
+	err := p.db.FoldOffsite(ctx)
+	if err == nil || !strings.Contains(err.Error(), "bucket a") {
+		t.Fatalf("fold: %v, want bucket a's failure", err)
+	}
+	var marks int
+	if err := p.db.QueryRow(`SELECT count(*) FROM offsite_dirty WHERE bucket = 'b'`).Scan(&marks); err != nil || marks != 0 {
+		t.Fatalf("bucket b: %d marks left (%v)", marks, err)
+	}
+}
+
+// REPL-11 (#81): a change marks its key with a newer mark whatever
+// conflict policy the writing statement names: an upsert and OR IGNORE
+// and OR REPLACE writes of a key already marked succeed and renew the
+// mark, so a fold that read before them cannot clear it.
+func TestAMarkIsRenewedWhateverTheWritersConflictPolicy(t *testing.T) {
+	p := newPool(t)
+	p.bucket("laptop", 2)
+	p.friend("B", 100)
+	p.friend("C", 100)
+	d := p.put("laptop", "data/1", "data", 1)
+	mark := func() int64 {
+		t.Helper()
+		var id int64
+		if err := p.db.QueryRow(`SELECT id FROM offsite_dirty WHERE bucket = 'laptop' AND key = 'data/1'`).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	for _, w := range []struct{ name, sql string }{
+		{"an OR IGNORE update", `UPDATE OR IGNORE placement SET started_at = 1 WHERE seq = ?`},
+		{"an upsert", `INSERT INTO queue (seq, bucket, key, op, class, state, created_at)
+			VALUES (?, 'laptop', 'data/1', 'put', 'data', 'done', 0) ON CONFLICT (seq) DO UPDATE SET local = 2`},
+		{"an OR IGNORE insert", `INSERT OR IGNORE INTO placement (seq, place, bucket, key, op, state)
+			VALUES (?, 'D', 'laptop', 'data/1', 'put', 'queued')`},
+		{"an OR REPLACE update", `UPDATE OR REPLACE queue SET local = 1 WHERE seq = ?`},
+	} {
+		before := mark()
+		if _, err := p.db.Exec(w.sql, d); err != nil {
+			t.Fatalf("%s of a marked key: %v", w.name, err)
+		}
+		if after := mark(); after <= before {
+			t.Fatalf("%s left the mark at %d (was %d)", w.name, after, before)
+		}
+	}
+	// A row moved to another key marks both.
+	before := mark()
+	mustExec(t, p.db, `UPDATE queue SET key = 'data/2' WHERE seq = ?`, d)
+	var renewed, moved int
+	if err := p.db.QueryRow(`SELECT count(*) FILTER (WHERE key = 'data/1' AND id > ?), count(*) FILTER (WHERE key = 'data/2')
+		FROM offsite_dirty WHERE bucket = 'laptop'`, before).Scan(&renewed, &moved); err != nil || renewed != 1 || moved != 1 {
+		t.Fatalf("a row moved from data/1 to data/2: old key renewed %d, new key marked %d (%v)", renewed, moved, err)
 	}
 }

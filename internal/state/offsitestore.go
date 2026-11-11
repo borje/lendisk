@@ -5,8 +5,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"slices"
+	"time"
 )
 
 // This file stores what the offsite watermark (REPL-11, offsite.go) is
@@ -118,43 +120,35 @@ const dirtyKeys = `SELECT key FROM offsite_dirty WHERE bucket = ?1 AND id <= ?4`
 // changed since the last fold, and clears their marks (#81); a bucket
 // never stored, or whose pool or copies changed since, is stored in
 // full. The daemon calls it every few seconds; a read is correct
-// without it, only slower the more keys are marked.
+// without it, only slower the more keys are marked. A bucket whose
+// fold fails is skipped; the others are folded, and the errors joined.
 //
 // Each bucket is read in a read transaction (a full store takes as long
-// as a full read, and must not hold the write lock), then written in a
-// short write transaction that clears only the marks the read saw: a
-// key changed after the read keeps a newer mark, so its rows stay
-// unread until the next fold. Two folds at once are safe for the same
-// reason; a fold whose basis another replaced meanwhile writes nothing.
-// Set the DB's Clock and ReplaceAfter as the daemon's.
+// as a full read, and must not hold the write lock), then written in
+// write transactions of SettleBudget each, SettlePause apart, so the
+// gateway's captures wait one batch at most (writeFold). Only the
+// marks the read saw are cleared: a key changed after the read keeps a
+// newer mark, so its rows stay unread until the next fold. Set the DB's
+// Clock and ReplaceAfter as the daemon's.
 func (db *DB) FoldOffsite(ctx context.Context) error {
 	if db.snap != nil {
 		return errSnapshot
 	}
-	rows, err := db.QueryContext(ctx, `SELECT name FROM buckets UNION SELECT bucket FROM offsite_dirty
+	buckets, err := keysOf(ctx, db, `SELECT name FROM buckets UNION SELECT bucket FROM offsite_dirty
 		UNION SELECT bucket FROM offsite_basis ORDER BY 1`)
 	if err != nil {
 		return err
 	}
-	var buckets []string
-	for rows.Next() {
-		var b string
-		if err := rows.Scan(&b); err != nil {
-			rows.Close()
-			return err
-		}
-		buckets = append(buckets, b)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
+	var errs []error
 	for _, b := range buckets {
 		if err := db.foldBucket(ctx, b); err != nil {
-			return err
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			errs = append(errs, fmt.Errorf("bucket %s: %w", b, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // fold is what foldBucket read: the rows to store, the marks they
@@ -162,7 +156,7 @@ func (db *DB) FoldOffsite(ctx context.Context) error {
 type fold struct {
 	mark    int64         // the newest mark read; 0 when none
 	full    bool          // every key: the basis is new
-	folds   sql.NullInt64 // the basis's count of folds written; NULL when none
+	folds   sql.NullInt64 // the basis's count of folds claimed; NULL when none
 	holders string
 	copies  int
 	rows    []short
@@ -177,56 +171,139 @@ func (db *DB) foldBucket(ctx context.Context, bucket string) error {
 	return db.writeFold(ctx, bucket, f)
 }
 
-// writeFold stores what readFold read of bucket.
+// errFoldStale stops a fold another fold claimed the bucket from.
+var errFoldStale = errors.New("another fold claimed the bucket")
+
+// writeFold stores what readFold read of bucket, in batches.
+//
+// The first transaction claims the bucket: it counts the fold in
+// offsite_basis.folds, if no fold was claimed since the read (another
+// fold's write may have cleared marks of changes this read did not
+// see), and for a full fold it empties the basis's holders, which match
+// no pool, so every read does the full read until the last batch. Each
+// batch then checks the claim is still this fold's, and replaces the
+// stored rows: a full fold all the bucket's, an incremental one the
+// marked keys'. Between batches, a read ignores the stored rows of
+// marked keys (their marks stay until the last batch) and, during a
+// full fold, the stored rows altogether: what it reads is never more
+// than the rows say. The last batch stores the basis and clears the
+// marks the read saw. A fold cut short (an error, a crash, a newer
+// claim) leaves the marks and, if full, the emptied basis: the next
+// fold reads again.
 func (db *DB) writeFold(ctx context.Context, bucket string, f fold) error {
 	if !f.full && f.mark == 0 {
 		return nil
 	}
+	var claim int64
+	err := db.foldBatch(ctx, func(tx *sql.Tx) error {
+		var folds sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT (SELECT folds FROM offsite_basis WHERE bucket = ?)`,
+			bucket).Scan(&folds); err != nil {
+			return err
+		}
+		if folds != f.folds {
+			return errFoldStale
+		}
+		claim = folds.Int64 + 1
+		holders := f.holders
+		if f.full {
+			holders = "" // no pool's: until the last batch
+		}
+		_, err := tx.ExecContext(ctx, `INSERT INTO offsite_basis (bucket, holders, copies, folds) VALUES (?, ?, ?, ?)
+			ON CONFLICT (bucket) DO UPDATE SET holders = excluded.holders, copies = excluded.copies, folds = excluded.folds`,
+			bucket, holders, f.copies, claim)
+		return err
+	})
+	if errors.Is(err, errFoldStale) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// The work, in order: each step does a little and says whether it
+	// has more.
+	keys, rows := f.keys, f.rows
+	cleared := !f.full
+	step := func(tx *sql.Tx) (bool, error) {
+		switch {
+		case !cleared:
+			r, err := tx.ExecContext(ctx, `DELETE FROM offsite_short WHERE rowid IN
+				(SELECT rowid FROM offsite_short WHERE bucket = ? LIMIT 500)`, bucket)
+			if err != nil {
+				return false, err
+			}
+			n, err := r.RowsAffected()
+			cleared = err == nil && n == 0
+			return true, err
+		case len(keys) > 0:
+			// The keys the read saw marked, by name: a key marked again
+			// since has a newer mark, but its rows go too.
+			_, err := tx.ExecContext(ctx, `DELETE FROM offsite_short WHERE bucket = ? AND key = ?`, bucket, keys[0])
+			keys = keys[1:]
+			return true, err
+		case len(rows) > 0:
+			s := rows[0]
+			_, err := tx.ExecContext(ctx, `INSERT INTO offsite_short
+				(bucket, key, seq, size, next, stuck, refused, dropped, gone, immutable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				bucket, s.key, s.seq, s.size, s.next, s.stuck, s.refused, s.dropped, s.gone, s.immutable)
+			rows = rows[1:]
+			return true, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE offsite_basis SET holders = ? WHERE bucket = ?`, f.holders, bucket); err != nil {
+			return false, err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM offsite_dirty WHERE bucket = ? AND id <= ?`, bucket, f.mark)
+		return false, err
+	}
+	for more, first := true, true; more; first = false {
+		if db.betweenFoldBatches != nil {
+			db.betweenFoldBatches()
+		}
+		if !first {
+			if err := pause(ctx); err != nil {
+				return err
+			}
+		}
+		err := db.foldBatch(ctx, func(tx *sql.Tx) error {
+			var folds int64
+			if err := tx.QueryRowContext(ctx, `SELECT coalesce((SELECT folds FROM offsite_basis WHERE bucket = ?), 0)`,
+				bucket).Scan(&folds); err != nil {
+				return err
+			}
+			if folds != claim {
+				return errFoldStale
+			}
+			start := time.Now()
+			for more = true; more && time.Since(start) < SettleBudget; {
+				var err error
+				if more, err = step(tx); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if errors.Is(err, errFoldStale) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// foldBatch runs do in one write transaction.
+func (db *DB) foldBatch(ctx context.Context, do func(*sql.Tx) error) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	if db.foldTook != nil {
+		start := time.Now()
+		defer func() { db.foldTook(time.Since(start)) }()
+	}
 	defer tx.Rollback()
-	// Another fold written since the read may have cleared marks of
-	// changes this read did not see: this one is then stale, and the
-	// next fold reads again.
-	var folds sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT (SELECT folds FROM offsite_basis WHERE bucket = ?)`,
-		bucket).Scan(&folds); err != nil {
-		return err
-	}
-	if folds != f.folds {
-		return nil
-	}
-	if f.full {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM offsite_short WHERE bucket = ?`, bucket); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO offsite_basis (bucket, holders, copies, folds) VALUES (?, ?, ?, 1)
-		ON CONFLICT (bucket) DO UPDATE SET holders = excluded.holders, copies = excluded.copies, folds = folds + 1`,
-		bucket, f.holders, f.copies); err != nil {
-		return err
-	}
-	// The keys the read saw marked, by name: a key marked again since
-	// has a newer mark, not one at or below f.mark, but its rows go too.
-	for _, k := range f.keys {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM offsite_short WHERE bucket = ? AND key = ?`, bucket, k); err != nil {
-			return err
-		}
-	}
-	ins, err := tx.PrepareContext(ctx, `INSERT INTO offsite_short
-		(bucket, key, seq, size, next, stuck, refused, dropped, gone, immutable) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-	if err != nil {
-		return err
-	}
-	defer ins.Close()
-	for _, s := range f.rows {
-		if _, err := ins.ExecContext(ctx, bucket, s.key, s.seq, s.size, s.next, s.stuck, s.refused, s.dropped, s.gone, s.immutable); err != nil {
-			return err
-		}
-	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM offsite_dirty WHERE bucket = ? AND id <= ?`, bucket, f.mark); err != nil {
+	if err := do(tx); err != nil {
 		return err
 	}
 	return tx.Commit()

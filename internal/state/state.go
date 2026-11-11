@@ -75,6 +75,11 @@ type DB struct {
 	// finding a listed key's queued rows and acknowledging them. Tests
 	// only.
 	beforeSeedAck func(tx *sql.Tx)
+	// betweenFoldBatches, if set, runs between the write transactions of
+	// an offsite fold (#81); foldTook, if set, is told how long each of
+	// them held the write lock. Tests only.
+	betweenFoldBatches func()
+	foldTook           func(time.Duration)
 
 	// snap, on a Snapshot, is the read transaction every query goes
 	// through.

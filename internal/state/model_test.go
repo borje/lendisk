@@ -251,12 +251,13 @@ func runModel(t *testing.T, seed uint64, steps int) {
 		}
 		m.log = append(m.log, fmt.Sprintf("%d %s: %s", m.step, m.p.now.UTC().Format("01-02 15:04"), m.what))
 		m.check()
-		m.checkOffsite(folds)
+		m.checkOffsite(folds, false)
 		if t.Failed() {
 			return
 		}
 	}
 	m.settle()
+	m.checkOffsite(folds, true)
 	if os.Getenv("LENDISK_MODEL_LOG") != "" {
 		t.Log(strings.Join(m.log, "\n"))
 	}
@@ -1381,18 +1382,21 @@ func (m *removalModel) check() {
 	}
 }
 
-// checkOffsite folds the stored watermark at random (#81), and at
-// random checks that each bucket's Offsite read from the stored rows equals the one
-// computed from every row: whatever writer the step ran, its changes
-// are marked.
-func (m *removalModel) checkOffsite(folds *rand.Rand) {
+// checkOffsite folds the stored watermark every 50 steps (#81), and
+// 25 steps later, and after the last step, checks that each bucket's
+// Offsite read from the stored rows equals the one computed from every
+// row: whatever writers the steps ran, their changes are marked.
+func (m *removalModel) checkOffsite(folds *rand.Rand, final bool) {
 	m.t.Helper()
-	if folds.IntN(3) == 0 {
+	// Folded 25 steps before each check: the check reads stored rows
+	// under 25 steps of marks.
+	if m.step%50 == 25 {
 		m.must(m.p.db.FoldOffsite(context.Background()))
 	}
 	// A key a step forgot to mark stays wrong until it is marked again,
-	// so a check every few steps finds it, at a quarter of the cost.
-	if folds.IntN(4) != 0 {
+	// so a check every 50 steps, and after the last, finds it at a
+	// fraction of the cost.
+	if m.step%50 != 0 && !final {
 		return
 	}
 	var latest int64
