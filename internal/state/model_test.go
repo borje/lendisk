@@ -32,6 +32,8 @@ import (
 //     sent, a held tomb, a denied delete, or a delete marker inside its
 //     window (the model's own view, not holdsLiveData's);
 //   - every acknowledged copy of a live object is one the model sent;
+//   - the offsite watermark read from what the fold stored, and the keys
+//     changed since, equals the one computed from every row (#81);
 //   - liveness, after the steps (settle, #108): made quiescent with
 //     friends holding everything, the pool empties every target within
 //     settleRounds rounds.
@@ -164,6 +166,9 @@ func TestRemovalModel(t *testing.T) {
 
 func runModel(t *testing.T, seed uint64, steps int) {
 	m := &removalModel{t: t, p: newPool(t), r: rand.New(rand.NewPCG(seed, 103)), seed: seed, byName: map[string]*mplace{}}
+	// The stored watermark (#81) is folded at random points of its own
+	// stream, so the model's steps are those it always took.
+	folds := rand.New(rand.NewPCG(seed, 81))
 	m.p.db.ReplaceAfter = 7 * 24 * time.Hour
 	// Every change of a put row's state, for the checks after each step.
 	for _, q := range []string{
@@ -246,6 +251,7 @@ func runModel(t *testing.T, seed uint64, steps int) {
 		}
 		m.log = append(m.log, fmt.Sprintf("%d %s: %s", m.step, m.p.now.UTC().Format("01-02 15:04"), m.what))
 		m.check()
+		m.checkOffsite(folds)
 		if t.Failed() {
 			return
 		}
@@ -1371,6 +1377,31 @@ func (m *removalModel) check() {
 				m.fail("I2: %s's metadata %s/%s (%d) went from %s to %s while it holds data of %s: %s",
 					k.place, r.bucket, r.key, k.seq, was, st, r.bucket, m.describe(pl, r.bucket))
 			}
+		}
+	}
+}
+
+// checkOffsite folds the stored watermark at random (#81), and at
+// random checks that each bucket's Offsite read from the stored rows equals the one
+// computed from every row: whatever writer the step ran, its changes
+// are marked.
+func (m *removalModel) checkOffsite(folds *rand.Rand) {
+	m.t.Helper()
+	if folds.IntN(3) == 0 {
+		m.must(m.p.db.FoldOffsite(context.Background()))
+	}
+	// A key a step forgot to mark stays wrong until it is marked again,
+	// so a check every few steps finds it, at a quarter of the cost.
+	if folds.IntN(4) != 0 {
+		return
+	}
+	var latest int64
+	m.must(m.p.db.QueryRow(`SELECT coalesce(max(seq), 0) FROM queue`).Scan(&latest))
+	for _, b := range m.buckets {
+		_, diff, err := sameOffsite(m.p.db, b, folds.Int64N(latest+1))
+		m.must(err)
+		if diff != "" {
+			m.fail("the stored watermark: %s", diff)
 		}
 	}
 }

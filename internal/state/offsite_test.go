@@ -444,39 +444,7 @@ func TestACancelledPassLeavesThePassDue(t *testing.T) {
 func TestOffsiteOfALargeBucketIsFast(t *testing.T) {
 	p := newPool(t)
 	ctx := context.Background()
-	for _, f := range []string{"B", "C", "D"} {
-		p.friend(f, 1<<20)
-	}
-	p.bucket("laptop", 2)
-	tx, err := p.db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, q := range []string{
-		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
-		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
-			SELECT 'laptop', 'data/' || i, 'put', 'data', 'done', 1000, 'h' || i, ?1 FROM n`,
-		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
-		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
-			SELECT 'laptop', 'index/' || i, 'put', 'metadata', 'done', 100, 'm' || i, ?1 FROM n`,
-		`INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
-			SELECT q.seq, f.peer_key, q.bucket, q.key, 'put', 'acked', q.sha256, ?1, 100
-			FROM queue q, friendship f WHERE q.class = 'metadata' OR f.peer_key != (CASE q.seq % 3 WHEN 0 THEN 'B' WHEN 1 THEN 'C' ELSE 'D' END)`,
-		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2 / 10)
-		INSERT INTO queue (bucket, key, op, class, state, created_at)
-			SELECT 'laptop', 'data/' || i, 'delete', 'data', 'done', ?1 FROM n`,
-		`INSERT INTO placement (seq, place, bucket, key, op, state, acked_at, size)
-			SELECT q.seq, f.peer_key, q.bucket, q.key, 'delete', 'acked', ?1, 0
-			FROM queue q, friendship f WHERE q.op = 'delete'`,
-	} {
-		if _, err := tx.ExecContext(ctx, q, p.now.Unix(), offsiteObjects); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	last := p.put("laptop", "data/last", "data", 1)
+	last := p.largeBucket(offsiteObjects)
 	holders, err := p.db.holders(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -509,10 +477,70 @@ func TestOffsiteOfALargeBucketIsFast(t *testing.T) {
 	if o.Watermark != last-1 || o.Waiting.Objects != 1 {
 		t.Fatalf("offsite %+v, want the watermark just before %d", o, last)
 	}
+	// Once the daemon has folded the rows (#81), a read costs what is
+	// short and what changed since, not the bucket.
+	p.fold()
+	stored := time.Duration(1 << 62)
+	for range 2 {
+		start := time.Now()
+		o = p.offsite("laptop", 0)
+		stored = min(stored, time.Since(start))
+	}
+	t.Logf("Offsite from the stored rows took %v", stored)
+	if stored*4 > took {
+		t.Fatalf("Offsite from the stored rows took %v, the full read %v", stored, took)
+	}
+	if o.Watermark != last-1 || o.Waiting.Objects != 1 {
+		t.Fatalf("offsite from the stored rows %+v, want the watermark just before %d", o, last)
+	}
 	p.ackAll(last)
 	if o := p.offsite("laptop", 0); !o.Complete() {
 		t.Fatalf("offsite %+v", o)
 	}
+}
+
+// largeBucket adds friends B, C and D and bucket laptop at copies 2
+// holding objects data objects at two of the three friends, a tenth of
+// them deleted since, and 1200 metadata objects everywhere, written
+// straight to the tables; then one more data object, still queued,
+// whose sequence it returns.
+func (p *pool) largeBucket(objects int) int64 {
+	t := p.t
+	t.Helper()
+	ctx := context.Background()
+	for _, f := range []string{"B", "C", "D"} {
+		p.friend(f, 1<<20)
+	}
+	p.bucket("laptop", 2)
+	tx, err := p.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
+			SELECT 'laptop', 'data/' || i, 'put', 'data', 'done', 1000, 'h' || i, ?1 FROM n`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+		INSERT INTO queue (bucket, key, op, class, state, size, sha256, created_at)
+			SELECT 'laptop', 'index/' || i, 'put', 'metadata', 'done', 100, 'm' || i, ?1 FROM n`,
+		`INSERT INTO placement (seq, place, bucket, key, op, state, sha256, acked_at, size)
+			SELECT q.seq, f.peer_key, q.bucket, q.key, 'put', 'acked', q.sha256, ?1, 100
+			FROM queue q, friendship f WHERE q.class = 'metadata' OR f.peer_key != (CASE q.seq % 3 WHEN 0 THEN 'B' WHEN 1 THEN 'C' ELSE 'D' END)`,
+		`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2 / 10)
+		INSERT INTO queue (bucket, key, op, class, state, created_at)
+			SELECT 'laptop', 'data/' || i, 'delete', 'data', 'done', ?1 FROM n`,
+		`INSERT INTO placement (seq, place, bucket, key, op, state, acked_at, size)
+			SELECT q.seq, f.peer_key, q.bucket, q.key, 'delete', 'acked', ?1, 0
+			FROM queue q, friendship f WHERE q.op = 'delete'`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, p.now.Unix(), objects); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	return p.put("laptop", "data/last", "data", 1)
 }
 
 // REPL-4, REPL-11 (#20): Offsite names the latest snapshot key at or

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -145,6 +147,57 @@ const (
 	snapA = "snapshots/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	snapB = "snapshots/fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 )
+
+// REPL-11 (#81): the daemon's folder stores the bucket's short puts and
+// clears the marks of what changed, and status, reading the stored rows
+// with the keys changed since, follows each acknowledgement as before.
+func TestTheDaemonFoldsTheOffsiteWatermarksChanges(t *testing.T) {
+	parallel(t, 0)
+	o := newOffsiteNode(t, "laptop", "restic")
+	ctx, cancel := context.WithCancel(t.Context())
+	stopped := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-stopped })
+	go func() {
+		defer close(stopped)
+		(&offsiteFolder{DB: o.db, Every: 10 * time.Millisecond, Log: slog.New(slog.NewTextHandler(io.Discard, nil))}).Run(ctx)
+	}()
+	folded := func() {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			var marks, bases int
+			if err := o.db.QueryRow(`SELECT (SELECT count(*) FROM offsite_dirty),
+				(SELECT count(*) FROM offsite_basis WHERE bucket = 'laptop')`).Scan(&marks, &bases); err != nil {
+				t.Fatal(err)
+			}
+			if marks == 0 && bases == 1 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("not folded: %d marks, %d bases", marks, bases)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	d1 := o.put("laptop", "data/1", "data", 1000)
+	o.ack(d1)
+	folded()
+	if b := bucketOf(t, o.status(), "laptop"); !b.Offsite.Complete || b.Offsite.Watermark != d1 {
+		t.Fatalf("data/1 acknowledged, folded: offsite %+v", b.Offsite)
+	}
+	d2 := o.put("laptop", "data/2", "data", 1000)
+	if b := bucketOf(t, o.status(), "laptop"); b.Offsite.Complete || b.Offsite.Watermark != d1 || b.Offsite.Waiting.Objects != 1 {
+		t.Fatalf("data/2 queued, not folded yet: offsite %+v", b.Offsite)
+	}
+	folded()
+	if b := bucketOf(t, o.status(), "laptop"); b.Offsite.Complete || b.Offsite.Watermark != d1 || b.Offsite.Waiting.Objects != 1 {
+		t.Fatalf("data/2 queued, folded: offsite %+v", b.Offsite)
+	}
+	o.ack(d2)
+	if b := bucketOf(t, o.status(), "laptop"); !b.Offsite.Complete || b.Offsite.Watermark != d2 {
+		t.Fatalf("data/2 acknowledged: offsite %+v", b.Offsite)
+	}
+}
 
 // REPL-4, REPL-11 (#20): for restic, status names the latest snapshot
 // and whether it is offsite at the bucket's copies, by restic's short ID;
