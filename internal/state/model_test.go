@@ -1408,4 +1408,10 @@ func (m *removalModel) checkOffsite(folds *rand.Rand, final bool) {
 			m.fail("the stored watermark: %s", diff)
 		}
 	}
+	// Status's other reads (#116), stored or indexed.
+	_, diff, err := sameStatusReads(m.p.db, m.p.now)
+	m.must(err)
+	if diff != "" {
+		m.fail("status's reads: %s", diff)
+	}
 }

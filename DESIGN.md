@@ -4747,10 +4747,96 @@ upstream bucket is Q-V.
   stored rows against 7.7 s in full
   (`TestStoredOffsiteOfAMillionObjectBucketIsFast`, run with
   `LENDISK_BIG_OFFSITE=1000000`), and `status`'s offsite read 23 ms.
-  `status` as a whole went from 18 s to 11 s there: its other reads
-  (below-copies counts 4.3 s, places 2.1 s, replicas 1.5 s, re-placement
-  in progress 1.4 s, queue counts 0.4 s) still read every row
-  (`TestStatusOfAMillionObjectBucket`, `LENDISK_BIG_STATUS=1000000`).
+  `status` as a whole went from 18 s to 11 s there; #116 took the rest
+  (below).
+
+  *Status's other reads (#116).* Each read `status` takes costs what is
+  not done (queued, refused, dropping, short, marked since the fold) or
+  reads a stored sum, never every row (schema 54):
+  - *Rewrites first.* `PlaceStats` reads the queued, refused and
+    dropping rows by their partial indexes (named with `INDEXED BY`)
+    and the places by skipping through `placement`'s primary key, one
+    look-up each; `Replacing` reads its queued and dropping rows the
+    same way. `Offsite`'s pending puts read `queue_pending`, and its
+    snapshot look-ups `queue_metadata`, by name: with a bound on `seq`
+    SQLite chose `queue_bucket_seq` and walked a prune's deletes.
+  - *No new index.* A partial index for `Through` (puts by `bucket,
+    seq`) lured the metadata look-ups of placement (`unsentMetadata`,
+    `placeMetadata`) off `queue_metadata` onto every put of the bucket,
+    an older lendisk's too (SQLite takes a partial index for any query
+    whose `WHERE` names its terms), and one for `HeldSince` (`place,
+    bucket, acked_at` of acknowledged puts) cost more on bulk writes
+    than all the rest: settling 200,000 recovered keys took 10 s
+    longer with it. Both are stored by the fold instead (below).
+  - *Stored sums: `queue_tally`.* The done rows and their put bytes
+    (`QueueStats`), and the live puts by class with their bytes
+    (`RepositorySize`, `RepositoryUse`, so capacity), per bucket, kept
+    by `AFTER` triggers on `queue` in the writer's transaction: for each
+    key a write touched, add its live put now and take away the one it
+    was (the latest done row among the key's rows but the written one,
+    and `OLD`). No `BEFORE` triggers: they fire for a row its writer's
+    `OR IGNORE` then skips. Each trigger statement updates the
+    bucket's row or inserts it `WHERE NOT EXISTS`, so it meets no
+    conflict. A `REPLACE` deleting a queue row would fire no delete
+    trigger (recursive triggers are off), but `seq` is the only key and
+    no writer names one. The migration fills it from the rows.
+  - *Stored by the fold: `below_short`, `below_basis.through`,
+    `held_basis`* (`internal/state/belowstore.go`). `BelowCopies`' rows
+    (a live put fewer than copies of whose placement rows are queued or
+    acknowledged at a friend or target) read only the places, the
+    copies and the key's own `queue` and `placement` rows: the inputs
+    of an offsite short put, with every friend and target for the
+    holders. So the offsite fold stores them from the same read, on the
+    same marks, and a read takes the stored rows of unmarked keys and
+    computes the marked ones afresh, as `Offsite` does; no new trigger.
+    The fold also stores the bucket's latest done put (`Through`,
+    `latestPut`) and each friend's and target's first acknowledgement
+    still held (`HeldSince`, `heldOf`): every put or acknowledgement
+    changed since is of a marked key, so a read takes the stored one
+    if its row is unchanged, and the marked keys' rows by key; when the
+    stored row changed it reads every row, as before. `below_basis` and
+    `held_basis` keep `offsite_basis.folds` as of the store: a full
+    below fold deletes `below_basis` in its claim (every read counts in
+    full until the last batch), an incremental one moves both along,
+    and a fold by an older lendisk, which counts a fold but stores
+    neither, leaves them behind, so they go unread until the next fold.
+
+  Evidence: `sameStatusReads` compares each read with the query it
+  replaced, in one snapshot, after every step of
+  `TestStoredWatermarkEqualsTheComputedOne` (and between a fold's
+  batches) and every 50 steps of `TestRemovalModel`; it requires the
+  stored below rows to be read in most steps, and dropping the marked
+  keys from the stored below rows, `Through` or `HeldSince` fails it.
+  `TestQueueTallyEqualsTheRowsWhateverWritesThem` drives `queue` by raw
+  SQL (null sizes, reclassing, moving keys and buckets, renumbering,
+  deletes, `OR IGNORE` skipped on a taken `seq`, `OR REPLACE`); dropping
+  the `OLD` term or the written row's exclusion fails it.
+  `TestTheUpgradeTalliesTheRowsAlreadyThere`,
+  `TestAnOlderLendisksFoldLeavesTheStoredBelowRowsUnread`. On the
+  million objects (`TestStatusOfAMillionObjectBucket`, which now asserts
+  every read under 100 ms and `status` under 0.5 s): below copies
+  4.3 s → 0.14 ms, places 1.6 s → 0.5 ms, replicas 1.3 s → 0.2 ms,
+  re-placement 1.1 s → 0.08 ms, capacity ~1 s → 0.3 ms, queue counts
+  0.31 s → 0.04 ms, offsite 0.32 s → 1.2 ms; `status` 11 s → 6.4 ms.
+
+  The cost is on writes, and on the fold. In large write transactions
+  (settling a recovered bucket) each statement's sub-journal spills
+  past SQLite's 64 KiB to a temporary file, and every page a write
+  touches is written there once per statement, the tally row among
+  them. Abandoning 200,000 recovered keys
+  (`TestSettlingLargeBucketKeepsWritersMoving`) took 27.7 s instead of
+  24 s, the whole test 43 s instead of 37 s. With `temp_store = MEMORY`
+  such a run took less than before #116, but that also keeps sorts and
+  materialized tables in memory, which is not decided (Q-AE). One
+  object at a time, as the gateway writes (capture, finish,
+  acknowledgement at two of three friends, beside 100,000 rows), cost
+  the same before and after, 89 ms against 91 ms (measured with the two
+  indexes above, the heavier variant), nearly all of it a per-capture
+  read of every row that predates #116. The first full fold at a
+  million objects, which also reads the below rows and each place's
+  first acknowledgement, took 18.7 s instead of 10.2 s, in a read
+  transaction and batches as before.
+
 
   *What `status` names (REPL-4, REPL-11).* Under each bucket, and in
   `buckets[].offsite` of `status --json` (`complete`, `watermark`,
@@ -9120,3 +9206,12 @@ design and disappear with it.
   works at RustFS 1.0.3 and versitygw with the root credential (CI's
   `overflow-versioned` job); the per-provider credential checks stay
   open.
+- **Q-AE (open, #116)** `temp_store = MEMORY` for `lendisk.db`. Large
+  write transactions spill each statement's sub-journal to a temporary
+  file past 64 KiB, so every page a write touches costs a write
+  syscall; the triggers of schemas 53 and 54 add pages. Abandoning
+  200,000 recovered keys took 17 s before #81, 24 s after, 27.7 s after
+  #116; with `temp_store = MEMORY` it took 22.6 s on a heavier draft of
+  #116's schema (two more indexes, 32 s without the pragma). The pragma also keeps sorts and materialized CTEs (a full
+  offsite fold's) in memory: measure peak memory of a full fold at a
+  million objects on a Pi before choosing it.

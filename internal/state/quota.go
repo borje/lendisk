@@ -291,13 +291,11 @@ func (db *DB) ResumePlace(ctx context.Context, place string, now time.Time) erro
 
 // RepositorySize is the node's repository size (LEND-7): the bytes of
 // every own bucket's live objects, each key's latest done write if a
-// put.
+// put. It reads the sums queue_tally keeps (schema 54, #116), not the
+// rows.
 func (db *DB) RepositorySize(ctx context.Context) (int64, error) {
 	var n int64
-	err := db.QueryRowContext(ctx, `SELECT coalesce(sum(q.size), 0) FROM queue q
-		WHERE q.op = 'put' AND q.state = 'done'
-		AND NOT EXISTS (SELECT 1 FROM queue l
-			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')`).Scan(&n)
+	err := db.QueryRowContext(ctx, `SELECT coalesce(sum(live_data_bytes + live_meta_bytes), 0) FROM queue_tally`).Scan(&n)
 	return n, err
 }
 
@@ -317,16 +315,15 @@ func (db *DB) RepositoryUse(ctx context.Context) (RepositoryUse, error) {
 	return repositoryUse(ctx, db)
 }
 
+// repositoryUse reads the sums queue_tally keeps (schema 54, #116): an
+// object without a size adds no overhead.
 func repositoryUse(ctx context.Context, q querier) (RepositoryUse, error) {
 	var u RepositoryUse
 	err := q.QueryRowContext(ctx, `SELECT
-		coalesce(sum(CASE WHEN q.class IN ('metadata', 'snapshot') THEN 0 ELSE q.size + ?1 END), 0),
-		coalesce(sum(CASE WHEN q.class IN ('metadata', 'snapshot') THEN q.size + ?1 ELSE 0 END), 0),
-		coalesce(max(CASE WHEN q.class IN ('metadata', 'snapshot') THEN NULL ELSE coalesce(b.copies, ?2) END), 0)
-		FROM queue q LEFT JOIN buckets b ON b.name = q.bucket
-		WHERE q.op = 'put' AND q.state = 'done'
-		AND NOT EXISTS (SELECT 1 FROM queue l
-			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')`,
+		coalesce(sum(t.live_data_bytes + t.live_data_sized * ?1), 0),
+		coalesce(sum(t.live_meta_bytes + t.live_meta_sized * ?1), 0),
+		coalesce(max(CASE WHEN t.live_data > 0 THEN coalesce(b.copies, ?2) END), 0)
+		FROM queue_tally t LEFT JOIN buckets b ON b.name = t.bucket`,
 		ObjectOverhead, DefaultCopies).Scan(&u.Data, &u.Metadata, &u.Copies)
 	return u, err
 }

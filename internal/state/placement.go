@@ -463,15 +463,31 @@ type PlaceStat struct {
 
 // PlaceStats returns each place's FIFO size and lag at now; places with
 // no placement rows are absent. A row re-placement queued counts its
-// lag from then (replaced_at), not from its capture (#26).
+// lag from then (replaced_at), not from its capture (#26). Only rows
+// whose queue row is still there count.
+//
+// It reads the queued, refused and dropping rows by their partial
+// indexes, and the places by skipping through the primary key, one
+// look-up each: a place's acknowledged copies, nearly all its rows,
+// are not read (#116).
 func (db *DB) PlaceStats(ctx context.Context, now time.Time) (map[string]PlaceStat, error) {
-	rows, err := db.QueryContext(ctx, `SELECT p.place,
-		count(*) FILTER (WHERE p.state = 'queued'),
-		coalesce(sum(q.size) FILTER (WHERE p.state = 'queued' AND p.op = 'put'), 0),
-		min(coalesce(p.replaced_at, q.created_at)) FILTER (WHERE p.state = 'queued'),
-		count(*) FILTER (WHERE p.state = 'refused' AND (p.cause IS NULL OR p.cause = 'immutable') AND `+current+`),
-		count(*) FILTER (WHERE p.state = 'dropping')
-		FROM placement p JOIN queue q ON q.seq = p.seq GROUP BY p.place`)
+	rows, err := db.QueryContext(ctx, `WITH RECURSIVE places (place) AS (
+			SELECT (SELECT min(place) FROM placement)
+			UNION ALL SELECT (SELECT min(p.place) FROM placement p WHERE p.place > places.place)
+			FROM places WHERE places.place IS NOT NULL),
+		queued AS (SELECT p.place, count(*) AS n, coalesce(sum(q.size) FILTER (WHERE p.op = 'put'), 0) AS bytes,
+				min(coalesce(p.replaced_at, q.created_at)) AS oldest
+			FROM placement p INDEXED BY placement_queued JOIN queue q ON q.seq = p.seq
+			WHERE p.state = 'queued' GROUP BY p.place),
+		refused AS (SELECT p.place, count(*) AS n FROM placement p INDEXED BY placement_refused JOIN queue q ON q.seq = p.seq
+			WHERE p.state = 'refused' AND (p.cause IS NULL OR p.cause = 'immutable') AND `+current+` GROUP BY p.place),
+		dropping AS (SELECT p.place, count(*) AS n FROM placement p INDEXED BY placement_dropping JOIN queue q ON q.seq = p.seq
+			WHERE p.state = 'dropping' GROUP BY p.place)
+		SELECT s.place, coalesce(u.n, 0), coalesce(u.bytes, 0), u.oldest, coalesce(r.n, 0), coalesce(d.n, 0)
+		FROM places s LEFT JOIN queued u ON u.place = s.place LEFT JOIN refused r ON r.place = s.place
+		LEFT JOIN dropping d ON d.place = s.place
+		WHERE s.place IS NOT NULL
+		AND EXISTS (SELECT 1 FROM placement p WHERE p.place = s.place AND EXISTS (SELECT 1 FROM queue q WHERE q.seq = p.seq))`)
 	if err != nil {
 		return nil, err
 	}

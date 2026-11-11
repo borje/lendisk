@@ -1,5 +1,7 @@
 package state
 
+import "strings"
+
 // migrations is the full, append-only schema history. Never edit a released
 // entry; add a new one. See the package comment for the Compat rule.
 var migrations = []Migration{
@@ -1185,4 +1187,159 @@ var migrations = []Migration{
 			INSERT INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
 		END;`,
 	},
+	{
+		Version: 54, Compat: 1, Release: "0.1",
+		SQL: migration54(),
+	},
+}
+
+// migration54 is schema 54's SQL (#116): what status sums over every
+// row of a large bucket, stored or indexed. Once released, never
+// change it.
+//
+// queue_tally keeps, per bucket, what QueueStats, RepositorySize and
+// RepositoryUse sum: the done rows and their puts' bytes, and the live
+// puts (each key's latest done write, if a put) by class, with how
+// many have a size. AFTER triggers keep it in the writer's
+// transaction, whichever code (or older lendisk) writes: for each key
+// a write touched, they add its live put as it is now and take away
+// the one it was, the latest done row among the key's rows but the
+// written one, and the row as it was (OLD). They fire only when a done
+// row is involved (a pending row counts nowhere), an update only for
+// the columns a contribution reads, and only for a row actually
+// written, so a write its conflict policy skips (OR IGNORE) changes
+// nothing; there are no BEFORE triggers, which would fire for it. Each
+// statement updates the bucket's row, or inserts it when missing
+// (WHERE NOT EXISTS), and so meets no conflict. A REPLACE that deletes
+// a queue row would fire no delete trigger (recursive_triggers is
+// off), but none can happen: the only key is seq, AUTOINCREMENT, which
+// no writer names. The table is filled from the rows as they are.
+//
+// below_short stores BelowCopies' rows (each live put that fewer than
+// copies places hold or will hold) as of the places and copies in
+// below_basis; the offsite fold stores them with its own rows, and a
+// read computes the keys offsite_dirty marks afresh, as for
+// offsite_short. below_basis.folds is offsite_basis.folds as of the
+// store: a fold by an older lendisk, which does not store them, counts
+// a fold and so leaves them unread until the next full fold.
+// below_basis.through is the bucket's latest done put as of the same
+// fold (Offsite's Through, latestPut), on the same terms.
+//
+// held_basis is each replica's first acknowledgement still held
+// (ReplicaChecks' HeldSince) as of the same fold, on the same terms.
+func migration54() string {
+	const meta = `('metadata', 'snapshot')`
+	// live changes the bucket's row by the key's live put now (a) less
+	// the one before the write (b), where when holds. written is the
+	// sequence of the row as written (NULL for a delete); old adds the
+	// row as it was, for an update or a delete. row, when not "", adds
+	// that row's done count and bytes (NEW) or takes them away (OLD) in
+	// the same statement.
+	live := func(bucket, key, written string, old bool, when, row string) string {
+		before := `SELECT seq, op, class, size FROM (SELECT seq, op, class, size FROM queue
+					WHERE bucket = $B AND key = $K AND state = 'done' AND seq IS NOT $X ORDER BY seq DESC LIMIT 1)`
+		if old {
+			before += `
+					UNION ALL SELECT OLD.seq, OLD.op, OLD.class, OLD.size
+					WHERE OLD.state = 'done' AND OLD.bucket IS $B AND OLD.key IS $K`
+		}
+		cols, vals := "", ""
+		if row != "" {
+			sign := map[string]string{"NEW": "+", "OLD": "-"}[row]
+			cols = `, done, done_bytes`
+			vals = strings.NewReplacer("$R", row, "$S", sign).Replace(`,
+					queue_tally.done $S ($R.state = 'done'),
+					queue_tally.done_bytes $S CASE WHEN $R.state = 'done' AND $R.op = 'put' THEN coalesce($R.size, 0) ELSE 0 END`)
+		}
+		return strings.NewReplacer("$B", bucket, "$K", key, "$X", written, "$W", when, "$M", meta,
+			"$COLS", cols, "$VALS", vals).Replace(strings.Replace(`
+			UPDATE queue_tally SET (live_data, live_data_sized, live_data_bytes, live_meta, live_meta_sized, live_meta_bytes$COLS) =
+				(SELECT queue_tally.live_data + (a.op IS 'put' AND a.class NOT IN $M) - (b.op IS 'put' AND b.class NOT IN $M),
+					queue_tally.live_data_sized + (a.op IS 'put' AND a.class NOT IN $M AND a.size IS NOT NULL)
+						- (b.op IS 'put' AND b.class NOT IN $M AND b.size IS NOT NULL),
+					queue_tally.live_data_bytes + CASE WHEN a.op IS 'put' AND a.class NOT IN $M THEN coalesce(a.size, 0) ELSE 0 END
+						- CASE WHEN b.op IS 'put' AND b.class NOT IN $M THEN coalesce(b.size, 0) ELSE 0 END,
+					queue_tally.live_meta + (a.op IS 'put' AND a.class IN $M) - (b.op IS 'put' AND b.class IN $M),
+					queue_tally.live_meta_sized + (a.op IS 'put' AND a.class IN $M AND a.size IS NOT NULL)
+						- (b.op IS 'put' AND b.class IN $M AND b.size IS NOT NULL),
+					queue_tally.live_meta_bytes + CASE WHEN a.op IS 'put' AND a.class IN $M THEN coalesce(a.size, 0) ELSE 0 END
+						- CASE WHEN b.op IS 'put' AND b.class IN $M THEN coalesce(b.size, 0) ELSE 0 END$VALS
+				FROM (SELECT 1)
+				LEFT JOIN (SELECT op, class, size FROM queue
+					WHERE bucket = $B AND key = $K AND state = 'done' ORDER BY seq DESC LIMIT 1) a ON 1
+				LEFT JOIN (SELECT op, class, size FROM ($P) ORDER BY seq DESC LIMIT 1) b ON 1)
+			WHERE bucket = $B AND $W;`, "$P", before, 1))
+	}
+	ensure := func(bucket string) string {
+		return strings.ReplaceAll(`
+			INSERT INTO queue_tally (bucket) SELECT $B WHERE NOT EXISTS (SELECT 1 FROM queue_tally WHERE bucket = $B);`,
+			"$B", bucket)
+	}
+	// done adds sign times row's done count and bytes, alone.
+	done := func(row, sign string) string {
+		return strings.NewReplacer("$R", row, "$S", sign).Replace(`
+			UPDATE queue_tally SET done = done $S ($R.state = 'done'),
+				done_bytes = done_bytes $S CASE WHEN $R.state = 'done' AND $R.op = 'put' THEN coalesce($R.size, 0) ELSE 0 END
+			WHERE bucket = $R.bucket;`)
+	}
+	moved := `(OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key)`
+	return `
+		CREATE TABLE queue_tally (
+			bucket          TEXT PRIMARY KEY,
+			done            INTEGER NOT NULL DEFAULT 0, -- done rows, puts and deletes
+			done_bytes      INTEGER NOT NULL DEFAULT 0, -- the done puts' bytes
+			live_data       INTEGER NOT NULL DEFAULT 0, -- live puts of the data class
+			live_data_sized INTEGER NOT NULL DEFAULT 0, -- … with a size
+			live_data_bytes INTEGER NOT NULL DEFAULT 0,
+			live_meta       INTEGER NOT NULL DEFAULT 0, -- live puts of the metadata and snapshot classes
+			live_meta_sized INTEGER NOT NULL DEFAULT 0,
+			live_meta_bytes INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO queue_tally (bucket, done, done_bytes) SELECT bucket, count(*) FILTER (WHERE state = 'done'),
+			coalesce(sum(size) FILTER (WHERE state = 'done' AND op = 'put'), 0) FROM queue GROUP BY bucket;
+		UPDATE queue_tally SET (live_data, live_data_sized, live_data_bytes, live_meta, live_meta_sized, live_meta_bytes) =
+			(SELECT count(*) FILTER (WHERE q.class NOT IN ` + meta + `),
+				count(q.size) FILTER (WHERE q.class NOT IN ` + meta + `),
+				coalesce(sum(q.size) FILTER (WHERE q.class NOT IN ` + meta + `), 0),
+				count(*) FILTER (WHERE q.class IN ` + meta + `),
+				count(q.size) FILTER (WHERE q.class IN ` + meta + `),
+				coalesce(sum(q.size) FILTER (WHERE q.class IN ` + meta + `), 0)
+			FROM queue q WHERE q.bucket = queue_tally.bucket AND q.state = 'done' AND q.op = 'put'
+			AND NOT EXISTS (SELECT 1 FROM queue l
+				WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done'));
+		CREATE TRIGGER queue_tally_insert AFTER INSERT ON queue WHEN NEW.state = 'done' BEGIN` +
+		ensure("NEW.bucket") + live("NEW.bucket", "NEW.key", "NEW.seq", false, "1", "NEW") + `
+		END;
+		CREATE TRIGGER queue_tally_update AFTER UPDATE OF seq, bucket, key, op, class, state, size ON queue
+		WHEN OLD.state = 'done' OR NEW.state = 'done' BEGIN` +
+		ensure("OLD.bucket") + ensure("NEW.bucket") +
+		live("OLD.bucket", "OLD.key", "NEW.seq", true, "1", "OLD") + live("NEW.bucket", "NEW.key", "NEW.seq", true, moved, "") +
+		done("NEW", "+") + `
+		END;
+		CREATE TRIGGER queue_tally_delete AFTER DELETE ON queue WHEN OLD.state = 'done' BEGIN` +
+		ensure("OLD.bucket") + live("OLD.bucket", "OLD.key", "NULL", true, "1", "OLD") + `
+		END;
+		CREATE TABLE below_short (
+			bucket TEXT NOT NULL,
+			key    TEXT NOT NULL,
+			seq    INTEGER NOT NULL, -- the live put's queue row
+			size   INTEGER,
+			PRIMARY KEY (bucket, seq)
+		);
+		CREATE INDEX below_short_key ON below_short (bucket, key);
+		CREATE TABLE below_basis (
+			bucket TEXT PRIMARY KEY,
+			places TEXT NOT NULL,    -- JSON: the friends and overflow targets whose rows count
+			copies INTEGER NOT NULL,
+			folds  INTEGER NOT NULL, -- offsite_basis.folds as of the store
+			through INTEGER          -- the latest done put as of the store; 0 if none
+		);
+		CREATE TABLE held_basis (
+			bucket   TEXT NOT NULL,
+			place    TEXT NOT NULL,
+			acked_at INTEGER,          -- the first acknowledgement of a put still held; NULL if none
+			seq      INTEGER,          -- its row
+			folds    INTEGER NOT NULL, -- offsite_basis.folds as of the store
+			PRIMARY KEY (bucket, place)
+		);`
 }

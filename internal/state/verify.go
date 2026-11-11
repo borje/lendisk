@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"math"
 	"time"
 )
 
@@ -126,10 +127,20 @@ const heldSince = `(SELECT min(h.acked_at) FROM placement h
 
 // ReplicaChecks returns every replica that a friend with an address
 // holds acknowledged objects of, or that has a record, by bucket and
-// then friend; a replica never checked has zero times.
+// then friend; a replica never checked has zero times. It reads in one
+// read transaction unless db is already a Snapshot; HeldSince comes
+// from what the fold stored (heldOf, #116).
 func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
+	if db.snap == nil {
+		view, done, err := db.Snapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer done()
+		return view.ReplicaChecks(ctx)
+	}
 	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name, c.checked_at, c.verified_at, c.full_at,
-		max(coalesce(c.cycle_full_at, 0), coalesce(c.full_at, 0)), c.unverified_at, coalesce(c.detail, ''), coalesce(c.error, ''), c.error_at, `+heldSince+`
+		max(coalesce(c.cycle_full_at, 0), coalesce(c.full_at, 0)), c.unverified_at, coalesce(c.detail, ''), coalesce(c.error, ''), c.error_at
 		FROM `+replicaPlaces+` f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
 		WHERE c.place IS NOT NULL OR coalesce(f.address, '') != '' AND EXISTS (SELECT 1 FROM placement p
@@ -142,19 +153,29 @@ func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 	var out []ReplicaCheck
 	for rows.Next() {
 		var c ReplicaCheck
-		var checked, verified, full, all, unverified, errAt, held sql.NullInt64
-		if err := rows.Scan(&c.Place, &c.Bucket, &checked, &verified, &full, &all, &unverified, &c.Detail, &c.Error, &errAt,
-			&held); err != nil {
+		var checked, verified, full, all, unverified, errAt sql.NullInt64
+		if err := rows.Scan(&c.Place, &c.Bucket, &checked, &verified, &full, &all, &unverified, &c.Detail, &c.Error, &errAt); err != nil {
 			return nil, err
 		}
 		c.CheckedAt, c.VerifiedAt, c.FullAt = timeOf(checked), timeOf(verified), timeOf(full)
-		c.UnverifiedAt, c.ErrorAt, c.HeldSince = timeOf(unverified), timeOf(errAt), timeOf(held)
+		c.UnverifiedAt, c.ErrorAt = timeOf(unverified), timeOf(errAt)
 		if all.Int64 > 0 {
 			c.AllCheckedAt = timeOf(all)
 		}
 		out = append(out, c)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	for i, c := range out {
+		h, err := db.heldOf(ctx, c.Place, c.Bucket, math.MaxInt64)
+		if err != nil {
+			return nil, err
+		}
+		out[i].HeldSince = timeOf(h.at)
+	}
+	return out, nil
 }
 
 // DueReplicas returns the replicas due for their daily challenge at now

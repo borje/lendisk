@@ -347,13 +347,16 @@ func (db *DB) UploadEntry(ctx context.Context, bucket, key, uploadID string) (se
 }
 
 // QueueStats returns each bucket's queue size; buckets with no rows are
-// absent.
+// absent. The done rows are counted in queue_tally (schema 54, #116),
+// the pending ones by their partial index: it costs the buckets and
+// the writes in flight, not every row.
 func (db *DB) QueueStats(ctx context.Context) (map[string]QueueStat, error) {
-	rows, err := db.QueryContext(ctx, `SELECT bucket,
-		count(*) FILTER (WHERE state = 'done'),
-		coalesce(sum(size) FILTER (WHERE state = 'done' AND op = 'put'), 0),
-		count(*) FILTER (WHERE state = 'pending')
-		FROM queue GROUP BY bucket`)
+	rows, err := db.QueryContext(ctx, `WITH pending AS (SELECT bucket, count(*) AS n
+			FROM queue INDEXED BY queue_pending WHERE state = 'pending' GROUP BY bucket)
+		SELECT t.bucket, t.done, t.done_bytes, coalesce(p.n, 0)
+		FROM queue_tally t LEFT JOIN pending p ON p.bucket = t.bucket WHERE t.done > 0 OR p.n > 0
+		UNION ALL
+		SELECT p.bucket, 0, 0, p.n FROM pending p WHERE p.bucket NOT IN (SELECT bucket FROM queue_tally)`)
 	if err != nil {
 		return nil, err
 	}
