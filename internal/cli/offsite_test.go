@@ -256,6 +256,38 @@ func TestTheDaemonRepairsADriftedQueueTallyAndWarns(t *testing.T) {
 	}
 }
 
+// #119: the same check repairs an overflow target's stored hold that
+// drifted (here by hand) and warns naming the target.
+func TestTheDaemonRepairsADriftedOverflowHoldAndWarns(t *testing.T) {
+	parallel(t, 0)
+	o := newOffsiteNode(t, "laptop", "restic")
+	if _, err := o.db.Exec(`INSERT INTO overflow_hold (place, objects, bytes) VALUES ('overflow:s3', 4, 4000)`); err != nil {
+		t.Fatal(err)
+	}
+	var log syncBuffer
+	ctx, cancel := context.WithCancel(t.Context())
+	stopped := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-stopped })
+	go func() {
+		defer close(stopped)
+		(&offsiteFolder{DB: o.db, Every: 10 * time.Millisecond, TallyEvery: time.Hour,
+			Log: slog.New(slog.NewTextHandler(&log, nil))}).Run(ctx)
+	}()
+	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(log.String(), "level=WARN"); {
+		if time.Now().After(deadline) {
+			t.Fatalf("no warning; log:\n%s", log.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if l := log.String(); !strings.Contains(l, "stored hold differed") || !strings.Contains(l, "place=overflow:s3") {
+		t.Fatalf("the repair's log:\n%s", l)
+	}
+	var objects int64
+	if err := o.db.QueryRow(`SELECT objects FROM overflow_hold WHERE place = 'overflow:s3'`).Scan(&objects); err != nil || objects != 0 {
+		t.Fatalf("hold %d (%v), want 0 once repaired", objects, err)
+	}
+}
+
 // REPL-4, REPL-11 (#20): for restic, status names the latest snapshot
 // and whether it is offsite at the bucket's copies, by restic's short ID;
 // while the next one is on its way it says what it waits for, and names

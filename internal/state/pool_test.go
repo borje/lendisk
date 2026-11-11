@@ -1098,3 +1098,35 @@ func TestABusyDatabaseStopsTheReroutingPass(t *testing.T) {
 		p.wantPlaces(fmt.Sprintf("data/%d", i), s, "B", "D")
 	}
 }
+
+// #119: a capture's reads of the bucket's metadata a place lacks
+// (unsentMetadata for each friend, placeMetadata for each chosen
+// target) walk the bucket's metadata rows by queue_metadata, not every
+// row of the bucket: without the index named, SQLite walked
+// queue_bucket_seq, some 90 ms a capture beside 100,000 objects.
+func TestACapturesMetadataReadsWalkOnlyTheBucketsMetadata(t *testing.T) {
+	db := openTest(t)
+	for name, q := range map[string]string{"unsentMetadata": unsentMetadataSQL, "placeMetadata": placeMetadataSQL} {
+		args := []any{"laptop", "B"}
+		if name == "unsentMetadata" {
+			args = append(args, ObjectOverhead)
+		}
+		rows, err := db.Query(`EXPLAIN QUERY PLAN `+q, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			plan = append(plan, detail)
+		}
+		rows.Close()
+		if len(plan) == 0 || !strings.Contains(plan[0], "SEARCH q USING INDEX queue_metadata (bucket=?)") {
+			t.Errorf("%s's plan:\n%s", name, strings.Join(plan, "\n"))
+		}
+	}
+}

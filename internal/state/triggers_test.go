@@ -117,7 +117,7 @@ func TestNoTriggerWritesATableThatHasTriggers(t *testing.T) {
 			}
 		}
 	}
-	for _, w := range []string{"place_use", "place_freed", "offsite_dirty", "queue_tally"} {
+	for _, w := range []string{"place_use", "place_freed", "offsite_dirty", "queue_tally", "overflow_live", "overflow_hold"} {
 		if !written[w] {
 			t.Errorf("no trigger found writing %s: the check reads the triggers wrong (%v)", w, written)
 		}

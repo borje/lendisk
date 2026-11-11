@@ -168,8 +168,36 @@ func heldSinceFull(ctx context.Context, db *DB) (map[[2]string]time.Time, error)
 	return out, rows.Err()
 }
 
+// overflowHoldsFull is OverflowHolds as it read every copy at each
+// target before #119.
+func overflowHoldsFull(ctx context.Context, db *DB) (map[string]OverflowHold, error) {
+	rows, err := db.QueryContext(ctx, `SELECT o.name, coalesce(u.bytes, 0),
+		(SELECT count(*) FROM placement p JOIN queue q ON q.seq = p.seq
+			WHERE p.place = '`+OverflowPrefix+`' || o.name AND p.state IN ('queued', 'acked') AND p.op = 'put'
+			AND q.class = 'data' AND `+liveQ+`),
+		(SELECT coalesce(sum(q.size), 0) FROM placement p JOIN queue q ON q.seq = p.seq
+			WHERE p.place = '`+OverflowPrefix+`' || o.name AND p.state IN ('queued', 'acked') AND p.op = 'put'
+			AND q.class = 'data' AND `+liveQ+`)
+		FROM overflow o LEFT JOIN place_use u ON u.place = '`+OverflowPrefix+`' || o.name ORDER BY o.name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]OverflowHold{}
+	for rows.Next() {
+		var name string
+		var h OverflowHold
+		if err := rows.Scan(&name, &h.Use, &h.DataObjects, &h.DataBytes); err != nil {
+			return nil, err
+		}
+		h.Use = max(h.Use, 0)
+		out[name] = h
+	}
+	return out, rows.Err()
+}
+
 // sameStatusReads compares, in one snapshot, each of status's reads
-// that #116 stored or indexed with its computation from every row.
+// that #116 and #119 stored or indexed with its computation from every row.
 // storedBelow counts the buckets whose below rows came from the stored
 // ones; diff is "" when everything agrees.
 func sameStatusReads(db *DB, now time.Time) (storedBelow int, diff string, err error) {
@@ -226,6 +254,13 @@ func sameStatusReads(db *DB, now time.Time) (storedBelow int, diff string, err e
 		return 0, "", err
 	}
 	if want, err := dueReplicasFull(ctx, view, now); err != nil || differs("due replicas", due, want) {
+		return 0, diff, err
+	}
+	holds, err := view.OverflowHolds(ctx)
+	if err != nil {
+		return 0, "", err
+	}
+	if want, err := overflowHoldsFull(ctx, view); err != nil || differs("overflow holds", holds, want) {
 		return 0, diff, err
 	}
 	places, err := belowPlaces(ctx, view)
@@ -394,6 +429,102 @@ func TestQueueTallyEqualsTheRowsWhateverWritesThem(t *testing.T) {
 	}
 }
 
+// #119: each overflow target's stored hold (overflow_live and
+// overflow_hold, kept by triggers on queue and placement) equals the
+// count and sum over its live data copies after every one of random
+// writes by raw SQL: copies queued, acknowledged, refused, dropped,
+// moved between targets and a friend, renumbered, deleted and written
+// under OR IGNORE and OR REPLACE; and queue rows written, settled,
+// reclassed, resized, moved to another key, renumbered and deleted, so
+// that a key's latest write, and with it which copies are live,
+// changes. A hold changed by hand is caught.
+func TestOverflowHoldsEqualTheRowsWhateverWritesThem(t *testing.T) {
+	ctx := context.Background()
+	db := openTest(t)
+	r := rand.New(rand.NewPCG(119, 1))
+	for _, n := range []string{"s3", "b2"} {
+		mustExec(t, db, `INSERT INTO overflow (name, endpoint, bucket, max_bytes, env_prefix, retention, added_at)
+			VALUES (?, 'https://x', 'b', 1000000, 'X', 0, 0)`, n)
+	}
+	pick := func(xs ...string) string { return xs[r.IntN(len(xs))] }
+	places := []string{"overflow:s3", "overflow:s3", "overflow:b2", "overflow:gone", "B"}
+	size := func() any {
+		if r.IntN(5) == 0 {
+			return nil
+		}
+		return r.IntN(1000)
+	}
+	const anySeq = `(SELECT seq FROM queue ORDER BY random() LIMIT 1)`
+	const anyCopy = `(SELECT rowid FROM placement ORDER BY random() LIMIT 1)`
+	held := 0 // steps after which some copy counted
+	for step := 1; step <= 800; step++ {
+		b, k := pick("laptop", "photos"), fmt.Sprintf("k%d", r.IntN(6))
+		var q string
+		var args []any
+		switch r.IntN(16) {
+		case 0, 1:
+			q = `INSERT INTO queue (bucket, key, op, class, state, size, created_at) VALUES (?, ?, ?, ?, ?, ?, 1)`
+			args = []any{b, k, pick("put", "put", "delete"), pick("data", "data", "metadata"), pick("done", "done", "pending"), size()}
+		case 2, 3, 4:
+			q = `INSERT OR IGNORE INTO placement (seq, place, bucket, key, op, state)
+				SELECT seq, ?, bucket, key, ?, ? FROM queue ORDER BY random() LIMIT 1`
+			args = []any{pick(places...), pick("put", "put", "delete"), pick("queued", "acked", "refused")}
+		case 5:
+			q = `UPDATE placement SET state = ? WHERE rowid = ` + anyCopy
+			args = []any{pick("queued", "acked", "dropped", "dropping", "refused")}
+		case 6:
+			q = `UPDATE OR IGNORE placement SET place = ? WHERE rowid = ` + anyCopy
+			args = []any{pick(places...)}
+		case 7:
+			q = `UPDATE OR ` + pick("IGNORE", "REPLACE") + ` placement SET seq = ` + anySeq + ` WHERE rowid = ` + anyCopy
+		case 8:
+			q = `UPDATE placement SET op = ? WHERE rowid = ` + anyCopy
+			args = []any{pick("put", "delete")}
+		case 9:
+			q = `DELETE FROM placement WHERE rowid = ` + anyCopy
+		case 10:
+			q = `INSERT OR REPLACE INTO placement (seq, place, bucket, key, op, state)
+				SELECT seq, ?, bucket, key, 'put', 'acked' FROM queue ORDER BY random() LIMIT 1`
+			args = []any{pick(places...)}
+		case 11:
+			q = `UPDATE queue SET state = ?, size = ? WHERE seq = ` + anySeq
+			args = []any{pick("done", "pending"), size()}
+		case 12:
+			q = `UPDATE queue SET class = ? WHERE seq = ` + anySeq
+			args = []any{pick("data", "metadata", "snapshot")}
+		case 13:
+			q = `UPDATE queue SET key = ?, bucket = ? WHERE seq = ` + anySeq
+			args = []any{k, b}
+		case 14:
+			q = `UPDATE OR ` + pick("IGNORE", "REPLACE") + ` queue SET seq = ` +
+				pick(anySeq, `(SELECT max(seq) + 1 FROM queue)`) + ` WHERE seq = ` + anySeq
+		case 15:
+			q = `DELETE FROM queue WHERE seq = ` + anySeq
+		}
+		if _, err := db.ExecContext(ctx, q, args...); err != nil {
+			t.Fatalf("step %d: %s: %v", step, q, err)
+		}
+		if _, diff, err := sameStatusReads(db, time.Now()); err != nil || diff != "" {
+			t.Fatalf("step %d (%s %v): %s %v", step, q, args, diff, err)
+		}
+		var some bool
+		if err := db.QueryRow(`SELECT EXISTS (SELECT 1 FROM overflow_live)`).Scan(&some); err != nil {
+			t.Fatal(err)
+		}
+		if some {
+			held++
+		}
+	}
+	if held < 100 {
+		t.Fatalf("a live copy at a target after only %d steps: the check is nearly vacuous", held)
+	}
+	mustExec(t, db, `INSERT INTO overflow_hold (place, bytes) VALUES ('overflow:s3', 1)
+		ON CONFLICT (place) DO UPDATE SET bytes = bytes + 1`)
+	if _, diff, err := sameStatusReads(db, time.Now()); err != nil || diff == "" {
+		t.Fatalf("a hold changed by hand was not caught: %q %v", diff, err)
+	}
+}
+
 // #116: schema 54 fills queue_tally from the rows already there, so an
 // upgraded node counts what it captured before.
 func TestTheUpgradeTalliesTheRowsAlreadyThere(t *testing.T) {
@@ -426,6 +557,49 @@ func TestTheUpgradeTalliesTheRowsAlreadyThere(t *testing.T) {
 	}
 	if n, err := db.RepositorySize(ctx); err != nil || n != 25 {
 		t.Fatalf("repository size %d, want 25 (%v)", n, err)
+	}
+}
+
+// #119: schema 57 fills each overflow target's hold from the copies
+// already there, so an upgraded node counts what its targets held
+// before: live data puts queued or acknowledged there, not a
+// metadata copy, a refused or dropped one, or the put of a key written
+// since.
+func TestTheUpgradeCountsWhatOverflowTargetsAlreadyHold(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	old, err := open(ctx, dir, migrations[:56], quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`INSERT INTO overflow (name, endpoint, bucket, max_bytes, env_prefix, retention, added_at) VALUES ('s3', 'https://x', 'b', 1000, 'X', 0, 0)`,
+		`INSERT INTO queue (seq, bucket, key, op, class, state, size, created_at) VALUES
+			(1, 'laptop', 'a', 'put', 'data', 'done', 10, 1), (2, 'laptop', 'b', 'put', 'data', 'done', 20, 1),
+			(3, 'laptop', 'c', 'put', 'data', 'done', 40, 1), (4, 'laptop', 'c', 'put', 'data', 'done', 80, 1),
+			(5, 'laptop', 'm', 'put', 'metadata', 'done', 5, 1), (6, 'laptop', 'd', 'put', 'data', 'done', 160, 1),
+			(7, 'laptop', 'e', 'put', 'data', 'done', NULL, 1)`,
+		`INSERT INTO placement (seq, place, bucket, key, op, state) VALUES
+			(1, 'overflow:s3', 'laptop', 'a', 'put', 'acked'), (2, 'overflow:s3', 'laptop', 'b', 'put', 'queued'),
+			(3, 'overflow:s3', 'laptop', 'c', 'put', 'acked'), (4, 'B', 'laptop', 'c', 'put', 'acked'),
+			(5, 'overflow:s3', 'laptop', 'm', 'put', 'acked'), (6, 'overflow:s3', 'laptop', 'd', 'put', 'dropped'),
+			(7, 'overflow:s3', 'laptop', 'e', 'put', 'acked'), (1, 'B', 'laptop', 'a', 'put', 'acked')`,
+	} {
+		if _, err := old.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old.Close()
+	db, err := Open(ctx, dir, quiet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, diff, err := sameStatusReads(db, time.Now()); err != nil || diff != "" {
+		t.Fatalf("after the upgrade: %s %v", diff, err)
+	}
+	if h, err := db.OverflowHolds(ctx); err != nil || h["s3"].DataObjects != 3 || h["s3"].DataBytes != 30 {
+		t.Fatalf("holds %+v (%v), want a, b and e: 3 objects of 30 bytes", h, err)
 	}
 }
 

@@ -1235,6 +1235,81 @@ var migrations = []Migration{
 		-- are of from here, not every live put.
 		CREATE INDEX placement_dropped ON placement (seq) WHERE state = 'dropped';`,
 	},
+	{
+		Version: 57, Compat: 1, Release: "0.1",
+		SQL: migration57(),
+	},
+}
+
+// migration57 is schema 57's SQL (#119): each overflow target's live
+// data copies (OverflowHolds), stored. Once released, never change it.
+//
+// overflow_live holds a row per copy that counts: a put's placement row
+// at an overflow target, queued or acked, whose queue row is of the
+// data class and its key's latest done write (liveQ), with the queue
+// row's bucket, key and size. overflow_hold keeps, per target, how many
+// rows overflow_live has and their sizes' sum. AFTER triggers keep both
+// in the writer's transaction, as queue_tally's do: a placement write
+// at a target recomputes that copy, and a queue write recomputes every
+// copy of each key it touched, since a key's latest write decides
+// which of its copies are live. Recomputing takes the key's or copy's
+// rows away from overflow_hold, deletes them, inserts them afresh from
+// queue and placement, and adds them back, so overflow_hold is always
+// overflow_live's sum and overflow_live what the rows say. Each insert
+// meets no conflict (WHERE NOT EXISTS), and neither table has triggers.
+// The tables are filled from the rows as they are; RepairQueueTally
+// repairs any drift. The statements are overflowlive.go's, frozen with
+// this migration.
+func migration57() string {
+	recompute := func(stmts ...[]string) string {
+		var all []string
+		for _, s := range stmts {
+			all = append(all, s...)
+		}
+		return "\n\t\t\t" + strings.Join(all, ";\n\t\t\t") + ";"
+	}
+	drop := func(row, cond string) []string { return overflowKeyDrop(row+".bucket", row+".key", cond) }
+	add := func(row, cond string) []string { return overflowKeyAdd(row+".bucket", row+".key", cond) }
+	moved := `(OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key)`
+	atTarget := func(row string) string { return overflowPlaceRange(row + ".place") }
+	oldCopy := overflowLiveDrop("$T.place = OLD.place AND $T.seq = OLD.seq")
+	return `
+		CREATE TABLE overflow_live (
+			place  TEXT NOT NULL,    -- the target's place
+			seq    INTEGER NOT NULL, -- the copy's queue row
+			bucket TEXT,             -- the queue row's bucket, key and size
+			key    TEXT,
+			size   INTEGER,
+			PRIMARY KEY (place, seq)
+		);
+		CREATE INDEX overflow_live_key ON overflow_live (bucket, key);
+		CREATE TABLE overflow_hold (
+			place   TEXT PRIMARY KEY,
+			objects INTEGER NOT NULL DEFAULT 0, -- overflow_live's rows at the place
+			bytes   INTEGER NOT NULL DEFAULT 0  -- … and their sizes
+		);
+		INSERT INTO overflow_live (place, seq, bucket, key, size) ` + overflowLiveRows + `;
+		INSERT INTO overflow_hold (place, objects, bytes)
+			SELECT place, count(*), coalesce(sum(size), 0) FROM overflow_live GROUP BY place;
+		CREATE TRIGGER overflow_live_queue_insert AFTER INSERT ON queue WHEN ` + anyOverflowCopy + ` BEGIN` +
+		recompute(drop("NEW", ""), add("NEW", "")) + `
+		END;
+		CREATE TRIGGER overflow_live_queue_update AFTER UPDATE OF seq, bucket, key, class, state, size ON queue WHEN ` + anyOverflowCopy + ` BEGIN` +
+		recompute(drop("OLD", ""), drop("NEW", moved), add("OLD", ""), add("NEW", moved)) + `
+		END;
+		CREATE TRIGGER overflow_live_queue_delete AFTER DELETE ON queue WHEN ` + anyOverflowCopy + ` BEGIN` +
+		recompute(drop("OLD", ""), add("OLD", "")) + `
+		END;
+		CREATE TRIGGER overflow_live_placement_insert AFTER INSERT ON placement WHEN ` + atTarget("NEW") + ` BEGIN` +
+		recompute(overflowCopy("NEW.place", "NEW.seq", "")) + `
+		END;
+		CREATE TRIGGER overflow_live_placement_update AFTER UPDATE OF seq, place, op, state ON placement
+		WHEN ` + atTarget("OLD") + ` OR ` + atTarget("NEW") + ` BEGIN` +
+		recompute(oldCopy, overflowCopy("NEW.place", "NEW.seq", "")) + `
+		END;
+		CREATE TRIGGER overflow_live_placement_delete AFTER DELETE ON placement WHEN ` + atTarget("OLD") + ` BEGIN` +
+		recompute(oldCopy) + `
+		END;`
 }
 
 // migration54 is schema 54's SQL (#116): what status sums over every

@@ -264,18 +264,28 @@ func poolPlaces(ctx context.Context, tx querier) ([]poolPlace, error) {
 // (RefuseObject), which no friend is sent (#26 review).
 func unsentMetadata(ctx context.Context, tx querier, bucket, place string) (int64, error) {
 	var n int64
-	err := tx.QueryRowContext(ctx, `SELECT coalesce(sum(q.size + ?3), 0) FROM queue q
+	err := tx.QueryRowContext(ctx, unsentMetadataSQL, bucket, place, ObjectOverhead).Scan(&n)
+	return n, err
+}
+
+// unsentFrom selects bucket ?1's live metadata that place ?2 lacks
+// (unsentMetadata, placeMetadata). It walks the bucket's metadata by
+// queue_metadata, named: SQLite chose queue_bucket_seq, every row of
+// the bucket, some 90 ms a capture beside 100,000 objects (#119).
+const unsentFrom = `FROM queue q INDEXED BY queue_metadata
 		WHERE q.bucket = ?1 AND q.class IN ('metadata', 'snapshot') AND q.op = 'put' AND q.state = 'done'
-		AND NOT EXISTS (SELECT 1 FROM queue l
-			WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done')
-		AND q.immutable IS NULL
+		AND ` + liveQ + ` AND q.immutable IS NULL
 		AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.place = ?2 AND p.seq = q.seq
 			AND p.state IN ('queued', 'acked', 'refused', 'dropping'))
 		AND NOT EXISTS (SELECT 1 FROM placement r WHERE r.seq = q.seq AND r.state = 'refused'
-			AND r.cause IN ('store', 'oversize'))`,
-		bucket, place, ObjectOverhead).Scan(&n)
-	return n, err
-}
+			AND r.cause IN ('store', 'oversize'))`
+
+// unsentMetadataSQL sums unsentFrom's rows as a place counts them (?3
+// is ObjectOverhead); placeMetadataSQL lists them in FIFO order.
+const (
+	unsentMetadataSQL = `SELECT coalesce(sum(q.size + ?3), 0) ` + unsentFrom
+	placeMetadataSQL  = `SELECT q.seq ` + unsentFrom + ` ORDER BY q.seq`
+)
 
 // choose is D6's choice of up to n places for an object of bucket that
 // counts need bytes at a place, never one in exclude: friends with free

@@ -203,16 +203,12 @@ type OverflowHold struct {
 }
 
 // OverflowHolds returns each overflow target's hold; a target holding
-// nothing is present with zeros.
+// nothing is present with zeros. Its data copies are stored totals
+// (overflow_hold, schema 57, #119), as its use is (place_use).
 func (db *DB) OverflowHolds(ctx context.Context) (map[string]OverflowHold, error) {
-	rows, err := db.QueryContext(ctx, `SELECT o.name, coalesce(u.bytes, 0),
-		(SELECT count(*) FROM placement p JOIN queue q ON q.seq = p.seq
-			WHERE p.place = '`+OverflowPrefix+`' || o.name AND p.state IN ('queued', 'acked') AND p.op = 'put'
-			AND q.class = 'data' AND `+liveQ+`),
-		(SELECT coalesce(sum(q.size), 0) FROM placement p JOIN queue q ON q.seq = p.seq
-			WHERE p.place = '`+OverflowPrefix+`' || o.name AND p.state IN ('queued', 'acked') AND p.op = 'put'
-			AND q.class = 'data' AND `+liveQ+`)
-		FROM overflow o LEFT JOIN place_use u ON u.place = '`+OverflowPrefix+`' || o.name ORDER BY o.name`)
+	rows, err := db.QueryContext(ctx, `SELECT o.name, coalesce(u.bytes, 0), coalesce(h.objects, 0), coalesce(h.bytes, 0)
+		FROM overflow o LEFT JOIN place_use u ON u.place = '`+OverflowPrefix+`' || o.name
+		LEFT JOIN overflow_hold h ON h.place = '`+OverflowPrefix+`' || o.name ORDER BY o.name`)
 	if err != nil {
 		return nil, err
 	}
@@ -536,14 +532,7 @@ func placeMetadata(ctx context.Context, tx interface {
 	querier
 	execer
 }, bucket, place string, now int64) (int64, error) {
-	seqs, err := column(ctx, tx, `SELECT q.seq FROM queue q
-		WHERE q.bucket = ?1 AND q.class IN ('metadata', 'snapshot') AND q.op = 'put' AND q.state = 'done'
-		AND `+liveQ+` AND q.immutable IS NULL
-		AND NOT EXISTS (SELECT 1 FROM placement p WHERE p.place = ?2 AND p.seq = q.seq
-			AND p.state IN ('queued', 'acked', 'refused', 'dropping'))
-		AND NOT EXISTS (SELECT 1 FROM placement r WHERE r.seq = q.seq AND r.state = 'refused'
-			AND r.cause IN ('store', 'oversize'))
-		ORDER BY q.seq`, bucket, place)
+	seqs, err := column(ctx, tx, placeMetadataSQL, bucket, place)
 	if err != nil {
 		return 0, err
 	}

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"math"
+	"slices"
 	"time"
 )
 
@@ -120,7 +121,7 @@ func (db *DB) RecordCheckError(ctx context.Context, place, bucket, msg string, n
 // FIFO to empty before it is challenged anyway.
 const Overdue = 24 * time.Hour
 
-// heldSince is the first acknowledgement still held at f.peer_key of
+// heldSince (DueCycles) is the first acknowledgement still held at f.peer_key of
 // bucket b.name (unix seconds), NULL when it holds none.
 const heldSince = `(SELECT min(h.acked_at) FROM placement h
 	WHERE h.place = f.peer_key AND h.bucket = b.name AND h.state = 'acked' AND h.op = 'put')`
@@ -189,9 +190,18 @@ func (db *DB) ReplicaChecks(ctx context.Context) ([]ReplicaCheck, error) {
 // anyway, so a FIFO that never empties (a friend at quota, a slow
 // uplink) does not starve it (#27 review). The FIFO is read by the
 // partial indexes of queued and dropping rows, not every copy the place
-// holds (#118).
+// holds (#118). The first acknowledgement of a replica never answered
+// whose FIFO is busy is what the offsite fold stored (heldOf, #119), as
+// ReplicaChecks reads it; only such a replica needs it, and then the
+// whole answer is read in one read transaction unless db is already a
+// Snapshot.
 func (db *DB) DueReplicas(ctx context.Context, now time.Time, every, retry time.Duration) ([]ReplicaKey, error) {
-	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name FROM `+replicaPlaces+` f CROSS JOIN buckets b
+	rows, err := db.QueryContext(ctx, `SELECT f.peer_key, b.name,
+		c.checked_at IS NULL AND (EXISTS (SELECT 1 FROM placement p INDEXED BY placement_queued
+				WHERE p.place = f.peer_key AND p.state = 'queued' AND p.bucket = b.name)
+			OR EXISTS (SELECT 1 FROM placement p INDEXED BY placement_dropping
+				WHERE p.place = f.peer_key AND p.state = 'dropping' AND p.bucket = b.name))
+		FROM `+replicaPlaces+` f CROSS JOIN buckets b
 		LEFT JOIN replica_check c ON c.place = f.peer_key AND c.bucket = b.name
 		WHERE coalesce(f.address, '') != '' AND c.unverified_at IS NULL
 		AND (c.checked_at IS NULL OR c.checked_at <= ?1) AND (c.error_at IS NULL OR c.error_at <= ?2)
@@ -202,22 +212,53 @@ func (db *DB) DueReplicas(ctx context.Context, now time.Time, every, retry time.
 			AND NOT EXISTS (SELECT 1 FROM placement p INDEXED BY placement_dropping
 				WHERE p.place = f.peer_key AND p.state = 'dropping' AND p.bucket = b.name)
 			OR c.checked_at <= ?3
-			OR c.checked_at IS NULL AND `+heldSince+` <= ?4)
+			OR c.checked_at IS NULL)
 		ORDER BY b.name, f.peer_key`, now.Add(-every).Unix(), now.Add(-retry).Unix(),
-		now.Add(-every-Overdue).Unix(), now.Add(-Overdue).Unix())
+		now.Add(-every-Overdue).Unix())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []ReplicaKey
+	var busy []bool
 	for rows.Next() {
 		var k ReplicaKey
-		if err := rows.Scan(&k.Place, &k.Bucket); err != nil {
+		var b bool
+		if err := rows.Scan(&k.Place, &k.Bucket, &b); err != nil {
 			return nil, err
 		}
-		out = append(out, k)
+		out, busy = append(out, k), append(busy, b)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	if !slices.Contains(busy, true) {
+		return out, nil
+	}
+	if db.snap == nil {
+		view, done, err := db.Snapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer done()
+		return view.DueReplicas(ctx, now, every, retry)
+	}
+	// Never answered, busy: due a day after its first acknowledgement.
+	var due []ReplicaKey
+	for i, k := range out {
+		if busy[i] {
+			h, err := db.heldOf(ctx, k.Place, k.Bucket, math.MaxInt64)
+			if err != nil {
+				return nil, err
+			}
+			if !h.at.Valid || h.at.Int64 > now.Add(-Overdue).Unix() {
+				continue
+			}
+		}
+		due = append(due, k)
+	}
+	return due, nil
 }
 
 // Challengeable is an object a challenge may name at a place: the place

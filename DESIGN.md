@@ -4911,14 +4911,87 @@ upstream bucket is Q-V.
     the queries they replaced in `sameStatusReads`, so after every step
     of the randomised tests (`droppedBelowFull`, `dueReplicasFull`);
     `TestAReplicaWaitsForTheCopiesDroppingThere` covers the dropping
-    term, which no test did. Left as they were: `OverflowHolds` (a
-    target's live data copies; cheap only with another stored sum),
-    `DueReplicas`' first-acknowledgement term (only for a replica never
-    answered whose FIFO is not empty), and the per-capture read the
-    #116 measurement found. `PlaceStats`' `EXISTS` stops at the place's
-    first row with a queue row; no writer deletes queue rows and keeps
-    their placement rows (a re-upload's pending row and dropped
-    captures have none, recovery deletes both), so it reads one row.
+    term, which no test did. Left as they were, and taken by #119
+    (below): `OverflowHolds` (a target's live data copies; cheap only
+    with another stored sum), `DueReplicas`' first-acknowledgement term
+    (only for a replica never answered whose FIFO is not empty), and
+    the per-capture read the #116 measurement found. `PlaceStats`'
+    `EXISTS` stops at the place's first row with a queue row; no writer
+    deletes queue rows and keeps their placement rows (a re-upload's
+    pending row and dropped captures have none, recovery deletes both),
+    so it reads one row.
+
+  *Overflow holds, due replicas and a capture (#119).* Three reads
+  still walked every copy of a place:
+  - *`OverflowHolds`* (each alert round, `capacity`, `overflow`) counted
+    and summed a target's live data copies: its put rows queued or
+    acknowledged there, of the data class, each its key's latest done
+    write. Schema 57 stores them: `overflow_live` holds one row per such
+    copy (place, seq, and the queue row's bucket, key and size), and
+    `overflow_hold` per target their count and bytes, which
+    `OverflowHolds` reads beside `place_use`. `AFTER` triggers keep both
+    in the writer's transaction (`internal/state/overflowlive.go`): a
+    placement write at a target recomputes that copy, a queue write
+    every copy of each key it touched (the old and the new key, when it
+    moves one), since a key's latest write decides which of its copies
+    are live. Recomputing takes the key's or copy's stored rows away
+    from `overflow_hold`, deletes them, inserts the copies that count
+    from `queue` and `placement`, `WHERE NOT EXISTS`, and adds those
+    back, so the total is always the stored rows' sum; neither table has
+    triggers, and no statement meets a conflict. Per-key rows rather than
+    `queue_tally`'s before-and-after arithmetic: which copies a write
+    makes live or not spans every row of the key at every target, and
+    the stored rows are the "before". A placement write elsewhere costs
+    nothing (the triggers' `WHEN` names the `overflow:` range); a
+    queue write runs the recompute only while some placement row or
+    stored copy is at a target (`anyOverflowCopy`, two index probes),
+    so a node without overflow pays nothing more, and one with it a
+    few index look-ups by the key per version of it at each target. The migration
+    fills both from the rows. `RepairQueueTally` checks them too, in the
+    same read transaction: a target's stored copies against the copies
+    that count (`EXCEPT` both ways), its total against the stored
+    copies' sum; in the write transaction it adds the total's
+    difference and recomputes each drifted key with the triggers' own
+    statements (every key dropped first, then added, so a copy stored
+    under the wrong key is gone before its own key adds it). The daemon
+    warns per target (`overflow: a target's stored hold differed from
+    its copies; repaired`, with both holds and the wrong copies'
+    count).
+  - *`DueReplicas`' first acknowledgement* reads what the fold stored,
+    `heldOf`, as `ReplicaChecks` does. The query flags the replicas it
+    is for (never answered, FIFO busy); only when one is flagged does
+    `DueReplicas` read again in one read transaction and keep those a
+    day past their first acknowledgement. `DueCycles` keeps the old
+    term (its FIFO read too): it runs after the daily challenges, not
+    every 5 s.
+  - *The per-capture read* was `unsentMetadata`, the bucket's live
+    metadata a friend lacks, asked for each friend `choose` weighs
+    (and `placeMetadata`'s list for a target given its first copy). Its
+    `WHERE` names the metadata classes, but SQLite walked
+    `queue_bucket_seq`, every row of the bucket, with three correlated
+    look-ups each. Both now name `queue_metadata`
+    (`TestACapturesMetadataReadsWalkOnlyTheBucketsMetadata` reads the
+    plan), so a capture reads the bucket's metadata, which grows with
+    the repository's index, not its data.
+
+  Evidence: `sameStatusReads` now also compares `OverflowHolds` with the
+  query it replaced, so after every step of the randomised and model
+  tests; `TestOverflowHoldsEqualTheRowsWhateverWritesThem` drives
+  `queue` and `placement` by raw SQL (copies moved between targets and
+  a friend, renumbered, reclassed, keys moved, `OR IGNORE`, `OR
+  REPLACE`; dropping the new key's recompute or the old copy's drop
+  fails it); `TestTheUpgradeCountsWhatOverflowTargetsAlreadyHold`;
+  `TestADriftedOverflowHoldIsRepairedKeepingTheWritesMeanwhile`;
+  `TestTheDaemonRepairsADriftedOverflowHoldAndWarns`. On the million
+  objects of `TestTheUpgradeAndTallyCheckOfAMillionObjectBucket`, two
+  thirds of the data at a target: `OverflowHolds` 2.4 s → 0.19 ms;
+  `DueReplicas` with a never-answered replica's FIFO busy, after a fold,
+  1.15 s → 0.95 ms; `unsentMetadata` 186 ms → 3.1 ms (1,200 metadata
+  objects), so a capture (begin, finish, place) about 20 ms, against
+  about 125 ms beside 100,000 objects before; the first capture after
+  opening took 0.7 s (a cold cache and the split's first read). Cost:
+  migration 57 takes 2.9 s once; the hourly check 1.8 s → 5.8 s, the
+  difference the target's copies compared both ways.
 
 
   *What `status` names (REPL-4, REPL-11).* Under each bucket, and in

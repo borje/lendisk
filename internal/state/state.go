@@ -13,13 +13,15 @@
 // may do so only in the release after the one whose schema it locks out.
 //
 // Trigger rule. Triggers on queue, placement and overflow_tomb keep
-// queue_tally, place_use, place_freed and the offsite marks
-// (offsite_dirty) in every writer's transaction; readers trust them. A
+// queue_tally, place_use, place_freed, the offsite marks
+// (offsite_dirty) and the overflow targets' holds (overflow_live,
+// overflow_hold) in every writer's transaction; readers trust them. A
 // migration that rebuilds one of those tables (create, copy, drop,
 // rename) drops its triggers with it: it must create them again and
-// refill what they keep from the rows, as migrations 12, 26, 53 and 54
-// fill them, in the same migration. The daemon repairs queue_tally
-// drift hourly (RepairQueueTally), but nothing else is checked. A
+// refill what they keep from the rows, as migrations 12, 26, 53, 54 and
+// 57 fill them, in the same migration. The daemon repairs queue_tally
+// and overflow hold drift hourly (RepairQueueTally), but nothing else
+// is checked. A
 // trigger names no conflict policy and must meet no conflict (insert
 // where missing, WHERE NOT EXISTS): the writer's policy overrides the
 // trigger's own (#117). Open turns recursive_triggers on, so a REPLACE

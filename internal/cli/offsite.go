@@ -449,8 +449,8 @@ func (f *offsiteFolder) Run(ctx context.Context) {
 	}
 }
 
-// checkTally repairs the stored queue sums where they drifted from the
-// rows, and says so.
+// checkTally repairs the stored queue sums, and the overflow targets'
+// stored holds (#119), where they drifted from the rows, and says so.
 func (f *offsiteFolder) checkTally(ctx context.Context) {
 	drift, err := f.DB.RepairQueueTally(ctx)
 	if err != nil {
@@ -460,6 +460,11 @@ func (f *offsiteFolder) checkTally(ctx context.Context) {
 		return
 	}
 	for _, d := range drift {
+		if d.Place != "" {
+			f.Log.Warn("overflow: a target's stored hold differed from its copies; repaired", "place", d.Place,
+				"stored", fmt.Sprintf("%+v", d.StoredHeld), "rows", fmt.Sprintf("%+v", d.ComputedHeld), "copies", d.Copies)
+			continue
+		}
 		f.Log.Warn("queue: a bucket's stored queue sums differed from its rows; repaired",
 			"bucket", d.Bucket, "stored", fmt.Sprintf("%+v", d.Stored), "rows", fmt.Sprintf("%+v", d.Computed))
 	}
