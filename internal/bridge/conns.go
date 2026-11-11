@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -22,6 +24,11 @@ import (
 // ErrCut is the cause of a tunnel request's context when its connection
 // was cut because the key's relationship ended (SEC-15).
 var ErrCut = errors.New("the relationship with this key ended")
+
+// ErrConnLost is the cause of a tunnel request's context when a read
+// from its connection failed with anything but end of stream or a
+// deadline (a reset), or a write to it failed (#101).
+var ErrConnLost = errors.New("the tunnel connection was lost")
 
 // DefaultGrace bounds how long Cut lets a busy connection's cancelled
 // requests answer before it closes the connection anyway.
@@ -178,6 +185,7 @@ type peerConn struct {
 	active atomic.Int32 // requests being served on it
 
 	mu       sync.Mutex
+	ctx      context.Context         // set by ConnContext; its requests' contexts end with it (detached)
 	cancel   context.CancelCauseFunc // set by ConnContext
 	cut      bool
 	closed   bool
@@ -260,14 +268,54 @@ func (c *peerConn) SetReadDeadline(t time.Time) error {
 // chunk's writeStall at the most: the write fails, net/http closes the
 // connection, and the proxy abandons the answer (#76). A client
 // reading slowly but steadily meets every deadline. A hijacked
-// connection's writes are bounded the same way.
+// connection's writes are bounded the same way. A failed write loses
+// the connection (lose).
 func (c *peerConn) Write(p []byte) (int, error) {
 	if c.writeStall > 0 {
 		if err := c.Conn.SetWriteDeadline(time.Now().Add(c.writeStall)); err != nil {
+			c.lose(err)
 			return 0, err
 		}
 	}
-	return c.Conn.Write(p)
+	n, err := c.Conn.Write(p)
+	if err != nil {
+		c.lose(err)
+	}
+	return n, err
+}
+
+// Read loses the connection (lose) when a read fails with anything but
+// end of stream or a deadline: a reset, or a tunnel that went away. End
+// of stream is the client's half-close, which may come as soon as its
+// request is sent (nc -N): its answer is still wanted, so it ends
+// nothing here (#101). net/http's background read takes it for an
+// abort and cancels the request context it made, which detached keeps
+// from the handler; a request body cut short by it still fails its
+// read, and a client that closed both ways is found once a write to
+// it fails. A deadline is net/http's or the body bound's own doing,
+// and each handles it.
+func (c *peerConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, os.ErrDeadlineExceeded) {
+		var ne net.Error
+		if !errors.As(err, &ne) || !ne.Timeout() {
+			c.lose(err)
+		}
+	}
+	return n, err
+}
+
+// lose cancels the connection's context, and with it its requests in
+// flight, with ErrConnLost: nothing more can pass on it. A cut
+// connection's context already ended with ErrCut, which stays its
+// cause.
+func (c *peerConn) lose(err error) {
+	c.mu.Lock()
+	cancel := c.cancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel(fmt.Errorf("%w: %w", ErrConnLost, err))
+	}
 }
 
 // SetDeadline is SetReadDeadline and the write deadline at once.
@@ -283,7 +331,7 @@ func (c *peerConn) SetDeadline(t time.Time) error {
 func (c *peerConn) context(parent context.Context) context.Context {
 	ctx, cancel := context.WithCancelCause(parent)
 	c.mu.Lock()
-	c.cancel = cancel
+	c.ctx, c.cancel = ctx, cancel
 	cut := c.cut
 	c.mu.Unlock()
 	if cut {
@@ -303,6 +351,39 @@ func counted(h http.Handler) http.Handler {
 			defer pc.active.Add(-1)
 		}
 		h.ServeHTTP(w, r)
+	})
+}
+
+// detached serves each request on a tunnel connection with a context
+// that keeps every value of the one net/http made but ends only with
+// the connection's own (cut, ErrCut; or lost, ErrConnLost) or when the
+// handler returns (#101). net/http cancels the request context it made
+// when its background read meets end of stream, so a client that
+// half-closes after its request (nc -N through peer forward) would
+// have its relationship lookup and proxied request cancelled and get a
+// 503 instead of its answer. A client that really went away is still
+// found: a reset fails a read and a closed one fails a write (Read,
+// Write), as HAProxy without abortonclose and nginx with
+// proxy_ignore_client_abort find it.
+func detached(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		pc, ok := r.Context().Value(connKey{}).(*peerConn)
+		if !ok {
+			h.ServeHTTP(w, r)
+			return
+		}
+		pc.mu.Lock()
+		conn := pc.ctx
+		pc.mu.Unlock()
+		if conn == nil {
+			h.ServeHTTP(w, r)
+			return
+		}
+		ctx, cancel := context.WithCancelCause(context.WithoutCancel(r.Context()))
+		defer cancel(nil)
+		stop := context.AfterFunc(conn, func() { cancel(context.Cause(conn)) })
+		defer stop()
+		h.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

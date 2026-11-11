@@ -7053,12 +7053,25 @@ the handler's own reads and is never cancelled; nothing below
   (`cli.splice`). A side that ends half-closes the other: the tunnel
   connection's `CloseWrite` delegates to gVisor's (`tunnelConn` embeds
   the conn, which does not promote it), so a client that half-closes
-  after its request (`nc -N`) still reads the friend's answer (#94).
-  That answer may be a 503: Go's `net/http` server on the friend's
-  tunnel port cancels an in-flight request's context when it reads
-  EOF, and the bridge's relationship lookup then fails ("cannot read
-  relationships"). Backup tools do not half-close; having the bridge
-  answer a half-closed request in full is a follow-up. It
+  after its request (`nc -N`) still reads the friend's answer (#94),
+  and in full (#101): Go's `net/http` server cancels an in-flight
+  request's context when its background read meets EOF, so the friend's
+  tunnel port serves each request with a context of its own
+  (`bridge.detached`), holding every value of net/http's but ending only
+  with the handler or with the connection's context. That one ends
+  when the connection is cut (`ErrCut`) or lost (`ErrConnLost`): a read
+  failing with anything but EOF or a deadline (a reset), or any failed
+  write (`peerConn.Read`, `peerConn.Write`). So a half-close ends
+  nothing, a request body cut short still fails its read, a reset ends
+  the proxied request at once, and a client that closed both ways while
+  its answer was pending is found when the answer's write fails. This
+  is HAProxy's behaviour without `option abortonclose` and nginx's
+  with `proxy_ignore_client_abort on`; Go's `httputil.ReverseProxy`
+  and Caddy, bound to the request context, abort on the half-close
+  (`TestAHalfClosingFriendReadsTheGatewaysAnswer`,
+  `TestAFriendWhoseConnectionResetsEndsItsProxiedRequest`). The
+  loopback and LAN listeners still abort on a half-close; local S3
+  tools do not half-close. It
   splices at most 32 connections at once (`cli.forwardConns`); while
   that many are open it accepts nothing and new ones wait in the
   listener's backlog, so no local user can make the node's dial key

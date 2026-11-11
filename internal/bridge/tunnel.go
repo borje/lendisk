@@ -252,13 +252,15 @@ func (l *peerListener) Close() error {
 // which TunnelHandler reads. caps bounds each key's open connections; it
 // is the Caps given to TunnelHandler, and nil means the defaults. conns
 // tracks the open connections by key, so Conns.Cut can end them
-// (SEC-15); nil tracks nothing.
+// (SEC-15); nil tracks nothing. A request's context ends with its
+// connection or its handler, not with the client's half-close
+// (detached, #101).
 func ServeTunnel(ctx context.Context, ln net.Listener, peerOf PeerOf, caps *Caps, conns *Conns, h http.Handler, log *slog.Logger) error {
 	if caps == nil {
 		caps = &Caps{}
 	}
 	srv := &http.Server{
-		Handler:           counted(h),
+		Handler:           counted(detached(h)),
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       5 * time.Minute,
 		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelDebug),
