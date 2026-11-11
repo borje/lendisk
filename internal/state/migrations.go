@@ -1102,4 +1102,87 @@ var migrations = []Migration{
 		-- its end lacks it.
 		ALTER TABLE listed ADD COLUMN unioned INTEGER; -- 1: the profile reads the union`,
 	},
+	{
+		Version: 53, Compat: 1, Release: "0.1",
+		SQL: `
+		-- The offsite watermark, stored (REPL-11, #81). offsite_short is
+		-- what shorts computes for a bucket's done puts: each put fewer
+		-- than copies places hold, with its key's next done write and its
+		-- stuck flags, as of the pool in offsite_basis (the holders as
+		-- JSON, and the bucket's copies). Every input a row reads besides
+		-- those is a queue or placement row of the same key, so the
+		-- triggers below mark the key in offsite_dirty in the transaction
+		-- that changes it, whichever code (or older lendisk) writes;
+		-- readers compute a marked key's puts afresh, and the daemon's
+		-- fold (FoldOffsite) stores them and clears the marks it read. A
+		-- mark's id grows on every change (deleted and inserted again,
+		-- AUTOINCREMENT), so a fold clears only marks no later change
+		-- renewed; the trigger names no conflict policy and meets no
+		-- conflict, so the writer's own (OR IGNORE, an upsert) changes
+		-- nothing. A bucket without a basis, or whose pool or copies
+		-- differ from it, is computed in full; holders '' matches no
+		-- pool, while a full fold writes. queue_bucket_seq finds a
+		-- bucket's latest and next writes without walking other
+		-- buckets' rows.
+		CREATE TABLE offsite_short (
+			bucket    TEXT NOT NULL,
+			key       TEXT NOT NULL,
+			seq       INTEGER NOT NULL, -- the put's queue row
+			size      INTEGER NOT NULL,
+			next      INTEGER NOT NULL, -- the key's next done write; 0 if none
+			stuck     INTEGER NOT NULL,
+			refused   INTEGER NOT NULL,
+			dropped   INTEGER NOT NULL,
+			gone      INTEGER NOT NULL,
+			immutable INTEGER NOT NULL,
+			PRIMARY KEY (bucket, seq)
+		);
+		CREATE INDEX offsite_short_key ON offsite_short (bucket, key);
+		CREATE INDEX offsite_short_next ON offsite_short (bucket, next);
+		CREATE INDEX queue_bucket_seq ON queue (bucket, seq);
+		CREATE TABLE offsite_basis (
+			bucket  TEXT PRIMARY KEY,
+			holders TEXT NOT NULL,    -- JSON: the places counted as holders
+			copies  INTEGER NOT NULL,
+			folds   INTEGER NOT NULL  -- folds claimed: a fold read before another claimed writes nothing
+		);
+		CREATE TABLE offsite_dirty (
+			id     INTEGER PRIMARY KEY AUTOINCREMENT,
+			bucket TEXT NOT NULL,
+			key    TEXT NOT NULL,
+			UNIQUE (bucket, key)
+		);
+		CREATE TRIGGER offsite_queue_insert AFTER INSERT ON queue BEGIN
+			DELETE FROM offsite_dirty WHERE bucket = NEW.bucket AND key = NEW.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+		END;
+		CREATE TRIGGER offsite_queue_update AFTER UPDATE ON queue BEGIN
+			DELETE FROM offsite_dirty WHERE bucket = NEW.bucket AND key = NEW.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+			DELETE FROM offsite_dirty WHERE bucket = OLD.bucket AND key = OLD.key
+				AND (OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key);
+			INSERT INTO offsite_dirty (bucket, key) SELECT OLD.bucket, OLD.key
+				WHERE OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key;
+		END;
+		CREATE TRIGGER offsite_queue_delete AFTER DELETE ON queue BEGIN
+			DELETE FROM offsite_dirty WHERE bucket = OLD.bucket AND key = OLD.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
+		END;
+		CREATE TRIGGER offsite_placement_insert AFTER INSERT ON placement BEGIN
+			DELETE FROM offsite_dirty WHERE bucket = NEW.bucket AND key = NEW.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+		END;
+		CREATE TRIGGER offsite_placement_update AFTER UPDATE ON placement BEGIN
+			DELETE FROM offsite_dirty WHERE bucket = NEW.bucket AND key = NEW.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (NEW.bucket, NEW.key);
+			DELETE FROM offsite_dirty WHERE bucket = OLD.bucket AND key = OLD.key
+				AND (OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key);
+			INSERT INTO offsite_dirty (bucket, key) SELECT OLD.bucket, OLD.key
+				WHERE OLD.bucket IS NOT NEW.bucket OR OLD.key IS NOT NEW.key;
+		END;
+		CREATE TRIGGER offsite_placement_delete AFTER DELETE ON placement BEGIN
+			DELETE FROM offsite_dirty WHERE bucket = OLD.bucket AND key = OLD.key;
+			INSERT INTO offsite_dirty (bucket, key) VALUES (OLD.bucket, OLD.key);
+		END;`,
+	},
 }

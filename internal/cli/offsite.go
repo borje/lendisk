@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"path/filepath"
 	"strings"
@@ -393,4 +394,39 @@ func seedNote(ctx context.Context, db *state.DB, bucket string) (string, error) 
 			plural(n, "object", "objects"), s.Place, textTime(utc(s.ExportedAt)))
 	}
 	return note, nil
+}
+
+// offsiteFoldEvery is how often the daemon folds the offsite watermark's
+// changes into what it stores (#81).
+const offsiteFoldEvery = 10 * time.Second
+
+// offsiteFolder is the daemon's fold of the stored offsite watermark
+// (REPL-11, #81): every Every it stores the short puts of the keys
+// changed since, so `status` reads them rather than every put. A read
+// is correct without it, only slower; a failed fold is logged and
+// tried again at the next tick.
+type offsiteFolder struct {
+	DB    *state.DB
+	Every time.Duration
+	Log   *slog.Logger
+}
+
+// Run folds at once, then every Every, until ctx ends.
+func (f *offsiteFolder) Run(ctx context.Context) {
+	every := f.Every
+	if every <= 0 {
+		every = offsiteFoldEvery
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		if err := f.DB.FoldOffsite(ctx); err != nil && ctx.Err() == nil {
+			f.Log.Error("offsite: storing the watermark's changes failed; status reads them afresh meanwhile", "err", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

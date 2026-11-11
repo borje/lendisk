@@ -1,6 +1,7 @@
 package state
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -148,6 +149,7 @@ func (o Offsite) For(target int64) Offsite {
 // short is a put whose bytes fewer than copies places hold, or one still
 // pending.
 type short struct {
+	key                    string
 	seq, next, size        int64 // next: the key's next done write; 0 if none
 	stuck, pending         bool
 	refused, dropped, gone bool
@@ -157,13 +159,38 @@ type short struct {
 
 // Offsite computes bucket's watermark and what keeps it below target
 // (the latest done write when target is 0); For counts it for another
-// target. It reads; nothing is stored, so it is the same in `status`
-// and the daemon. Set the DB's Clock and ReplaceAfter as the daemon's:
-// they decide which friends are gone.
+// target. It reads, in one read transaction unless db is already a
+// Snapshot, so it is the same in `status` and the daemon. Set the DB's
+// Clock and ReplaceAfter as the daemon's: they decide which friends are
+// gone.
+//
+// The short puts come from what the daemon's fold stored
+// (storedShorts, #81) when the pool and copies are those it stored them
+// for, with every key changed since computed afresh; otherwise every
+// put of the bucket is read (fullShorts). Both give the same rows.
 func (db *DB) Offsite(ctx context.Context, bucket string, target int64) (Offsite, error) {
+	return db.offsite(ctx, bucket, target, false)
+}
+
+// offsiteFull is Offsite reading every put, never the stored rows:
+// what Offsite must equal (tests).
+func (db *DB) offsiteFull(ctx context.Context, bucket string, target int64) (Offsite, error) {
+	return db.offsite(ctx, bucket, target, true)
+}
+
+func (db *DB) offsite(ctx context.Context, bucket string, target int64, full bool) (Offsite, error) {
+	if db.snap == nil {
+		view, done, err := db.Snapshot(ctx)
+		if err != nil {
+			return Offsite{}, err
+		}
+		defer done()
+		return view.offsite(ctx, bucket, target, full)
+	}
 	o := Offsite{Copies: DefaultCopies}
 	if err := db.QueryRowContext(ctx, `SELECT coalesce((SELECT copies FROM buckets WHERE name = ?1), ?2),
-		coalesce((SELECT max(seq) FROM queue WHERE bucket = ?1 AND state = 'done'), 0)`,
+		coalesce((SELECT seq FROM queue INDEXED BY queue_bucket_seq WHERE bucket = ?1 AND state = 'done'
+			ORDER BY seq DESC LIMIT 1), 0)`,
 		bucket, DefaultCopies).Scan(&o.Copies, &o.Latest); err != nil {
 		return o, err
 	}
@@ -171,8 +198,16 @@ func (db *DB) Offsite(ctx context.Context, bucket string, target int64) (Offsite
 	if err != nil {
 		return o, err
 	}
-	if o.shorts, err = db.shorts(ctx, bucket, o.Copies, holders); err != nil {
-		return o, err
+	stored := false
+	if !full {
+		if o.shorts, stored, err = db.storedShorts(ctx, bucket, o.Copies, holders, o.Latest); err != nil {
+			return o, err
+		}
+	}
+	if !stored {
+		if o.shorts, err = db.fullShorts(ctx, bucket, o.Copies, holders); err != nil {
+			return o, err
+		}
 	}
 	// A re-placement pass due may place what is short (#26): nothing
 	// it could place is stuck until it has answered the pool as it is.
@@ -187,34 +222,47 @@ func (db *DB) Offsite(ctx context.Context, bucket string, target int64) (Offsite
 			}
 		}
 	}
-	// The highest valid w: each short put r rules out [r, next).
-	// Scanning by r descending, w only falls, and an interval passed
-	// over starts above every later w.
-	o.Watermark = o.Latest
-	for _, s := range slices.Backward(o.shorts) {
-		if s.seq <= o.Watermark && (s.next == 0 || s.next > o.Watermark) {
-			o.Watermark = s.seq - 1
-		}
+	o.Watermark = watermark(o.shorts, o.Latest)
+	// A put superseded at or below the watermark counts for no target
+	// For is asked (a target below the watermark is reached): only the
+	// rest are kept, which are all storedShorts reads.
+	o.shorts = slices.DeleteFunc(o.shorts, func(s short) bool { return s.next != 0 && s.next <= o.Watermark })
+	if len(o.shorts) == 0 {
+		o.shorts = nil // whichever way they were read
 	}
 	o = o.For(target)
-	if o.Snapshot, err = db.write(ctx, snapshotPut+` AND bucket = ? AND seq <= ? AND `+live,
+	if o.Snapshot, err = db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND seq <= ? AND `+live,
 		bucket, o.Watermark); err != nil {
 		return o, err
 	}
-	if o.LatestSnapshot, err = db.write(ctx, snapshotPut+` AND bucket = ? AND `+live, bucket); err != nil {
+	if o.LatestSnapshot, err = db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND `+live, bucket); err != nil {
 		return o, err
 	}
-	if o.Through, err = db.write(ctx, `+q.bucket = ? AND q.op = 'put' AND q.seq <= ?`, bucket, o.Watermark); err != nil {
+	if o.Through, err = db.write(ctx, `queue q INDEXED BY queue_bucket_seq`, `q.bucket = ? AND q.op = 'put' AND q.seq <= ?`, bucket, o.Watermark); err != nil {
 		return o, err
 	}
 	var at int64
-	err = db.QueryRowContext(ctx, `SELECT seq, key, created_at FROM queue WHERE seq > ? AND +bucket = ?
-		ORDER BY seq LIMIT 1`, o.Watermark, bucket).Scan(&o.Next.Seq, &o.Next.Key, &at)
+	err = db.QueryRowContext(ctx, `SELECT seq, key, created_at FROM queue INDEXED BY queue_bucket_seq
+		WHERE bucket = ? AND seq > ? ORDER BY seq LIMIT 1`, bucket, o.Watermark).Scan(&o.Next.Seq, &o.Next.Key, &at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, nil
 	}
 	o.Next.CapturedAt = time.Unix(at, 0)
 	return o, err
+}
+
+// watermark is the highest valid w up to latest, given the short puts
+// in sequence order: each short put r rules out [r, next). Scanning by
+// r descending, w only falls, and an interval passed over starts above
+// every later w.
+func watermark(shorts []short, latest int64) int64 {
+	w := latest
+	for _, s := range slices.Backward(shorts) {
+		if s.seq <= w && (s.next == 0 || s.next > w) {
+			w = s.seq - 1
+		}
+	}
+	return w
 }
 
 // holders are the places that count as holding copies, as JSON for
@@ -268,15 +316,15 @@ func (s *Shortfall) add(r short) {
 // Seq is 0 when there is none.
 func (db *DB) LatestSnapshotWrite(ctx context.Context, bucket string, seq int64) (Write, error) {
 	if seq <= 0 {
-		return db.write(ctx, snapshotPut+` AND bucket = ?`, bucket)
+		return db.write(ctx, `queue q`, snapshotPut+` AND bucket = ?`, bucket)
 	}
-	return db.write(ctx, snapshotPut+` AND bucket = ? AND seq <= ?`, bucket, seq)
+	return db.write(ctx, `queue q`, snapshotPut+` AND bucket = ? AND seq <= ?`, bucket, seq)
 }
 
 // LatestWrite is bucket's latest done write, put or delete; Seq is 0
 // when there is none.
 func (db *DB) LatestWrite(ctx context.Context, bucket string) (Write, error) {
-	return db.write(ctx, `+q.bucket = ?`, bucket)
+	return db.write(ctx, `queue q INDEXED BY queue_bucket_seq`, `q.bucket = ?`, bucket)
 }
 
 // live keeps queue rows q that are their key's latest done write.
@@ -289,14 +337,15 @@ const live = `NOT EXISTS (SELECT 1 FROM queue l
 // -race).
 const snapshotPut = `q.class IN ('metadata', 'snapshot') AND q.class = 'snapshot' AND q.op = 'put'`
 
-// write returns the latest done queue row q matching where. A where
-// that writes the bucket term as +q.bucket walks the queue backwards
-// by sequence and stops at the first match, rather than reading and
-// sorting every row of the bucket.
-func (db *DB) write(ctx context.Context, where string, args ...any) (Write, error) {
+// write returns the latest done queue row q of from matching where.
+// From names the index to read: queue_bucket_seq walks the bucket's
+// rows backwards by sequence and stops at the first match, rather than
+// reading and sorting every row of the bucket, or walking every other
+// bucket's rows written since (#81 review).
+func (db *DB) write(ctx context.Context, from, where string, args ...any) (Write, error) {
 	var w Write
 	var at int64
-	err := db.QueryRowContext(ctx, `SELECT q.seq, q.key, q.created_at FROM queue q
+	err := db.QueryRowContext(ctx, `SELECT q.seq, q.key, q.created_at FROM `+from+`
 		WHERE q.state = 'done' AND `+where+` ORDER BY q.seq DESC LIMIT 1`, args...).Scan(&w.Seq, &w.Key, &at)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Write{}, nil
@@ -316,35 +365,77 @@ const holds = `coalesce((SELECT a.state = 'acked' AND a.op = 'put' AND qa.sha256
 	AND a.state IN ('acked', 'abandoned', 'dropping', 'drained')
 	ORDER BY a.seq DESC LIMIT 1), 0)`
 
-// shorts lists bucket's done puts that fewer than copies places hold,
-// in sequence order, each with its key's next done write and whether it
-// is stuck: the key's latest write, with too few places holding it or
-// queued to (a refusal, a dropped copy, no room). Each put costs one
-// indexed look-up per place (placement_key), counted once (counted is
+// fullShorts lists bucket's short puts, done and pending, in sequence
+// order, reading every done put.
+func (db *DB) fullShorts(ctx context.Context, bucket string, copies int, holders string) ([]short, error) {
+	done, err := doneShorts(ctx, db, bucket, copies, holders, "")
+	if err != nil {
+		return nil, err
+	}
+	return db.withPending(ctx, bucket, done)
+}
+
+// withPending adds bucket's pending puts to done and sorts them by
+// sequence: a pending put has no placement yet (#20 review), so it is
+// always short, and is never stored.
+func (db *DB) withPending(ctx context.Context, bucket string, done []short) ([]short, error) {
+	rows, err := db.QueryContext(ctx, `SELECT seq, unmatchable IS NOT NULL FROM queue
+		WHERE state = 'pending' AND bucket = ? AND op = 'put'`, bucket)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		s := short{pending: true}
+		if err := rows.Scan(&s.seq, &s.unmatchable); err != nil {
+			return nil, err
+		}
+		s.stuck = s.unmatchable
+		done = append(done, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	slices.SortFunc(done, func(a, b short) int { return cmp.Compare(a.seq, b.seq) })
+	return done, nil
+}
+
+// doneShorts lists bucket's done puts that fewer than copies places
+// hold, each with its key's next done write and whether it is stuck:
+// the key's latest write, with too few places holding it or queued to
+// (a refusal, a dropped copy, no room). Each put costs one indexed
+// look-up per place (placement_key), counted once (counted is
 // materialized, so SQLite does not count again for the output); its
-// next write and queued rows are read only for the short ones.
-func (db *DB) shorts(ctx context.Context, bucket string, copies int, holders string) ([]short, error) {
+// next write and queued rows are read only for the short ones. keys,
+// when not "", restricts the puts to the keys it selects (a subquery,
+// which may name ?1, the bucket, and args after the first three).
+//
+// Every row it returns reads only holders, copies, and queue and
+// placement rows of the put's own key: what lets the fold store the
+// rows and recompute only the keys offsite_dirty marks (#81). A change
+// that breaks that must widen the marks (migration 53's triggers).
+func doneShorts(ctx context.Context, db querier, bucket string, copies int, holders, keys string, args ...any) ([]short, error) {
+	filter := ""
+	if keys != "" {
+		filter = ` AND q.key IN (` + keys + `)`
+	}
 	rows, err := db.QueryContext(ctx, `WITH places AS MATERIALIZED (SELECT value AS place FROM json_each(?3)),
 		counted AS MATERIALIZED (SELECT q.seq, q.bucket, q.key, q.sha256, coalesce(q.size, 0) AS size,
 			q.immutable IS NOT NULL AS changed, (SELECT count(*) FROM places pl WHERE `+holds+`) AS held
-			FROM queue q WHERE q.bucket = ?1 AND q.state = 'done' AND q.op = 'put'),
-		puts AS (SELECT q.seq, q.size, q.changed, q.held,
+			FROM queue q WHERE q.bucket = ?1 AND q.state = 'done' AND q.op = 'put'`+filter+`),
+		puts AS (SELECT q.seq, q.key, q.size, q.changed, q.held,
 			(SELECT min(l.seq) FROM queue l WHERE l.bucket = q.bucket AND l.key = q.key AND l.seq > q.seq AND l.state = 'done') AS next,
 			(SELECT count(*) FROM placement w JOIN places pl ON pl.place = w.place
 				WHERE w.seq = q.seq AND w.state = 'queued' AND NOT `+holds+`) AS queued
 			FROM counted q WHERE q.held < ?2)
-		SELECT seq, size, coalesce(next, 0), next IS NULL AND held + queued < ?2,
+		SELECT seq, key, size, coalesce(next, 0), next IS NULL AND held + queued < ?2,
 			EXISTS (SELECT 1 FROM placement r WHERE r.seq = puts.seq AND r.state = 'refused'),
 			EXISTS (SELECT 1 FROM placement d WHERE d.seq = puts.seq AND d.state = 'dropped'),
 			EXISTS (SELECT 1 FROM placement g WHERE g.seq = puts.seq AND g.state = 'acked'
-				AND g.place NOT IN (SELECT place FROM places)), 0, 0,
+				AND g.place NOT IN (SELECT place FROM places)),
 			changed OR EXISTS (SELECT 1 FROM placement i WHERE i.seq = puts.seq AND i.state = 'refused'
 				AND i.cause = '`+CauseImmutable+`')
-		FROM puts
-		UNION ALL
-		SELECT seq, 0, 0, unmatchable IS NOT NULL, 0, 0, 0, 1, unmatchable IS NOT NULL, 0 FROM queue
-		WHERE state = 'pending' AND bucket = ?1 AND op = 'put'
-		ORDER BY 1`, bucket, copies, holders)
+		FROM puts ORDER BY seq`, append([]any{bucket, copies, holders}, args...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +443,7 @@ func (db *DB) shorts(ctx context.Context, bucket string, copies int, holders str
 	var out []short
 	for rows.Next() {
 		var s short
-		if err := rows.Scan(&s.seq, &s.size, &s.next, &s.stuck, &s.refused, &s.dropped, &s.gone, &s.pending, &s.unmatchable, &s.immutable); err != nil {
+		if err := rows.Scan(&s.seq, &s.key, &s.size, &s.next, &s.stuck, &s.refused, &s.dropped, &s.gone, &s.immutable); err != nil {
 			return nil, err
 		}
 		out = append(out, s)

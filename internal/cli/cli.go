@@ -135,6 +135,9 @@ type app struct {
 	// reloadEvery is how often serve looks at its config file for changed
 	// pacing settings; zero means defaultReloadEvery. Tests set it.
 	reloadEvery time.Duration
+	// offsiteFoldEvery is how often serve folds the stored offsite
+	// watermark (#81); zero means offsiteFoldEvery. Tests set it.
+	offsiteFoldEvery time.Duration
 	// afterOpen, if set, runs once serve has opened lendisk.db: a long
 	// start-up, for tests only.
 	afterOpen func()

@@ -361,6 +361,13 @@ func (a *app) serveCmd() *cobra.Command {
 				}
 				running++
 				go func() { und.Run(ctx); errc <- nil }()
+
+				// The stored offsite watermark (REPL-11, #81): the keys
+				// changed since the last fold, stored so `status` need
+				// not read every put.
+				folder := &offsiteFolder{DB: db, Every: a.offsiteFoldEvery, Log: log}
+				running++
+				go func() { folder.Run(ctx); errc <- nil }()
 			} else {
 				log.Info(lendingOnlyLog)
 				if a.serving != nil {

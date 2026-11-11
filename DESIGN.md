@@ -4490,10 +4490,11 @@ upstream bucket is Q-V.
 - **REPL-11, the watermark (#20).** The bucket's watermark is the
   highest sequence `w` up to which every object has `copies`
   acknowledged placements; it is the offsite-complete point (REPL-4).
-  Nothing stores it: `state.DB.Offsite` computes it from `queue` and
-  `placement` whenever `status` asks (`internal/state/offsite.go`), so
-  it advances as each acknowledgement is recorded, needs no migration
-  and cannot drift from the rows. Per-place lag (the oldest `queued`
+  `state.DB.Offsite` computes it from `queue` and `placement` whenever
+  `status` asks (`internal/state/offsite.go`), in one read transaction,
+  so it advances as each acknowledgement is recorded; since #81 it reads
+  the short puts the daemon stored rather than every put (*stored*,
+  below), with the same result. Per-place lag (the oldest `queued`
   row's age) is kept beside it (`places[]`) for `status` and OPS-2.
   How each row counts, against a candidate `w`
   (`TestWatermarkAdvancesAsAcknowledgementsArrive`,
@@ -4656,11 +4657,100 @@ upstream bucket is Q-V.
   recounts what waits for the latest snapshot with `Offsite.For`, which
   reads nothing (`TestForRecountsLikeAFreshRead`); `status --wait`
   pauses ten times as long as its last read took, never less than 2 s
-  (`TestStatusWaitBacksOffOnASlowRead`). *Next step (#20 review): a
-  stored, incremental watermark* (per bucket, advanced as
-  acknowledgements, deletes and settled pending rows arrive, recomputed
-  only from the lowest sequence a change can affect), so neither cost
-  grows with the repository.
+  (`TestStatusWaitBacksOffOnASlowRead`).
+
+  *Stored (#81).* That full read is now the fallback; normally `Offsite`
+  costs what is short and what changed since the daemon last looked
+  (`internal/state/offsitestore.go`, schema 53). *Decision: store the
+  short puts, not the watermark, and mark changes by trigger.* The
+  issue's option was a per-bucket watermark advanced by the writers and
+  recomputed when one could move it back; but under the rules above an
+  ordinary acknowledgement moves it back too (a rewrite acknowledged at
+  one place before the other leaves the old version at one place, so
+  the watermark falls below it until both hold the new one), so
+  "recompute only on a refusal, drop or removal" would overclaim, and
+  recomputing on every such acknowledgement is the full read again.
+  What the watermark is a function of is the set of short puts, and a
+  short put's row (`doneShorts`: held, next, stuck and its reasons)
+  reads only the pool's holders, the bucket's copies, and `queue` and
+  `placement` rows of its own key. So:
+  - `offsite_short` holds `doneShorts`'s rows for a bucket as of the
+    holders and copies in `offsite_basis`;
+  - triggers on every insert, update and delete of `queue` and
+    `placement` put the row's bucket and key in `offsite_dirty`, in the
+    writer's own transaction. About fifty statements in `internal/state`
+    write those tables (captures, `FinishPut` and `FinishDelete`,
+    acknowledgements, sends started, cancels, refusals, re-routing,
+    re-placement's drops and drains, friend and target removal, seeds,
+    undelete, reconcile, recovery); a trigger cannot miss one, nor a
+    write by an older lendisk after a downgrade. Each mark is deleted
+    and inserted again (`AUTOINCREMENT`), naming no conflict policy and
+    meeting no conflict, so a writer's `OR IGNORE`, `OR REPLACE` or
+    upsert still renews it (from the #81 review:
+    `TestAMarkIsRenewedWhateverTheWritersConflictPolicy`). The marking
+    costs bulk writes: abandoning 200,000 recovered keys took 25 s
+    instead of 17 s;
+  - a read takes the stored rows of keys not marked and computes the
+    marked keys' puts afresh (and the pending puts, never stored), so it
+    equals the full read at every commit, folded or not. The holders
+    change with the clock too (a friend gone past `replace_after` with
+    nothing written), so they are compared, not marked: a read whose
+    holders or copies differ from the basis does the full read;
+  - the daemon folds every 10 s (`offsiteFolder`, `FoldOffsite`): per
+    bucket it reads the marked keys' rows in a read transaction, then
+    writes them in transactions of `SettleBudget` (0.25 s),
+    `SettlePause` apart, as settling does, so the gateway's captures
+    wait one batch at most. The first claims the bucket
+    (`offsite_basis.folds`); every batch checks the claim, and a fold
+    whose read predates another's claim writes nothing, since that one
+    may have cleared marks of changes this read did not see
+    (`TestAFoldKeepsTheMarksOfChangesAfterItsRead`). The last batch
+    clears the marks the read saw; a key changed after the read has a
+    newer mark and stays marked. Between batches nothing overclaims:
+    an incremental fold's keys stay marked until the last batch, and a
+    full one (a bucket without a basis, or whose holders or copies
+    changed: the first fold after the upgrade, which reads 9 s for a
+    million objects) empties the basis's holders in its claim, which
+    then match no pool, so every read does the full read until the
+    last batch stores them (from the #81 review: one transaction held
+    the lock 0.93 s for 100,000 short rows, some 13 s for a million;
+    `TestAFullFoldKeepsWritersMoving`). A bucket whose fold fails is
+    logged and the others folded
+    (`TestAFailingBucketDoesNotStopTheFoldOfTheOthers`).
+
+  A deleted or rewritten object leaves its old put short for good, as
+  many as there are live objects in a pruned repository, but a put
+  superseded at or below the watermark (`next <= w`) rules nothing out
+  at or above it and counts for no target `For` is asked. So the read
+  first finds `w` from the stored rows whose key's latest done write
+  they are (`next = 0`), and while `w` comes out below the bound it read
+  for, reads the rows superseded above `w` again (index
+  `offsite_short_next`): each round reads the backlog above `w`, not
+  the history. `Offsite` keeps only those rows either way. Its latest,
+  next and last fully placed writes walk the bucket's own rows by the
+  index `queue_bucket_seq` (schema 53), not the queue backwards, so a
+  quiet bucket behind another's million writes costs no more than a
+  busy one (from the #81 review:
+  `TestAQuietBucketsOffsiteDoesNotWalkABusyOnesRows`).
+
+  Evidence: `TestStoredWatermarkEqualsTheComputedOne` compares the
+  stored read with the full one after every step of random puts,
+  deletes, rewrites, acknowledgements, refusals, sends started and
+  cancelled, re-routes, re-placement, pending uploads settling or
+  marked unmatchable, friends failing, gone, added and refusing, copies
+  changed, and folds at random points, some with steps between their
+  read and write; the removal model (`TestRemovalModel`, §3.4) checks
+  the same every 50 of its steps and at its end, through the rest of the writers
+  (seeds, undelete, overflow targets). Weakening the `queue` or
+  `placement` update trigger fails them. On a million objects at two
+  of three friends, a tenth deleted, the read takes 1 ms from the
+  stored rows against 7.7 s in full
+  (`TestStoredOffsiteOfAMillionObjectBucketIsFast`, run with
+  `LENDISK_BIG_OFFSITE=1000000`), and `status`'s offsite read 23 ms.
+  `status` as a whole went from 18 s to 11 s there: its other reads
+  (below-copies counts 4.3 s, places 2.1 s, replicas 1.5 s, re-placement
+  in progress 1.4 s, queue counts 0.4 s) still read every row
+  (`TestStatusOfAMillionObjectBucket`, `LENDISK_BIG_STATUS=1000000`).
 
   *What `status` names (REPL-4, REPL-11).* Under each bucket, and in
   `buckets[].offsite` of `status --json` (`complete`, `watermark`,
@@ -4718,8 +4808,9 @@ upstream bucket is Q-V.
   stand (stuck objects, above), with the reason on stderr. `--timeout`
   defaults to 24 hours (a nightly script's next run), 0 waiting without
   a limit. *Decision (#20): it polls `lendisk.db`, not the daemon.*
-  The watermark is computed from the rows, which the daemon writes in
-  WAL mode, so a reader never blocks it and needs no control API call;
+  The watermark is computed from the rows (and the daemon's stored
+  short puts, #81), which the daemon writes in WAL mode, so a reader
+  never blocks it and needs no control API call;
   it reads every 2 s, or ten times as long as a read took (above). A
   pending row below the snapshot holds it (above), so a multipart pack
   still being hashed is waited for (`TestStatusWaitWaitsForAMultipartPack`).
