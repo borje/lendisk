@@ -106,6 +106,12 @@ type Lending struct {
 	// afterVouchRead runs when vouch has read an unverified upload's row
 	// and its object, and not yet hashed it (#113).
 	afterVouchRead func()
+	// alerted, if set, asks the alert service to look again: a rotten
+	// object was recorded (judgeUnread).
+	alerted func()
+	// unread remembers what objects whose upload ID cannot be read hashed
+	// to (unread.go).
+	unread unreadMemo
 	// afterUndeleteKey runs when undelete has handled a key; afterReviveLink
 	// when a revival has linked a tomb back and not yet unlinked it, an
 	// error stopping it there as a crash would.

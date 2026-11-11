@@ -242,6 +242,9 @@ func (g *Gateway) Run(ctx context.Context, ready chan<- struct{}) error {
 	}
 	lend := &Lending{Next: dec, DB: g.DB, Uploads: be, StoreDir: g.StoreDir, Floor: g.Floor, Statfs: g.Statfs, Log: g.Log,
 		Now: g.Clock, BeforeRead: g.BeforeRead}
+	if g.Sample != nil {
+		lend.alerted = g.Sample.Alerted
+	}
 	g.lending = lend
 	g.running.Store(lend)
 	if g.lendingHook != nil {

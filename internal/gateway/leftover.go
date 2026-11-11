@@ -152,10 +152,11 @@ func (l *Lending) midCompletion(ctx context.Context, peer string, id identity.No
 //     the object before the lender verified it (vouch, #113). An object
 //     that cannot be read or removed leaves everything as it is, past
 //     AbandonAfter too, until a reconcile can tell.
-//   - If the object's upload ID cannot be read but it declares the
-//     upload's hash (declares), it is hashed the same way; a match
-//     drops the row, but proves nothing of the directory, which falls
-//     to the next rule (#115).
+//   - If the object's upload ID cannot be read, the row is judged by
+//     its trusted hash (unreadRow, #115): settled (verified, proven
+//     another upload's, or failed and removed) it is dropped, but that
+//     proves nothing of the directory, which falls to the next rule;
+//     otherwise both are kept.
 //   - Otherwise, once the directory has been still for AbandonAfter
 //     (its change time: the hiding rename sets it on Linux) it is
 //     removed, as an abandoned upload is aborted.
@@ -182,29 +183,31 @@ func (l *Lending) hiddenUpload(ctx context.Context, peer string, id identity.Nod
 	bad, kept := false, false
 	if !verified[uid] && hasRow && LentName(id, row.Sealed) == bucket && keyDirName(row.Key) == filepath.Base(keyDir) {
 		linked, err := l.linkedBy(bucket, row.Key, uid)
-		byHash := false
 		if err != nil {
-			linked, err = l.declares(ctx, bucket, row)
-			byHash = true
-		}
-		if err != nil {
-			l.log().Warn("lending: an object a hidden upload may have assembled cannot be read; keeping both",
-				"peer", peer, "bucket", bucket, "key", row.Key, "upload", uid, "err", err)
-			kept = true
+			// Judged by a trusted hash alone (#115): settled, the
+			// directory is not proven a copy of the object without the
+			// upload ID, and falls to the abandon rule.
+			delta, drop := l.unreadRow(ctx, peer, bucket, row)
+			total += delta
+			switch {
+			case !drop:
+				kept = true
+			case delta < 0:
+				l.dropUpload(uid)
+				hasRow, bad = false, true
+			default:
+				l.dropUpload(uid)
+				hasRow = false
+			}
 		} else if linked {
 			delta, v := l.landed(ctx, peer, bucket, row)
 			total += delta
-			switch {
-			case v == landedGood && byHash:
-				// Verified and settled, but without the upload ID the
-				// directory is not proven a copy of it: it falls to
-				// the abandon rule (#115).
-				hasRow = false
-			case v == landedGood:
+			switch v {
+			case landedGood:
 				verified[uid] = true
-			case v == landedBad:
+			case landedBad:
 				hasRow, bad = false, true // dropped; the directory is not removed on that evidence
-			case v == landedKept:
+			case landedKept:
 				kept = true // never removed unverified (#113)
 			}
 		}
@@ -262,16 +265,6 @@ func (l *Lending) linkedBy(bucket, key, uid string) (bool, error) {
 	}
 	got, err := l.Uploads.UploadID(bucket, key)
 	return err == nil && got == uid, err
-}
-
-// declares reports, for an object whose upload ID cannot be read
-// (linkedBy's error), whether upload u may have linked it: the object
-// at u's key declares u's hash. Each upload's object carries the hash
-// its create declared, so one that declares another is not u's. An
-// error means the object cannot be read (#115).
-func (l *Lending) declares(ctx context.Context, bucket string, u state.LentUpload) (bool, error) {
-	old, has, err := l.existing(ctx, bucket, u.Key)
-	return err == nil && has && old.sha256 == u.SHA256, err
 }
 
 type landing int

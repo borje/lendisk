@@ -1366,9 +1366,10 @@ func (l *Lending) reconcileOne(ctx context.Context, peer string) error {
 // .sgwtmp is counted, and removed when garbage (midCompletion). A row
 // whose upload the store no longer has is dropped, its object hashed
 // first if the upload assembled the one at its key (landed), or, when
-// the object's upload ID cannot be read, if the object declares the
-// upload's hash (#115); one whose object cannot be read or removed is
-// kept to try again (#113). Nothing else drops one.
+// the object's upload ID cannot be read, judged by the row's hash
+// (unreadRow, #115); one whose object cannot be read or removed, or
+// that no trusted hash settles, is kept to try again (#113). Nothing
+// else drops one.
 func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 	id, err := identity.ParseNodeID(peer)
 	if err != nil {
@@ -1473,13 +1474,14 @@ func (l *Lending) listed(ctx context.Context, peer string) (int64, error) {
 		bucket := LentName(id, r.Sealed)
 		linked, err := l.linkedBy(bucket, r.Key, r.UploadID)
 		if err != nil {
-			// The upload ID cannot tell: the object's declared hash can
-			// (#115).
-			if linked, err = l.declares(ctx, bucket, r); err != nil {
-				l.log().Warn("lending: an object a borrower's upload may have assembled cannot be read; keeping its row",
-					"peer", peer, "bucket", bucket, "key", r.Key, "upload", r.UploadID, "err", err)
-				continue
+			// The upload ID cannot tell: only a trusted hash settles
+			// the row (unreadRow, #115).
+			n, drop := l.unreadRow(ctx, peer, bucket, r)
+			total += n
+			if drop {
+				l.dropUpload(r.UploadID)
 			}
+			continue
 		}
 		if linked {
 			n, v := l.landed(ctx, peer, bucket, r)
