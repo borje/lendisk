@@ -750,8 +750,11 @@ func TestMultipartVerifiedAsAWhole(t *testing.T) {
 // LEND-1, SEC-5: re-sends of one part, of different sizes and racing,
 // are counted as the store holds them: the counter equals the bucket,
 // the upload and the stored part, and the next put over quota is
-// refused. The second re-send is forced to store while the first,
-// already stored, has not been counted yet.
+// refused. The hook between A's part being published and its locks
+// being taken offers B the interleaving the locks forbid (#66): B
+// re-sends and publishes the part, B settles, then A settles, which
+// would leave lent_part with A's size while the store holds B's. The
+// locks taken at the body's end (onEOF) make B wait until A is counted.
 func TestRacingPartResendsCountedAsStored(t *testing.T) {
 	aStored, bDone := make(chan struct{}), make(chan error, 1)
 	var once sync.Once
@@ -762,7 +765,7 @@ func TestRacingPartResendsCountedAsStored(t *testing.T) {
 					return
 				}
 				once.Do(func() { close(aStored) })
-				select { // B stores and counts here unless the upload is locked
+				select { // B stores and settles here unless A holds the locks from its body's end
 				case err := <-bDone:
 					bDone <- err
 				case <-time.After(500 * time.Millisecond):
@@ -1101,6 +1104,59 @@ func TestAbandonedUploadsAborted(t *testing.T) {
 		KeyMarker: aws.String(""), UploadIdMarker: aws.String(""), MaxUploads: aws.Int32(100)})
 	if err != nil || len(ups.Uploads) != 0 {
 		t.Fatalf("uploads left: %+v %v", ups.Uploads, err)
+	}
+}
+
+// LEND-1 (#66): an upload a crash left hidden mid-completion (posix's
+// <upload ID>.<token>.inprogress directory, which no listing shows)
+// still counts with its parts and keeps its row; once it has been still
+// for the abandon period the reconcile removes it and frees its bytes.
+func TestUploadLeftMidCompletionCountedThenRemoved(t *testing.T) {
+	var now atomic.Int64
+	now.Store(time.Now().Unix())
+	l := lendTo(t, 1<<30, func(h *harness) {
+		h.lending = func(l *Lending) { l.Now = func() time.Time { return time.Unix(now.Load(), 0) } }
+	})
+	ctx := context.Background()
+	p1, p2 := bytes.Repeat([]byte("1"), 5<<20), []byte("tail")
+	id, err := l.create("data/mp", hashMeta(append(append([]byte{}, p1...), p2...)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, p := range [][]byte{p1, p2} {
+		if _, err := l.part("data/mp", id, int32(i+1), p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dirs, err := filepath.Glob(filepath.Join(l.dir, ".sgwtmp", "multipart", "*", *id))
+	if err != nil || len(dirs) != 1 {
+		t.Fatalf("the upload's directory: %v %v", dirs, err)
+	}
+	hidden := dirs[0] + ".0123456789abcdef0123456789abcdef-2" + inProgressSuffix
+	if err := os.Rename(dirs[0], hidden); err != nil { // the crash, mid-completion
+		t.Fatal(err)
+	}
+	want := 2*ov + int64(len(p1)+len(p2))
+	if err := l.h.db.SetLentUsage(ctx, l.peer(), 0, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.lending().reconcile(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	l.wantUsage(want)
+	if u, err := l.h.db.GetLentUpload(ctx, *id); err != nil || u.Counted != int64(len(p1)+len(p2)) {
+		t.Fatalf("the hidden upload's row: %+v %v", u, err)
+	}
+	now.Add(int64(8 * 24 * time.Hour / time.Second))
+	if err := l.lending().reconcile(ctx, 0); err != nil {
+		t.Fatal(err)
+	}
+	l.wantUsage(ov)
+	if _, err := os.Stat(hidden); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the hidden upload's directory after the abandon period: %v", err)
+	}
+	if _, err := l.h.db.GetLentUpload(ctx, *id); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("the hidden upload's row after the abandon period: %v", err)
 	}
 }
 

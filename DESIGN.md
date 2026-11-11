@@ -4778,7 +4778,10 @@ the handler's own reads and is never cancelled; nothing below
   moment the store may publish (a body's last read, or the store call)
   until it is counted; a part also holds its upload's lock over that
   span, so parts of one number are published and counted in the same
-  order. The counter is reconciled against a listing (`ListObjectsV2`
+  order (`TestRacingPartResendsCountedAsStored` forces, through the
+  `afterPartStored` hook between the store publishing a part and the
+  request taking its locks, the order the locks forbid: A publishes
+  part N, B re-sends and publishes it, B settles, A settles, #66). The counter is reconciled against a listing (`ListObjectsV2`
   of each `lent-` bucket and its rows in `lent_bucket`, plus
   `ListParts` of each upload `ListMultipartUploads` shows, which also
   resets `lent_part`, plus the borrower's `tombstone` rows, since
@@ -4793,6 +4796,23 @@ the handler's own reads and is never cancelled; nothing below
   reconcile and its `lent_upload` row dropped. Otherwise a row is
   dropped only when its upload is finished, aborted, or gone from the
   store; an upload begun long ago that still gets parts keeps it.
+  *Decision (#66):* posix hides an upload while it completes it,
+  renaming `<bucket>/.sgwtmp/multipart/<sha256 of key>/<upload ID>` to
+  `<upload ID>.<claim token>.inprogress`, and `ListMultipartUploads`
+  skips that name; a crash mid-completion leaves it so. The reconcile
+  reads those directories itself (`Lending.midCompletion`): since it
+  holds the publication lock exclusively and a completion holds it
+  shared until the store answers, every one it sees is a crash's. It
+  counts each as an open upload (its overhead and its part files) and
+  keeps and resets its row, so the borrower is never undercounted for
+  bytes on the lender's disk. Once the directory's change time (set by
+  the hiding rename) is `AbandonAfter` old it is removed and its row
+  dropped, as an abandoned upload is aborted, since its bytes are
+  garbage: no S3 call can list, read, complete or abort it (a retried
+  completion is answered from the directory's name alone), and its
+  parts are either a copy of the object already linked or the bytes of
+  a completion the borrower never had acknowledged, which its
+  replication sends again (`TestUploadLeftMidCompletionCountedThenRemoved`).
   `lending.max_total` bounds the sum of the node's own numbers;
   `peer quota`, `invite` and `peer add` refuse a value that would
   exceed it (LEND-8, §3.2); unset, it is the store's filesystem size less
